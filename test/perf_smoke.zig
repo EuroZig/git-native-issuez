@@ -16,7 +16,12 @@ pub fn main(init: std.process.Init) !u8 {
         std.debug.print("usage: perf-smoke <git-issue> [--issues N] [--budget-ms MS]\n", .{});
         return 2;
     }
-    const exe = args[1];
+    const cwd = try std.process.currentPathAlloc(io, arena);
+    // It runs in the test repository, so a path relative to here would miss.
+    const exe = if (std.fs.path.isAbsolute(args[1]))
+        args[1]
+    else
+        try std.fs.path.join(arena, &.{ cwd, args[1] });
     var issues: u32 = 10_000;
     var budget_ms: u64 = 1_000;
     var i: usize = 2;
@@ -36,7 +41,6 @@ pub fn main(init: std.process.Init) !u8 {
 
     var rnd: [6]u8 = undefined;
     io.random(&rnd);
-    const cwd = try std.process.currentPathAlloc(io, arena);
     const repo = try std.fmt.allocPrint(arena, "{s}/.zig-cache/tmp/perf-{x}", .{ cwd, rnd });
     defer Io.Dir.cwd().deleteTree(io, repo) catch {};
     try check(try std.process.run(arena, io, .{
