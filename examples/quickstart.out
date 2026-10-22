@@ -1,0 +1,24 @@
+created df230b4 and fc7b9ae
+
+ID       STATE   TITLE
+df230b4  closed  Login page crashes
+fc7b9ae  open    Document the sync protocol
+
+Login page crashes (closed)
+labels: bug regression
+Assignee: ada@example.invalid
+Fixed-By: abc1234
+Priority: high
+
+Clicking "Sign in" with an empty password crashes the app.
+
+--- Ada <ada@example.invalid>: Reproduced on 1.4.2.
+Stack trace attached.
+
+--- Ada <ada@example.invalid>: Update labels, assignee
+Labels: bug, regression
+Assignee: ada@example.invalid
+
+--- Ada <ada@example.invalid>: Close issue
+State: closed
+Fixed-By: abc1234
