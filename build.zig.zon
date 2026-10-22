@@ -3,7 +3,15 @@
     .version = "0.0.1",
     .minimum_zig_version = "0.16.0",
     .fingerprint = 0x7bba8a1d2cbb8815,
-    .dependencies = .{},
+    .dependencies = .{
+        // Upstream git-native-issue (GPL-2.0), the interop test oracle.
+        // Never vendored; only fetched by test-interop / test-upstream-suite.
+        .git_native_issue = .{
+            .url = "git+https://github.com/remenoscodes/git-native-issue#004c0f9f66152471595a82ad14d01735518ac6e6",
+            .hash = "N-V-__8AANZ_FQDK_dKZMtrsZb7Q9uIi6QcIEtg1VljiuUGg",
+            .lazy = true,
+        },
+    },
     .paths = .{
         "build.zig",
         "build.zig.zon",

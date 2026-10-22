@@ -1,0 +1,9 @@
+// Two empty clones.
+.{
+    .format = .sha1,
+    .seed = 1,
+    .clones = .{
+        .{ .name = "alice" },
+        .{ .name = "bob" },
+    },
+}

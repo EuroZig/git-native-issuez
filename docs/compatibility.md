@@ -8,6 +8,10 @@ CLI behaves differently, it is on purpose, and this page says why.
 
 Upstream's `merge` is not in this version yet.
 
+`zig build test-upstream-suite` runs upstream's own tests against this
+`git-issue`. `test/upstream-allowlist.txt` lists every test it fails on
+purpose, with the reason.
+
 ## Provider bridges
 
 `import`, `export` and provider `sync` (GitHub, GitLab, Gitea/Forgejo,

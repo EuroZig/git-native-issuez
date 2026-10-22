@@ -1,0 +1,557 @@
+//! The oracle: a separate, simple statement of what a command may do to a
+//! world. It must not import the engine, only object primitives and the
+//! world format. When the two disagree, one of them has a bug.
+
+const std = @import("std");
+const Allocator = std.mem.Allocator;
+const issuez = @import("issuez");
+const object = issuez.backend.object;
+const hex_fmt = issuez.format.hex;
+const World = issuez.backend.GitSim.World;
+const Oid = object.Oid;
+
+pub const command = @import("command.zig");
+pub const Command = command.Command;
+
+/// Reasons a transition was rejected.
+pub const Report = struct {
+    arena: Allocator,
+    violations: std.ArrayList([]const u8) = .empty,
+
+    pub fn fail(r: *Report, comptime fmt: []const u8, args: anytype) Allocator.Error!void {
+        try r.violations.append(r.arena, try std.fmt.allocPrint(r.arena, fmt, args));
+    }
+
+    pub fn ok(r: Report) bool {
+        return r.violations.items.len == 0;
+    }
+};
+
+/// What git-native-issuez may write. Nothing else may change.
+pub const owned_prefixes = [_][]const u8{
+    "refs/issues/",
+};
+
+pub fn isOwnedRef(name: []const u8) bool {
+    for (owned_prefixes) |p| if (std.mem.startsWith(u8, name, p)) return true;
+    return false;
+}
+
+/// Must hold whatever the command.
+pub fn checkInvariants(
+    arena: Allocator,
+    before: World,
+    after: World,
+    report: *Report,
+) Allocator.Error!void {
+    if (before.format != after.format) try report.fail("object format changed", .{});
+    if (!std.mem.eql(u8, before.identity.name, after.identity.name) or
+        !std.mem.eql(u8, before.identity.email, after.identity.email))
+        try report.fail("world identity changed", .{});
+    if (after.clock.now < before.clock.now) try report.fail("clock went backwards", .{});
+    if (before.clones.len != after.clones.len) {
+        try report.fail(
+            "number of clones changed ({d} -> {d})",
+            .{ before.clones.len, after.clones.len },
+        );
+        return;
+    }
+    for (before.clones, after.clones) |b, a| {
+        if (!std.mem.eql(u8, b.name, a.name)) {
+            try report.fail("clone renamed or reordered ('{s}' -> '{s}')", .{ b.name, a.name });
+            continue;
+        }
+        try checkClone(arena, before.format, b, a, report);
+    }
+}
+
+fn checkClone(
+    arena: Allocator,
+    format: object.ObjectFormat,
+    b: World.Clone,
+    a: World.Clone,
+    report: *Report,
+) Allocator.Error!void {
+    const before_objects = try objectSet(arena, format, b);
+    const after_objects = try objectSet(arena, format, a);
+
+    // Objects never disappear.
+    var it = before_objects.keyIterator();
+    while (it.next()) |hex| if (!after_objects.contains(hex.*))
+        try report.fail("clone '{s}': object {s} disappeared", .{ a.name, hex.* });
+
+    // Refs point at existing objects, issue refs only reach empty-tree
+    // commits.
+    for (a.refs) |r| {
+        const o = after_objects.get(r.oid) orelse {
+            try report.fail(
+                "clone '{s}': ref {s} points at missing object {s}",
+                .{ a.name, r.name, r.oid },
+            );
+            continue;
+        };
+        if (std.mem.startsWith(u8, r.name, "refs/issues/")) {
+            try checkEmptyTreeHistory(arena, format, a.name, r.name, o, after_objects, report);
+        }
+    }
+
+    // Refs outside our namespaces never change.
+    for (b.refs) |r| if (!isOwnedRef(r.name)) {
+        const now = findRef(a, r.name);
+        if (now == null or !std.mem.eql(u8, now.?, r.oid))
+            try report.fail("clone '{s}': foreign ref {s} was changed", .{ a.name, r.name });
+    };
+    for (a.refs) |r| if (!isOwnedRef(r.name) and findRef(b, r.name) == null)
+        try report.fail("clone '{s}': foreign ref {s} was created", .{ a.name, r.name });
+}
+
+/// Format 1 issues only use the empty tree.
+fn checkEmptyTreeHistory(
+    arena: Allocator,
+    format: object.ObjectFormat,
+    clone: []const u8,
+    ref: []const u8,
+    tip: World.StoredObject,
+    objects: std.StringHashMapUnmanaged(World.StoredObject),
+    report: *Report,
+) Allocator.Error!void {
+    const empty = object.emptyTree(format);
+    var stack: std.ArrayList(World.StoredObject) = .empty;
+    var seen: std.StringHashMapUnmanaged(void) = .empty;
+    try stack.append(arena, tip);
+    while (stack.pop()) |o| {
+        if (o.kind != .commit) {
+            try report.fail("clone '{s}': {s} reaches a non-commit object", .{ clone, ref });
+            return;
+        }
+        const c = object.Commit.parse(arena, format, o.data) catch {
+            try report.fail("clone '{s}': {s} reaches an undecodable commit", .{ clone, ref });
+            return;
+        };
+        if (!c.tree.eql(empty)) try report.fail(
+            "clone '{s}': {s} has a commit with a non-empty tree",
+            .{ clone, ref },
+        );
+        for (c.parents) |p| {
+            const hex = try arena.dupe(u8, p.hex().slice());
+            const gop = try seen.getOrPut(arena, hex);
+            if (gop.found_existing) continue;
+            const parent = objects.get(hex) orelse {
+                try report.fail("clone '{s}': {s} has missing parent {s}", .{ clone, ref, hex });
+                continue;
+            };
+            try stack.append(arena, parent);
+        }
+    }
+}
+
+fn objectSet(
+    arena: Allocator,
+    format: object.ObjectFormat,
+    clone: World.Clone,
+) Allocator.Error!std.StringHashMapUnmanaged(World.StoredObject) {
+    var set: std.StringHashMapUnmanaged(World.StoredObject) = .empty;
+    for (clone.objects) |o| {
+        const oid = object.hashObject(format, o.kind, o.data);
+        try set.put(arena, try arena.dupe(u8, oid.hex().slice()), o);
+    }
+    return set;
+}
+
+fn findRef(clone: World.Clone, name: []const u8) ?[]const u8 {
+    for (clone.refs) |r| if (std.mem.eql(u8, r.name, name)) return r.oid;
+    return null;
+}
+
+pub const commands = @import("commands.zig");
+
+/// Checks `command(before) == after` on clone `clone_name` (the first by
+/// default). NoRule when there's no rule for the case yet.
+pub fn checkTransition(
+    arena: Allocator,
+    before: World,
+    after: World,
+    clone_name: ?[]const u8,
+    cmd: Command,
+    exit_code: u8,
+    report: *Report,
+) (Allocator.Error || error{NoRule})!void {
+    try checkInvariants(arena, before, after, report);
+    if (before.clones.len != after.clones.len) return;
+    const target = if (clone_name) |n| (before.cloneIndex(n) orelse return error.NoRule) else 0;
+
+    // A command touches one clone.
+    for (before.clones, after.clones, 0..) |b, a, i| {
+        if (i == target) continue;
+        try expectCloneUnchanged(arena, before.format, b, a, report, true);
+    }
+    const b = before.clones[target];
+    const a = after.clones[target];
+
+    if (exit_code != 0) {
+        // A failed command may leave unreferenced objects, nothing else.
+        return expectCloneUnchanged(arena, before.format, b, a, report, false);
+    }
+    if (cmd == .read) return expectCloneUnchanged(arena, before.format, b, a, report, true);
+    const cb = try commands.Clone.init(arena, before.format, b);
+    const ca = try commands.Clone.init(arena, after.format, a);
+    switch (cmd) {
+        .read => unreachable,
+        .init => return checkInit(arena, cb, ca, report),
+        .create => |x| return checkCreate(arena, after, cb, ca, x, report),
+        .comment => |x| return checkComment(arena, after, cb, ca, x, report),
+        .state => |x| return checkState(arena, after, cb, ca, x, report),
+        .edit => |x| return checkEdit(arena, after, cb, ca, x, report),
+    }
+}
+
+const RefChange = struct { name: []const u8, old: ?[]const u8, new: ?[]const u8 };
+
+fn refChanges(
+    arena: Allocator,
+    b: commands.Clone,
+    a: commands.Clone,
+) Allocator.Error![]const RefChange {
+    var out: std.ArrayList(RefChange) = .empty;
+    for (a.clone.refs) |r| {
+        const old = b.ref(r.name);
+        if (old == null or !std.mem.eql(u8, old.?, r.oid)) try out.append(
+            arena,
+            .{ .name = r.name, .old = old, .new = r.oid },
+        );
+    }
+    for (b.clone.refs) |r| if (a.ref(r.name) == null) try out.append(
+        arena,
+        .{ .name = r.name, .old = r.oid, .new = null },
+    );
+    return out.items;
+}
+
+fn configEqual(b: World.Clone, a: World.Clone) bool {
+    if (b.config.len != a.config.len) return false;
+    for (b.config, a.config) |x, y| {
+        if (!std.mem.eql(u8, x.key, y.key) or !std.mem.eql(u8, x.value, y.value)) return false;
+    }
+    return true;
+}
+
+fn checkInit(
+    arena: Allocator,
+    b: commands.Clone,
+    a: commands.Clone,
+    report: *Report,
+) Allocator.Error!void {
+    if ((try refChanges(arena, b, a)).len != 0) try report.fail("init changed refs", .{});
+    // Only remote.<name>.fetch entries may be added or removed.
+    for (a.clone.config) |e| if (!containsEntry(b.clone.config, e) and !isFetchKey(e.key))
+        try report.fail("init added config '{s}'", .{e.key});
+    for (b.clone.config) |e| if (!containsEntry(a.clone.config, e) and !isFetchKey(e.key))
+        try report.fail("init removed config '{s}'", .{e.key});
+    for (a.clone.config) |e| if (isFetchKey(e.key) and !containsEntry(b.clone.config, e)) {
+        // And only the staging refspecs may be added.
+        const remote = e.key["remote.".len .. e.key.len - ".fetch".len];
+        var ok = false;
+        for ([_][]const u8{"issues"}) |ns| {
+            const expected = try std.fmt.allocPrint(
+                arena,
+                "+refs/{s}/*:refs/remotes/{s}/{s}/*",
+                .{ ns, remote, ns },
+            );
+            if (std.mem.eql(u8, e.value, expected)) ok = true;
+        }
+        if (!ok) try report.fail(
+            "init added unexpected refspec '{s}'",
+            .{e.value},
+        );
+    };
+}
+
+fn isFetchKey(key: []const u8) bool {
+    return std.mem.startsWith(u8, key, "remote.") and std.mem.endsWith(u8, key, ".fetch");
+}
+
+fn containsEntry(list: []const World.ConfigEntry, e: World.ConfigEntry) bool {
+    for (list) |x| if (std.mem.eql(u8, x.key, e.key) and std.mem.eql(
+        u8,
+        x.value,
+        e.value,
+    )) return true;
+    return false;
+}
+
+fn checkCreate(
+    arena: Allocator,
+    world: World,
+    b: commands.Clone,
+    a: commands.Clone,
+    x: command.Create,
+    report: *Report,
+) (Allocator.Error || error{NoRule})!void {
+    if (!configEqual(b.clone, a.clone)) try report.fail("create changed config", .{});
+    const changes = try refChanges(arena, b, a);
+    if (changes.len != 1 or changes[0].old != null or changes[0].new == null) {
+        try report.fail("create must add exactly one ref (changed {d})", .{changes.len});
+        return;
+    }
+    const name = changes[0].name;
+    if (!std.mem.startsWith(u8, name, "refs/issues/")) return report.fail(
+        "create wrote {s}",
+        .{name},
+    );
+    const id = name["refs/issues/".len..];
+    if (!isV4Uuid(id)) try report.fail("create used a non-v4 UUID: {s}", .{id});
+    const c = a.commit(changes[0].new.?) orelse return report.fail(
+        "create: ref points at a non-commit",
+        .{},
+    );
+    if (c.parents.len != 0) try report.fail("create: root commit has parents", .{});
+    if (!c.tree.eql(object.emptyTree(world.format))) try report.fail("create: non-empty tree", .{});
+    try checkIdentity(world, c, report);
+    const expected = try commands.expectedCreateMessage(arena, x);
+    if (!std.mem.eql(u8, c.message, expected))
+        try report.fail("create wrote message\n{s}\nexpected\n{s}", .{ c.message, expected });
+}
+
+/// The one commit `cmd` must have added on top of issue `id`: a single
+/// parent, the empty tree, the world identity. Null after reporting why not.
+fn appendCommit(
+    arena: Allocator,
+    world: World,
+    b: commands.Clone,
+    a: commands.Clone,
+    cmd: []const u8,
+    id: []const u8,
+    report: *Report,
+) Allocator.Error!?object.Commit {
+    if (!configEqual(b.clone, a.clone)) try report.fail("{s} changed config", .{cmd});
+    const matches = try b.matching(id);
+    if (matches.len != 1) {
+        try report.fail(
+            "{s} succeeded although '{s}' matches {d} issues",
+            .{ cmd, id, matches.len },
+        );
+        return null;
+    }
+    const changes = try refChanges(arena, b, a);
+    if (changes.len != 1 or !std.mem.eql(
+        u8,
+        changes[0].name,
+        matches[0],
+    ) or changes[0].new == null) {
+        try report.fail("{s} must advance exactly {s}", .{ cmd, matches[0] });
+        return null;
+    }
+    const c = a.commit(changes[0].new.?) orelse {
+        try report.fail("{s}: new tip is not a commit", .{cmd});
+        return null;
+    };
+    if (c.parents.len != 1 or !std.mem.eql(u8, c.parents[0].hex().slice(), changes[0].old.?)) {
+        try report.fail("{s}: new commit's parent is not the previous tip", .{cmd});
+        return null;
+    }
+    if (!c.tree.eql(object.emptyTree(world.format))) try report.fail("{s}: non-empty tree", .{cmd});
+    try checkIdentity(world, c, report);
+    return c;
+}
+
+fn checkComment(
+    arena: Allocator,
+    world: World,
+    b: commands.Clone,
+    a: commands.Clone,
+    x: command.Comment,
+    report: *Report,
+) Allocator.Error!void {
+    if (x.paragraphs.len == 0) return report.fail("comment without text succeeded", .{});
+    const c = (try appendCommit(arena, world, b, a, "comment", x.id, report)) orelse return;
+    const block = try commands.trailersOf(arena, c.message);
+    if (block.first_line != null) try report.fail("comment message has a trailer block", .{});
+    const text = try std.mem.join(arena, "\n\n", x.paragraphs);
+    const want = try commands.contentLines(arena, text);
+    const got = try commands.contentLines(arena, c.message);
+    if (!sameLines(want, got)) try report.fail("comment text differs:\n{s}", .{c.message});
+}
+
+fn checkState(
+    arena: Allocator,
+    world: World,
+    b: commands.Clone,
+    a: commands.Clone,
+    x: command.State,
+    report: *Report,
+) Allocator.Error!void {
+    const c = (try appendCommit(arena, world, b, a, "state", x.id, report)) orelse return;
+    const block = try commands.trailersOf(arena, c.message);
+    try expectBlock(report, "state", block, try commands.expectedStateTrailers(arena, x));
+    try expectSubject(arena, report, "state", x.message, c.message);
+}
+
+fn checkEdit(
+    arena: Allocator,
+    world: World,
+    b: commands.Clone,
+    a: commands.Clone,
+    x: command.Edit,
+    report: *Report,
+) (Allocator.Error || error{NoRule})!void {
+    const c = (try appendCommit(arena, world, b, a, "edit", x.id, report)) orelse return;
+    const previous = try b.naive(c.parents[0].hex().slice());
+    try expectBlock(
+        report,
+        "edit",
+        try commands.trailersOf(arena, c.message),
+        try commands.expectedEditTrailers(arena, x, previous),
+    );
+}
+
+/// Subjects the CLI picks itself ("Close issue") are its own business. A
+/// message the user gave has to be the subject.
+fn expectSubject(
+    arena: Allocator,
+    report: *Report,
+    cmd: []const u8,
+    given: ?[]const u8,
+    message: []const u8,
+) Allocator.Error!void {
+    const text = given orelse return;
+    const want = try commands.subjectOf(arena, text);
+    const got = try commands.subjectOf(arena, message);
+    if (!std.mem.eql(u8, want, got))
+        try report.fail("{s}: subject '{s}', expected '{s}'", .{ cmd, got, want });
+}
+
+fn expectBlock(
+    report: *Report,
+    cmd: []const u8,
+    block: commands.Block,
+    want: []const commands.Trailer,
+) Allocator.Error!void {
+    if (block.trailers.len != want.len) {
+        try report.fail(
+            "{s}: {d} trailers written, expected {d}",
+            .{ cmd, block.trailers.len, want.len },
+        );
+        return;
+    }
+    for (block.trailers, want) |g, w| {
+        // Label order doesn't matter.
+        const same_value = if (std.mem.eql(
+            u8,
+            g.key,
+            "Labels",
+        ) and std.mem.eql(u8, w.key, "Labels"))
+            sameLabelSet(g.value, w.value)
+        else
+            std.mem.eql(u8, g.value, w.value);
+        if (!std.mem.eql(u8, g.key, w.key) or !same_value)
+            try report.fail(
+                "{s}: trailer '{s}: {s}', expected '{s}: {s}'",
+                .{ cmd, g.key, g.value, w.key, w.value },
+            );
+    }
+}
+
+fn sameLabelSet(a: []const u8, b: []const u8) bool {
+    var buf: [4096]u8 = undefined;
+    var fba: std.heap.FixedBufferAllocator = .init(&buf);
+    const arena = fba.allocator();
+    const la = commands.splitLabels(arena, a) catch return false;
+    const lb = commands.splitLabels(arena, b) catch return false;
+    return commands.sameSet(la, lb);
+}
+
+fn sameLines(a: []const []const u8, b: []const []const u8) bool {
+    if (a.len != b.len) return false;
+    for (a, b) |x, y| if (!std.mem.eql(u8, x, y)) return false;
+    return true;
+}
+
+fn checkIdentity(world: World, c: object.Commit, report: *Report) Allocator.Error!void {
+    if (!std.mem.eql(u8, c.author.name, world.identity.name) or !std.mem.eql(
+        u8,
+        c.author.email,
+        world.identity.email,
+    ))
+        try report.fail("commit author is not the world identity", .{});
+}
+
+fn isV4Uuid(id: []const u8) bool {
+    if (id.len != 36) return false;
+    for (id, 0..) |ch, i| {
+        const hyphen = i == 8 or i == 13 or i == 18 or i == 23;
+        if (hyphen != (ch == '-')) return false;
+        if (!hyphen and !hex_fmt.isLowerDigit(ch)) return false;
+    }
+    return id[14] == '4' and (id[19] == '8' or id[19] == '9' or id[19] == 'a' or id[19] == 'b');
+}
+
+fn expectCloneUnchanged(
+    arena: Allocator,
+    format: object.ObjectFormat,
+    b: World.Clone,
+    a: World.Clone,
+    report: *Report,
+    objects_too: bool,
+) Allocator.Error!void {
+    if (objects_too) {
+        const bo = try objectSet(arena, format, b);
+        const ao = try objectSet(arena, format, a);
+        if (bo.count() != ao.count())
+            try report.fail(
+                "clone '{s}': objects changed ({d} -> {d})",
+                .{ a.name, bo.count(), ao.count() },
+            );
+    }
+    if (b.refs.len != a.refs.len) {
+        try report.fail("clone '{s}': refs changed", .{a.name});
+    } else for (b.refs) |r| {
+        const now = findRef(a, r.name);
+        if (now == null or !std.mem.eql(u8, now.?, r.oid))
+            try report.fail("clone '{s}': ref {s} changed", .{ a.name, r.name });
+    }
+    if (!configEqual(b, a)) try report.fail("clone '{s}': config changed", .{a.name});
+}
+
+const testing = std.testing;
+
+test isOwnedRef {
+    try testing.expect(isOwnedRef("refs/issues/abc"));
+    try testing.expect(!isOwnedRef("refs/heads/main"));
+    try testing.expect(!isOwnedRef("refs/remotes/origin/main"));
+}
+
+test "foreign refs and lost objects" {
+    var arena_state: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    const msg = "tree 4b825dc642cb6eb9a060e54bf8d69288fbee4904\n" ++
+        "author T <t@e.x> 1 +0000\ncommitter T <t@e.x> 1 +0000\n\nx\n";
+    const oid = object.hashObject(.sha1, .commit, msg).hex();
+    const obj: World.StoredObject = .{ .kind = .commit, .data = msg };
+
+    const before: World = .{ .clones = &.{.{
+        .name = "a",
+        .objects = &.{obj},
+        .refs = &.{.{ .name = "refs/heads/main", .oid = oid.slice() }},
+    }} };
+    const after: World = .{ .clones = &.{.{ .name = "a" }} };
+
+    var report: Report = .{ .arena = arena };
+    try checkTransition(arena, before, after, null, .{ .read = &.{"version"} }, 0, &report);
+    try testing.expect(!report.ok());
+    try testing.expect(report.violations.items.len >= 2);
+
+    var report2: Report = .{ .arena = arena };
+    try checkTransition(arena, before, before, null, .{ .read = &.{"version"} }, 0, &report2);
+    try testing.expect(report2.ok());
+
+    // Unknown commands fail in the CLI and change nothing.
+    var report3: Report = .{ .arena = arena };
+    try checkTransition(arena, before, after, null, .{ .read = &.{"frobnicate"} }, 1, &report3);
+    try testing.expect(!report3.ok());
+}
+
+test {
+    _ = command;
+}

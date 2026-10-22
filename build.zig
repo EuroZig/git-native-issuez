@@ -1,5 +1,10 @@
 //!   zig build                      git-issue
-//!   zig build test                 unit, backend and CLI tests
+//!   zig build test                 unit, backend, simulator/oracle and fuzz smoke tests
+//!   zig build simulator            git-issue-sim
+//!   zig build -Dfuzz               also install git-issue-fuzz (ReleaseSafe)
+//!   zig build test-interop         tests against upstream (fetched lazily)
+//!   zig build test-upstream-suite  upstream's t/*.sh against our binary
+//!   zig build test-perf            `ls` over 10 000 issues
 //!   zig build examples             library examples (examples/*.zig)
 //!   zig build example-<name>       run one (quickstart, real-repo -- <path> ls)
 //!   zig build update-snapshots     rewrite examples/*.out
@@ -10,6 +15,7 @@ const entry_points = @import("src/cli/entry_points.zig");
 pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
     const optimize = b.standardOptimizeOption(.{});
+    const fuzz = b.option(bool, "fuzz", "Install the fuzzer") orelse false;
 
     const zon = b.createModule(.{ .root_source_file = b.path("build.zig.zon") });
 
@@ -19,7 +25,14 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
     });
 
-    const cli = Cli{ .b = b, .target = target, .issuez = issuez, .zon = zon };
+    const oracle = b.createModule(.{
+        .root_source_file = b.path("src/oracle/root.zig"),
+        .target = target,
+        .optimize = optimize,
+        .imports = &.{.{ .name = "issuez", .module = issuez }},
+    });
+
+    const cli = Cli{ .b = b, .target = target, .issuez = issuez, .oracle = oracle, .zon = zon };
 
     const exe = cli.exe("git-issue", "src/cli/main.zig", optimize);
     b.installArtifact(exe);
@@ -30,10 +43,18 @@ pub fn build(b: *std.Build) void {
     if (b.args) |args| run_exe.addArgs(args);
     run_step.dependOn(&run_exe.step);
 
-    const test_step = b.step("test", "Run unit, backend and CLI tests");
+    const sim = cli.exe("git-issue-sim", "src/cli/main_sim.zig", optimize);
+    const sim_step = b.step("simulator", "Build git-issue-sim");
+    sim_step.dependOn(&b.addInstallArtifact(sim, .{}).step);
+
+    const fuzz_exe = cli.exe("git-issue-fuzz", "src/cli/main_fuzz.zig", .ReleaseSafe);
+    if (fuzz) b.installArtifact(fuzz_exe);
+
+    const test_step = b.step("test", "Run unit, backend, simulator/oracle and fuzz smoke tests");
 
     const unit_roots = [_]struct { name: []const u8, module: *std.Build.Module }{
         .{ .name = "issuez", .module = issuez },
+        .{ .name = "oracle", .module = oracle },
         .{ .name = "cli", .module = cli.module("src/cli/main.zig", optimize) },
     };
     for (unit_roots) |u| {
@@ -69,6 +90,32 @@ pub fn build(b: *std.Build) void {
         const run_t = b.addRunArtifact(t);
         run_t.has_side_effects = true;
         test_step.dependOn(&run_t.step);
+    }
+
+    // Fixed seed so CI is reproducible.
+    const fuzz_smoke = b.addRunArtifact(fuzz_exe);
+    fuzz_smoke.addArgs(&.{ "--seed", "20261018", "--iterations", "300" });
+    fuzz_smoke.expectExitCode(0);
+    fuzz_smoke.expectStdErrMatch("300 cases passed");
+    test_step.dependOn(&fuzz_smoke.step);
+
+    // Against a ReleaseSafe git-issue, budget 1 s.
+    {
+        const perf_exe = cli.exe("git-issue", "src/cli/main.zig", .ReleaseSafe);
+        const runner = b.addExecutable(.{
+            .name = "perf-smoke",
+            .root_module = b.createModule(.{
+                .root_source_file = b.path("test/perf_smoke.zig"),
+                .target = b.graph.host,
+                .optimize = .Debug,
+            }),
+        });
+        const run_perf = b.addRunArtifact(runner);
+        run_perf.addArtifactArg(perf_exe);
+        if (b.args) |args| run_perf.addArgs(args);
+        run_perf.stdio = .inherit;
+        b.step("test-perf", "Time `ls -a` over 10 000 issues against the 1 s budget")
+            .dependOn(&run_perf.step);
     }
 
     // The simulator examples need no git and must print exactly their
@@ -152,6 +199,53 @@ pub fn build(b: *std.Build) void {
             }
         }
     }
+
+    const interop_step = b.step(
+        "test-interop",
+        "Cross-tool tests against upstream git-native-issue",
+    );
+    const suite_step = b.step("test-upstream-suite", "Run upstream's t/*.sh against our git-issue");
+    // Only here, so dependents never fetch the GPL upstream.
+    if (isRootPackage(b)) {
+        if (b.lazyDependency("git_native_issue", .{})) |upstream| {
+            const opts = b.addOptions();
+            opts.addOptionPath("upstream_bin", upstream.path("bin"));
+            opts.addOptionPath("git_issue_exe", exe.getEmittedBin());
+            const interop = b.addTest(.{
+                .name = "interop",
+                .root_module = b.createModule(.{
+                    .root_source_file = b.path("test/interop.zig"),
+                    .target = target,
+                    .optimize = optimize,
+                    .imports = &.{
+                        .{ .name = "issuez", .module = issuez },
+                        .{ .name = "paths", .module = opts.createModule() },
+                    },
+                }),
+            });
+            const run_interop = b.addRunArtifact(interop);
+            run_interop.has_side_effects = true;
+            interop_step.dependOn(&run_interop.step);
+
+            const suite = b.addExecutable(.{
+                .name = "upstream-suite",
+                .root_module = b.createModule(.{
+                    .root_source_file = b.path("test/upstream_suite.zig"),
+                    .target = b.graph.host,
+                    .optimize = .Debug,
+                }),
+            });
+            const run_suite = b.addRunArtifact(suite);
+            run_suite.addDirectoryArg(upstream.path(""));
+            run_suite.addArtifactArg(exe);
+            run_suite.addFileArg(b.path("test/upstream-expected.txt"));
+            run_suite.addFileArg(b.path("test/upstream-allowlist.txt"));
+            // The runner reports on stderr, which a checked step would treat
+            // as a failure.
+            run_suite.stdio = .inherit;
+            suite_step.dependOn(&run_suite.step);
+        }
+    }
 }
 
 /// Relative symlinks to `git-issue`, copies on Windows.
@@ -210,6 +304,7 @@ const Cli = struct {
     b: *std.Build,
     target: std.Build.ResolvedTarget,
     issuez: *std.Build.Module,
+    oracle: *std.Build.Module,
     zon: *std.Build.Module,
 
     fn module(
@@ -224,6 +319,7 @@ const Cli = struct {
             .optimize = optimize,
             .imports = &.{
                 .{ .name = "issuez", .module = cli.issuez },
+                .{ .name = "oracle", .module = cli.oracle },
                 .{ .name = "build.zig.zon", .module = cli.zon },
             },
         });

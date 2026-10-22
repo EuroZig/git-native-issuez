@@ -1,0 +1,220 @@
+# Upstream tests (t/*.sh at the pinned revision) that MUST pass against our
+# git-issue. Format: <file>::<test name>. The runner lists passing tests
+# that aren't in this file yet.
+#
+# Only add a test once it passes for the right reason. "jq missing aborts
+# (import-github)" passes because we refuse provider bridges outright, so
+# it isn't listed. Neither are tests whose name embeds a local value
+# ("git version >= 2.22 (2.54.0)").
+#
+# Every format-1 command (create, ls, show, comment, edit, state, search,
+# fsck, init).
+test-assignee-validation.sh::valid email formats accepted
+test-assignee-validation.sh::invalid email rejected: no @
+test-assignee-validation.sh::invalid email rejected: no domain
+test-assignee-validation.sh::invalid email rejected: no TLD
+test-assignee-validation.sh::invalid email rejected: missing local part
+test-assignee-validation.sh::assignee can be changed
+test-assignee-validation.sh::assignee displayed in show
+test-assignee-validation.sh::assignee filter works
+test-assignee-validation.sh::assignee + label filter works
+test-assignee-validation.sh::assignee + state filter works
+test-assignee-validation.sh::triple filter (assignee+label+state) works
+test-assignee-validation.sh::assignee in full format display
+test-assignee-validation.sh::edit assignee changes assignment
+test-assignee-validation.sh::combined edit (assignee+labels+priority) works
+test-assignee-validation.sh::email validation error message is helpful
+test-assignee-validation.sh::assignee can be unassigned with empty string
+test-assignee-validation.sh::unassigned issue excluded from assignee filter
+test-concurrency.sh::normal state change succeeds
+test-concurrency.sh::normal edit succeeds
+test-concurrency.sh::normal comment succeeds
+test-concurrency.sh::rapid sequential operations succeed
+test-concurrency.sh::empty tree generation works
+test-concurrency.sh::ref update creates proper commit chain
+test-concurrency.sh::concurrent operations (at least one succeeds)
+test-environment.sh::works with minimal PATH
+test-environment.sh::read-only .git/refs/issues surfaces error
+test-environment.sh::UTF-8 content preserved in issue
+test-environment.sh::works under C/POSIX locale
+test-environment.sh::permission error surfaces meaningful message
+test-environment.sh::works from nested subdirectory
+test-environment.sh::works with invalid HOME
+test-environment.sh::long title (500 chars) preserved
+test-failure-modes.sh::update-ref failure detected during state change
+test-failure-modes.sh::empty tree hash failure caught
+test-failure-modes.sh::concurrent modification detection (CAS retry)
+test-failure-modes.sh::nonexistent repo dir handled gracefully
+test-failure-modes.sh::corrupt git object causes show to fail
+test-failure-modes.sh::for-each-ref failure in search is detected
+test-init-auto-detect.sh::No remotes: Provides helpful message
+test-init-auto-detect.sh::No remotes: Exits gracefully (exit 0)
+test-init-auto-detect.sh::One remote: Auto-detects 'upstream'
+test-init-auto-detect.sh::One remote: Configured fetch refspec
+test-init-auto-detect.sh::Multiple with origin: Auto-detects 'origin'
+test-init-auto-detect.sh::Multiple with origin: Configured origin refspec
+test-init-auto-detect.sh::Multiple without origin: Asks user to specify
+test-init-auto-detect.sh::Multiple without origin: Lists available remotes
+test-init-auto-detect.sh::Multiple without origin: Shows example usage
+test-init-auto-detect.sh::Explicit remote: Accepts user choice
+test-init-auto-detect.sh::Explicit remote: Configured fork refspec
+test-init-auto-detect.sh::Non-existent: Clear error message
+test-init-auto-detect.sh::Non-existent: Lists available remotes
+test-issue.sh::git issue version prints version
+test-issue.sh::git issue create outputs short ID
+test-issue.sh::created issue has exactly one ref
+test-issue.sh::issue ref uses UUID format
+test-issue.sh::root commit subject is the issue title
+test-issue.sh::root commit uses empty tree
+test-issue.sh::root commit has State: open trailer
+test-issue.sh::root commit has Format-Version: 1 trailer
+test-issue.sh::create with labels stores Labels: trailer
+test-issue.sh::create with body stores description
+test-issue.sh::create with multiple -m flags builds multi-paragraph body
+test-issue.sh::create with priority stores Priority: trailer
+test-issue.sh::create rejects invalid priority
+test-issue.sh::create requires title
+test-issue.sh::ls shows open issues
+test-issue.sh::ls filters by state
+test-issue.sh::ls filters by label
+test-issue.sh::show displays issue details
+test-issue.sh::show with nonexistent ID fails
+test-issue.sh::comment creates a child commit
+test-issue.sh::comment commit has root as parent
+test-issue.sh::comment content stored correctly
+test-issue.sh::state --close changes state to closed
+test-issue.sh::state --open reopens issue
+test-issue.sh::state change records Fixed-By and Release trailers
+test-issue.sh::multiple issues have unique UUIDs
+test-issue.sh::init configures fetch refspec for issues
+test-issue.sh::init is idempotent
+test-issue.sh::for-each-ref listing works per spec
+test-issue.sh::show displays comments in order
+test-issue.sh::comment requires -m message
+test-issue.sh::state requires --open/--close/--state
+test-issue.sh::fails outside git repo
+test-issue.sh::create with --assignee stores Assignee: trailer
+test-issue.sh::create with --milestone stores Milestone: trailer
+test-issue.sh::create with all options stores all trailers correctly
+test-issue.sh::create handles special characters in title
+test-issue.sh::newline in title is rejected
+test-issue.sh::ls with no issues returns empty
+test-issue.sh::ls --state closed shows only closed issues
+test-issue.sh::show displays assignee and milestone
+test-issue.sh::show displays state change indicator
+test-issue.sh::show works for issue with no body
+test-issue.sh::comment on nonexistent issue fails
+test-issue.sh::comment commit uses empty tree
+test-issue.sh::three comments create correct 4-commit chain
+test-issue.sh::comment with multiple -m flags builds multi-paragraph body
+test-issue.sh::state --state accepts custom values
+test-issue.sh::state --reason stores Reason: trailer
+test-issue.sh::state -m uses custom message as commit subject
+test-issue.sh::state on nonexistent issue fails
+test-issue.sh::state change commit uses empty tree
+test-issue.sh::full lifecycle: create, comment, close, reopen, comment
+test-issue.sh::show displays full lifecycle history
+test-issue.sh::ls output format matches spec
+test-issue.sh::create outside git repo fails
+test-issue.sh::show outside git repo fails
+test-issue.sh::edit replaces labels
+test-issue.sh::edit --add-label appends to existing labels
+test-issue.sh::edit --remove-label removes label
+test-issue.sh::edit changes assignee
+test-issue.sh::edit changes priority
+test-issue.sh::edit changes milestone
+test-issue.sh::edit changes title via Title: trailer
+test-issue.sh::edit creates a child commit
+test-issue.sh::edit rejects invalid priority
+test-issue.sh::edit requires at least one option
+test-issue.sh::edit on nonexistent issue fails
+test-issue.sh::edit uses custom message as commit subject
+test-issue.sh::ls --format full shows metadata
+test-issue.sh::ls --format oneline has no brackets
+test-issue.sh::ls rejects invalid format
+test-issue.sh::--remove-label does not corrupt substring labels
+test-issue.sh::--remove-label handles regex metacharacters (C++)
+test-issue.sh::ls respects Title: trailer
+test-issue.sh::show respects Title: trailer
+test-issue.sh::version outputs valid version string
+test-labels-validation.sh::create rejects label with comma
+test-labels-validation.sh::edit --add-label rejects label with comma
+test-labels-validation.sh::edit -l rejects label with comma
+test-labels-validation.sh::create deduplicates labels
+test-labels-validation.sh::edit --add-label deduplicates
+test-labels-validation.sh::create normalizes whitespace in labels
+test-labels-validation.sh::edit removes empty labels after removal
+test-labels-validation.sh::normal multi-label creation works
+test-labels-validation.sh::Unicode/emoji labels preserved
+test-labels-validation.sh::whitespace-only label removed
+test-labels-validation.sh::comma rejection error message is helpful
+test-labels-validation.sh::combined add/remove labels work
+test-local-only-repo.sh::Repo has no remotes (verified)
+test-local-only-repo.sh::git issue create works without remote
+test-local-only-repo.sh::git issue ls works without remote
+test-local-only-repo.sh::git issue show works without remote
+test-local-only-repo.sh::git issue comment works without remote
+test-local-only-repo.sh::git issue edit works without remote
+test-local-only-repo.sh::git issue state works without remote
+test-local-only-repo.sh::git issue search works without remote
+test-local-only-repo.sh::git issue fsck works without remote
+test-local-only-repo.sh::git issue init provides helpful message when no remotes
+test-local-only-repo.sh::git issue init reports missing remote clearly
+test-local-only-repo.sh::git issue sync requires provider (expected)
+test-local-only-repo.sh::Issues stored in refs/issues/* (count: 1)
+test-local-only-repo.sh::Issue ref points to valid commit
+test-merge.sh::fsck passes on valid issues
+test-merge.sh::fsck handles no issues
+test-merge.sh::fsck detects missing State trailer
+test-merge.sh::fsck detects missing Format-Version trailer
+test-merge.sh::fsck --quiet only shows errors
+test-merge.sh::fsck outside git repo fails
+test-properties.sh::git issue ls is idempotent (3 consecutive calls)
+test-properties.sh::git issue ls --all is idempotent (3 consecutive calls)
+test-properties.sh::git issue show is idempotent (3 consecutive calls)
+test-properties.sh::git issue fsck is idempotent (3 consecutive calls)
+test-properties.sh::git issue ls with label filter is idempotent
+test-properties.sh::git issue ls with state filter is idempotent
+test-properties.sh::label order does not affect stored labels (sorted match)
+test-properties.sh::edit --add-label order does not affect final label set
+test-properties.sh::close then open returns to open state
+test-properties.sh::same input produces same tree object
+test-properties.sh::all commits in issue ref use empty tree
+test-properties.sh::all 5 created issues have valid UUID format
+test-properties.sh::issue ref has exactly one root commit after multiple operations
+test-properties.sh::root commit always has State trailer
+test-properties.sh::State trailer present on commit after state change
+test-properties.sh::root commit has Format-Version: 1 trailer
+test-properties.sh::ref chain forms valid DAG (no merge commits, linear chain)
+test-properties.sh::commit count matches operation count (4 ops = 4 commits)
+test-properties.sh::operations on issue A do not affect issue B
+test-properties.sh::closed issues excluded from default ls (2 -> 1)
+test-properties.sh::ls --all includes both open and closed issues
+test-properties.sh::reopened issue reappears in default ls
+test-properties.sh::git issue ls stable across 10 consecutive calls
+test-properties.sh::git issue show stable across 10 consecutive calls
+test-qol.sh::ls --assignee filters by assignee
+test-qol.sh::ls --priority filters by priority
+test-qol.sh::ls --priority rejects invalid value
+test-qol.sh::ls --sort priority orders by priority level
+test-qol.sh::ls --sort priority --reverse reverses order
+test-qol.sh::ls --sort updated orders by last modification
+test-qol.sh::ls --sort rejects invalid value
+test-qol.sh::search finds issue by title
+test-qol.sh::search finds issue by comment
+test-qol.sh::search finds issue by body
+test-qol.sh::search -i is case insensitive
+test-qol.sh::search --state filters results
+test-qol.sh::search with no matches returns nothing
+test-qol.sh::search requires pattern
+test-qol.sh::search outside git repo fails
+test-qol.sh::init with custom remote
+test-qol.sh::init with custom remote is idempotent
+test-qol.sh::init with nonexistent remote fails
+test-qol.sh::init default still works
+test-qol.sh::version outputs valid version string
+
+# Bridge file test-edge-cases.sh stops at its first provider step, but this
+# check runs before it and passes for the right reason (empty comments are
+# refused).
+test-edge-cases.sh::empty comment rejected with error

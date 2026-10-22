@@ -1,0 +1,27 @@
+// Two clones: alice has one upstream-format issue and a code branch whose
+// ref must never be touched; bob is empty.
+.{
+    .format = .sha1,
+    .seed = 2,
+    .clock = .{ .now = 1700000600, .tz_offset_minutes = 60 },
+    .identity = .{ .name = "Alice", .email = "alice@example.invalid" },
+    .clones = .{
+        .{
+            .name = "alice",
+            .config = .{
+                .{ .key = "user.name", .value = "Alice" },
+            },
+            .objects = .{
+                .{
+                    .kind = .commit,
+                    .data = "tree 4b825dc642cb6eb9a060e54bf8d69288fbee4904\nauthor Alice <alice@example.invalid> 1700000000 +0100\ncommitter Alice <alice@example.invalid> 1700000000 +0100\n\nLogin page crashes\n\nSteps to reproduce are in the comments.\n\nState: open\nLabels: bug\nFormat-Version: 1\n",
+                },
+            },
+            .refs = .{
+                .{ .name = "refs/heads/main", .oid = "d8c716f16589674730f30ff50450aed285a2c400" },
+                .{ .name = "refs/issues/a7f3b2c1-4e5d-4a8b-9c1e-2f3a4b5c6d7e", .oid = "d8c716f16589674730f30ff50450aed285a2c400" },
+            },
+        },
+        .{ .name = "bob" },
+    },
+}
