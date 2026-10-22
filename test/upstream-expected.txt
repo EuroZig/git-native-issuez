@@ -5,7 +5,9 @@
 # Only add a test once it passes for the right reason. "jq missing aborts
 # (import-github)" passes because we refuse provider bridges outright, so
 # it isn't listed. Neither are tests whose name embeds a local value
-# ("git version >= 2.22 (2.54.0)").
+# ("git version >= 2.22 (2.54.0)"), or tests in files that skip
+# themselves without a logged-in gh (test-edge-cases.sh): they don't run on
+# CI.
 #
 # Every format-1 command (create, ls, show, comment, edit, state, search,
 # fsck, init).
@@ -213,8 +215,3 @@ test-qol.sh::init with custom remote is idempotent
 test-qol.sh::init with nonexistent remote fails
 test-qol.sh::init default still works
 test-qol.sh::version outputs valid version string
-
-# Bridge file test-edge-cases.sh stops at its first provider step, but this
-# check runs before it and passes for the right reason (empty comments are
-# refused).
-test-edge-cases.sh::empty comment rejected with error
