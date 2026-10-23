@@ -910,6 +910,23 @@ const RacingSim = struct {
     pub fn remoteNames(r: *RacingSim, arena: Allocator) Error![]const []const u8 {
         return r.sim.remoteNames(arena);
     }
+    pub fn fetch(
+        r: *RacingSim,
+        arena: Allocator,
+        remote: []const u8,
+        refspecs: []const []const u8,
+    ) (Error || error{FetchFailed})!void {
+        return r.sim.fetch(arena, remote, refspecs);
+    }
+    pub fn push(
+        r: *RacingSim,
+        arena: Allocator,
+        remote: []const u8,
+        refspecs: []const []const u8,
+        atomic: bool,
+    ) (Error || error{PushFailed})!contract.PushResult {
+        return r.sim.push(arena, remote, refspecs, atomic);
+    }
     pub fn identity(
         r: *RacingSim,
         arena: Allocator,

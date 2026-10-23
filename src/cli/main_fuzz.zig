@@ -1,9 +1,12 @@
 //! `git-issue-fuzz`: seeded fuzzing on `GitSim`.
 //!
 //! Each case first drives random backend operations against a separate
-//! model, then runs random commands on a few clones. Every command is
-//! checked by the oracle and the engine's reading of each issue is compared
-//! with the oracle's. A failing case prints its seed:
+//! model, then runs random commands on a few clones sharing a hub remote.
+//! Every command is checked by the oracle and the engine's reading of each
+//! issue is compared with the oracle's. Now and then someone force-pushes
+//! to the hub, so clones quarantine and resolve. Finally all clones sync,
+//! accepting the hub's version of anything quarantined, until they hold
+//! exactly the hub's refs. A failing case prints its seed:
 //!
 //!     git-issue-fuzz --seed <seed> --iterations 1
 
@@ -103,6 +106,7 @@ pub fn main(init: std.process.Init) u8 {
 
 const CaseError = error{
     OutOfMemory,
+    NotConverged,
     ModelMismatch,
     RoundTripMismatch,
     OracleRejected,
@@ -230,7 +234,7 @@ fn pickAlloc(rand: std.Random, pool: []const []const u8) Allocator.Error![]const
 }
 
 fn generate(arena: Allocator, rand: std.Random, ids: []const []const u8) Allocator.Error!Generated {
-    switch (rand.uintLessThan(u8, 12)) {
+    switch (rand.uintLessThan(u8, 15)) {
         0...2 => { // create
             var valid = true;
             var title: std.ArrayList([]const u8) = .empty;
@@ -307,11 +311,34 @@ fn generate(arena: Allocator, rand: std.Random, ids: []const []const u8) Allocat
                 pick(rand, &.{ "show", "search" }),
                 try genPrefix(arena, rand, ids),
             }) } },
-        else => {
-            const verbs = [_][]const u8{ "init", "version", "frobnicate", "sync" };
+        11 => {
+            if (rand.uintLessThan(u8, 3) == 0) return .{ .cmd = .{ .quarantine = .{
+                .remote = pick(rand, &.{ "origin", "nosuch" }),
+                .accept = rand.boolean(),
+                .id = try genPrefix(arena, rand, ids),
+            } } };
+            // Without a remote, merge and sync must refuse and change nothing.
+            const verbs = [_][]const u8{
+                "init", "version", "frobnicate", "merge", "sync", "status",
+            };
             const verb = pick(rand, &verbs);
             if (std.mem.eql(u8, verb, "init")) return .{ .cmd = .{ .init = .{} } };
             return .{ .cmd = .{ .read = try arena.dupe([]const u8, &.{verb}) } };
+        },
+        else => {
+            const remotes = [_][]const u8{ "origin", "origin", "origin", "nosuch" };
+            const x: spec.Sync = .{ .remote = pick(rand, &remotes) };
+            return .{ .cmd = switch (rand.uintLessThan(u8, 3)) {
+                0 => blk: {
+                    var merge = x;
+                    if (rand.uintLessThan(u8, 4) == 0) {
+                        if (rand.boolean()) merge.check = true else merge.no_fetch = true;
+                    }
+                    break :blk .{ .merge = merge };
+                },
+                1 => .{ .push = x },
+                else => .{ .sync = x },
+            } };
         },
     }
 }
@@ -323,9 +350,16 @@ fn fuzzCommands(
     environ_map: *std.process.Environ.Map,
     rand: std.Random,
 ) CaseError!void {
+    // Work clones c0..cN share "hub" as origin.
     const work_count = rand.intRangeAtMost(usize, 1, 3);
-    const clones = try arena.alloc(World.Clone, work_count);
-    for (clones, 0..) |*c, idx| c.* = .{ .name = try std.fmt.allocPrint(arena, "c{d}", .{idx}) };
+    const clones = try arena.alloc(World.Clone, work_count + 1);
+    for (clones[0..work_count], 0..) |*c, idx| {
+        c.* = .{
+            .name = try std.fmt.allocPrint(arena, "c{d}", .{idx}),
+            .config = &.{.{ .key = "remote.origin.url", .value = "sim:hub" }},
+        };
+    }
+    clones[work_count] = .{ .name = "hub" };
     var world: World = .{
         .format = if (rand.boolean()) .sha1 else .sha256,
         .seed = rand.int(u64),
@@ -346,11 +380,210 @@ fn fuzzCommands(
                 r.name["refs/issues/".len..],
             );
         }
+        if (rand.uintLessThan(u8, 5) == 0) {
+            // Someone using upstream on this clone.
+            try upstreamStep(arena, &world, clone_index);
+            continue;
+        }
+        if (rand.uintLessThan(u8, 10) == 0) {
+            // Someone force-pushes to the hub.
+            try rewriteHub(arena, rand, &world, work_count);
+            continue;
+        }
+        const quarantined = try quarantinedIds(arena, world.clones[clone_index]);
+        if (quarantined.len > 0 and rand.boolean()) {
+            const id = pick(rand, quarantined);
+            const cmd: Command = .{ .quarantine = .{
+                .remote = "origin",
+                .accept = rand.boolean(),
+                .id = if (rand.boolean()) id else id[0..8],
+            } };
+            _ = try step(io, gpa, arena, environ_map, &world, clone_index, cmd, true);
+            continue;
+        }
         const gen = try generate(arena, rand, ids.items);
-        try step(io, gpa, arena, environ_map, &world, clone_index, gen.cmd, gen.must_succeed);
+        _ = try step(io, gpa, arena, environ_map, &world, clone_index, gen.cmd, gen.must_succeed);
     }
 
+    // Everyone syncs and takes the hub's version of whatever got
+    // quarantined, until nothing changes. Then every clone must match the
+    // hub.
+    var round: usize = 0;
+    while (round < 8) : (round += 1) {
+        const snapshot = try issueRefsDigest(arena, world);
+        var resolved = false;
+        for (0..work_count) |i| {
+            const code = try step(
+                io,
+                gpa,
+                arena,
+                environ_map,
+                &world,
+                i,
+                .{ .sync = .{ .remote = "origin" } },
+                true,
+            );
+            _ = code;
+            for (try quarantinedIds(arena, world.clones[i])) |id| {
+                const cmd: Command = .{ .quarantine = .{
+                    .remote = "origin",
+                    .accept = true,
+                    .id = id,
+                } };
+                _ = try step(io, gpa, arena, environ_map, &world, i, cmd, true);
+                resolved = true;
+            }
+        }
+        if (!resolved and std.mem.eql(u8, snapshot, try issueRefsDigest(arena, world))) break;
+    } else {
+        std.debug.print("  sync did not settle after {d} rounds\n", .{round});
+        return error.NotConverged;
+    }
+    const hub = world.clones[work_count];
+    for (hub.objects) |o| {
+        if (o.kind != .commit) continue;
+        const c = object.Commit.parse(arena, world.format, o.data) catch continue;
+        if (c.parents.len == 2 and std.mem.eql(u8, c.author.name, "git-issue")) countOutcome(
+            "(merge commits)",
+            true,
+        );
+    }
+    for (world.clones[0..work_count]) |c| {
+        if (!sameIssueRefs(hub, c)) {
+            std.debug.print("  clone {s} differs from hub after full sync\n", .{c.name});
+            return error.NotConverged;
+        }
+    }
     try checkRoundTrip(arena, world);
+}
+
+/// What an upstream user does: `git issue merge origin` (modelled by
+/// oracle.upstream), then `git push origin 'refs/issues/*:refs/issues/*'`.
+/// The engine must read the result like the oracle does, and sync must
+/// still converge afterwards.
+fn upstreamStep(arena: Allocator, world: *World, clone_index: usize) CaseError!void {
+    const before = world.*;
+    var sim = try GitSim.init(arena, world, clone_index);
+    const staging = "refs/remotes/origin/issues/";
+    sim.fetch(arena, "origin", &.{"+refs/issues/*:" ++ staging ++ "*"}) catch {
+        countOutcome("(upstream merge)", false);
+        return;
+    };
+    var merged = false;
+    for (try sim.listRefs(arena, staging)) |s| {
+        const id = s.name[staging.len..];
+        const local_name = try std.fmt.allocPrint(arena, "refs/issues/{s}", .{id});
+        const local = try sim.resolveRef(local_name);
+        if (local == null) {
+            sim.updateRefs(&.{.{ .name = local_name, .op = .{ .create = s.oid } }}) catch {};
+        } else if (local.?.eql(s.oid) or try sim.isAncestor(s.oid, local.?)) {
+            // up to date, or the remote is behind
+        } else if (try sim.isAncestor(local.?, s.oid)) {
+            sim.updateRefs(&.{.{
+                .name = local_name,
+                .op = .{ .update = .{ .new = s.oid, .old = local.? } },
+            }}) catch {};
+        } else {
+            const model = oracle.upstream.mergeMessage(arena, &sim, local.?, s.oid, "origin");
+            const message = model catch |err| switch (err) {
+                error.OutOfMemory => |e| return e,
+                else => continue, // criss-cross or unrelated: not modelled
+            };
+            const who = sim.identity(arena) catch |err| switch (err) {
+                error.OutOfMemory => |e| return e,
+                error.IdentityUnknown => continue,
+            };
+            const commit: object.Commit = .{
+                .tree = object.emptyTree(world.format),
+                .parents = &.{ local.?, s.oid },
+                .author = who.author,
+                .committer = who.committer,
+                .message = message,
+            };
+            const oid = try sim.writeObject(.commit, try commit.serializeAlloc(arena));
+            sim.updateRefs(&.{.{
+                .name = local_name,
+                .op = .{ .update = .{ .new = oid, .old = local.? } },
+            }}) catch continue;
+            merged = true;
+        }
+        sim.updateRefs(&.{.{ .name = s.name, .op = .{ .delete = s.oid } }}) catch {};
+    }
+    var specs: std.ArrayList([]const u8) = .empty;
+    for (try sim.listRefs(arena, "refs/issues/")) |r| {
+        try specs.append(arena, try std.fmt.allocPrint(arena, "{s}:{s}", .{ r.name, r.name }));
+    }
+    if (specs.items.len > 0) _ = sim.push(arena, "origin", specs.items, false) catch {};
+    try sim.commit();
+    countOutcome("(upstream merge commit)", merged);
+
+    var report: oracle.Report = .{ .arena = arena };
+    try oracle.checkInvariants(arena, before, world.*, &report);
+    if (!report.ok()) {
+        std.debug.print("  upstream-style merge on {s}\n", .{world.clones[clone_index].name});
+        return reject(report);
+    }
+    try crossCheckModel(arena, world, clone_index);
+}
+
+/// A force-push to the hub: one issue goes back to an older commit of its
+/// history, or is replaced by an unrelated one. Clones that merged the lost
+/// commits must quarantine it.
+fn rewriteHub(arena: Allocator, rand: std.Random, world: *World, hub_index: usize) CaseError!void {
+    const before = world.*;
+    var hub = try GitSim.init(arena, world, hub_index);
+    const issues = try hub.listRefs(arena, "refs/issues/");
+    if (issues.len == 0) return;
+    const target = issues[rand.uintLessThan(usize, issues.len)];
+    const tip_object = (try hub.readObject(arena, target.oid)).?;
+    const tip = object.Commit.parse(arena, world.format, tip_object.data) catch
+        return error.ModelMismatch;
+    const new = if (tip.parents.len > 0 and rand.uintLessThan(u8, 3) != 0) blk: {
+        countOutcome("(hub rewound)", true);
+        break :blk tip.parents[rand.uintLessThan(usize, tip.parents.len)];
+    } else blk: {
+        countOutcome("(hub replaced)", true);
+        const sig: object.Signature = .{
+            .name = "Mallory",
+            .email = "mallory@example.invalid",
+            .time = world.clock.now,
+            .tz_offset_minutes = 0,
+        };
+        const commit: object.Commit = .{
+            .tree = object.emptyTree(world.format),
+            .parents = &.{},
+            .author = sig,
+            .committer = sig,
+            .message = try std.fmt.allocPrint(
+                arena,
+                "Started over {d}\n\nState: open\nFormat-Version: 1\n",
+                .{rand.int(u32)},
+            ),
+        };
+        break :blk try hub.writeObject(.commit, try commit.serializeAlloc(arena));
+    };
+    hub.updateRefs(&.{.{
+        .name = target.name,
+        .op = .{ .update = .{ .new = new, .old = target.oid } },
+    }}) catch return error.ModelMismatch;
+    try hub.commit();
+
+    var report: oracle.Report = .{ .arena = arena };
+    try oracle.checkInvariants(arena, before, world.*, &report);
+    if (!report.ok()) {
+        std.debug.print("  force-push of {s} to the hub\n", .{target.name});
+        return reject(report);
+    }
+}
+
+/// Issue IDs quarantined from origin on this clone.
+fn quarantinedIds(arena: Allocator, clone: World.Clone) Allocator.Error![]const []const u8 {
+    const prefix = "refs/issuez-sync/origin/quarantined/issues/";
+    var out: std.ArrayList([]const u8) = .empty;
+    for (clone.refs) |r| if (std.mem.startsWith(u8, r.name, prefix)) {
+        try out.append(arena, r.name[prefix.len..]);
+    };
+    return out.items;
 }
 
 /// One CLI invocation, checked by the oracle, then the engine's reading of
@@ -364,7 +597,7 @@ fn step(
     clone_index: usize,
     cmd: Command,
     must_succeed: bool,
-) CaseError!void {
+) CaseError!u8 {
     const before = world.*;
     const argv = try cmd.argv(arena);
     var discard_buf: [256]u8 = undefined;
@@ -405,6 +638,41 @@ fn step(
         return reject(report);
     }
     try crossCheckModel(arena, world, clone_index);
+    return code;
+}
+
+fn issueRefsDigest(arena: Allocator, world: World) Allocator.Error![]const u8 {
+    var w: std.Io.Writer.Allocating = .init(arena);
+    for (world.clones) |c| {
+        w.writer.print("{s}\n", .{c.name}) catch return error.OutOfMemory;
+        for (c.refs) |r| if (isSynced(r.name)) {
+            w.writer.print("{s} {s}\n", .{ r.name, r.oid }) catch return error.OutOfMemory;
+        };
+    }
+    return w.written();
+}
+
+/// What sync has to converge.
+fn isSynced(name: []const u8) bool {
+    return std.mem.startsWith(u8, name, "refs/issues/");
+}
+
+fn sameIssueRefs(a: World.Clone, b: World.Clone) bool {
+    var na: usize = 0;
+    for (a.refs) |r| {
+        if (!isSynced(r.name)) continue;
+        na += 1;
+        var found = false;
+        for (b.refs) |o| if (std.mem.eql(u8, o.name, r.name) and std.mem.eql(u8, o.oid, r.oid)) {
+            found = true;
+        };
+        if (!found) return false;
+    }
+    var nb: usize = 0;
+    for (b.refs) |r| if (isSynced(r.name)) {
+        nb += 1;
+    };
+    return na == nb;
 }
 
 fn crossCheckModel(arena: Allocator, world: *World, clone_index: usize) CaseError!void {

@@ -15,6 +15,9 @@ pub const help =
     \\   - one root commit, carrying State: and Format-Version: trailers
     \\   - the whole history is readable
     \\
+    \\Quarantined issues (see `git issue status`) are noted, not counted as
+    \\errors.
+    \\
     \\Options:
     \\   -q, --quiet  Only report problems
     \\   -h, --help   Show this help
@@ -78,10 +81,28 @@ pub fn main(comptime B: type, ctx: *context.Context(B), argv: []const []const u8
         }
         if (problems.len == 0 and !quiet) ctx.out.print("ok {s}\n", .{short}) catch {};
     }
+    reportQuarantine(B, ctx, repo.backend);
     if (errors == 0) {
         ctx.out.print("Checked {d} issues, no errors found.\n", .{refs.len}) catch {};
         return common.exit_ok;
     }
     ctx.err.print("Checked {d} issues, {d} errors found.\n", .{ refs.len, errors }) catch {};
     return common.exit_error;
+}
+
+/// Quarantine is a sync state, not damage: noted, not counted.
+fn reportQuarantine(comptime B: type, ctx: *context.Context(B), backend: *B) void {
+    const s = issuez.Sync(B).init(backend);
+    const remotes = backend.remoteNames(ctx.arena) catch return;
+    for (remotes) |r| {
+        const st = s.status(ctx.arena, r) catch continue;
+        var open: usize = 0;
+        for (st.quarantined) |q| if (!q.kept_local) {
+            open += 1;
+        };
+        if (open > 0) ctx.err.print(
+            "note: {d} issue(s) quarantined from '{s}' (see 'git issue status {s}')\n",
+            .{ open, r, r },
+        ) catch {};
+    }
 }

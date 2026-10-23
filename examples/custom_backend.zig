@@ -2,7 +2,7 @@
 //! so you can put your own layer between the library and git.
 //!
 //! `Audited(Inner)` wraps any backend, logs every ref change and refuses
-//! writes outside the issue namespace. The example also shows `.expect`,
+//! writes outside the issue namespaces. The example also shows `.expect`,
 //! the version token an HTTP API would use as its ETag.
 //!
 //!   zig build example-custom-backend
@@ -24,20 +24,32 @@ fn Audited(comptime Inner: type) type {
 
         pub const Error = Inner.Error;
 
-        // The operation this wrapper changes.
+        // The two operations this wrapper changes.
 
         pub fn updateRefs(
             self: *Self,
             updates: []const contract.RefUpdate,
         ) (Error || error{RefConflict})!void {
             for (updates) |u| {
-                // The library only writes issue refs, so
+                // The library only writes issue and bookkeeping refs, so
                 // anything else is a bug.
-                if (!std.mem.startsWith(u8, u.name, "refs/issues/"))
-                    @panic("write outside the issue namespace");
+                const allowed = std.mem.startsWith(u8, u.name, "refs/issues/") or
+                    std.mem.startsWith(u8, u.name, "refs/issuez-sync/");
+                if (!allowed) @panic("write outside the issue namespaces");
                 self.log.print("  ref {t} {s}\n", .{ u.op, u.name }) catch {};
             }
             return self.inner.updateRefs(updates);
+        }
+
+        pub fn push(
+            self: *Self,
+            arena: Allocator,
+            remote: []const u8,
+            refspecs: []const []const u8,
+            atomic: bool,
+        ) (Error || error{PushFailed})!contract.PushResult {
+            self.log.print("  push {d} ref(s) to {s}\n", .{ refspecs.len, remote }) catch {};
+            return self.inner.push(arena, remote, refspecs, atomic);
         }
 
         // Plain delegation for the rest of the contract.
@@ -107,6 +119,14 @@ fn Audited(comptime Inner: type) type {
         }
         pub fn randomBytes(self: *Self, buf: []u8) void {
             self.inner.randomBytes(buf);
+        }
+        pub fn fetch(
+            self: *Self,
+            arena: Allocator,
+            remote: []const u8,
+            refspecs: []const []const u8,
+        ) (Error || error{FetchFailed})!void {
+            return self.inner.fetch(arena, remote, refspecs);
         }
 
         comptime {

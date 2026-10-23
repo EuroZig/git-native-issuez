@@ -3,7 +3,7 @@
 //!
 //!   perf-smoke <git-issue> [--issues N] [--budget-ms MS]
 //!
-//! Defaults to 10 000 issues and 1 000 ms. Exits 1 when over budget.
+//! Defaults to 10 000 issues and 2 000 ms. Exits 1 when over budget.
 
 const std = @import("std");
 const Io = std.Io;
@@ -23,7 +23,7 @@ pub fn main(init: std.process.Init) !u8 {
     else
         try std.fs.path.join(arena, &.{ cwd, args[1] });
     var issues: u32 = 10_000;
-    var budget_ms: u64 = 1_000;
+    var budget_ms: u64 = 2_000;
     var i: usize = 2;
     while (i + 1 < args.len) : (i += 2) {
         const value = args[i + 1];

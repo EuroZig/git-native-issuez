@@ -8,7 +8,8 @@
 const std = @import("std");
 
 pub const names = [_][]const u8{
-    "create", "ls", "show", "comment", "edit", "state", "search", "fsck", "init",
+    "create", "ls",   "show", "comment", "edit", "state",
+    "search", "fsck", "init", "merge",
 };
 
 /// Names reserved for upstream's provider bridges.

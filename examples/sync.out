@@ -1,0 +1,5 @@
+alice: created df230b4, pushed 1
+bob: merge created 1
+alice: push needed 1 merge(s), pushed 1
+alice: priority=high assignee=bob@example.invalid
+bob: fast-forwarded 1

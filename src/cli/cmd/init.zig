@@ -1,7 +1,8 @@
 //! `git issue init [<remote>] [--fix-refspec]`
 //!
 //! Fetches into a staging namespace instead of upstream's direct refspec,
-//! so a plain `git fetch` can't overwrite local issues.
+//! so a plain `git fetch` can't overwrite local issues. `merge` takes it
+//! from there.
 
 const std = @import("std");
 const context = @import("../context.zig");
@@ -11,7 +12,7 @@ pub const help =
     \\usage: git issue init [<remote>] [--fix-refspec]
     \\
     \\Configure a remote so `git fetch` also fetches issues, into
-    \\refs/remotes/<remote>/issues/.
+    \\refs/remotes/<remote>/issues/ (merge them with `git issue merge`).
     \\
     \\Without <remote>: the only remote, else `origin`.
     \\
@@ -69,7 +70,8 @@ pub fn main(comptime B: type, ctx: *context.Context(B), argv: []const []const u8
                 \\Note: git issue init is OPTIONAL. You can use git-issue without any remote:
                 \\  - All core commands (create, ls, show, comment, edit, state) work locally
                 \\  - To share issues with a remote later, without init:
-                \\    git push <remote> 'refs/issues/*'
+                \\    git issue sync <remote>
+                \\    (or: git push <remote> 'refs/issues/*' and git issue merge <remote>)
                 \\
                 \\To configure automatic fetch when you add a remote, run:
                 \\  git issue init <remote-name>

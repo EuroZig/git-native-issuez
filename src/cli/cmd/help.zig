@@ -14,9 +14,16 @@ pub const text =
     \\   edit        Change issue metadata
     \\   state       Close or reopen an issue
     \\   search      Search issues by text
+    \\   merge       Merge issues from a remote
     \\   fsck        Check issue data integrity
     \\   init        Configure the repository for issue tracking
     \\   version     Print version information
+    \\
+    \\git-native-issuez commands:
+    \\   push        Push issues to a remote
+    \\   sync        Merge from and push to a remote
+    \\   status      Show unpushed, quarantined and conflicted issues
+    \\   quarantine  Resolve a quarantined issue
     \\
     \\Run 'git issue <command> --help' for details on a command.
     \\Provider import/export (GitHub, GitLab, ...): use upstream git-native-issue's

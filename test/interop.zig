@@ -13,8 +13,11 @@ const testing = std.testing;
 const Allocator = std.mem.Allocator;
 const issuez = @import("issuez");
 const paths = @import("paths");
+const oracle = @import("oracle");
 
 const GitProcess = issuez.backend.GitProcess;
+const object = issuez.backend.object;
+const Oid = object.Oid;
 const Repo = issuez.Repo(GitProcess);
 
 const io = testing.io;
@@ -77,6 +80,8 @@ const Sandbox = struct {
     const RepoOptions = struct {
         /// Extra `git init` flags, such as `--object-format=sha256`.
         init_flags: []const []const u8 = &.{},
+        /// The `origin` remote.
+        origin: ?[]const u8 = null,
     };
 
     /// A new repository with one empty commit.
@@ -87,7 +92,17 @@ const Sandbox = struct {
         }));
         const clone: Clone = .{ .sb = sb, .path = path };
         _ = try clone.git("commit -q --allow-empty -m initial", .{});
+        if (options.origin) |url| _ = try clone.git("remote add origin {s}", .{url});
         return clone;
+    }
+
+    /// A bare repository for clones to push to and fetch from.
+    fn hub(sb: *Sandbox, name: []const u8, init_flags: []const []const u8) ![]const u8 {
+        const path = try std.fmt.allocPrint(sb.allocator(), "{s}/{s}", .{ sb.root, name });
+        _ = try sb.git(sb.root, try std.mem.concat(sb.allocator(), []const u8, &.{
+            &.{ "init", "-q", "--bare" }, init_flags, &.{path},
+        }));
+        return path;
     }
 
     fn exec(
@@ -136,6 +151,9 @@ const Tool = enum { ours, upstream };
 const Clone = struct {
     sb: *Sandbox,
     path: []const u8,
+    /// Author and committer date of everything written, so merges are
+    /// reproducible. Unset, git uses the current time.
+    date: ?[]const u8 = null,
 
     /// `git issue <command>` with our CLI, which has to succeed.
     fn ours(c: Clone, comptime command: []const u8, args: anytype) !void {
@@ -171,8 +189,20 @@ const Clone = struct {
         };
         const path = env.get("PATH") orelse "/usr/bin:/bin";
         try env.put("PATH", try std.fmt.allocPrint(arena, "{s}:{s}", .{ bin, path }));
+        if (c.date) |date| {
+            try env.put("GIT_AUTHOR_DATE", date);
+            try env.put("GIT_COMMITTER_DATE", date);
+            try env.put("LC_ALL", "C"); // upstream sorts labels with sort(1)
+        }
         const argv = try std.mem.concat(arena, []const u8, &.{ &.{ "git", "issue" }, args });
         return c.sb.exec(c.path, argv, &env);
+    }
+
+    /// The same clone, writing with a fixed date ("1700000000 +0000").
+    fn at(c: Clone, date: []const u8) Clone {
+        var dated = c;
+        dated.date = date;
+        return dated;
     }
 
     /// `git issue create <command>` with `tool`. Returns the short ID.
@@ -518,6 +548,93 @@ test "messages upstream mangles stay intact with ours" {
     try testing.expectEqual(@as(u8, 1), refused.code);
 }
 
+test "sync with upstream" {
+    var sb = try Sandbox.init();
+    defer sb.deinit();
+    // `a` works with our CLI, `b` with upstream's, both through one hub.
+    const hub = try sb.hub("hub.git", &.{});
+    const a = try sb.repo("a", .{ .origin = hub });
+    const b = try sb.repo("b", .{ .origin = hub });
+
+    // a creates and pushes, b merges it in.
+    const id = try a.create(.ours, "Shared -l bug -p low", .{});
+    try a.ours("push origin", .{});
+    try b.upstream("merge origin", .{});
+
+    // Round 1, resolved by our merge: b edits and pushes, a comments
+    // locally, then syncs and writes a merge commit.
+    try b.upstream("edit {s} -p high --add-label ui", .{id});
+    _ = try b.git("push -q origin refs/issues/*:refs/issues/*", .{});
+    try a.ours("comment {s} -m 'from ours'", .{id});
+    try expectContains(try a.read(.ours, "sync origin", .{}), "Merged ");
+    // b fast-forwards onto our merge commit.
+    try expectContains(try b.read(.upstream, "merge origin", .{}), "Fast-forwarded");
+
+    // Round 2, resolved by upstream's merge: a edits and pushes, b comments
+    // locally, merges and pushes.
+    try a.ours("edit {s} -a alice@e.x --remove-label bug", .{id});
+    try a.ours("push origin", .{});
+    try b.upstream("comment {s} -m 'from upstream'", .{id});
+    try expectContains(try b.read(.upstream, "merge origin", .{}), "Merged ");
+    _ = try b.git("push -q origin refs/issues/*:refs/issues/*", .{});
+    try expectContains(try a.read(.ours, "sync origin", .{}), "Fast-forwarded");
+
+    // Both clones hold the same tip, and both tools read the same state.
+    for ([_]Clone{ a, b }) |clone| {
+        const listed = try expectSameStdout(clone, "ls -a -f full", .{});
+        try expectContains(listed, "labels:ui assignee:alice@e.x priority:high");
+        try clone.upstream("fsck", .{});
+        try clone.ours("fsck", .{});
+
+        // The history has merge commits from both tools, and `show` counts
+        // and prints the same updates (upstream: rev-list <root>..<tip>).
+        const ours_show = try clone.read(.ours, "show {s}", .{id});
+        const upstream_show = try clone.read(.upstream, "show {s}", .{id});
+        const ours_updates = ours_show[std.mem.find(u8, ours_show, "Updates (").?..];
+        const upstream_updates = upstream_show[std.mem.find(u8, upstream_show, "Updates (").?..];
+        try testing.expectEqualStrings(upstream_updates, ours_updates);
+        try expectContains(ours_updates, "  Merge issue\n");
+        try expectContains(ours_updates, "  Merge issue from origin\n");
+    }
+    const shown = try a.read(.ours, "show {s}", .{id});
+    try expectContains(shown, "from ours");
+    try expectContains(shown, "from upstream");
+    try expectLacks(shown, "Conflict:");
+}
+
+test "quarantine" {
+    var sb = try Sandbox.init();
+    defer sb.deinit();
+    const hub = try sb.hub("hub.git", &.{});
+    const repo = try sb.repo("repo", .{ .origin = hub });
+
+    // A local issue, and an unrelated commit under the same ref on the hub,
+    // as a broken tool might push it.
+    _ = try repo.create(.ours, "'Local version'", .{});
+    const ref = try repo.git("for-each-ref --format=%(refname) refs/issues/", .{});
+    const empty_tree = "4b825dc642cb6eb9a060e54bf8d69288fbee4904";
+    const impostor = try repo.git(
+        "commit-tree {s} -m 'Impostor\n\nState: open\nFormat-Version: 1'",
+        .{empty_tree},
+    );
+    _ = try repo.git("push -q origin {s}:{s}", .{ impostor, ref });
+    const local_tip = try repo.git("rev-parse {s}", .{ref});
+
+    // merge sets the stranger aside and keeps the local issue...
+    const merged = try repo.run(.ours, "merge origin", .{});
+    try testing.expectEqual(@as(u8, 0), merged.code);
+    try expectContains(merged.stderr, "Quarantined");
+    try expectContains(merged.stdout, "1 quarantined");
+    try testing.expectEqualStrings(local_tip, try repo.git("rev-parse {s}", .{ref}));
+
+    // ...and push leaves the hub's version alone.
+    const pushed = try repo.run(.ours, "push origin", .{});
+    try testing.expectEqual(@as(u8, 0), pushed.code);
+    try expectContains(pushed.stderr, "quarantined");
+    const hub_tip = try repo.git("--git-dir {s} rev-parse {s}", .{ hub, ref });
+    try testing.expectEqualStrings(impostor, hub_tip);
+}
+
 test "email validation" {
     var sb = try Sandbox.init();
     defer sb.deinit();
@@ -593,24 +710,135 @@ test "sha256 and reftable" {
     };
     for (formats) |f| {
         if (f.needs_reftable and !reftable_ok) continue;
-        const repo = try sb.repo(try std.fmt.allocPrint(arena, "{s}-repo", .{f.name}), .{
+        const hub = try sb.hub(try std.fmt.allocPrint(arena, "{s}-hub.git", .{f.name}), &.{f.flag});
+        const a = try sb.repo(try std.fmt.allocPrint(arena, "{s}-a", .{f.name}), .{
             .init_flags = &.{f.flag},
+            .origin = hub,
+        });
+        const b = try sb.repo(try std.fmt.allocPrint(arena, "{s}-b", .{f.name}), .{
+            .init_flags = &.{f.flag},
+            .origin = hub,
         });
 
-        // Created by us, changed by both tools.
-        const id = try repo.create(.ours, "'Format test' -l bug", .{});
-        try repo.upstream("comment {s} -m 'From upstream'", .{id});
-        try repo.ours("edit {s} -p high", .{id});
-        try repo.upstream("state {s} --close", .{id});
+        // Created by us, changed by both tools in one clone.
+        const id = try a.create(.ours, "'Format test' -l bug", .{});
+        try a.upstream("comment {s} -m 'From upstream'", .{id});
+        try a.ours("edit {s} -p high", .{id});
+        try a.ours("push origin", .{});
 
-        const listed = try expectSameStdout(repo, "ls -a -f full", .{});
-        try expectContains(listed, "[closed] Format test");
-        try repo.upstream("fsck", .{});
-        try repo.ours("fsck", .{});
+        // The other clone gets it with upstream's merge, closes it, pushes.
+        try b.upstream("merge origin", .{});
+        try b.upstream("state {s} --close", .{id});
+        _ = try b.git("push -q origin refs/issues/*:refs/issues/*", .{});
+        try expectContains(try a.read(.ours, "sync origin", .{}), "Fast-forwarded");
+
+        for ([_]Clone{ a, b }) |clone| {
+            const listed = try expectSameStdout(clone, "ls -a -f full", .{});
+            try expectContains(listed, "[closed] Format test");
+            try clone.upstream("fsck", .{});
+            try clone.ours("fsck", .{});
+        }
         if (std.mem.eql(u8, f.name, "sha256")) {
             // Real SHA-256 object IDs end to end.
-            const tip = try repo.git("for-each-ref --format=%(objectname) refs/issues/", .{});
+            const tip = try a.git("for-each-ref --format=%(objectname) refs/issues/", .{});
             try testing.expectEqual(@as(usize, 64), tip.len);
         }
+    }
+}
+
+/// What upstream's `merge` will write for the clone's one issue, by the
+/// oracle's model of it: fetches the hub's version and predicts the merge
+/// commit message. Also returns both parents.
+fn predictUpstreamMerge(
+    clone: Clone,
+    git: *GitProcess,
+) !struct { message: []const u8, local: Oid, remote: Oid, ref: []const u8 } {
+    const arena = clone.sb.allocator();
+    _ = try clone.git("fetch -q origin +refs/issues/*:refs/remotes/origin/issues/*", .{});
+    const local = (try git.listRefs(arena, "refs/issues/"))[0];
+    const remote_ref = try std.fmt.allocPrint(
+        arena,
+        "refs/remotes/origin/issues/{s}",
+        .{local.name["refs/issues/".len..]},
+    );
+    const remote = (try git.resolveRef(remote_ref)).?;
+    const message = try oracle.upstream.mergeMessage(arena, git, local.oid, remote, "origin");
+    return .{ .message = message, .local = local.oid, .remote = remote, .ref = local.name };
+}
+
+test "upstream merge model" {
+    var sb = try Sandbox.init();
+    defer sb.deinit();
+    const arena = sb.allocator();
+
+    // Each case edits one issue in two clones at once, then upstream merges
+    // them. The oracle's model of upstream's merge has to predict the merge
+    // commit exactly.
+    const Case = struct {
+        name: []const u8,
+        /// Edit flags and date, in clone a and b.
+        a: []const u8,
+        a_at: []const u8,
+        b: []const u8,
+        b_at: []const u8,
+    };
+    const cases = [_]Case{
+        .{
+            .name = "labels three-way, scalars one- and two-sided",
+            .a = "--add-label c -p high",
+            .b = "--remove-label a -p medium -a bob@e.x",
+            .a_at = "1700000100 +0000",
+            .b_at = "1700000200 +0000",
+        },
+        .{
+            .name = "both changed at the same second: commit ID decides",
+            .a = "-p critical --milestone v1",
+            .b = "-p low --milestone v2",
+            .a_at = "1700000300 +0000",
+            .b_at = "1700000300 +0000",
+        },
+        .{
+            .name = "local is newer",
+            .a = "-a carol@e.x",
+            .b = "-a dave@e.x --add-label z",
+            .a_at = "1700000500 +0000",
+            .b_at = "1700000400 +0000",
+        },
+    };
+    for (cases, 0..) |case, n| {
+        const hub = try sb.hub(try std.fmt.allocPrint(arena, "m{d}-hub.git", .{n}), &.{});
+        const a = (try sb.repo(try std.fmt.allocPrint(arena, "m{d}-a", .{n}), .{ .origin = hub }))
+            .at("1700000000 +0000");
+        const b = (try sb.repo(try std.fmt.allocPrint(arena, "m{d}-b", .{n}), .{ .origin = hub }))
+            .at("1700000000 +0000");
+        const id = try a.create(.ours, "Merged -l a -l b -p low", .{});
+        try a.ours("push origin", .{});
+        try b.ours("merge origin", .{});
+
+        // Concurrent edits; b's reaches the hub first.
+        try a.at(case.a_at).ours("edit {s} {s}", .{ id, case.a });
+        try b.at(case.b_at).ours("edit {s} {s}", .{ id, case.b });
+        try b.at(case.b_at).ours("push origin", .{});
+
+        var git = try a.open();
+        defer git.close();
+        const predicted = try predictUpstreamMerge(a, &git);
+
+        // Upstream merges for real.
+        const merged = try a.at("1700000900 +0000").read(.upstream, "merge origin", .{});
+        try expectContains(merged, "Merged ");
+        const tip = (try git.resolveRef(predicted.ref)).?;
+        const merge = try object.Commit.parse(
+            arena,
+            git.objectFormat(),
+            (try git.readObject(arena, tip)).?.data,
+        );
+        testing.expectEqualStrings(predicted.message, merge.message) catch |err| {
+            std.debug.print("case: {s}\n", .{case.name});
+            return err;
+        };
+        try testing.expectEqual(@as(usize, 2), merge.parents.len);
+        try testing.expect(merge.parents[0].eql(predicted.local));
+        try testing.expect(merge.parents[1].eql(predicted.remote));
     }
 }

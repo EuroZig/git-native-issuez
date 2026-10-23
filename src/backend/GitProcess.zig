@@ -297,6 +297,80 @@ pub fn remoteNames(gp: *GitProcess, arena: Allocator) Error![]const []const u8 {
     return splitLines(arena, try gp.runOk(arena, &.{ "git", "remote" }, null));
 }
 
+/// Only the given refspecs write refs: `--refmap=` stops git from also
+/// updating refs through `remote.<name>.fetch`, which with upstream's
+/// `+refs/issues/*:refs/issues/*` would reset unpushed local issues. Tags
+/// and FETCH_HEAD are left alone.
+pub fn fetch(
+    gp: *GitProcess,
+    arena: Allocator,
+    remote: []const u8,
+    refspecs: []const []const u8,
+) (Error || error{FetchFailed})!void {
+    assert(contract.isValidRemoteName(remote));
+    var argv: std.ArrayList([]const u8) = .empty;
+    try argv.appendSlice(
+        arena,
+        &.{
+            "git",     "fetch", "--no-tags", "--no-write-fetch-head", "--refmap=",
+            "--quiet", "--",    remote,
+        },
+    );
+    try argv.appendSlice(arena, refspecs);
+    const result = try gp.run(arena, argv.items, null);
+    if (!result.ok()) {
+        gp.keepStderr(result.stderr);
+        return error.FetchFailed;
+    }
+}
+
+/// Never forced. Falls back to a plain push when the remote can't do
+/// atomic pushes.
+pub fn push(
+    gp: *GitProcess,
+    arena: Allocator,
+    remote: []const u8,
+    refspecs: []const []const u8,
+    atomic: bool,
+) (Error || error{PushFailed})!contract.PushResult {
+    assert(contract.isValidRemoteName(remote));
+    assert(refspecs.len > 0);
+    var argv: std.ArrayList([]const u8) = .empty;
+    // Hooks run like for any push, so the user's pre-push policies apply.
+    try argv.appendSlice(arena, &.{ "git", "push", "--porcelain" });
+    if (atomic) try argv.append(arena, "--atomic");
+    try argv.appendSlice(arena, &.{ "--", remote });
+    try argv.appendSlice(arena, refspecs);
+    const result = try gp.run(arena, argv.items, null);
+    if (atomic and !result.ok() and std.mem.find(
+        u8,
+        result.stderr,
+        "does not support --atomic",
+    ) != null) {
+        return gp.push(arena, remote, refspecs, false);
+    }
+    // "<flag>\t<src>:<dst>\t<summary>" per ref
+    var refs: std.ArrayList(contract.PushedRef) = .empty;
+    var lines = std.mem.tokenizeScalar(u8, result.stdout, '\n');
+    while (lines.next()) |line| {
+        if (line.len < 3 or line[1] != '\t') continue;
+        var fields = std.mem.splitScalar(u8, line[2..], '\t');
+        const spec = fields.next() orelse continue;
+        const colon = std.mem.findScalar(u8, spec, ':') orelse continue;
+        const status: contract.PushedRef.Status = switch (line[0]) {
+            ' ', '*', '+' => .ok,
+            '=' => .up_to_date,
+            else => .rejected,
+        };
+        try refs.append(arena, .{ .name = spec[colon + 1 ..], .status = status });
+    }
+    if (!result.ok() and refs.items.len == 0) {
+        gp.keepStderr(result.stderr);
+        return error.PushFailed;
+    }
+    return .{ .refs = refs.items };
+}
+
 fn splitLines(arena: Allocator, text: []const u8) Error![]const []const u8 {
     var out: std.ArrayList([]const u8) = .empty;
     var it = std.mem.tokenizeScalar(u8, text, '\n');

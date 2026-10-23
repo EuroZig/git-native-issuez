@@ -30,10 +30,18 @@ pub const Report = struct {
 /// What git-native-issuez may write. Nothing else may change.
 pub const owned_prefixes = [_][]const u8{
     "refs/issues/",
+    "refs/issuez-sync/",
 };
 
 pub fn isOwnedRef(name: []const u8) bool {
     for (owned_prefixes) |p| if (std.mem.startsWith(u8, name, p)) return true;
+    // Fetch staging: refs/remotes/<remote>/issues/
+    if (std.mem.startsWith(u8, name, "refs/remotes/")) {
+        const rest = name["refs/remotes/".len..];
+        const slash = std.mem.findScalar(u8, rest, '/') orelse return false;
+        const ns = rest[slash + 1 ..];
+        if (std.mem.startsWith(u8, ns, "issues/")) return true;
+    }
     return false;
 }
 
@@ -164,6 +172,9 @@ fn findRef(clone: World.Clone, name: []const u8) ?[]const u8 {
 }
 
 pub const commands = @import("commands.zig");
+/// Upstream's merge commits, for the fuzzer. test/interop.zig checks the
+/// model against real upstream.
+pub const upstream = @import("upstream.zig");
 
 /// Checks `command(before) == after` on clone `clone_name` (the first by
 /// default). NoRule when there's no rule for the case yet.
@@ -180,9 +191,10 @@ pub fn checkTransition(
     if (before.clones.len != after.clones.len) return;
     const target = if (clone_name) |n| (before.cloneIndex(n) orelse return error.NoRule) else 0;
 
-    // A command touches one clone.
+    // A command touches one clone, plus the remote for push and sync.
+    const exempt = syncRemoteIndex(before, target, cmd);
     for (before.clones, after.clones, 0..) |b, a, i| {
-        if (i == target) continue;
+        if (i == target or (exempt != null and i == exempt.?)) continue;
         try expectCloneUnchanged(arena, before.format, b, a, report, true);
     }
     const b = before.clones[target];
@@ -202,7 +214,286 @@ pub fn checkTransition(
         .comment => |x| return checkComment(arena, after, cb, ca, x, report),
         .state => |x| return checkState(arena, after, cb, ca, x, report),
         .edit => |x| return checkEdit(arena, after, cb, ca, x, report),
+        .merge, .push, .sync => |x| {
+            try checkSync(arena, before, after, target, cmd, x, report);
+        },
+        .quarantine => |x| return checkResolve(arena, cb, ca, x, report),
     }
+}
+
+/// The remote is another clone of the world (`remote.<name>.url = sim:<clone>`).
+fn checkSync(
+    arena: Allocator,
+    before: World,
+    after: World,
+    target: usize,
+    which: Command,
+    x: command.Sync,
+    report: *Report,
+) (Allocator.Error || error{NoRule})!void {
+    const cmd = which.verb();
+    const name = x.remote;
+    const check_only = x.check;
+    const no_fetch = x.no_fetch;
+    const pushing = which != .merge;
+    const lb = try commands.Clone.init(arena, before.format, before.clones[target]);
+    const la = try commands.Clone.init(arena, after.format, after.clones[target]);
+
+    // The remote's issues as merge sees them: from the remote clone, or with
+    // --no-fetch from the staging refs already here.
+    var remote_refs: std.ArrayList(World.Ref) = .empty;
+    var ra: ?commands.Clone = null;
+    var rb: ?commands.Clone = null;
+    if (no_fetch and !pushing) {
+        const staging = try std.fmt.allocPrint(arena, "refs/remotes/{s}/issues/", .{name});
+        for (lb.clone.refs) |r| if (std.mem.startsWith(u8, r.name, staging)) {
+            try remote_refs.append(arena, .{
+                .name = try std.fmt.allocPrint(arena, "refs/issues/{s}", .{r.name[staging.len..]}),
+                .oid = r.oid,
+            });
+        };
+    } else {
+        const url_key = try std.fmt.allocPrint(arena, "remote.{s}.url", .{name});
+        var url: ?[]const u8 = null;
+        for (before.clones[target].config) |e| if (std.mem.eql(u8, e.key, url_key)) {
+            url = e.value;
+        };
+        const u = url orelse return error.NoRule; // the command can't have succeeded
+        if (!std.mem.startsWith(u8, u, "sim:")) return error.NoRule;
+        const remote_idx = before.cloneIndex(u["sim:".len..]) orelse return error.NoRule;
+        rb = try commands.Clone.init(arena, before.format, before.clones[remote_idx]);
+        ra = try commands.Clone.init(arena, after.format, after.clones[remote_idx]);
+        for (rb.?.clone.refs) |r| if (std.mem.startsWith(
+            u8,
+            r.name,
+            "refs/issues/",
+        )) try remote_refs.append(
+            arena,
+            r,
+        );
+    }
+
+    // checkTransition treated the remote like any other clone, so check
+    // here only what a remote may do.
+    if (!configEqual(before.clones[target], after.clones[target])) try report.fail(
+        "{s} changed config",
+        .{cmd},
+    );
+
+    // Remote issue refs are never deleted or rewound, and only push moves
+    // them.
+    if (rb) |rbc| for (rbc.clone.refs) |r| {
+        if (!std.mem.startsWith(u8, r.name, "refs/issues/")) continue;
+        const now = ra.?.ref(r.name) orelse {
+            try report.fail("{s} deleted remote {s}", .{ cmd, r.name });
+            continue;
+        };
+        if (std.mem.eql(u8, now, r.oid)) continue;
+        if (!pushing or check_only) {
+            try report.fail("{s} changed remote {s}", .{ cmd, r.name });
+        } else if (!try isAncestorIn(ra.?, r.oid, now)) {
+            try report.fail("{s} rewound remote {s}", .{ cmd, r.name });
+        }
+    };
+
+    // Local issue refs are never deleted or rewound. --check changes nothing.
+    for (lb.clone.refs) |r| {
+        if (!std.mem.startsWith(u8, r.name, "refs/issues/")) continue;
+        const now = la.ref(r.name) orelse {
+            try report.fail("{s} deleted local {s}", .{ cmd, r.name });
+            continue;
+        };
+        if (std.mem.eql(u8, now, r.oid)) continue;
+        if (check_only) try report.fail("merge --check changed {s}", .{r.name});
+        if (!try isAncestorIn(la, r.oid, now)) try report.fail(
+            "{s} rewound local {s}",
+            .{ cmd, r.name },
+        );
+    }
+    if (check_only) return;
+
+    // New merge commits have the deterministic shape and restate our own
+    // resolution of their parents.
+    for (la.clone.refs) |r| {
+        if (!std.mem.startsWith(u8, r.name, "refs/issues/")) continue;
+        const old = lb.ref(r.name);
+        if (old != null and std.mem.eql(u8, old.?, r.oid)) continue;
+        try checkNewMerges(arena, la, if (old) |o| o else null, r.oid, report);
+    }
+
+    // merge/sync: every issue the remote had is now here and contains the
+    // remote tip, unless quarantined for a real reason. Push only merges
+    // when rejected, so it can't promise this.
+    const qprefix = try std.fmt.allocPrint(
+        arena,
+        "refs/issuez-sync/{s}/quarantined/issues/",
+        .{name},
+    );
+    const merges_everything = which != .push;
+    if (merges_everything) for (remote_refs.items) |r| {
+        const id = r.name["refs/issues/".len..];
+        const qref = try std.fmt.allocPrint(arena, "{s}{s}", .{ qprefix, id });
+        if (la.ref(qref) != null) {
+            try checkQuarantine(arena, lb, r.name, r.oid, report);
+            continue;
+        }
+        const local_now = la.ref(r.name) orelse {
+            try report.fail("{s}: remote issue {s} missing locally", .{ cmd, id });
+            continue;
+        };
+        if (!try isAncestorIn(la, r.oid, local_now))
+            try report.fail("{s}: local {s} doesn't contain the remote tip", .{ cmd, id });
+    };
+
+    if (pushing) {
+        // After a successful push the remote has every non-quarantined local
+        // tip.
+        for (la.clone.refs) |r| {
+            if (!std.mem.startsWith(u8, r.name, "refs/issues/")) continue;
+            const id = r.name["refs/issues/".len..];
+            if (la.ref(try std.fmt.allocPrint(arena, "{s}{s}", .{ qprefix, id })) != null) continue;
+            // It may be further ahead if another clone pushed meanwhile.
+            const remote_now = ra.?.ref(r.name);
+            if (remote_now == null or !try isAncestorIn(ra.?, r.oid, remote_now.?))
+                try report.fail("{s}: remote lacks local tip of {s}", .{ cmd, id });
+        }
+    }
+}
+
+/// Checks every merge commit added on top of `old`, or in the whole
+/// history.
+fn checkNewMerges(
+    arena: Allocator,
+    c: commands.Clone,
+    old: ?[]const u8,
+    tip: []const u8,
+    report: *Report,
+) (Allocator.Error || error{NoRule})!void {
+    var stack: std.ArrayList([]const u8) = .empty;
+    var seen: std.StringHashMapUnmanaged(void) = .empty;
+    try stack.append(arena, tip);
+    while (stack.pop()) |hex| {
+        if (old != null and (std.mem.eql(
+            u8,
+            hex,
+            old.?,
+        ) or try isAncestorIn(c, hex, old.?))) continue;
+        if ((try seen.getOrPut(arena, hex)).found_existing) continue;
+        const cm = c.commit(hex) orelse return error.NoRule;
+        for (cm.parents) |p| try stack.append(arena, try arena.dupe(u8, p.hex().slice()));
+        if (cm.parents.len != 2) continue;
+        if (!std.mem.eql(u8, cm.author.name, "git-issue")) continue; // not ours (e.g. upstream)
+        const p0 = cm.parents[0].hex();
+        const p1 = cm.parents[1].hex();
+        if (std.mem.order(u8, p0.slice(), p1.slice()) != .lt) try report.fail(
+            "merge {s}: parents not sorted",
+            .{hex[0..7]},
+        );
+        if (!std.mem.eql(
+            u8,
+            cm.author.email,
+            "git-issue@invalid",
+        ) or cm.author.tz_offset_minutes != 0)
+            try report.fail("merge {s}: wrong identity", .{hex[0..7]});
+        const t0 = c.commit(p0.slice()).?.committer.time;
+        const t1 = c.commit(p1.slice()).?.committer.time;
+        if (cm.author.time != @max(t0, t1) or cm.committer.time != cm.author.time)
+            try report.fail("merge {s}: time is not the latest parent's", .{hex[0..7]});
+        // The oracle's own resolution of the two parents.
+        const n = try c.naiveAt(&.{
+            try arena.dupe(u8, p0.slice()),
+            try arena.dupe(u8, p1.slice()),
+        });
+        var want: std.ArrayList(commands.Trailer) = .empty;
+        try want.append(arena, .{ .key = "State", .value = n.state });
+        if (n.title_override) |t| try want.append(arena, .{ .key = "Title", .value = t });
+        if (n.labels.len > 0) try want.append(
+            arena,
+            .{ .key = "Labels", .value = try std.mem.join(arena, ", ", n.labels) },
+        );
+        if (n.assignee.len > 0) try want.append(arena, .{ .key = "Assignee", .value = n.assignee });
+        if (n.priority.len > 0) try want.append(arena, .{ .key = "Priority", .value = n.priority });
+        if (n.milestone.len > 0) try want.append(
+            arena,
+            .{ .key = "Milestone", .value = n.milestone },
+        );
+        try expectBlock(report, "merge", try commands.trailersOf(arena, cm.message), want.items);
+    }
+}
+
+/// Only unrelated histories, or a remote that lost what we merged before,
+/// justify a quarantine.
+fn checkQuarantine(
+    arena: Allocator,
+    local: commands.Clone,
+    name: []const u8,
+    remote_tip: []const u8,
+    report: *Report,
+) (Allocator.Error || error{NoRule})!void {
+    const local_tip = local.ref(name) orelse return; // nothing local: only invalid issues qualify
+    // With shared history only a rewind does, and then the remote tip can't
+    // just fast-forward the local one.
+    if (try sharesHistory(
+        arena,
+        local,
+        local_tip,
+        remote_tip,
+    ) and try isAncestorIn(local, local_tip, remote_tip))
+        try report.fail("quarantined {s} although it fast-forwards", .{name});
+}
+
+fn sharesHistory(
+    arena: Allocator,
+    c: commands.Clone,
+    a: []const u8,
+    b: []const u8,
+) Allocator.Error!bool {
+    const ancestors_a = try closure(arena, c, a);
+    const ancestors_b = try closure(arena, c, b);
+    var it = ancestors_a.keyIterator();
+    while (it.next()) |k| if (ancestors_b.contains(k.*)) return true;
+    return false;
+}
+
+fn closure(
+    arena: Allocator,
+    c: commands.Clone,
+    tip: []const u8,
+) Allocator.Error!std.StringHashMapUnmanaged(void) {
+    var set: std.StringHashMapUnmanaged(void) = .empty;
+    var stack: std.ArrayList([]const u8) = .empty;
+    try stack.append(arena, tip);
+    while (stack.pop()) |hex| {
+        if ((try set.getOrPut(arena, hex)).found_existing) continue;
+        const cm = c.commit(hex) orelse continue;
+        for (cm.parents) |p| try stack.append(arena, try arena.dupe(u8, p.hex().slice()));
+    }
+    return set;
+}
+
+fn isAncestorIn(
+    c: commands.Clone,
+    ancestor: []const u8,
+    descendant: []const u8,
+) Allocator.Error!bool {
+    if (std.mem.eql(u8, ancestor, descendant)) return true;
+    const set = try closure(c.arena, c, descendant);
+    return set.contains(ancestor);
+}
+
+/// The clone `push` and `sync <remote>` may change.
+fn syncRemoteIndex(world: World, target: usize, cmd: Command) ?usize {
+    const name = switch (cmd) {
+        .push, .sync => |x| x.remote,
+        else => return null,
+    };
+    var key_buf: [300]u8 = undefined;
+    const key = std.fmt.bufPrint(&key_buf, "remote.{s}.url", .{name}) catch return null;
+    for (world.clones[target].config) |e| if (std.mem.eql(u8, e.key, key)) {
+        if (!std.mem.startsWith(u8, e.value, "sim:")) return null;
+        return world.cloneIndex(e.value["sim:".len..]);
+    };
+    return null;
 }
 
 const RefChange = struct { name: []const u8, old: ?[]const u8, new: ?[]const u8 };
@@ -225,6 +516,97 @@ fn refChanges(
         .{ .name = r.name, .old = r.oid, .new = null },
     );
     return out.items;
+}
+
+/// Whether an issue matching `prefix` is quarantined and that remote
+/// version was already kept.
+fn alreadyKept(
+    arena: Allocator,
+    b: commands.Clone,
+    remote: []const u8,
+    prefix: []const u8,
+) Allocator.Error!bool {
+    const qprefix = try std.fmt.allocPrint(arena, "refs/issuez-sync/{s}/quarantined/issues/", .{remote});
+    for (b.clone.refs) |r| {
+        if (!std.mem.startsWith(u8, r.name, qprefix)) continue;
+        const id = r.name[qprefix.len..];
+        if (!std.mem.startsWith(u8, id, prefix)) continue;
+        const kept = b.ref(try std.fmt.allocPrint(
+            arena,
+            "refs/issuez-sync/{s}/kept/issues/{s}",
+            .{ remote, id },
+        )) orelse continue;
+        if (std.mem.eql(u8, kept, r.oid)) return true;
+    }
+    return false;
+}
+
+/// Only the one quarantined issue's refs change. Accepting moves the local
+/// issue to the refused tip and keeps the old one in `replaced`, keeping
+/// never touches the local issue.
+fn checkResolve(
+    arena: Allocator,
+    b: commands.Clone,
+    a: commands.Clone,
+    x: command.Quarantine,
+    report: *Report,
+) Allocator.Error!void {
+    const r = x.remote;
+    const accept = x.accept;
+    const qprefix = try std.fmt.allocPrint(arena, "refs/issuez-sync/{s}/quarantined/issues/", .{r});
+
+    var id: ?[]const u8 = null;
+    for (try refChanges(arena, b, a)) |ch| {
+        const this = issueIdOf(ch.name, r) orelse {
+            try report.fail("quarantine changed unrelated ref {s}", .{ch.name});
+            continue;
+        };
+        if (id) |seen| {
+            if (!std.mem.eql(u8, seen, this)) try report.fail("quarantine changed two issues", .{});
+        } else id = this;
+    }
+    const which = id orelse {
+        // Keeping a remote version that is already kept is a no-op.
+        if (!accept and try alreadyKept(arena, b, r, x.id)) return;
+        return report.fail("quarantine changed nothing", .{});
+    };
+    const marker = b.ref(try std.fmt.allocPrint(arena, "{s}{s}", .{ qprefix, which })) orelse
+        return report.fail("quarantine resolved {s}, which wasn't quarantined", .{which});
+    const issue_ref = try std.fmt.allocPrint(arena, "refs/issues/{s}", .{which});
+    const local_before = b.ref(issue_ref);
+    const local_after = a.ref(issue_ref);
+    if (accept) {
+        if (local_after == null or !std.mem.eql(u8, local_after.?, marker))
+            try report.fail("--accept-remote: {s} is not the remote tip", .{which});
+        if (local_before) |old| {
+            const backup = a.ref(try std.fmt.allocPrint(
+                arena,
+                "refs/issuez-sync/{s}/replaced/issues/{s}",
+                .{ r, which },
+            ));
+            if (backup == null or !std.mem.eql(u8, backup.?, old))
+                try report.fail("--accept-remote: old local tip of {s} not kept", .{which});
+        }
+    } else {
+        const same = if (local_before) |old|
+            local_after != null and std.mem.eql(u8, old, local_after.?)
+        else
+            local_after == null;
+        if (!same) try report.fail("--keep-local changed the local issue {s}", .{which});
+    }
+}
+
+/// When the ref is the issue's or one of its sync records for `remote`.
+fn issueIdOf(name: []const u8, remote: []const u8) ?[]const u8 {
+    if (std.mem.startsWith(u8, name, "refs/issues/")) return name["refs/issues/".len..];
+    const sync_prefix = "refs/issuez-sync/";
+    if (!std.mem.startsWith(u8, name, sync_prefix)) return null;
+    const rest = name[sync_prefix.len..];
+    if (!std.mem.startsWith(u8, rest, remote) or rest.len <= remote.len or rest[remote.len] != '/')
+        return null;
+    const marker = "/issues/";
+    const at = std.mem.find(u8, rest, marker) orelse return null;
+    return rest[at + marker.len ..];
 }
 
 fn configEqual(b: World.Clone, a: World.Clone) bool {
@@ -512,6 +894,8 @@ const testing = std.testing;
 
 test isOwnedRef {
     try testing.expect(isOwnedRef("refs/issues/abc"));
+    try testing.expect(isOwnedRef("refs/remotes/origin/issues/abc"));
+    try testing.expect(isOwnedRef("refs/issuez-sync/origin/merged/issues/abc"));
     try testing.expect(!isOwnedRef("refs/heads/main"));
     try testing.expect(!isOwnedRef("refs/remotes/origin/main"));
 }
@@ -550,4 +934,5 @@ test "foreign refs and lost objects" {
 
 test {
     _ = command;
+    _ = upstream;
 }

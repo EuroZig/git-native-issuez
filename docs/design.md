@@ -44,7 +44,7 @@ cli ──► engine ──► model ──► format
 | --------- | --------------------- | ------------------------------------------------------------------------------- |
 | `format`  | `src/format/`         | trailers exactly as git parses them, labels, UUIDs, hex, upstream's value rules |
 | `model`   | `src/model/issue.zig` | one issue from its commit DAG: fields, comments, conflicts                      |
-| `engine`  | `src/engine/`         | `Repo` (read, create, comment, edit, state, check) and `query` (filter, sort)   |
+| `engine`  | `src/engine/`         | `Repo` (read, create, comment, edit, state, check), `Sync`, `query`             |
 | `backend` | `src/backend/`        | the contract, `GitProcess`, `GitSim`, git objects                               |
 | `cli`     | `src/cli/`            | argument parsing, output, exit codes                                            |
 
@@ -62,13 +62,15 @@ set of plumbing operations:
   every update states the value it expects;
 - graph: is-ancestor and merge bases;
 - config, remotes, the default identity;
+- transport: fetch with explicit refspecs, and push (optionally atomic)
+  with a result per ref;
 - random bytes, for UUIDs.
 
-| Backend      | Use                                                                                                                                                                                                                                       |
-| ------------ | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `GitProcess` | Runs `git` from PATH with a fixed environment and `--` separators. Reads objects through one long-lived `cat-file --batch`. Output is bounded.                                                                                            |
-| `GitSim`     | An in-memory world of clones, serialised as ZON. Objects hash exactly like git, so OIDs are real. Clock and randomness come from the world. Breaking a protocol rule (a commit pointing at a missing object, an invalid ref name) panics. |
-| your own     | Wrap or replace either one. `examples/custom_backend.zig` logs every ref change and refuses writes outside `refs/issues/`.                                                                                                                |
+| Backend      | Use                                                                                                                                                                                                                                                                                                                   |
+| ------------ | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `GitProcess` | Runs `git` from PATH with a fixed environment and `--` separators. Reads objects through one long-lived `cat-file --batch`. Output is bounded.                                                                                                                                                                        |
+| `GitSim`     | An in-memory world of clones, serialised as ZON. Objects hash exactly like git, so OIDs are real. A remote is another clone of the world (`remote.<name>.url = sim:<clone>`). Clock and randomness come from the world. Breaking a protocol rule (a commit pointing at a missing object, an invalid ref name) panics. |
+| your own     | Wrap or replace either one. `examples/custom_backend.zig` logs every ref change and push, and refuses writes outside the issue and bookkeeping refs.                                                                                                                                                                  |
 
 ## Reading an issue
 
@@ -103,6 +105,33 @@ refuse. The CLI uses the same checks and adds upstream's error messages.
 A caller can pass `.expect` with the version it read (an issue's tip). The
 write then fails with `VersionMismatch` instead of retrying when the issue
 changed, like an HTTP ETag.
+
+## Sync
+
+`Sync(B)` (`src/engine/sync.zig`) sits on top of `Repo(B)`:
+
+1. Fetch into `refs/remotes/<remote>/issues/`. A fetch never writes
+   `refs/issues/` directly.
+2. Classify each fetched issue against the local one: new, fast-forward, up
+   to date, local ahead, diverged, or to be quarantined (unrelated history,
+   rewritten since the last merge, fails `fsck`).
+3. Fast-forward, or write a deterministic merge commit, with the same
+   compare and swap as every other write.
+4. Fetch again to learn what the remote has (someone may have
+   force-pushed), then push what differs, atomically in batches. A
+   rejection means the remote moved: merge again and retry, up to a fixed
+   number of rounds.
+5. Record what was merged and pushed in `refs/issuez-sync/`, and report
+   every issue's outcome.
+
+The bookkeeping refs are a cache: they make rewound remotes detectable and
+`status` cheap, and losing them only costs a slower next sync. Nothing is
+force-pushed or deleted. Quarantine keeps the local issue, and resolving it
+keeps the version it replaces ([format.md](format.md) §5).
+
+Merge commits are deterministic, so every clone that merges the same pair
+writes the same commit. After all clones have exchanged everything, they
+hold identical refs: the fuzzer checks exactly that.
 
 ## Errors and resources
 
@@ -147,18 +176,32 @@ way, to go unnoticed.
     empty-tree commits, other refs never change, only the target clone
     changes, and a failed command changes nothing;
   - per command: what `create`, `comment`, `edit`, `state` and `init` may
-    write, and that read-only commands change nothing. Messages are checked
-    where the format depends on them (the root message, trailers, text the
-    user wrote). Subjects the CLI picks itself are not.
+    write, and that read-only commands change nothing. Messages are
+    checked where the format depends on them (the root message, trailers,
+    text the user wrote). Subjects the CLI picks itself are not;
+  - for `merge`, `push`, `sync` and `quarantine`: issue refs are never
+    deleted or rewound on either side, a merge commit has the deterministic
+    shape and restates the oracle's own resolution of its parents, every
+    remote issue arrives unless a real reason quarantines it, and after a
+    push the remote has every local tip that isn't quarantined.
 
   It may not import the model or the engine, only git objects, the world
   format and the trailer parser (which is itself checked against git).
+
+- **Upstream model** (`src/oracle/upstream.zig`): upstream's merge commit,
+  so the fuzzer can mix upstream merges into its histories.
+  `test/interop.zig` compares it with real upstream merges.
 - **Fuzzer** (`git-issue-fuzz`, built with `-Dfuzz`): each case first runs
   random backend operations against a separate model of the contract, then
-  random commands, valid and invalid, on one to three clones of a random
-  world. Every command is checked by the oracle, and the engine's reading
-  of each issue is compared with the oracle's. The seed is printed, and
-  `--seed <seed> --iterations 1` replays a failure.
+  random commands, valid and invalid, on a few clones that share a hub
+  remote, with some upstream merges mixed in. Now and then someone
+  force-pushes to the hub, resetting an issue to an older commit or
+  replacing it with unrelated history, so clones quarantine and resolve.
+  Every command is checked by the oracle, and the engine's reading of each
+  issue is compared with the oracle's. At the end every clone syncs, taking
+  the hub's version of anything quarantined, until nothing changes, and
+  each must then hold exactly the hub's issues (convergence). The seed is
+  printed, and `--seed <seed> --iterations 1` replays a failure.
 
 `zig build test` runs the fixture worlds in `src/cli/worlds/` through the
 simulator and the oracle, and a short fuzz run with a fixed seed: the same

@@ -10,7 +10,7 @@
 # CI.
 #
 # Every format-1 command (create, ls, show, comment, edit, state, search,
-# fsck, init).
+# fsck, init) and merge (test-merge.sh).
 test-assignee-validation.sh::valid email formats accepted
 test-assignee-validation.sh::invalid email rejected: no @
 test-assignee-validation.sh::invalid email rejected: no domain
@@ -162,6 +162,7 @@ test-local-only-repo.sh::git issue search works without remote
 test-local-only-repo.sh::git issue fsck works without remote
 test-local-only-repo.sh::git issue init provides helpful message when no remotes
 test-local-only-repo.sh::git issue init reports missing remote clearly
+test-local-only-repo.sh::git issue merge requires remote (expected)
 test-local-only-repo.sh::git issue sync requires provider (expected)
 test-local-only-repo.sh::Issues stored in refs/issues/* (count: 1)
 test-local-only-repo.sh::Issue ref points to valid commit
@@ -215,3 +216,17 @@ test-qol.sh::init with custom remote is idempotent
 test-qol.sh::init with nonexistent remote fails
 test-qol.sh::init default still works
 test-qol.sh::version outputs valid version string
+test-merge.sh::merge creates new issue from remote
+test-merge.sh::merge fast-forwards when local is behind
+test-merge.sh::merge skips when remote is behind
+test-merge.sh::merge skips when already in sync
+test-merge.sh::merge creates merge commit preserving both comments
+test-merge.sh::merge resolves scalar with LWW (later timestamp wins)
+test-merge.sh::merge resolves labels with three-way set merge
+test-merge.sh::merge --check detects divergence without merging
+test-merge.sh::merge handles no remote issues
+test-merge.sh::merge outside git repo fails
+test-merge.sh::merge preserves non-conflicting scalar changes from both sides
+test-merge.sh::merge works with real remote (two-repo scenario)
+test-merge.sh::fsck passes after merge
+test-merge.sh::version outputs valid version string

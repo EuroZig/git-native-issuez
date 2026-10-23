@@ -321,3 +321,126 @@ test "GitSim agrees with git" {
         try testing.expectEqual(@as(usize, 2), criss.len);
     }
 }
+
+test "push and fetch" {
+    const gpa = testing.allocator;
+    var arena_state: std.heap.ArenaAllocator = .init(gpa);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    var hub = try Repo.init(gpa, &.{"--bare"});
+    defer hub.deinit(gpa);
+    var a = try Repo.init(gpa, &.{});
+    defer a.deinit(gpa);
+    var b = try Repo.init(gpa, &.{});
+    defer b.deinit(gpa);
+    const cwd = try std.process.currentPathAlloc(io, arena);
+    const hub_url = try std.fmt.allocPrint(arena, "{s}/{s}", .{ cwd, hub.path });
+    try runGit(gpa, &a.env, a.path, &.{ "git", "remote", "add", "origin", hub_url });
+    try runGit(gpa, &b.env, b.path, &.{ "git", "remote", "add", "origin", hub_url });
+
+    var ga = try a.open(gpa);
+    defer ga.close();
+    var gb = try b.open(gpa);
+    defer gb.close();
+    const remotes = try ga.remoteNames(arena);
+    try testing.expectEqual(@as(usize, 1), remotes.len);
+    try testing.expectEqualStrings("origin", remotes[0]);
+
+    const name = "refs/issues/a7f3b2c1-4e5d-4a8b-9c1e-2f3a4b5c6d7e";
+    const root = try ga.writeObject(.commit, try commitBytes(arena, .sha1, &.{}, "root\n"));
+    try ga.updateRefs(&.{.{ .name = name, .op = .{ .create = root } }});
+    const spec = name ++ ":" ++ name;
+    const first = try ga.push(arena, "origin", &.{spec}, true);
+    try testing.expectEqual(@as(usize, 1), first.refs.len);
+    try testing.expectEqual(issuez.backend.contract.PushedRef.Status.ok, first.refs[0].status);
+    const again = try ga.push(arena, "origin", &.{spec}, true);
+    try testing.expectEqual(
+        issuez.backend.contract.PushedRef.Status.up_to_date,
+        again.refs[0].status,
+    );
+
+    // b fetches into staging, builds on it, pushes.
+    try gb.fetch(arena, "origin", &.{"+refs/issues/*:refs/remotes/origin/issues/*"});
+    const staged_name = "refs/remotes/origin/issues/a7f3b2c1-4e5d-4a8b-9c1e-2f3a4b5c6d7e";
+    const staged = (try gb.resolveRef(staged_name)).?;
+    try testing.expect(staged.eql(root));
+    const b_child = try gb.writeObject(
+        .commit,
+        try commitBytes(arena, .sha1, &.{root}, "from b\n"),
+    );
+    try gb.updateRefs(&.{.{ .name = name, .op = .{ .create = b_child } }});
+    try testing.expect(!(try gb.push(arena, "origin", &.{spec}, true)).rejected());
+
+    // a's diverging commit is not a fast-forward: rejected, and with
+    // --atomic the other ref in the same push isn't applied either.
+    const a_child = try ga.writeObject(
+        .commit,
+        try commitBytes(arena, .sha1, &.{root}, "from a\n"),
+    );
+    try ga.updateRefs(&.{.{ .name = name, .op = .{ .update = .{ .new = a_child, .old = root } } }});
+    const other = "refs/issues/b8e4c3d2-5f6e-4b9c-8d2f-3a4b5c6d7e8f";
+    try ga.updateRefs(&.{.{ .name = other, .op = .{ .create = root } }});
+    const rejected = try ga.push(arena, "origin", &.{ spec, other ++ ":" ++ other }, true);
+    try testing.expect(rejected.rejected());
+    try gb.fetch(arena, "origin", &.{"+refs/issues/*:refs/remotes/origin/issues/*"});
+    const other_staged = "refs/remotes/origin/issues/b8e4c3d2-5f6e-4b9c-8d2f-3a4b5c6d7e8f";
+    try testing.expect(try gb.resolveRef(other_staged) == null);
+
+    // An unknown remote is a fetch failure with git's explanation kept.
+    try testing.expectError(
+        error.FetchFailed,
+        ga.fetch(arena, "nosuchremote", &.{"+refs/issues/*:refs/remotes/x/issues/*"}),
+    );
+    try testing.expect(ga.lastStderr().len > 0);
+}
+
+test "pre-push hook" {
+    const gpa = testing.allocator;
+    var arena_state: std.heap.ArenaAllocator = .init(gpa);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    var hub = try Repo.init(gpa, &.{"--bare"});
+    defer hub.deinit(gpa);
+    var a = try Repo.init(gpa, &.{});
+    defer a.deinit(gpa);
+    const cwd = try std.process.currentPathAlloc(io, arena);
+    const hub_url = try std.fmt.allocPrint(arena, "{s}/{s}", .{ cwd, hub.path });
+    try runGit(gpa, &a.env, a.path, &.{ "git", "remote", "add", "origin", hub_url });
+
+    // The hook records the refs it is told about. It refuses while
+    // `refuse` exists.
+    const seen = try std.fmt.allocPrint(arena, "{s}/hook-seen", .{cwd});
+    const refuse = try std.fmt.allocPrint(arena, "{s}/{s}/refuse", .{ cwd, a.path });
+    const hook = try std.fmt.allocPrint(
+        arena,
+        "#!/bin/sh\ncat >> '{s}'\ntest ! -e '{s}'\n",
+        .{ seen, refuse },
+    );
+    const hook_path = try std.fmt.allocPrint(arena, "{s}/.git/hooks/pre-push", .{a.path});
+    try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = hook_path, .data = hook });
+    try runGit(gpa, &a.env, ".", &.{ "chmod", "+x", hook_path });
+    defer std.Io.Dir.cwd().deleteFile(io, seen) catch {};
+
+    var ga = try a.open(gpa);
+    defer ga.close();
+    const name = "refs/issues/a7f3b2c1-4e5d-4a8b-9c1e-2f3a4b5c6d7e";
+    const root = try ga.writeObject(.commit, try commitBytes(arena, .sha1, &.{}, "root\n"));
+    try ga.updateRefs(&.{.{ .name = name, .op = .{ .create = root } }});
+
+    try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = refuse, .data = "" });
+    const refused = ga.push(arena, "origin", &.{name ++ ":" ++ name}, true);
+    if (refused) |r| try testing.expect(r.rejected()) else |err| {
+        try testing.expectEqual(error.PushFailed, err);
+    }
+    var gh = try hub.open(gpa);
+    defer gh.close();
+    try testing.expect(try gh.resolveRef(name) == null);
+
+    try std.Io.Dir.cwd().deleteFile(io, refuse);
+    const pushed = try ga.push(arena, "origin", &.{name ++ ":" ++ name}, true);
+    try testing.expect(!pushed.rejected());
+    const log = try std.Io.Dir.cwd().readFileAlloc(io, seen, arena, .limited(4096));
+    try testing.expect(std.mem.find(u8, log, name) != null);
+}
