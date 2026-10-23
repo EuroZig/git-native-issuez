@@ -6,8 +6,6 @@ v1.3.3. The git format is the same and stays the same. The commands here
 accept every upstream option with the same short and long forms. Where the
 CLI behaves differently, it is on purpose, and this page says why.
 
-Upstream's `merge` is not in this version yet.
-
 `zig build test-upstream-suite` runs upstream's own tests against this
 `git-issue`. `test/upstream-allowlist.txt` lists every test it fails on
 purpose, with the reason.
@@ -22,6 +20,10 @@ the others refuse and point to upstream: run its `git-issue-import`,
 share the issue refs. The trailers the bridges write (`Provider-ID`,
 `Provider-Comment-ID`, `Exported-Commit`, `Parent-ID`) are read and kept,
 never written.
+
+`git issue sync` exists here, but it syncs with a git remote
+(`git issue sync origin`). A provider argument (`git issue sync github:...`,
+anything with a `:`) is refused with the pointer to upstream.
 
 The `git-issue-<command>` entry points installed here never include
 `import`, `export` or `sync`, so upstream's stay reachable when both tools
@@ -97,3 +99,41 @@ are installed.
   command warns while a remote still has it, and `git issue init <remote>
   --fix-refspec` replaces it.
 - Several remotes as arguments are refused. Upstream takes the last one.
+
+## merge
+
+- A field's merged value comes from the causal rule
+  ([format.md](format.md) §4) over the whole history. Upstream does a
+  three-way merge of the trailers it finds at the two tips and their merge
+  base. The results agree on upstream's own tests. They differ when both
+  sides changed a field: upstream takes the side whose tip has the later
+  author time, the causal rule the later of the two changes, and reports a
+  conflict.
+- Merge commits are deterministic (fixed subject, identity and date, sorted
+  parents; [format.md](format.md) §4), so two clones merging the same pair
+  write the same commit instead of two that need merging again.
+- A remote issue with no history in common with the local one, a remote
+  that rewrote history since the last merge, or one that fails `fsck` is
+  quarantined: left alone and reported by `status`, until `quarantine`
+  resolves it. A remote merely reset to an older tip is not: the next push
+  restores the local tip.
+- Several remotes as arguments are refused, as for `push` and `sync`.
+- The remote must be a configured remote name. URLs and paths are refused
+  with a `git remote add` hint; upstream fails on them too, at the fetch.
+- `--no-fetch` keeps the staging refs, like upstream. A fetching merge
+  removes the ones it merged.
+
+## Commands upstream doesn't have
+
+- `push <remote>`: fetches to see what the remote has, then pushes the
+  issues that differ, never with force. When the remote moved, it merges
+  first and retries. When the remote refuses a ref (a hook, permissions),
+  it stops with the remote's message.
+- `sync <remote>`: `merge`, then `push`.
+- `status [<remote>]`: issues not pushed yet, quarantined issues and how to
+  resolve them, and issues with conflicts. Local state only.
+- `quarantine <remote> --accept-remote|--keep-local <id>`: resolves a
+  quarantined issue. Nothing is force-pushed and no version is dropped: the
+  replaced local tip stays under `refs/issuez-sync/`.
+
+`fsck` notes quarantined issues on stderr without counting them as errors.

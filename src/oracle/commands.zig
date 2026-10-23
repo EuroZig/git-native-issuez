@@ -26,6 +26,7 @@ pub fn subjectOf(arena: Allocator, text: []const u8) Allocator.Error![]const u8 
 /// One issue as the oracle reads it. See `Dag` for the merge rule.
 pub const NaiveIssue = struct {
     title: []const u8,
+    title_override: ?[]const u8,
     state: []const u8,
     labels: []const []const u8,
     assignee: []const u8,
@@ -262,6 +263,7 @@ const Dag = struct {
                 d.arena,
                 d.commits[r].commit.message,
             ),
+            .title_override = if (title != null and title.?.len > 0) title.? else null,
             .state = if (state != null and state.?.len > 0) state.? else "open",
             .labels = try d.set("Labels"),
             .assignee = (try d.scalar("Assignee")) orelse "",

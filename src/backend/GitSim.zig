@@ -353,6 +353,179 @@ pub fn randomBytes(sim: *GitSim, buf: []u8) void {
     sim.prng.random().bytes(buf);
 }
 
+/// Remotes are other clones: `remote.<name>.url = sim:<clone>`.
+fn remoteClone(sim: *GitSim, arena: Allocator, remote: []const u8) Error!?usize {
+    const key = try std.fmt.allocPrint(arena, "remote.{s}.url", .{remote});
+    const url = (try sim.configGet(arena, key)) orelse return null;
+    if (!std.mem.startsWith(u8, url, "sim:")) return null;
+    const idx = sim.world.cloneIndex(url["sim:".len..]) orelse return null;
+    if (idx == sim.clone_index) protocolViolation(
+        "remote '{s}' points at the clone itself",
+        .{remote},
+    );
+    return idx;
+}
+
+fn objectsOf(arena: Allocator, format: ObjectFormat, clone: World.Clone) Error!ObjectMap {
+    var map: ObjectMap = .empty;
+    for (clone.objects) |o| try map.put(arena, object.hashObject(format, o.kind, o.data), o);
+    return map;
+}
+
+fn copyReachable(
+    arena: Allocator,
+    format: ObjectFormat,
+    from: *const ObjectMap,
+    into: *ObjectMap,
+    start: Oid,
+) Error!void {
+    var stack: std.ArrayList(Oid) = .empty;
+    try stack.append(arena, start);
+    while (stack.pop()) |oid| {
+        if (into.contains(oid)) continue;
+        const o = from.get(oid) orelse {
+            if (oid.eql(object.emptyTree(format))) continue; // always present in git
+            protocolViolation("remote object {f} is missing", .{oid});
+        };
+        try into.put(arena, oid, o);
+        if (o.kind == .commit) {
+            const c = object.Commit.parse(arena, format, o.data) catch
+                protocolViolation("remote commit {f} does not decode", .{oid});
+            try stack.append(arena, c.tree);
+            for (c.parents) |p| try stack.append(arena, p);
+        }
+    }
+}
+
+const Refspec = struct { force: bool, src: []const u8, dst: []const u8 };
+
+fn parseRefspec(spec: []const u8) Refspec {
+    const force = spec.len > 0 and spec[0] == '+';
+    const body = if (force) spec[1..] else spec;
+    const colon = std.mem.findScalar(u8, body, ':') orelse protocolViolation(
+        "refspec '{s}' has no ':'",
+        .{spec},
+    );
+    return .{ .force = force, .src = body[0..colon], .dst = body[colon + 1 ..] };
+}
+
+fn mapRef(arena: Allocator, name: []const u8, spec: Refspec) Error!?[]const u8 {
+    if (std.mem.endsWith(u8, spec.src, "*")) {
+        const prefix = spec.src[0 .. spec.src.len - 1];
+        if (!std.mem.startsWith(u8, name, prefix)) return null;
+        if (!std.mem.endsWith(u8, spec.dst, "*")) protocolViolation("refspec dst lacks '*'", .{});
+        return try std.mem.concat(
+            arena,
+            u8,
+            &.{ spec.dst[0 .. spec.dst.len - 1], name[prefix.len..] },
+        );
+    }
+    return if (std.mem.eql(u8, name, spec.src)) spec.dst else null;
+}
+
+pub fn fetch(
+    sim: *GitSim,
+    arena: Allocator,
+    remote: []const u8,
+    refspecs: []const []const u8,
+) (Error || error{FetchFailed})!void {
+    const idx = (try sim.remoteClone(arena, remote)) orelse return error.FetchFailed;
+    const remote_clone = sim.world.clones[idx];
+    const format = sim.world.format;
+    const remote_objects = try objectsOf(arena, format, remote_clone);
+    for (refspecs) |raw| {
+        const spec = parseRefspec(raw);
+        for (remote_clone.refs) |r| {
+            const dst = (try mapRef(arena, r.name, spec)) orelse continue;
+            if (!contract.isValidRefName(dst)) protocolViolation(
+                "fetch into invalid ref '{s}'",
+                .{dst},
+            );
+            const oid = Oid.parseHex(format, r.oid) catch protocolViolation("bad remote oid", .{});
+            try copyReachable(arena, format, &remote_objects, &sim.objects, oid);
+            const current = sim.refs.get(dst);
+            if (current != null and !spec.force and !try sim.isAncestor(current.?, oid)) continue;
+            try sim.refs.put(arena, try arena.dupe(u8, dst), oid);
+        }
+    }
+}
+
+pub fn push(
+    sim: *GitSim,
+    arena: Allocator,
+    remote: []const u8,
+    refspecs: []const []const u8,
+    atomic: bool,
+) (Error || error{PushFailed})!contract.PushResult {
+    const idx = (try sim.remoteClone(arena, remote)) orelse return error.PushFailed;
+    const target = sim.world.clones[idx];
+    const format = sim.world.format;
+    var target_objects = try objectsOf(arena, format, target);
+    var target_refs: std.array_hash_map.String(Oid) = .empty;
+    for (target.refs) |r| try target_refs.put(
+        arena,
+        r.name,
+        Oid.parseHex(format, r.oid) catch protocolViolation("bad oid", .{}),
+    );
+
+    const Plan = struct { dst: []const u8, new: Oid, status: contract.PushedRef.Status };
+    var plans: std.ArrayList(Plan) = .empty;
+    var any_rejected = false;
+    for (refspecs) |raw| {
+        const spec = parseRefspec(raw);
+        if (spec.force) protocolViolation("forced push '{s}'", .{raw});
+        if (!contract.isValidRefName(spec.dst)) protocolViolation(
+            "push to invalid ref '{s}'",
+            .{spec.dst},
+        );
+        const new = sim.refs.get(spec.src) orelse return error.PushFailed;
+        const old = target_refs.get(spec.dst);
+        const status: contract.PushedRef.Status = if (old == null)
+            .ok
+        else if (old.?.eql(new))
+            .up_to_date
+        else if (sim.objects.contains(old.?) and try sim.isAncestor(old.?, new))
+            .ok
+        else
+            .rejected;
+        if (status == .rejected) any_rejected = true;
+        try plans.append(arena, .{ .dst = spec.dst, .new = new, .status = status });
+    }
+    if (atomic and any_rejected) {
+        for (plans.items) |*p| if (p.status == .ok) {
+            p.status = .rejected;
+        };
+    }
+    var changed = false;
+    for (plans.items) |p| if (p.status == .ok) {
+        try copyReachable(arena, format, &sim.objects, &target_objects, p.new);
+        try target_refs.put(arena, p.dst, p.new);
+        changed = true;
+    };
+    if (changed) {
+        var objs: std.ArrayList(World.StoredObject) = .empty;
+        var oids: std.ArrayList(Oid) = .empty;
+        var it = target_objects.keyIterator();
+        while (it.next()) |k| try oids.append(arena, k.*);
+        std.mem.sort(Oid, oids.items, {}, oidLessThan);
+        for (oids.items) |o| try objs.append(arena, target_objects.get(o).?);
+        const names = try arena.dupe([]const u8, target_refs.keys());
+        std.mem.sort([]const u8, names, {}, stringLessThan);
+        var refs: std.ArrayList(World.Ref) = .empty;
+        for (names) |n| try refs.append(arena, .{
+            .name = n,
+            .oid = try arena.dupe(u8, target_refs.get(n).?.hex().slice()),
+        });
+        const clones = try arena.dupe(World.Clone, sim.world.clones);
+        clones[idx].objects = objs.items;
+        clones[idx].refs = refs.items;
+        sim.world.clones = clones;
+    }
+    const out = try arena.alloc(contract.PushedRef, plans.items.len);
+    for (plans.items, out) |p, *o| o.* = .{ .name = p.dst, .status = p.status };
+    return .{ .refs = out };
+}
+
 comptime {
     contract.assertBackend(GitSim);
 }

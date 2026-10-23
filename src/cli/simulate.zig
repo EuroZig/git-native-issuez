@@ -83,6 +83,19 @@ test "fixture worlds through the oracle" {
             .output = "error: state is required (--open, --close, or --state <value>)",
         },
         .{
+            .cmd = .{ .merge = .{ .remote = "../other-clone" } },
+            .exit = 1,
+            .output = "error: invalid remote name '../other-clone'\n" ++
+                "       issues sync through a named remote; add one with:\n" ++
+                "       git remote add <name> <url-or-path>\n",
+        },
+        .{ .cmd = .{ .read = &.{"status"} }, .exit = 0 },
+        .{
+            .cmd = .{ .quarantine = .{ .remote = "origin", .id = "ffff", .accept = false } },
+            .exit = 1,
+            .output = "error: no issue matching 'ffff' is quarantined for 'origin'",
+        },
+        .{
             .cmd = .{ .init = .{ .remotes = &.{ "origin", "upstream" } } },
             .exit = 1,
             .output = "error: only one remote can be given",

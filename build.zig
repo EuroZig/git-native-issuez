@@ -7,7 +7,7 @@
 //!   zig build test-perf            `ls` over 10 000 issues
 //!   zig build ci [-Dseed=N]        what CI runs
 //!   zig build examples             library examples (examples/*.zig)
-//!   zig build example-<name>       run one (quickstart, real-repo -- <path> ls)
+//!   zig build example-<name>       run one (quickstart, sync, real-repo -- <path> ls)
 //!   zig build update-snapshots     rewrite examples/*.out
 
 const std = @import("std");
@@ -101,8 +101,9 @@ pub fn build(b: *std.Build) void {
     fuzz_run.expectStdErrMatch("300 cases passed");
     test_step.dependOn(&fuzz_run.step);
 
-    // Budget 1 s. Most of the time is spent in git.
-    const perf_exe = cli.exe("git-issue", "src/cli/main.zig", optimize);
+    // Budget 2 s, on a ReleaseSafe build whatever -Doptimize says: that is
+    // what users run. Most of the time is spent in git.
+    const perf_exe = cli.exe("git-issue", "src/cli/main.zig", .ReleaseSafe);
     const perf_runner = b.addExecutable(.{
         .name = "perf-smoke",
         .root_module = b.createModule(.{
@@ -115,12 +116,12 @@ pub fn build(b: *std.Build) void {
     run_perf.addArtifactArg(perf_exe);
     if (b.args) |args| run_perf.addArgs(args);
     run_perf.stdio = .inherit;
-    b.step("test-perf", "Time `ls -a` over 10 000 issues against the 1 s budget")
+    b.step("test-perf", "Time `ls -a` over 10 000 issues against the 2 s budget")
         .dependOn(&run_perf.step);
 
     // What CI runs, so `zig build ci -Dseed=<run id>` reproduces a CI run:
     // `test`, long fuzz and trailer runs on the seed, interop, upstream's
-    // suite, and perf with headroom for shared runners.
+    // suite, and perf.
     const ci_step = b.step("ci", "Run what CI runs (-Dseed=<n> for its fuzz and trailer runs)");
     {
         const seed = b.fmt("{d}", .{b.option(u64, "seed", "Seed of the ci runs") orelse 20261018});
@@ -148,8 +149,9 @@ pub fn build(b: *std.Build) void {
 
         const ci_perf = b.addRunArtifact(perf_runner);
         ci_perf.addArtifactArg(perf_exe);
-        ci_perf.addArgs(&.{ "--budget-ms", "2000" });
         ci_perf.stdio = .inherit;
+        // After the long fuzz run, so the two do not share the CPU.
+        ci_perf.step.dependOn(&long_fuzz.step);
         ci_step.dependOn(&ci_perf.step);
     }
 
@@ -171,6 +173,7 @@ pub fn build(b: *std.Build) void {
             .root = "examples/quickstart.zig",
             .snapshot = "examples/quickstart.out",
         },
+        .{ .name = "sync", .root = "examples/sync.zig", .snapshot = "examples/sync.out" },
         .{
             .name = "custom-backend",
             .root = "examples/custom_backend.zig",
@@ -254,6 +257,7 @@ pub fn build(b: *std.Build) void {
                     .optimize = optimize,
                     .imports = &.{
                         .{ .name = "issuez", .module = issuez },
+                        .{ .name = "oracle", .module = oracle },
                         .{ .name = "paths", .module = opts.createModule() },
                     },
                 }),

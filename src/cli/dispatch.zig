@@ -17,6 +17,9 @@ const cmd_state = @import("cmd/state.zig");
 const cmd_search = @import("cmd/search.zig");
 const cmd_fsck = @import("cmd/fsck.zig");
 const cmd_init = @import("cmd/init.zig");
+const cmd_merge = @import("cmd/merge.zig");
+const cmd_status = @import("cmd/status.zig");
+const cmd_quarantine = @import("cmd/quarantine.zig");
 
 pub const program = "git-issue";
 
@@ -32,6 +35,7 @@ pub const Command = enum {
     import,
     @"export",
     sync,
+    merge,
     fsck,
     init,
     version,
@@ -40,6 +44,9 @@ pub const Command = enum {
     help,
     @"--help",
     @"-h",
+    push,
+    status,
+    quarantine,
 };
 
 pub const Invocation = struct {
@@ -85,7 +92,20 @@ pub fn run(
         .search => cmd_search.main(B, ctx, inv.args),
         .fsck => cmd_fsck.main(B, ctx, inv.args),
         .init => cmd_init.main(B, ctx, inv.args),
-        .import, .@"export", .sync => if (firstPositional(inv.args) == null)
+        .merge => cmd_merge.main(B, ctx, inv.args, .merge),
+        .push => cmd_merge.main(B, ctx, inv.args, .push),
+        .status => cmd_status.main(B, ctx, inv.args),
+        .quarantine => cmd_quarantine.main(B, ctx, inv.args),
+        .sync => if (hasHelp(inv.args))
+            cmd_merge.main(B, ctx, inv.args, .sync)
+        else if (firstPositional(inv.args)) |target|
+            (if (std.mem.findScalar(u8, target, ':') != null)
+                unsupportedBridge(B, ctx, sub)
+            else
+                cmd_merge.main(B, ctx, inv.args, .sync))
+        else
+            common.missing(ctx.err, sub, "remote or provider is required"),
+        .import, .@"export" => if (firstPositional(inv.args) == null)
             common.missing(ctx.err, sub, "provider is required (provider bridges stay upstream)")
         else
             unsupportedBridge(B, ctx, sub),
@@ -100,6 +120,11 @@ fn unknown(comptime B: type, ctx: *context.Context(B), sub: []const u8) u8 {
     return common.exit_error;
 }
 
+fn hasHelp(args: []const []const u8) bool {
+    for (args) |a| if (common.isHelp(a)) return true;
+    return false;
+}
+
 fn firstPositional(args: []const []const u8) ?[]const u8 {
     for (args) |a| if (a.len == 0 or a[0] != '-') return a;
     return null;
@@ -110,8 +135,9 @@ fn unsupportedBridge(comptime B: type, ctx: *context.Context(B), sub: []const u8
         "git-issue: '{s}' with a provider (GitHub, GitLab, Gitea, ...) is not supported\n" ++
             "by git-native-issuez. Provider import, export and sync are done by\n" ++
             "upstream git-native-issue: run its git-issue-import, git-issue-export\n" ++
-            "or git-issue-sync in this repository; both tools share the same\n" ++
-            "issue refs.\n",
+            "or git-issue-sync in this repository; both tools share the same issue\n" ++
+            "refs. To share issues between clones, use 'git issue sync <remote>'\n" ++
+            "or plain git push/fetch.\n",
         .{sub},
     ) catch {};
     return common.exit_error;
@@ -146,5 +172,6 @@ test "entry point names" {
         };
         try std.testing.expect(!entry_points.isReservedForUpstream(name));
     }
+    try std.testing.expect(entry_points.isReservedForUpstream("sync"));
     try std.testing.expect(entry_points.isReservedForUpstream("import-github"));
 }

@@ -24,6 +24,8 @@ pub const model = struct {
 
 pub const engine = @import("engine/repo.zig");
 pub const Repo = engine.Repo;
+pub const sync = @import("engine/sync.zig");
+pub const Sync = sync.Sync;
 pub const query = @import("engine/query.zig");
 
 test {
@@ -38,5 +40,6 @@ test {
     _ = format.core;
     _ = model.issue;
     _ = engine;
+    _ = sync;
     _ = query;
 }

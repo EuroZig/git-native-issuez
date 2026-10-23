@@ -8,10 +8,10 @@ command. It reads and writes the format of
 Issues live under `refs/issues/<uuid>` as chains of commits with an empty
 tree. There is no server, no database and nothing in the working tree.
 
-**Status:** early. This version covers format 1 on a single repository:
-creating, listing, showing, commenting on, editing, closing and searching
-issues, plus `fsck` and `init`. Sharing issues between clones (`merge`,
-`push`, `sync`) is not here yet.
+**Status:** early. This version covers format 1: creating, listing,
+showing, commenting on, editing, closing and searching issues, `fsck` and
+`init`, and sharing issues between clones through any git remote (`merge`,
+`push`, `sync`).
 
 > [!WARNING]
 > Generative AI was used to edit and/or produce large portions of this code.
@@ -29,9 +29,19 @@ git issue state a7f3 --close --fixed-by 1a2b3c4
 git issue show a7f3
 git issue search -i safari
 git issue fsck
+git issue sync origin            # merge the remote's issues, push ours
 ```
 
 Issue IDs can be shortened to any unique prefix.
+
+`git issue sync <remote>` fetches the remote's issues, merges them, and
+pushes the local ones. Concurrent edits get a merge commit; which value
+wins follows from the history, and `git issue ls --conflicts` shows where
+two clones disagreed. Sync never force-pushes and never drops a version: a
+remote issue whose history was rewritten is quarantined until you decide
+(`git issue status`, `git issue quarantine`). Clones can sync with
+upstream's `git issue merge` and `git push` too.
+
 `git issue <command> --help` describes each command.
 
 Like upstream, the `git-issue-<command>` entry points are installed next to
@@ -74,6 +84,7 @@ for (open) |issue| std.debug.print("{s} {s}\n", .{ issue.state, issue.title });
 | Example                                           | Shows                                                                                  | Run                                        |
 | ------------------------------------------------- | -------------------------------------------------------------------------------------- | ------------------------------------------ |
 | [quickstart.zig](examples/quickstart.zig)         | create, resolve by prefix, comment, edit, close, list, show (in memory, no git needed) | `zig build example-quickstart`             |
+| [sync.zig](examples/sync.zig)                     | two clones syncing through a remote, with a concurrent edit (in memory)                | `zig build example-sync`                   |
 | [real_repo.zig](examples/real_repo.zig)           | the same API on a real repository through `GitProcess`                                 | `zig build example-real-repo -- <repo> ls` |
 | [custom_backend.zig](examples/custom_backend.zig) | your own backend (audit log, write policy) and ETag-style `.expect` versions           | `zig build example-custom-backend`         |
 

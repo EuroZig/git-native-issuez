@@ -14,6 +14,10 @@ pub const Command = union(enum) {
     comment: Comment,
     state: State,
     edit: Edit,
+    merge: Sync,
+    push: Sync,
+    sync: Sync,
+    quarantine: Quarantine,
 
     /// The CLI's name for it, for messages and statistics.
     pub fn verb(c: Command) []const u8 {
@@ -35,6 +39,8 @@ pub const Command = union(enum) {
             .comment => |x| try x.render(&out),
             .state => |x| try x.render(&out),
             .edit => |x| try x.render(&out),
+            .merge, .push, .sync => |x| try x.render(&out, @tagName(c)),
+            .quarantine => |x| try x.render(&out),
         }
         return out.list.items;
     }
@@ -146,6 +152,33 @@ pub const Edit = struct {
         try out.opt("-a", x.assignee);
         try out.opt("-p", x.priority);
         try out.opt("--milestone", x.milestone);
+    }
+};
+
+/// `merge`, `push` and `sync`.
+pub const Sync = struct {
+    remote: []const u8,
+    /// merge only.
+    check: bool = false,
+    /// merge only.
+    no_fetch: bool = false,
+
+    fn render(x: Sync, out: *Argv, verb: []const u8) Allocator.Error!void {
+        try out.words(&.{ verb, x.remote });
+        if (x.check) try out.word("--check");
+        if (x.no_fetch) try out.word("--no-fetch");
+    }
+};
+
+pub const Quarantine = struct {
+    remote: []const u8,
+    id: []const u8,
+    /// `--accept-remote`, else `--keep-local`.
+    accept: bool,
+
+    fn render(x: Quarantine, out: *Argv) Allocator.Error!void {
+        const how = if (x.accept) "--accept-remote" else "--keep-local";
+        try out.words(&.{ "quarantine", x.remote, how, x.id });
     }
 };
 
