@@ -112,21 +112,27 @@ finds, show the merged state.
 ## 5. Sync
 
 `git issue merge <remote>` fetches the remote's issues into
-`refs/remotes/<remote>/issues/` and compares each one with the local issue:
+`refs/remotes/<remote>/issues/` and compares each one with the local issue.
+Only refs named by a UUID there are issues: a remote branch `issues/...`,
+which git's default refspec also tracks there, is left alone.
 
 - no local issue: created;
 - local is an ancestor of remote: fast-forwarded;
-- remote is an ancestor of local: nothing to do, the next push sends it;
+- remote is an ancestor of local: nothing to do, the next push sends it.
+  This includes a remote reset to an older tip: nothing is lost;
 - both moved: a merge commit (§4) with both tips as parents;
 - no shared root, a remote that no longer contains the tip merged last time
-  (rewritten history), or an issue that fails `fsck`: **quarantined**. The
-  local issue is left as it is and the remote version is reported, until
-  `git issue quarantine` resolves it.
+  and isn't contained in the local issue either (rewritten history), or an
+  issue that fails `fsck`: **quarantined**. The local issue is left as it
+  is and the remote version is reported, until `git issue quarantine`
+  resolves it.
 
 `git issue push <remote>` first fetches the remote's issue refs to see
 what it has, then pushes the local issues that differ, in atomic batches
 and never with force. When the remote moved, it merges and tries again, a
-bounded number of times. `git issue sync` is merge, then push.
+bounded number of times. A ref the remote refuses (a hook, permissions)
+fails the push with the remote's message. `git issue sync` is merge, then
+push.
 
 ### Bookkeeping refs
 
@@ -138,7 +144,7 @@ the next sync:
 - `.../quarantined/issues/<uuid>`: a refused remote tip;
 - `.../kept/issues/<uuid>`: a refused remote tip the user chose to ignore
   (`quarantine --keep-local`);
-- `.../replaced/issues/<uuid>`: the local tip replaced by
+- `.../replaced/issues/<uuid>/<tip>`: each local tip replaced by
   `quarantine --accept-remote`, so no version is ever dropped;
 - `.../seen/issues/<uuid>`: where `push` fetches the remote's refs, deleted
   right after.

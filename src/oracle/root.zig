@@ -431,15 +431,14 @@ fn checkQuarantine(
     report: *Report,
 ) (Allocator.Error || error{NoRule})!void {
     const local_tip = local.ref(name) orelse return; // nothing local: only invalid issues qualify
-    // With shared history only a rewind does, and then the remote tip can't
-    // just fast-forward the local one.
-    if (try sharesHistory(
-        arena,
-        local,
-        local_tip,
-        remote_tip,
-    ) and try isAncestorIn(local, local_tip, remote_tip))
+    // With shared history only a rewrite does, and then neither tip can
+    // contain the other: a fast-forward merges, and a remote reset to a tip
+    // the local issue has loses nothing.
+    if (!try sharesHistory(arena, local, local_tip, remote_tip)) return;
+    if (try isAncestorIn(local, local_tip, remote_tip))
         try report.fail("quarantined {s} although it fast-forwards", .{name});
+    if (try isAncestorIn(local, remote_tip, local_tip))
+        try report.fail("quarantined {s} although the local issue has the remote tip", .{name});
 }
 
 fn sharesHistory(
@@ -542,8 +541,8 @@ fn alreadyKept(
 }
 
 /// Only the one quarantined issue's refs change. Accepting moves the local
-/// issue to the refused tip and keeps the old one in `replaced`, keeping
-/// never touches the local issue.
+/// issue to the refused tip and keeps the old one in `replaced/.../<tip>`,
+/// keeping never touches the local issue.
 fn checkResolve(
     arena: Allocator,
     b: commands.Clone,
@@ -581,8 +580,8 @@ fn checkResolve(
         if (local_before) |old| {
             const backup = a.ref(try std.fmt.allocPrint(
                 arena,
-                "refs/issuez-sync/{s}/replaced/issues/{s}",
-                .{ r, which },
+                "refs/issuez-sync/{s}/replaced/issues/{s}/{s}",
+                .{ r, which, old },
             ));
             if (backup == null or !std.mem.eql(u8, backup.?, old))
                 try report.fail("--accept-remote: old local tip of {s} not kept", .{which});
@@ -606,7 +605,9 @@ fn issueIdOf(name: []const u8, remote: []const u8) ?[]const u8 {
         return null;
     const marker = "/issues/";
     const at = std.mem.find(u8, rest, marker) orelse return null;
-    return rest[at + marker.len ..];
+    const id = rest[at + marker.len ..];
+    // `replaced/issues/<id>/<tip>`
+    return id[0 .. std.mem.findScalar(u8, id, '/') orelse id.len];
 }
 
 fn configEqual(b: World.Clone, a: World.Clone) bool {

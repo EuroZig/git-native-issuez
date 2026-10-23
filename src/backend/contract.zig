@@ -80,7 +80,8 @@ pub const PushedRef = struct {
         ok,
         up_to_date,
         /// Not a fast-forward, or the atomic push failed because of another
-        /// ref.
+        /// ref. When the remote refused a ref for any other reason (a hook,
+        /// permissions), `push` fails with PushFailed instead.
         rejected,
     };
 };

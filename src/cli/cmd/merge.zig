@@ -60,7 +60,8 @@ pub fn main(
     while (args.next()) |arg| {
         if (!args.isOption(arg)) {
             if (args.was_separator) continue;
-            if (remote == null) remote = arg;
+            if (remote != null) return common.missing(ctx.err, name, "unexpected argument");
+            remote = arg;
         } else if (common.isHelp(arg)) {
             ctx.out.writeAll(switch (mode) {
                 .merge => merge_help,

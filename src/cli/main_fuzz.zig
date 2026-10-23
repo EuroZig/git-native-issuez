@@ -527,8 +527,9 @@ fn upstreamStep(arena: Allocator, world: *World, clone_index: usize) CaseError!v
 }
 
 /// A force-push to the hub: one issue goes back to an older commit of its
-/// history, or is replaced by an unrelated one. Clones that merged the lost
-/// commits must quarantine it.
+/// history, maybe with a new commit on top, or is replaced by an unrelated
+/// one. Clones that merged the lost commits push them back after a plain
+/// reset, and must quarantine the others.
 fn rewriteHub(arena: Allocator, rand: std.Random, world: *World, hub_index: usize) CaseError!void {
     const before = world.*;
     var hub = try GitSim.init(arena, world, hub_index);
@@ -538,17 +539,30 @@ fn rewriteHub(arena: Allocator, rand: std.Random, world: *World, hub_index: usiz
     const tip_object = (try hub.readObject(arena, target.oid)).?;
     const tip = object.Commit.parse(arena, world.format, tip_object.data) catch
         return error.ModelMismatch;
-    const new = if (tip.parents.len > 0 and rand.uintLessThan(u8, 3) != 0) blk: {
-        countOutcome("(hub rewound)", true);
-        break :blk tip.parents[rand.uintLessThan(usize, tip.parents.len)];
+    const sig: object.Signature = .{
+        .name = "Mallory",
+        .email = "mallory@example.invalid",
+        .time = world.clock.now,
+        .tz_offset_minutes = 0,
+    };
+    const kind = rand.uintLessThan(u8, 3);
+    const new = if (tip.parents.len > 0 and kind != 0) blk: {
+        const older = tip.parents[rand.uintLessThan(usize, tip.parents.len)];
+        if (kind == 1) {
+            countOutcome("(hub rewound)", true);
+            break :blk older;
+        }
+        countOutcome("(hub rewritten)", true);
+        const commit: object.Commit = .{
+            .tree = object.emptyTree(world.format),
+            .parents = &.{older},
+            .author = sig,
+            .committer = sig,
+            .message = try std.fmt.allocPrint(arena, "Rewritten {d}\n", .{rand.int(u32)}),
+        };
+        break :blk try hub.writeObject(.commit, try commit.serializeAlloc(arena));
     } else blk: {
         countOutcome("(hub replaced)", true);
-        const sig: object.Signature = .{
-            .name = "Mallory",
-            .email = "mallory@example.invalid",
-            .time = world.clock.now,
-            .tz_offset_minutes = 0,
-        };
         const commit: object.Commit = .{
             .tree = object.emptyTree(world.format),
             .parents = &.{},

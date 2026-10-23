@@ -351,6 +351,7 @@ pub fn push(
     }
     // "<flag>\t<src>:<dst>\t<summary>" per ref
     var refs: std.ArrayList(contract.PushedRef) = .empty;
+    var refused = false;
     var lines = std.mem.tokenizeScalar(u8, result.stdout, '\n');
     while (lines.next()) |line| {
         if (line.len < 3 or line[1] != '\t') continue;
@@ -362,9 +363,15 @@ pub fn push(
             '=' => .up_to_date,
             else => .rejected,
         };
+        // "[rejected]" comes from git itself: the remote moved. "[remote
+        // rejected]" is the server refusing (a hook, permissions), which
+        // no retry fixes, unless it only failed with another ref.
+        const summary = fields.next() orelse "";
+        if (std.mem.startsWith(u8, summary, "[remote rejected]") and
+            std.mem.find(u8, summary, "atomic push fail") == null) refused = true;
         try refs.append(arena, .{ .name = spec[colon + 1 ..], .status = status });
     }
-    if (!result.ok() and refs.items.len == 0) {
+    if (refused or (!result.ok() and refs.items.len == 0)) {
         gp.keepStderr(result.stderr);
         return error.PushFailed;
     }

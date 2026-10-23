@@ -195,8 +195,9 @@ way, to go unnoticed.
   random backend operations against a separate model of the contract, then
   random commands, valid and invalid, on a few clones that share a hub
   remote, with some upstream merges mixed in. Now and then someone
-  force-pushes to the hub, resetting an issue to an older commit or
-  replacing it with unrelated history, so clones quarantine and resolve.
+  force-pushes to the hub: it resets an issue to an older commit, which
+  clones push back, or rewrites it from an older commit or replaces it with
+  unrelated history, which clones quarantine and resolve.
   Every command is checked by the oracle, and the engine's reading of each
   issue is compared with the oracle's. At the end every clone syncs, taking
   the hub's version of anything quarantined, until nothing changes, and

@@ -12,7 +12,7 @@ pub const help =
     \\Resolve an issue that a merge from <remote> quarantined (see
     \\`git issue status`). Sync never force-pushes and never drops a version:
     \\--accept-remote keeps the replaced local version in
-    \\refs/issuez-sync/<remote>/replaced/issues/<id>.
+    \\refs/issuez-sync/<remote>/replaced/issues/<id>/<commit>.
     \\
     \\Options:
     \\   --accept-remote <issue-id>  Replace the local issue with the remote version
@@ -81,7 +81,7 @@ pub fn main(comptime B: type, ctx: *context.Context(B), argv: []const []const u8
         return common.exit_error;
     };
 
-    s.resolve(arena, r, q.id, resolution) catch |e| switch (e) {
+    const replaced = s.resolve(arena, r, q.id, resolution) catch |e| switch (e) {
         error.RemoteIssueInvalid => {
             ctx.err.print(
                 "error: the remote version of {s} fails integrity checks; " ++
@@ -94,11 +94,14 @@ pub fn main(comptime B: type, ctx: *context.Context(B), argv: []const []const u8
     };
     const short = uuid.shortId(q.id);
     switch (resolution) {
-        .accept_remote => ctx.out.print(
-            "Accepted the remote version of {s}; the local one is kept in " ++
-                "refs/issuez-sync/{s}/replaced/issues/{s}\n",
-            .{ short, r, q.id },
-        ) catch {},
+        .accept_remote => if (replaced) |tip| {
+            const backup = issuez.sync.replacedRef(arena, r, q.id, tip) catch
+                return common.exit_fatal;
+            ctx.out.print(
+                "Accepted the remote version of {s}; the local one is kept in {s}\n",
+                .{ short, backup },
+            ) catch {};
+        } else ctx.out.print("Accepted the remote version of {s}\n", .{short}) catch {},
         .keep_local => if (q.reason == .rewound)
             ctx.out.print(
                 "Kept the local version of {s}; the next 'git issue sync {s}' pushes it\n",

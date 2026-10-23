@@ -152,8 +152,8 @@ test "quarantine" {
     try testing.expectEqualStrings(alice_tip, std.mem.trimEnd(u8, now.stdout, "\n"));
     const backup = try std.fmt.allocPrint(
         arena,
-        "refs/issuez-sync/origin/replaced/issues/{s}",
-        .{ref_name["refs/issues/".len..]},
+        "refs/issuez-sync/origin/replaced/issues/{s}/{s}",
+        .{ ref_name["refs/issues/".len..], bob_tip },
     );
     const kept = try sb.runIn(bob, &.{ "git", "rev-parse", backup });
     try testing.expectEqualStrings(bob_tip, std.mem.trimEnd(u8, kept.stdout, "\n"));
@@ -194,6 +194,62 @@ test "upstream's fetch refspec doesn't reset unpushed changes" {
         "git", "--git-dir", hub, "for-each-ref", "--format=%(objectname)", "refs/issues/",
     });
     try testing.expectEqualStrings(local, on_hub.stdout);
+}
+
+test "remote branches named issues/ are not issues" {
+    var sb = try Sandbox.init(.{});
+    defer sb.deinit();
+    const arena = sb.arena();
+    const hub = try std.fmt.allocPrint(arena, "{s}-hub.git", .{sb.repo});
+    try sb.git(&.{ "init", "-q", "--bare", hub });
+    try sb.git(&.{ "remote", "add", "origin", hub });
+    try sb.git(&.{ "commit", "-q", "--allow-empty", "-m", "Fix login" });
+    try sb.git(&.{ "push", "-q", "origin", "HEAD:refs/heads/issues/123-fix-login" });
+    // The default refspec tracks it as refs/remotes/origin/issues/123-fix-login.
+    try sb.git(&.{ "fetch", "-q", "origin" });
+    try expectSuccess(try gitIssue(&sb, &.{ "create", "Shared" }));
+
+    const synced = try gitIssue(&sb, &.{ "sync", "origin" });
+    try expectSuccess(synced);
+    try testing.expect(std.mem.find(u8, synced.stdout, "uarantine") == null);
+    try testing.expect(std.mem.find(u8, synced.stderr, "uarantine") == null);
+    const branch = "refs/remotes/origin/issues/123-fix-login";
+    try expectSuccess(try sb.run(&.{ "git", "rev-parse", "--verify", "-q", branch }));
+}
+
+test "a push the remote refuses" {
+    var sb = try Sandbox.init(.{});
+    defer sb.deinit();
+    const arena = sb.arena();
+    const hub = try std.fmt.allocPrint(arena, "{s}-hub.git", .{sb.repo});
+    try sb.git(&.{ "init", "-q", "--bare", hub });
+    try sb.git(&.{ "remote", "add", "origin", hub });
+    const hook = try std.fmt.allocPrint(arena, "{s}/hooks/pre-receive", .{hub});
+    try expectSuccess(try sb.run(&.{
+        "sh", "-c", "printf '#!/bin/sh\\necho no issues here >&2\\nexit 1\\n' > \"$1\" && chmod +x \"$1\"",
+        "sh", hook,
+    }));
+    try expectSuccess(try gitIssue(&sb, &.{ "create", "Refused" }));
+
+    // No retry rounds: the reason comes straight from the remote.
+    const pushed = try gitIssue(&sb, &.{ "push", "origin" });
+    try testing.expectEqual(@as(u8, 1), pushed.code);
+    try testing.expect(std.mem.startsWith(u8, pushed.stderr, "error: failed to push issues to 'origin'\n"));
+    try testing.expect(std.mem.find(u8, pushed.stderr, "no issues here") != null);
+}
+
+test "one remote per merge, push and sync" {
+    var sb = try Sandbox.init(.{});
+    defer sb.deinit();
+    for ([_][]const u8{ "merge", "push", "sync" }) |verb| {
+        const out = try gitIssue(&sb, &.{ verb, "origin", "upstream" });
+        const want = try std.fmt.allocPrint(
+            sb.arena(),
+            "error: unexpected argument\nRun 'git issue {s} --help' for usage.\n",
+            .{verb},
+        );
+        try expectFailure(out, 1, want);
+    }
 }
 
 test "parallel writers" {
