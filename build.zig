@@ -101,8 +101,9 @@ pub fn build(b: *std.Build) void {
     fuzz_run.expectStdErrMatch("300 cases passed");
     test_step.dependOn(&fuzz_run.step);
 
-    // Budget 1 s. Most of the time is spent in git.
-    const perf_exe = cli.exe("git-issue", "src/cli/main.zig", optimize);
+    // Budget 2 s, on a ReleaseSafe build whatever -Doptimize says: that is
+    // what users run. Most of the time is spent in git.
+    const perf_exe = cli.exe("git-issue", "src/cli/main.zig", .ReleaseSafe);
     const perf_runner = b.addExecutable(.{
         .name = "perf-smoke",
         .root_module = b.createModule(.{
@@ -120,7 +121,7 @@ pub fn build(b: *std.Build) void {
 
     // What CI runs, so `zig build ci -Dseed=<run id>` reproduces a CI run:
     // `test`, long fuzz and trailer runs on the seed, interop, upstream's
-    // suite, and perf with headroom for shared runners.
+    // suite, and perf.
     const ci_step = b.step("ci", "Run what CI runs (-Dseed=<n> for its fuzz and trailer runs)");
     {
         const seed = b.fmt("{d}", .{b.option(u64, "seed", "Seed of the ci runs") orelse 20261018});
@@ -149,6 +150,8 @@ pub fn build(b: *std.Build) void {
         const ci_perf = b.addRunArtifact(perf_runner);
         ci_perf.addArtifactArg(perf_exe);
         ci_perf.stdio = .inherit;
+        // After the long fuzz run, so the two do not share the CPU.
+        ci_perf.step.dependOn(&long_fuzz.step);
         ci_step.dependOn(&ci_perf.step);
     }
 
