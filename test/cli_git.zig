@@ -89,7 +89,7 @@ test "parallel writers" {
     var spawned: usize = 0;
     defer for (children[0..spawned]) |*c| c.kill(io);
     for (0..writers) |i| {
-        const exe = paths.git_issue_exe;
+        const exe = try sb.exe(paths.git_issue_exe);
         const argv: []const []const u8 = if (i % 2 == 0)
             &.{ exe, "comment", id, "-m", try std.fmt.allocPrint(arena, "note {d}", .{i}) }
         else
@@ -143,7 +143,7 @@ test "sha256 and reftable" {
         const run = struct {
             fn f(s: *Sandbox, dir: []const u8, args: []const []const u8) !Sandbox.Output {
                 var argv: std.ArrayList([]const u8) = .empty;
-                try argv.append(s.arena(), paths.git_issue_exe);
+                try argv.append(s.arena(), try s.exe(paths.git_issue_exe));
                 try argv.appendSlice(s.arena(), args);
                 return s.runIn(dir, argv.items);
             }

@@ -13,6 +13,10 @@ creating, listing, showing, commenting on, editing, closing and searching
 issues, plus `fsck` and `init`. Sharing issues between clones (`merge`,
 `push`, `sync`) is not here yet.
 
+> [!WARNING]
+> Generative AI was used to edit and/or produce large portions of this code.
+> Every line in this repo was verified by a human.
+
 ## Usage
 
 ```sh
@@ -85,17 +89,24 @@ for (open) |issue| std.debug.print("{s} {s}\n", .{ issue.state, issue.title });
 Requires Zig 0.16.0 and git 2.30 or newer.
 
 ```sh
-zig build                   # git-issue and the git-issue-<sub> links
-zig build test              # unit tests, the backend against real git, CLI tests, examples
-zig build update-snapshots  # rewrite examples/*.out after an intended output change
+zig build                      # git-issue and the git-issue-<sub> links
+zig build test                 # unit, backend, CLI, simulator and fuzz smoke tests, examples
+zig build test-interop         # both tools on shared repositories (fetches upstream)
+zig build test-upstream-suite  # upstream's t/*.sh against our git-issue
+zig build test-perf            # `ls -a` over 10 000 issues within 1 s
+zig build ci -Dseed=N          # all of the above, plus long fuzz runs: what CI runs
+zig build update-snapshots     # rewrite examples/*.out after an intended output change
 ```
 
 `zig build test` runs every example. The in-memory ones must print exactly
 their snapshot (`examples/<name>.out`), and `real-repo` runs against a fresh
 repository in a temporary directory.
 
-> [!WARNING] Generative AI was used to edit and/or produce large portions of
-> this code. Every line in this repo was verified by a human
+Every command runs in a simulator on an in-memory repository, and an
+independent oracle checks what it may change. The fuzzer runs random
+commands through both; see [docs/design.md](docs/design.md). Upstream is
+only fetched for `test-interop` and `test-upstream-suite`, and never
+vendored. [CONTRIBUTING.md](CONTRIBUTING.md) has the rules for changes.
 
 ## License
 

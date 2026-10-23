@@ -10,6 +10,8 @@ const Sandbox = @This();
 
 tmp: testing.TmpDir,
 repo: []const u8,
+/// Where the test started. The build may pass executables relative to it.
+cwd: []const u8,
 env: std.process.Environ.Map,
 arena_state: std.heap.ArenaAllocator,
 
@@ -25,11 +27,13 @@ pub fn init(options: Options) !Sandbox {
     var sb: Sandbox = .{
         .tmp = testing.tmpDir(.{}),
         .repo = undefined,
+        .cwd = undefined,
         .env = try testing.environ.createMap(testing.allocator),
         .arena_state = .init(testing.allocator),
     };
     errdefer sb.deinit();
     const cwd = try std.process.currentPathAlloc(io, sb.arena());
+    sb.cwd = cwd;
     sb.repo = try std.fmt.allocPrint(
         sb.arena(),
         "{s}/.zig-cache/tmp/{s}/repo",
@@ -95,10 +99,17 @@ pub fn git(sb: *Sandbox, args: []const []const u8) !void {
     }
 }
 
-/// Runs `exe args...` in the repo.
-pub fn tool(sb: *Sandbox, exe: []const u8, args: []const []const u8) !Output {
+/// A built executable, as an absolute path. The build may pass one
+/// relative to where the test started, and commands run in the repo.
+pub fn exe(sb: *Sandbox, path: []const u8) ![]const u8 {
+    if (std.fs.path.isAbsolute(path)) return path;
+    return std.fs.path.join(sb.arena(), &.{ sb.cwd, path });
+}
+
+/// Runs `program args...` in the repo.
+pub fn tool(sb: *Sandbox, program: []const u8, args: []const []const u8) !Output {
     var argv: std.ArrayList([]const u8) = .empty;
-    try argv.append(sb.arena(), exe);
+    try argv.append(sb.arena(), try sb.exe(program));
     try argv.appendSlice(sb.arena(), args);
     return sb.run(argv.items);
 }

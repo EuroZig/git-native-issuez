@@ -1,6 +1,7 @@
-//! Subcommand dispatch. Called as `git-issue <sub> ...` or, like
-//! upstream's scripts do, as `git-issue-<sub> ...`. Top-level usage,
-//! version and unknown-command output match upstream's dispatcher.
+//! Subcommand dispatch, shared by `git-issue` and `git-issue-sim`. Called
+//! as `git-issue <sub> ...` or, like upstream's scripts do, as
+//! `git-issue-<sub> ...`. Top-level usage, version and unknown-command
+//! output match upstream's dispatcher.
 
 const std = @import("std");
 const context = @import("context.zig");

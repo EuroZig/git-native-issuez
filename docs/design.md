@@ -126,6 +126,45 @@ changed, like an HTTP ETag.
   stores the result or the error; only commands that need a repository
   report the error, so `version` and `help` work anywhere.
 
+## Simulator, oracle and fuzzer
+
+Every write rule is stated twice: once in the engine, and once in an oracle
+written separately and kept simple. A bug has to be made twice, the same
+way, to go unnoticed.
+
+- **Simulator** (`src/cli/simulate.zig`): the real command code running
+  against `GitSim`, on a world (ZON: clones, refs, objects, config, clock,
+  seed). No processes and no files. `git-issue-sim` does the same from the
+  command line, reading the world on stdin and writing the result to
+  stdout.
+- **Commands as data** (`src/oracle/command.zig`): a command is a `Command`
+  value, such as `.{ .edit = .{ .id = "a7f3", .priority = "high" } }`. Its
+  `argv` is what the CLI gets, and the oracle gets the value itself, so the
+  oracle never parses arguments.
+- **Oracle** (`src/oracle/`, `checkTransition`): checks that running the
+  command on world BEFORE may give world AFTER:
+  - for every command: objects never disappear, issue refs only reach
+    empty-tree commits, other refs never change, only the target clone
+    changes, and a failed command changes nothing;
+  - per command: what `create`, `comment`, `edit`, `state` and `init` may
+    write, and that read-only commands change nothing. Messages are checked
+    where the format depends on them (the root message, trailers, text the
+    user wrote). Subjects the CLI picks itself are not.
+
+  It may not import the model or the engine, only git objects, the world
+  format and the trailer parser (which is itself checked against git).
+- **Fuzzer** (`git-issue-fuzz`, built with `-Dfuzz`): each case first runs
+  random backend operations against a separate model of the contract, then
+  random commands, valid and invalid, on one to three clones of a random
+  world. Every command is checked by the oracle, and the engine's reading
+  of each issue is compared with the oracle's. The seed is printed, and
+  `--seed <seed> --iterations 1` replays a failure.
+
+`zig build test` runs the fixture worlds in `src/cli/worlds/` through the
+simulator and the oracle, and a short fuzz run with a fixed seed: the same
+cases every time, so it catches regressions. `zig build ci` adds a long
+run on `-Dseed`, a fresh one on every CI run, which finds new bugs.
+
 ## Tests
 
 - Unit tests next to the code, mostly on `GitSim`.
@@ -136,3 +175,15 @@ changed, like an HTTP ETag.
 - `test/cli_git.zig`: the CLI against real git, for what only real git shows
   (identity rules, config, the environment).
 - The examples, against their snapshots.
+- `test/interop.zig` (`zig build test-interop`): both tools on the same
+  repositories, each reading what the other wrote.
+- `test/upstream_suite.zig` (`zig build test-upstream-suite`): upstream's
+  own `t/*.sh` against our binary. `test/upstream-expected.txt` lists the
+  tests that have to pass, `test/upstream-allowlist.txt` the ones we fail on
+  purpose, each with its reason.
+- `test/perf_smoke.zig` (`zig build test-perf`): `ls -a` over 10 000
+  issues within 1 s.
+
+Upstream is GPL-2.0. It is a lazy dependency in `build.zig.zon`, fetched
+only by `test-interop` and `test-upstream-suite` in this package, never
+vendored and never fetched by packages that depend on this one.

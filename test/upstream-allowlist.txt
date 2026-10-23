@@ -1,0 +1,36 @@
+# Upstream tests we don't match on purpose, each with a reason.
+#   <file>::<test name>   # reason
+#   skip-file <file>      # reason
+# An entry here may never also be in upstream-expected.txt.
+#
+# Policy: the git data format stays compatible; CLI behaviour, messages and
+# reporting may improve on upstream.
+
+# Live-service integration tests: need real provider credentials/APIs.
+# Upstream's own `make test` does not run them either.
+skip-file test-integration-gitea.sh            # needs a live Gitea instance and token
+skip-file test-integration-cross-platform.sh   # needs live GitHub/GitLab/Gitea accounts
+skip-file test-integration-simple.sh           # needs live provider accounts
+
+# git never reads a single-paragraph comment as trailers, so
+# "legit comment\nState: closed" is harmless and accepted. Multi-paragraph
+# comments whose last paragraph reads as trailers are refused.
+test-issue.sh::comment rejects trailer injection   # harmless single-paragraph text; real injections are refused
+
+# These mock failures of shell tools inside upstream's scripts (sed, awk,
+# head, sort, interpret-trailers, commit-tree, `git log` in a pipe) or check
+# for shell `trap` cleanup. The native binary uses none of them.
+test-failure-modes.sh::pipe failure detected (git log in pipe)          # we read objects via cat-file, not git log
+test-failure-modes.sh::interrupted commit creates no orphan refs         # we write commits via hash-object, not commit-tree
+test-failure-modes.sh::pipe component failure (sed in pipe)              # no sed in a native binary
+test-failure-modes.sh::pipe component failure (head in pipe)             # no head in a native binary
+test-failure-modes.sh::temp file cleanup (trap EXIT in create/comment/state/edit)  # no temp files or shell traps
+test-failure-modes.sh::interpret-trailers failure propagates             # we build messages ourselves
+test-failure-modes.sh::awk failure in ls pipeline detected               # no awk in a native binary
+test-failure-modes.sh::sort failure in ls pipeline detected              # no sort in a native binary
+test-failure-modes.sh::pipe failure in search (git log | awk)            # no git log | awk pipeline
+
+# Files that stop early (informational; nothing after the stop runs):
+# - test-assignee-validation.sh sources bin/git-issue-lib (shell functions)
+# - provider-bridge files (bridge, comment-sync, edge-cases*, *-bridge):
+#   import, export and provider sync stay upstream's, use upstream for them
