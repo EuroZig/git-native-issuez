@@ -250,16 +250,12 @@ fn checkInit(
     for (a.clone.config) |e| if (isFetchKey(e.key) and !containsEntry(b.clone.config, e)) {
         // And only the staging refspecs may be added.
         const remote = e.key["remote.".len .. e.key.len - ".fetch".len];
-        var ok = false;
-        for ([_][]const u8{"issues"}) |ns| {
-            const expected = try std.fmt.allocPrint(
-                arena,
-                "+refs/{s}/*:refs/remotes/{s}/{s}/*",
-                .{ ns, remote, ns },
-            );
-            if (std.mem.eql(u8, e.value, expected)) ok = true;
-        }
-        if (!ok) try report.fail(
+        const expected = try std.fmt.allocPrint(
+            arena,
+            "+refs/issues/*:refs/remotes/{s}/issues/*",
+            .{remote},
+        );
+        if (!std.mem.eql(u8, e.value, expected)) try report.fail(
             "init added unexpected refspec '{s}'",
             .{e.value},
         );
@@ -286,7 +282,7 @@ fn checkCreate(
     a: commands.Clone,
     x: command.Create,
     report: *Report,
-) (Allocator.Error || error{NoRule})!void {
+) Allocator.Error!void {
     if (!configEqual(b.clone, a.clone)) try report.fail("create changed config", .{});
     const changes = try refChanges(arena, b, a);
     if (changes.len != 1 or changes[0].old != null or changes[0].new == null) {

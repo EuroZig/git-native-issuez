@@ -91,6 +91,10 @@ fn run(init: std.process.Init) !u8 {
     try env.put("GIT_COMMITTER_NAME", "Suite Runner");
     try env.put("GIT_COMMITTER_EMAIL", "suite@example.invalid");
     try env.put("NO_COLOR", "1");
+    // No GitHub login, so the tests that need one skip themselves everywhere,
+    // as they do on CI.
+    try env.put("GH_CONFIG_DIR", try std.fmt.allocPrint(arena, "{s}/gh", .{work}));
+    for ([_][]const u8{ "GH_TOKEN", "GITHUB_TOKEN", "GH_ENTERPRISE_TOKEN" }) |k| _ = env.swapRemove(k);
 
     // Discover test files.
     const t_dir = try std.fmt.allocPrint(arena, "{s}/t", .{work});

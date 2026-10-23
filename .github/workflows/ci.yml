@@ -18,19 +18,5 @@ jobs:
       # uuid-runtime: upstream's test-merge.sh uses uuidgen.
       - run: sudo apt-get update -qq && sudo apt-get install -y -qq gawk uuid-runtime
 
-      - name: Tests, with a fresh seed for the trailer parser against git
-        run: zig build test --summary all
-        env:
-          ISSUEZ_TRAILER_CASES: 5000
-          ISSUEZ_TRAILER_SEED: ${{ github.run_id }}
-
-      - name: Fuzz with a random seed
-        # A failure prints its replay command.
-        run: zig build -Dfuzz -Doptimize=ReleaseSafe && zig-out/bin/git-issue-fuzz --iterations 5000
-
-      - run: zig build test-interop --summary all
-      - run: zig build test-upstream-suite
-
-      - name: Performance smoke
-        # 1 s on a developer machine, shared runners get headroom.
-        run: zig build test-perf -- --budget-ms 2000
+      # `zig build ci -Dseed=<run id>` reproduces a run locally.
+      - run: zig build ci -Dseed=${{ github.run_id }} --summary all

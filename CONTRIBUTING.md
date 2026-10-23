@@ -13,15 +13,15 @@ approach before you put in the work.
   `fsck` fails on mawk) and uuid-runtime.
 
 ```sh
-zig build test                 # the default check
-zig build test-interop         # against upstream git-native-issue (fetched lazily)
-zig build test-upstream-suite  # upstream's own t/*.sh against our binary
-zig build test-perf            # 10 000 issues, `ls -a` within budget
-zig build -Dfuzz -Doptimize=ReleaseSafe && zig-out/bin/git-issue-fuzz --iterations 4000
+zig build test                 # the quick check
+zig build ci                   # what CI runs: also interop, upstream's suite, perf
+                               # and long fuzz runs (-Dseed=N for other cases)
 ```
 
-A change is ready when all five pass. When the fuzzer fails, it prints a
-replay command (`--seed N --iterations 1`).
+A change is ready when `zig build ci` passes. A failed CI run reproduces
+with `zig build ci -Dseed=<run id>`; the run id is in the job's command
+line. When the fuzzer fails, it also prints a replay command for that case
+(`zig build -Dfuzz && zig-out/bin/git-issue-fuzz --seed N --iterations 1`).
 
 ## Rules that keep the project working
 

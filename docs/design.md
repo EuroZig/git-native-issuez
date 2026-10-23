@@ -152,8 +152,7 @@ way, to go unnoticed.
     user wrote). Subjects the CLI picks itself are not.
 
   It may not import the model or the engine, only git objects, the world
-  format, the trailer parser (which is itself checked against git) and the
-  format's limits.
+  format and the trailer parser (which is itself checked against git).
 - **Fuzzer** (`git-issue-fuzz`, built with `-Dfuzz`): each case first runs
   random backend operations against a separate model of the contract, then
   random commands, valid and invalid, on one to three clones of a random
@@ -162,7 +161,9 @@ way, to go unnoticed.
   `--seed <seed> --iterations 1` replays a failure.
 
 `zig build test` runs the fixture worlds in `src/cli/worlds/` through the
-simulator and the oracle, and a short fuzz run with a fixed seed.
+simulator and the oracle, and a short fuzz run with a fixed seed: the same
+cases every time, so it catches regressions. `zig build ci` adds a long
+run on `-Dseed`, a fresh one on every CI run, which finds new bugs.
 
 ## Tests
 

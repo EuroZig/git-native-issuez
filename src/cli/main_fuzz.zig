@@ -8,7 +8,6 @@
 //!     git-issue-fuzz --seed <seed> --iterations 1
 
 const std = @import("std");
-const assert = std.debug.assert;
 const Allocator = std.mem.Allocator;
 const issuez = @import("issuez");
 const oracle = @import("oracle");
@@ -348,7 +347,7 @@ fn fuzzCommands(
             );
         }
         const gen = try generate(arena, rand, ids.items);
-        _ = try step(io, gpa, arena, environ_map, &world, clone_index, gen.cmd, gen.must_succeed);
+        try step(io, gpa, arena, environ_map, &world, clone_index, gen.cmd, gen.must_succeed);
     }
 
     try checkRoundTrip(arena, world);
@@ -365,7 +364,7 @@ fn step(
     clone_index: usize,
     cmd: Command,
     must_succeed: bool,
-) CaseError!u8 {
+) CaseError!void {
     const before = world.*;
     const argv = try cmd.argv(arena);
     var discard_buf: [256]u8 = undefined;
@@ -406,7 +405,6 @@ fn step(
         return reject(report);
     }
     try crossCheckModel(arena, world, clone_index);
-    return code;
 }
 
 fn crossCheckModel(arena: Allocator, world: *World, clone_index: usize) CaseError!void {
@@ -472,7 +470,8 @@ fn driveBackend(arena: Allocator, rand: std.Random, sim: *GitSim) CaseError!void
                     ];
                     if (parent_count == 2 and parents[0].eql(parents[1])) parent_count = 1;
                 }
-                const sig = (sim.identity(arena) catch return error.ModelMismatch).author;
+                const who = sim.identity(arena) catch return backendMismatch("no identity", .{});
+                const sig = who.author;
                 var msg_buf: [64]u8 = undefined;
                 const msg = std.fmt.bufPrint(
                     &msg_buf,
@@ -491,7 +490,7 @@ fn driveBackend(arena: Allocator, rand: std.Random, sim: *GitSim) CaseError!void
                     format,
                     .commit,
                     try c.serializeAlloc(arena),
-                ))) return error.ModelMismatch;
+                ))) return backendMismatch("writeObject disagrees with git's hashing", .{});
                 try commits.append(arena, oid);
             },
             // 1 to 3 ref updates, sometimes with stale expectations.
@@ -533,7 +532,8 @@ fn driveBackend(arena: Allocator, rand: std.Random, sim: *GitSim) CaseError!void
                 if (n == 0) continue;
                 const result = sim.updateRefs(updates[0..n]);
                 if (result) |_| {
-                    if (!predicted_ok) return error.ModelMismatch;
+                    if (!predicted_ok)
+                        return backendMismatch("ref update succeeded on a stale expectation", .{});
                     for (updates[0..n]) |u| switch (u.op) {
                         .create => |x| try model.put(arena, u.name, x),
                         .update => |x| try model.put(arena, u.name, x.new),
@@ -541,13 +541,15 @@ fn driveBackend(arena: Allocator, rand: std.Random, sim: *GitSim) CaseError!void
                         .verify => {},
                     };
                 } else |err| switch (err) {
-                    error.RefConflict => if (predicted_ok) return error.ModelMismatch,
+                    error.RefConflict => if (predicted_ok)
+                        return backendMismatch("ref update refused although it was current", .{}),
                     error.OutOfMemory => |e| return e,
                 }
                 for (ref_pool) |name| {
                     const actual = try sim.resolveRef(name);
                     const expected = model.get(name);
-                    if (!sameRef(actual, expected)) return error.ModelMismatch;
+                    if (!sameRef(actual, expected))
+                        return backendMismatch("{s} differs from the model", .{name});
                 }
             },
             // Every merge base is an ancestor of both.
@@ -560,12 +562,19 @@ fn driveBackend(arena: Allocator, rand: std.Random, sim: *GitSim) CaseError!void
                     if (!try sim.isAncestor(
                         base,
                         a,
-                    ) or !try sim.isAncestor(base, b)) return error.ModelMismatch;
+                    ) or !try sim.isAncestor(base, b))
+                        return backendMismatch("a merge base isn't an ancestor", .{});
                 }
-                if (a.eql(b) and (bases.len != 1 or !bases[0].eql(a))) return error.ModelMismatch;
+                if (a.eql(b) and (bases.len != 1 or !bases[0].eql(a)))
+                    return backendMismatch("merge base of a commit with itself isn't itself", .{});
             },
         }
     }
+}
+
+fn backendMismatch(comptime what: []const u8, args: anytype) CaseError {
+    std.debug.print("  backend: " ++ what ++ "\n", args);
+    return error.ModelMismatch;
 }
 
 fn expectationHolds(op: contract.RefUpdate.Op, current: ?Oid) bool {

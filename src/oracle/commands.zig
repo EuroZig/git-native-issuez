@@ -1,14 +1,13 @@
 //! Oracle rules for issue commands. Besides object primitives this may
 //! use the trailer parser, which test/trailers_git.zig checks against git,
-//! and the format's policy constants, but nothing from the model, the
-//! engine or the CLI. Expected messages are built from scratch.
+//! but nothing from the model, the engine or the CLI. Expected messages
+//! are built from scratch.
 
 const std = @import("std");
 const Allocator = std.mem.Allocator;
 const issuez = @import("issuez");
 const object = issuez.backend.object;
 const trailers = issuez.format.trailers;
-const hex_fmt = issuez.format.hex;
 const World = issuez.backend.GitSim.World;
 const command = @import("command.zig");
 
@@ -27,13 +26,11 @@ pub fn subjectOf(arena: Allocator, text: []const u8) Allocator.Error![]const u8 
 /// One issue as the oracle reads it. See `Dag` for the merge rule.
 pub const NaiveIssue = struct {
     title: []const u8,
-    title_override: ?[]const u8,
     state: []const u8,
     labels: []const []const u8,
     assignee: []const u8,
     priority: []const u8,
     milestone: []const u8,
-    commits: usize,
 };
 
 pub const Clone = struct {
@@ -265,13 +262,11 @@ const Dag = struct {
                 d.arena,
                 d.commits[r].commit.message,
             ),
-            .title_override = if (title != null and title.?.len > 0) title.? else null,
             .state = if (state != null and state.?.len > 0) state.? else "open",
             .labels = try d.set("Labels"),
             .assignee = (try d.scalar("Assignee")) orelse "",
             .priority = (try d.scalar("Priority")) orelse "",
             .milestone = (try d.scalar("Milestone")) orelse "",
-            .commits = d.commits.len,
         };
     }
 };

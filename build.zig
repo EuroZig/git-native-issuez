@@ -1,10 +1,11 @@
 //!   zig build                      git-issue
 //!   zig build test                 unit, backend, simulator/oracle and fuzz smoke tests
 //!   zig build simulator            git-issue-sim
-//!   zig build -Dfuzz               also install git-issue-fuzz (ReleaseSafe)
+//!   zig build -Dfuzz               also install git-issue-fuzz
 //!   zig build test-interop         tests against upstream (fetched lazily)
 //!   zig build test-upstream-suite  upstream's t/*.sh against our binary
 //!   zig build test-perf            `ls` over 10 000 issues
+//!   zig build ci [-Dseed=N]        what CI runs
 //!   zig build examples             library examples (examples/*.zig)
 //!   zig build example-<name>       run one (quickstart, real-repo -- <path> ls)
 //!   zig build update-snapshots     rewrite examples/*.out
@@ -47,7 +48,7 @@ pub fn build(b: *std.Build) void {
     const sim_step = b.step("simulator", "Build git-issue-sim");
     sim_step.dependOn(&b.addInstallArtifact(sim, .{}).step);
 
-    const fuzz_exe = cli.exe("git-issue-fuzz", "src/cli/main_fuzz.zig", .ReleaseSafe);
+    const fuzz_exe = cli.exe("git-issue-fuzz", "src/cli/main_fuzz.zig", optimize);
     if (fuzz) b.installArtifact(fuzz_exe);
 
     const test_step = b.step("test", "Run unit, backend, simulator/oracle and fuzz smoke tests");
@@ -92,30 +93,64 @@ pub fn build(b: *std.Build) void {
         test_step.dependOn(&run_t.step);
     }
 
-    // Fixed seed so CI is reproducible.
-    const fuzz_smoke = b.addRunArtifact(fuzz_exe);
-    fuzz_smoke.addArgs(&.{ "--seed", "20261018", "--iterations", "300" });
-    fuzz_smoke.expectExitCode(0);
-    fuzz_smoke.expectStdErrMatch("300 cases passed");
-    test_step.dependOn(&fuzz_smoke.step);
+    // A smoke run: the same cases every time, so it catches regressions.
+    // `ci` adds a long run on a fresh seed, which finds new bugs.
+    const fuzz_run = b.addRunArtifact(fuzz_exe);
+    fuzz_run.addArgs(&.{ "--seed", "20261018", "--iterations", "300" });
+    fuzz_run.expectExitCode(0);
+    fuzz_run.expectStdErrMatch("300 cases passed");
+    test_step.dependOn(&fuzz_run.step);
 
-    // Against a ReleaseSafe git-issue, budget 1 s.
+    // Budget 1 s. Most of the time is spent in git.
+    const perf_exe = cli.exe("git-issue", "src/cli/main.zig", optimize);
+    const perf_runner = b.addExecutable(.{
+        .name = "perf-smoke",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("test/perf_smoke.zig"),
+            .target = b.graph.host,
+            .optimize = .Debug,
+        }),
+    });
+    const run_perf = b.addRunArtifact(perf_runner);
+    run_perf.addArtifactArg(perf_exe);
+    if (b.args) |args| run_perf.addArgs(args);
+    run_perf.stdio = .inherit;
+    b.step("test-perf", "Time `ls -a` over 10 000 issues against the 1 s budget")
+        .dependOn(&run_perf.step);
+
+    // What CI runs, so `zig build ci -Dseed=<run id>` reproduces a CI run:
+    // `test`, long fuzz and trailer runs on the seed, interop, upstream's
+    // suite, and perf with headroom for shared runners.
+    const ci_step = b.step("ci", "Run what CI runs (-Dseed=<n> for its fuzz and trailer runs)");
     {
-        const perf_exe = cli.exe("git-issue", "src/cli/main.zig", .ReleaseSafe);
-        const runner = b.addExecutable(.{
-            .name = "perf-smoke",
+        const seed = b.fmt("{d}", .{b.option(u64, "seed", "Seed of the ci runs") orelse 20261018});
+        ci_step.dependOn(test_step);
+
+        const long_fuzz = b.addRunArtifact(fuzz_exe);
+        long_fuzz.addArgs(&.{ "--seed", seed, "--iterations", "5000" });
+        long_fuzz.expectExitCode(0);
+        long_fuzz.expectStdErrMatch("5000 cases passed");
+        ci_step.dependOn(&long_fuzz.step);
+
+        const trailers = b.addTest(.{
+            .name = "trailers_git",
             .root_module = b.createModule(.{
-                .root_source_file = b.path("test/perf_smoke.zig"),
-                .target = b.graph.host,
-                .optimize = .Debug,
+                .root_source_file = b.path("test/trailers_git.zig"),
+                .target = target,
+                .optimize = optimize,
+                .imports = &.{.{ .name = "issuez", .module = issuez }},
             }),
         });
-        const run_perf = b.addRunArtifact(runner);
-        run_perf.addArtifactArg(perf_exe);
-        if (b.args) |args| run_perf.addArgs(args);
-        run_perf.stdio = .inherit;
-        b.step("test-perf", "Time `ls -a` over 10 000 issues against the 1 s budget")
-            .dependOn(&run_perf.step);
+        const long_trailers = b.addRunArtifact(trailers);
+        long_trailers.setEnvironmentVariable("ISSUEZ_TRAILER_CASES", "5000");
+        long_trailers.setEnvironmentVariable("ISSUEZ_TRAILER_SEED", seed);
+        ci_step.dependOn(&long_trailers.step);
+
+        const ci_perf = b.addRunArtifact(perf_runner);
+        ci_perf.addArtifactArg(perf_exe);
+        ci_perf.addArgs(&.{ "--budget-ms", "2000" });
+        ci_perf.stdio = .inherit;
+        ci_step.dependOn(&ci_perf.step);
     }
 
     // The simulator examples need no git and must print exactly their
@@ -226,6 +261,7 @@ pub fn build(b: *std.Build) void {
             const run_interop = b.addRunArtifact(interop);
             run_interop.has_side_effects = true;
             interop_step.dependOn(&run_interop.step);
+            ci_step.dependOn(&run_interop.step);
 
             const suite = b.addExecutable(.{
                 .name = "upstream-suite",
@@ -244,6 +280,7 @@ pub fn build(b: *std.Build) void {
             // as a failure.
             run_suite.stdio = .inherit;
             suite_step.dependOn(&run_suite.step);
+            ci_step.dependOn(&run_suite.step);
         }
     }
 }
