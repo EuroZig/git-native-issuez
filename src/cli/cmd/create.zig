@@ -97,13 +97,17 @@ pub fn main(comptime B: type, ctx: *context.Context(B), argv: []const []const u8
     const repo = common.openRepo(B, ctx) orelse return common.exit_fatal;
     const body_text = std.mem.join(arena, "\n\n", body.items) catch return common.oom(ctx.err);
     const x = ext.resolve(B, ctx, repo) orelse return common.exit_error;
+    const ms = ext_flags.resolveMilestone(B, ctx, repo, ext, milestone, null) orelse
+        return common.exit_error;
     const created = repo.create(arena, .{
         .title = title_text,
         .body = body_text,
         .labels = labels.items,
         .assignee = assignee,
         .priority = priority,
-        .milestone = milestone,
+        .milestone = ms.text,
+        .milestone_id = ms.id,
+        .milestone_mode = ms.mode,
         .parent = x.parent,
         .blocked_by = x.blocked_by,
         .start_date = x.start,

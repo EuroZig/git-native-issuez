@@ -29,6 +29,8 @@ pub const sync = @import("engine/sync.zig");
 pub const Sync = sync.Sync;
 pub const query = @import("engine/query.zig");
 pub const projection = @import("engine/projection.zig");
+pub const milestone = @import("engine/milestone.zig");
+pub const Catalog = milestone.Catalog;
 
 test {
     _ = backend.contract;
@@ -46,4 +48,5 @@ test {
     _ = sync;
     _ = query;
     _ = projection;
+    _ = milestone;
 }

@@ -6,6 +6,12 @@ const issuez = @import("issuez");
 const uuid = issuez.format.uuid;
 const sync = issuez.sync;
 
+/// `a7f3c21` for an issue, `milestone a7f3c21` for a milestone.
+pub fn label(buf: *[32]u8, ns: sync.Namespace, id: []const u8) []const u8 {
+    if (ns != .milestones) return uuid.shortId(id);
+    return std.fmt.bufPrint(buf, "milestone {s}", .{uuid.shortId(id)}) catch uuid.shortId(id);
+}
+
 pub fn printMerge(
     out: *std.Io.Writer,
     err: *std.Io.Writer,
@@ -18,7 +24,8 @@ pub fn printMerge(
         return;
     }
     for (report.entries) |e| {
-        const short = uuid.shortId(e.id);
+        var buf: [32]u8 = undefined;
+        const short = label(&buf, e.namespace, e.id);
         switch (e.outcome) {
             .created => if (check)
                 out.print("[new] {s}: {s}\n", .{ short, e.title }) catch {}

@@ -244,6 +244,11 @@ pub fn reportEngineError(err: *std.Io.Writer, e: anyerror) void {
             "delete or move them first (see 'git issue tree <id>')\n",
         error.CommentNotFound => "error: that isn't a comment of this issue\n",
         error.ParentDeleted => "error: that parent is deleted; restore it first\n",
+        error.MilestoneCompleted => "error: the milestone is completed; reopen it first " ++
+            "('git issue milestone reopen')\n",
+        error.MilestoneRetired => "error: the milestone is retired; pick another one\n",
+        error.OpenWorkInMilestone => "error: the milestone still has open issues; close or " ++
+            "move them first (see 'git issue milestone show')\n",
         error.NothingToEdit => "error: at least one edit option is required\n",
         error.InvalidIssueRef => "error: not an issue ref\n",
         error.VersionMismatch => "error: the issue changed since it was read\n",

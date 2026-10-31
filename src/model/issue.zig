@@ -110,6 +110,8 @@ pub const Extensions = struct {
     estimate_minutes: ?u32 = null,
     /// As written. The projection applies the default for open issues.
     workflow: ?[]const u8 = null,
+    milestone_id: ?[]const u8 = null,
+    milestone_mode: ?fields_fmt.MilestoneMode = null,
     invalid: []const Field = &.{},
 };
 
@@ -622,6 +624,16 @@ fn extensions(
             try invalid.append(arena, .{ .key = "X-Estimate-Minutes", .value = v });
         }
     }
+    if (value(s, "X-Milestone-Id")) |v| {
+        if (uuid_fmt.isCanonical(v)) ext.milestone_id = v else {
+            try invalid.append(arena, .{ .key = "X-Milestone-Id", .value = v });
+        }
+    }
+    if (value(s, "X-Milestone-Mode")) |v| {
+        if (fields_fmt.MilestoneMode.parse(v)) |m| ext.milestone_mode = m else {
+            try invalid.append(arena, .{ .key = "X-Milestone-Mode", .value = v });
+        }
+    }
     if (value(s, "X-Deleted")) |v| {
         if (fields_fmt.parseBool(v) == null) try invalid.append(arena, .{ .key = "X-Deleted", .value = v });
     }
@@ -670,6 +682,8 @@ fn canonicalKey(key: []const u8) []const u8 {
         "X-Estimate-Minutes",
         "X-Workflow-State",
         "X-Deleted",
+        "X-Milestone-Id",
+        "X-Milestone-Mode",
     };
     for (core) |c| if (std.ascii.eqlIgnoreCase(c, key)) return c;
     return key;

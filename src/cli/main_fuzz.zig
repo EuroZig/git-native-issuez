@@ -40,6 +40,7 @@ const ref_pool = [_][]const u8{
     "refs/issues/0b6c4f63-6f5a-4a3e-9c2b-1d2e3f4a5b6c",
     "refs/issues/1c7d5e74-7a6b-4b4f-8d3c-2e3f4a5b6c7d",
     "refs/issues/2d8e6f85-8b7c-4c5a-9e4d-3f4a5b6c7d8e",
+    "refs/milestones/3e9f7a96-9c8d-4d6b-8f5e-4a5b6c7d8e9f",
 };
 
 pub fn main(init: std.process.Init) u8 {
@@ -207,7 +208,9 @@ const label_pool = [_][]const u8{
 };
 const email_pool = [_][]const u8{ "a@e.x", "bob@example.com", "", "noat", "a@b", "@x.y" };
 const priority_pool = [_][]const u8{ "low", "medium", "high", "critical", "urgent" };
-const milestone_pool = [_][]const u8{ "v1", "2026 Q4", "" };
+const milestone_pool = [_][]const u8{ "v1", "v2", "Later", "2026 Q4", "" };
+const milestone_key_pool = [_][]const u8{ "v1", "v2", "Later", "zzzz" };
+const milestone_mode_pool = [_][]const u8{ "inherit", "none", "explicit", "auto" };
 const message_pool = [_][]const u8{
     "Repro steps",                    "line one\nline two",  "para one\n\npara two",
     "Looks good.\n\nX-Deleted: true", "State: closed",       "Fixes: 12\nmore",
@@ -278,6 +281,8 @@ fn genExt(
         .{ &ext.due, &date_pool },
         .{ &ext.estimate, &estimate_pool },
         .{ &ext.workflow, &workflow_pool },
+        .{ &ext.milestone_id, &milestone_key_pool },
+        .{ &ext.milestone_mode, &milestone_mode_pool },
     };
     for (single) |x| if (rand.uintLessThan(u8, 5) == 0) {
         x[0].* = pick(rand, x[1]);
@@ -289,6 +294,61 @@ fn genExt(
     return !ext.isEmpty();
 }
 
+/// Milestone guards need long sequences (link, close, complete, reopen,
+/// move, restore) that random commands rarely produce.
+fn generateMilestoneWork(
+    arena: Allocator,
+    rand: std.Random,
+    ids: []const []const u8,
+    /// Few, to keep duplicate names rare. Named by ID now and then, which
+    /// reaches retired milestones too.
+    milestones: []const []const u8,
+) Allocator.Error!Generated {
+    const id = try genPrefix(arena, rand, ids);
+    const by_id = milestones.len > 0 and rand.uintLessThan(u8, 3) == 0;
+    const named = if (rand.uintLessThan(u8, 4) == 0) "v2" else "v1";
+    var kind = rand.uintLessThan(u8, 8);
+    if (milestones.len == 0 and rand.boolean()) kind = 0;
+    if (kind == 0 and milestones.len > 0 and rand.uintLessThan(u8, 8) != 0) kind = 1;
+    const name = if (by_id and kind != 0 and kind != 2)
+        pick(rand, milestones)[0..8]
+    else
+        named;
+    const cmd: Command = switch (kind) {
+        0 => .{ .milestone = .{ .sub = .create, .name = name } },
+        1 => .{ .milestone = .{
+            .sub = switch (rand.uintLessThan(u8, 4)) {
+                0, 1 => .complete,
+                2 => .reopen,
+                else => .retire,
+            },
+            .name = name,
+        } },
+        2 => .{ .create = .{
+            .title = "Work",
+            .milestone = name,
+            .ext = .{ .parent = if (rand.boolean()) id else null },
+        } },
+        3 => .{ .create = .{ .title = "Sub", .ext = .{ .parent = id } } },
+        4 => blk: {
+            var x: spec.Edit = .{ .id = id };
+            switch (rand.uintLessThan(u8, 5)) {
+                0 => x.milestone = name,
+                1 => x.ext.milestone_id = name,
+                2 => x.ext.milestone_mode = pick(rand, &.{ "inherit", "none", "explicit" }),
+                3 => x.ext.parent = try genPrefix(arena, rand, ids),
+                else => x.ext.clear = try arena.dupe([]const u8, &.{
+                    pick(rand, &.{ "milestone", "parent" }),
+                }),
+            }
+            break :blk .{ .edit = x };
+        },
+        5, 6 => if (rand.boolean()) .{ .close = .{ .id = id } } else .{ .reopen = .{ .id = id } },
+        else => if (rand.boolean()) .{ .delete = .{ .id = id } } else .{ .restore = .{ .id = id } },
+    };
+    return .{ .cmd = cmd };
+}
+
 fn generateLifecycle(
     arena: Allocator,
     rand: std.Random,
@@ -296,7 +356,31 @@ fn generateLifecycle(
     commits: []const []const u8,
 ) Allocator.Error!Generated {
     const id = try genPrefix(arena, rand, ids);
-    const cmd: Command = switch (rand.uintLessThan(u8, 4)) {
+    const cmd: Command = switch (rand.uintLessThan(u8, 5)) {
+        4 => blk: { // milestones
+            const names = [_][]const u8{ "v1", "v2", "Later", "v1" };
+            const name = pick(rand, &names);
+            break :blk switch (rand.uintLessThan(u8, 8)) {
+                0, 1 => .{ .milestone = .{
+                    .sub = .create,
+                    .name = name,
+                    .due = if (rand.boolean()) pick(rand, &date_pool) else null,
+                } },
+                2 => .{ .read = if (rand.boolean())
+                    try arena.dupe([]const u8, &.{ "milestone", "ls", name, "--all" })
+                else
+                    try arena.dupe([]const u8, &.{ "milestone", "ls", name }) },
+                3 => .{ .read = try arena.dupe([]const u8, &.{ "milestone", "show", name }) },
+                4 => .{ .milestone = .{
+                    .sub = .edit,
+                    .name = name,
+                    .new_name = pick(rand, &names),
+                } },
+                5 => .{ .milestone = .{ .sub = .complete, .name = name } },
+                6 => .{ .milestone = .{ .sub = .reopen, .name = name } },
+                else => .{ .milestone = .{ .sub = .retire, .name = name } },
+            };
+        },
         0 => if (rand.boolean()) .{ .delete = .{ .id = id } } else .{ .restore = .{ .id = id } },
         1 => blk: {
             const x: spec.Lifecycle = .{
@@ -365,7 +449,14 @@ fn generate(arena: Allocator, rand: std.Random, ids: []const []const u8) Allocat
                 if (std.mem.eql(u8, p, "urgent")) valid = false;
                 x.priority = p;
             }
-            if (rand.uintLessThan(u8, 4) == 0) x.milestone = pick(rand, &milestone_pool);
+            if (rand.uintLessThan(u8, 4) == 0) {
+                const m = pick(rand, &milestone_pool);
+                // A catalog name may be completed, retired or ambiguous.
+                for (milestone_key_pool) |k| if (std.mem.eql(u8, k, m)) {
+                    valid = false;
+                };
+                x.milestone = m;
+            }
             const bodies = [_][]const u8{ "First paragraph.", "Two\nlines", "Fixes: 12" };
             if (rand.boolean()) x.body = pick(rand, &bodies);
             if (try genExt(arena, rand, ids, &x.ext, false)) valid = false;
@@ -480,6 +571,7 @@ fn fuzzCommands(
         .clones = clones,
     };
 
+    const milestone_focus = rand.uintLessThan(u8, 3) == 0;
     for (0..rand.intRangeAtMost(usize, 5, 40)) |_| {
         const clone_index = rand.uintLessThan(usize, work_count);
         // So most generated prefixes resolve.
@@ -516,13 +608,22 @@ fn fuzzCommands(
             _ = try step(io, gpa, arena, environ_map, &world, clone_index, cmd, true);
             continue;
         }
+        var milestone_ids: std.ArrayList([]const u8) = .empty;
+        for (world.clones[clone_index].refs) |r| {
+            if (std.mem.startsWith(u8, r.name, "refs/milestones/")) try milestone_ids.append(
+                arena,
+                r.name["refs/milestones/".len..],
+            );
+        }
         // So comment events sometimes target a real comment.
         var commits: std.ArrayList([]const u8) = .empty;
         for (world.clones[clone_index].objects) |o| if (o.kind == .commit) {
             const oid = object.hashObject(world.format, .commit, o.data);
             try commits.append(arena, try arena.dupe(u8, oid.hex().slice()));
         };
-        const gen = if (rand.uintLessThan(u8, 6) == 0)
+        const gen = if (milestone_focus and rand.uintLessThan(u8, 2) == 0)
+            try generateMilestoneWork(arena, rand, ids.items, milestone_ids.items)
+        else if (rand.uintLessThan(u8, 6) == 0)
             try generateLifecycle(arena, rand, ids.items, commits.items)
         else
             try generate(arena, rand, ids.items);
@@ -658,6 +759,7 @@ const foreign_pools = [_]struct { []const u8, []const []const u8 }{
     .{ "X-Due-Date", &(date_pool ++ [_][]const u8{""}) },
     .{ "X-Estimate-Minutes", &estimate_pool },
     .{ "X-Workflow-State", &(workflow_pool ++ [_][]const u8{""}) },
+    .{ "X-Milestone-Mode", &milestone_mode_pool },
     .{ "X-Deleted", &.{ "true", "false", "maybe", "" } },
 };
 
@@ -715,16 +817,18 @@ fn foreignStep(
     try crossCheckModel(arena, world, clone_index);
 }
 
-/// A force-push to the hub: one issue goes back to an older commit of its
-/// history, maybe with a new commit on top, or is replaced by an unrelated
-/// one. Clones that merged the lost commits push them back after a plain
-/// reset, and must quarantine the others.
+/// A force-push to the hub: one issue or milestone goes back to an older
+/// commit of its history, maybe with a new commit on top, or is replaced by
+/// an unrelated one. Clones that merged the lost commits push them back
+/// after a plain reset, and must quarantine the others.
 fn rewriteHub(arena: Allocator, rand: std.Random, world: *World, hub_index: usize) CaseError!void {
     const before = world.*;
     var hub = try GitSim.init(arena, world, hub_index);
-    const issues = try hub.listRefs(arena, "refs/issues/");
-    if (issues.len == 0) return;
-    const target = issues[rand.uintLessThan(usize, issues.len)];
+    const milestones = try hub.listRefs(arena, "refs/milestones/");
+    const milestone = milestones.len > 0 and rand.uintLessThan(u8, 3) == 0;
+    const refs = if (milestone) milestones else try hub.listRefs(arena, "refs/issues/");
+    if (refs.len == 0) return;
+    const target = refs[rand.uintLessThan(usize, refs.len)];
     const tip_object = (try hub.readObject(arena, target.oid)).?;
     const tip = object.Commit.parse(arena, world.format, tip_object.data) catch
         return error.ModelMismatch;
@@ -759,8 +863,8 @@ fn rewriteHub(arena: Allocator, rand: std.Random, world: *World, hub_index: usiz
             .committer = sig,
             .message = try std.fmt.allocPrint(
                 arena,
-                "Started over {d}\n\nState: open\nFormat-Version: 1\n",
-                .{rand.int(u32)},
+                "Started over {d}\n\n{s}\nFormat-Version: 1\n",
+                .{ rand.int(u32), if (milestone) "Name: Over" else "State: open" },
             ),
         };
         break :blk try hub.writeObject(.commit, try commit.serializeAlloc(arena));
@@ -779,11 +883,13 @@ fn rewriteHub(arena: Allocator, rand: std.Random, world: *World, hub_index: usiz
     }
 }
 
-/// Issue IDs quarantined from origin on this clone.
+/// Issue and milestone IDs quarantined from origin on this clone.
 fn quarantinedIds(arena: Allocator, clone: World.Clone) Allocator.Error![]const []const u8 {
-    const prefix = "refs/issuez-sync/origin/quarantined/issues/";
     var out: std.ArrayList([]const u8) = .empty;
-    for (clone.refs) |r| if (std.mem.startsWith(u8, r.name, prefix)) {
+    for ([_][]const u8{
+        "refs/issuez-sync/origin/quarantined/issues/",
+        "refs/issuez-sync/origin/quarantined/milestones/",
+    }) |prefix| for (clone.refs) |r| if (std.mem.startsWith(u8, r.name, prefix)) {
         try out.append(arena, r.name[prefix.len..]);
     };
     return out.items;
@@ -877,7 +983,12 @@ fn guardViolations(
         repo.done_states = states.items;
     }
     const issues = repo.loadAll(arena) catch return error.ModelMismatch;
-    const proj = try issuez.projection.build(arena, issues, .{ .done_states = repo.done_states });
+    const cat = issuez.Catalog(GitSim).of(repo);
+    const milestones = cat.infos(arena) catch return error.ModelMismatch;
+    const proj = try issuez.projection.build(arena, issues, .{
+        .milestones = milestones,
+        .done_states = repo.done_states,
+    });
     var out: std.ArrayList([]const u8) = .empty;
     for (proj.problems) |p| switch (p.kind) {
         // Not guard rules: values from elsewhere, size limits, a parent
@@ -888,6 +999,10 @@ fn guardViolations(
         .invalid_event,
         .pending_event,
         .event_in_other_issue,
+        // Retiring keeps the issues in the milestone.
+        .milestone_retired,
+        // Upstream syncs issues but not milestones.
+        .milestone_missing,
         => {},
         else => try out.append(arena, try std.fmt.allocPrint(arena, "{s} {t}", .{ p.id, p.kind })),
     };
@@ -907,7 +1022,8 @@ fn issueRefsDigest(arena: Allocator, world: World) Allocator.Error![]const u8 {
 
 /// What sync has to converge.
 fn isSynced(name: []const u8) bool {
-    return std.mem.startsWith(u8, name, "refs/issues/");
+    return std.mem.startsWith(u8, name, "refs/issues/") or
+        std.mem.startsWith(u8, name, "refs/milestones/");
 }
 
 fn sameIssueRefs(a: World.Clone, b: World.Clone) bool {
@@ -955,6 +1071,8 @@ fn crossCheckModel(arena: Allocator, world: *World, clone_index: usize) CaseErro
             std.mem.eql(u8, issue.field("X-Due-Date") orelse "", n.due) and
             std.mem.eql(u8, issue.field("X-Estimate-Minutes") orelse "", n.estimate) and
             std.mem.eql(u8, issue.field("X-Workflow-State") orelse "", n.workflow) and
+            std.mem.eql(u8, issue.field("X-Milestone-Id") orelse "", n.milestone_id) and
+            std.mem.eql(u8, issue.field("X-Milestone-Mode") orelse "", n.milestone_mode) and
             sameBlockers(issue.ext, n.blocked_by) and
             issue.deleted == std.mem.eql(u8, n.deleted, "true");
         if (!ok) {

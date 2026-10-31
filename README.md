@@ -12,9 +12,9 @@ tree. There is no server, no database and nothing in the working tree.
 showing, commenting on, editing, closing and searching issues, `fsck` and
 `init`, and sharing issues between clones through any git remote (`merge`,
 `push`, `sync`). On top of format 1 it adds planning fields (parent issues,
-blockers, dates, estimates, workflow states) and lifecycle events (editing
-and deleting comments, deleting and restoring issues), as extra trailers
-that upstream keeps and shows.
+blockers, dates, estimates, workflow states), milestones, and lifecycle
+events (editing and deleting comments, deleting and restoring issues), as
+extra trailers that upstream keeps and shows.
 
 > [!WARNING]
 > Generative AI was used to edit and/or produce large portions of this code.
@@ -31,6 +31,9 @@ git issue edit a7f3 -a ada@example.com
 git issue create "Release 1.0" --due 2026-12-01
 git issue edit a7f3 --parent 5e21 --estimate 2h
 git issue tree                   # parents, sub-issues, progress, blockers
+git issue milestone create v1.0 --due 2026-12-01
+git issue edit 5e21 --milestone v1.0   # sub-issues inherit it
+git issue milestone show v1.0    # its issues and progress
 git issue close a7f3 --fixed-by 1a2b3c4
 git issue show a7f3
 git issue search -i safari
@@ -46,8 +49,14 @@ Edits never rewrite history: `git issue comment <id> --edit <comment-id>`,
 shows comment IDs, `git issue ls --problems` lists issues whose parent or
 blocker is missing or loops back.
 
-`git issue sync <remote>` fetches the remote's issues, merges them, and
-pushes the local ones. Concurrent edits get a merge commit; which value
+Milestones live under `refs/milestones/<uuid>` and sync with the issues.
+An issue is in a milestone directly or through its parent, and a
+milestone can only be completed once all of its issues are closed. Linking
+one also writes upstream's `Milestone:` field, so upstream shows its
+name.
+
+`git issue sync <remote>` fetches the remote's issues and milestones,
+merges them, and pushes the local ones. Concurrent edits get a merge commit; which value
 wins follows from the history, and `git issue ls --conflicts` shows where
 two clones disagreed. Sync never force-pushes and never drops a version: a
 remote issue whose history was rewritten is quarantined until you decide

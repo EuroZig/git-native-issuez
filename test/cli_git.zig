@@ -508,3 +508,100 @@ test "lifecycle commands" {
     const problems = try gitIssue(&sb, &.{ "ls", "--problems" });
     try testing.expect(std.mem.find(u8, problems.stdout, "parent is deleted") != null);
 }
+
+test "milestone commands and sync" {
+    var sb = try Sandbox.init(.{});
+    defer sb.deinit();
+    const arena = sb.arena();
+    const hub = try std.fmt.allocPrint(arena, "{s}-hub.git", .{sb.repo});
+    const other = try std.fmt.allocPrint(arena, "{s}-other", .{sb.repo});
+    try sb.git(&.{ "init", "-q", "--bare", hub });
+    try sb.git(&.{ "init", "-q", other });
+    try sb.git(&.{ "remote", "add", "origin", hub });
+    try expectSuccess(try sb.runIn(other, &.{ "git", "remote", "add", "origin", hub }));
+    const inOther = struct {
+        fn run(s: *Sandbox, dir: []const u8, args: []const []const u8) !Sandbox.Output {
+            var argv: std.ArrayList([]const u8) = .empty;
+            try argv.append(s.arena(), try s.exe(paths.git_issue_exe));
+            try argv.appendSlice(s.arena(), args);
+            return s.runIn(dir, argv.items);
+        }
+    }.run;
+
+    const create = [_][]const u8{ "milestone", "create", "v1.0", "--due", "2026-12-01" };
+    const created = try gitIssue(&sb, &create);
+    try expectSuccess(created);
+    try testing.expect(std.mem.startsWith(u8, created.stdout, "Created milestone "));
+    try expectSuccess(try gitIssue(&sb, &.{ "init", "origin" }));
+    const fetch = try sb.run(&.{ "git", "config", "--get-all", "remote.origin.fetch" });
+    const spec = "+refs/milestones/*:refs/remotes/origin/milestones/*";
+    try testing.expect(std.mem.find(u8, fetch.stdout, spec) != null);
+    try expectSuccess(try gitIssue(&sb, &.{ "sync", "origin" }));
+
+    // The other clone gets it, completes it, pushes it back.
+    const merged = try inOther(&sb, other, &.{ "sync", "origin" });
+    try expectSuccess(merged);
+    try testing.expect(std.mem.find(u8, merged.stdout, "Created milestone ") != null);
+    try expectSuccess(try inOther(&sb, other, &.{ "milestone", "complete", "v1.0" }));
+    try expectSuccess(try inOther(&sb, other, &.{ "sync", "origin" }));
+    try expectSuccess(try gitIssue(&sb, &.{ "sync", "origin" }));
+
+    const ls = try gitIssue(&sb, &.{ "milestone", "ls", "--all" });
+    const line = "[completed] v1.0  (due 2026-12-01)";
+    try testing.expect(std.mem.find(u8, ls.stdout, line) != null);
+    const open = try gitIssue(&sb, &.{ "milestone", "ls" });
+    try testing.expectEqualStrings("", open.stdout);
+}
+
+test "issues in milestones" {
+    var sb = try Sandbox.init(.{});
+    defer sb.deinit();
+    const created = struct {
+        fn id(out: Sandbox.Output) ![]const u8 {
+            try expectSuccess(out);
+            return std.mem.trimEnd(u8, out.stdout["Created issue ".len..], "\n");
+        }
+    }.id;
+    try expectSuccess(try gitIssue(&sb, &.{ "milestone", "create", "v1" }));
+    const epic = try created(try gitIssue(&sb, &.{ "create", "Epic", "--milestone", "v1" }));
+    const task = try created(try gitIssue(&sb, &.{ "create", "Task", "--parent", epic }));
+
+    // By name: the catalog ID is written next to the readable name.
+    const log = try sb.run(&.{ "git", "log", "--all", "--format=%B" });
+    try testing.expect(std.mem.find(u8, log.stdout, "Milestone: v1\n") != null);
+    try testing.expect(std.mem.find(u8, log.stdout, "X-Milestone-Mode: explicit\n") != null);
+
+    const show = try gitIssue(&sb, &.{ "milestone", "show", "v1" });
+    try expectSuccess(show);
+    try testing.expect(std.mem.find(u8, show.stdout, "Progress: 0/1 done\n") != null);
+    try testing.expect(std.mem.find(u8, show.stdout, "Issues (2):\n") != null);
+
+    try expectFailure(
+        try gitIssue(&sb, &.{ "milestone", "complete", "v1" }),
+        1,
+        "error: the milestone still has open issues; close or move them first " ++
+            "(see 'git issue milestone show')\n",
+    );
+    try expectSuccess(try gitIssue(&sb, &.{ "close", task }));
+    try expectSuccess(try gitIssue(&sb, &.{ "close", epic }));
+    try expectSuccess(try gitIssue(&sb, &.{ "milestone", "complete", "v1" }));
+    try expectFailure(
+        try gitIssue(&sb, &.{ "reopen", epic }),
+        1,
+        "error: the milestone is completed; reopen it first ('git issue milestone reopen')\n",
+    );
+    try expectFailure(
+        try gitIssue(&sb, &.{ "create", "Late", "--milestone", "v1" }),
+        1,
+        "error: milestone 'v1' is completed; reopen it first\n",
+    );
+
+    // Unknown names stay text (as upstream writes them), with a hint.
+    const free = try gitIssue(&sb, &.{ "create", "Free", "--milestone", "someday" });
+    try expectSuccess(free);
+    try testing.expectEqualStrings(
+        "hint: no open milestone is named 'someday'; it is kept as text only " ++
+            "(see 'git issue milestone ls')\n",
+        free.stderr,
+    );
+}
