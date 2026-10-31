@@ -114,6 +114,7 @@ pub const Entry = struct {
 };
 
 pub const Quarantined = struct {
+    namespace: Namespace = .issues,
     id: []const u8,
     /// Local title, or the remote one if the issue only exists there.
     title: []const u8,
@@ -132,7 +133,7 @@ pub const Status = struct {
 
 pub const Resolution = enum {
     /// The local tip is kept in
-    /// `refs/issuez-sync/<remote>/replaced/issues/<id>/<tip>`, one ref per
+    /// `refs/issuez-sync/<remote>/replaced/<ns>/<id>/<tip>`, one ref per
     /// replaced tip.
     accept_remote,
     /// A rewound remote becomes the new baseline, so the next merge works
@@ -367,6 +368,7 @@ pub fn Sync(comptime B: type) type {
                     try recordRef(a, q.remote, .kept, q.ns, q.id),
                 );
                 return .{
+                    .namespace = q.ns,
                     .id = q.id,
                     .title = title,
                     .outcome = .{ .quarantined = reason },
@@ -528,19 +530,23 @@ pub fn Sync(comptime B: type) type {
         /// From local state only, no fetch.
         pub fn status(self: Self, arena: Allocator, remote: []const u8) Error!Status {
             if (!contract.isValidRemoteName(remote)) return error.InvalidRemoteName;
-            const prefix = try recordRef(arena, remote, .quarantined, .issues, "");
             var quarantined: std.ArrayList(Quarantined) = .empty;
-            for (try self.b().listRefs(arena, prefix)) |m| {
-                const id = m.name[prefix.len..];
-                const local = try self.b().resolveRef(try localRef(arena, .issues, id));
-                const kept = try self.b().resolveRef(try recordRef(arena, remote, .kept, .issues, id));
-                try quarantined.append(arena, .{
-                    .id = id,
-                    .title = try self.titleOf(arena, id, local orelse m.oid),
-                    .remote_tip = m.oid,
-                    .reason = try self.classify(arena, remote, id, local, m.oid),
-                    .kept_local = kept != null and kept.?.eql(m.oid),
-                });
+            for (namespaces) |ns| {
+                const prefix = try recordRef(arena, remote, .quarantined, ns, "");
+                for (try self.b().listRefs(arena, prefix)) |m| {
+                    const id = m.name[prefix.len..];
+                    const local = try self.b().resolveRef(try localRef(arena, ns, id));
+                    const kept_ref = try recordRef(arena, remote, .kept, ns, id);
+                    const kept = try self.b().resolveRef(kept_ref);
+                    try quarantined.append(arena, .{
+                        .namespace = ns,
+                        .id = id,
+                        .title = try self.titleOf(arena, ns, id, local orelse m.oid),
+                        .remote_tip = m.oid,
+                        .reason = try self.classify(arena, remote, ns, id, local, m.oid),
+                        .kept_local = kept != null and kept.?.eql(m.oid),
+                    });
+                }
             }
             var skipped: std.ArrayList([]const u8) = .empty;
             return .{
@@ -549,13 +555,19 @@ pub fn Sync(comptime B: type) type {
             };
         }
 
-        fn titleOf(self: Self, arena: Allocator, id: []const u8, tip: Oid) Error![]const u8 {
-            const ref: repo_mod.IssueRef = .{ .name = try localRef(arena, .issues, id), .tip = tip };
-            const issue = self.repo.load(arena, ref) catch |e| switch (e) {
+        fn titleOf(
+            self: Self,
+            arena: Allocator,
+            ns: Namespace,
+            id: []const u8,
+            tip: Oid,
+        ) Error![]const u8 {
+            const ref: repo_mod.IssueRef = .{ .name = try localRef(arena, ns, id), .tip = tip };
+            const loaded = self.repo.load(arena, ref) catch |e| switch (e) {
                 error.OutOfMemory => return error.OutOfMemory,
                 else => return "?",
             };
-            return issue.title;
+            return titleIn(ns, loaded);
         }
 
         /// Why `merge` would quarantine this remote issue, null when it
@@ -564,12 +576,13 @@ pub fn Sync(comptime B: type) type {
             self: Self,
             arena: Allocator,
             remote: []const u8,
+            ns: Namespace,
             id: []const u8,
             local: ?Oid,
             remote_tip: Oid,
         ) Error!?Reason {
             if (!uuid_fmt.isCanonical(id)) return .invalid_issue;
-            switch (try self.vet(arena, remote, .issues, id, local, remote_tip)) {
+            switch (try self.vet(arena, remote, ns, id, local, remote_tip)) {
                 .ok => {},
                 .refused => |r| return r.reason,
             }
@@ -646,20 +659,28 @@ pub fn Sync(comptime B: type) type {
         ) Error!?Oid {
             if (!contract.isValidRemoteName(remote)) return error.InvalidRemoteName;
             if (!uuid_fmt.isCanonical(id)) return error.NotQuarantined;
-            const marker_name = try recordRef(arena, remote, .quarantined, .issues, id);
-            const remote_tip = (try self.b().resolveRef(marker_name)) orelse
+            // An issue or a milestone: UUIDs don't repeat across them.
+            var found: ?struct { Namespace, []const u8, Oid } = null;
+            for (namespaces) |n| {
+                const marker = try recordRef(arena, remote, .quarantined, n, id);
+                if (try self.b().resolveRef(marker)) |tip| {
+                    found = .{ n, marker, tip };
+                    break;
+                }
+            }
+            const ns, const marker_name, const remote_tip = found orelse
                 return error.NotQuarantined;
-            const local_name = try localRef(arena, .issues, id);
+            const local_name = try localRef(arena, ns, id);
             const local = try self.b().resolveRef(local_name);
-            const reason = try self.classify(arena, remote, id, local, remote_tip);
-            const kept_name = try recordRef(arena, remote, .kept, .issues, id);
+            const reason = try self.classify(arena, remote, ns, id, local, remote_tip);
+            const kept_name = try recordRef(arena, remote, .kept, ns, id);
 
             switch (how) {
                 .accept_remote => {
                     if (reason == .invalid_issue) return error.RemoteIssueInvalid;
                     var ops: std.ArrayList(contract.RefUpdate) = .empty;
                     if (local) |l| {
-                        const backup = try replacedRef(arena, remote, id, l);
+                        const backup = try replacedRef(arena, remote, ns, id, l);
                         if (try self.b().resolveRef(backup) == null) try ops.append(arena, .{
                             .name = backup,
                             .op = .{ .create = l },
@@ -680,16 +701,20 @@ pub fn Sync(comptime B: type) type {
                         error.RefConflict => return error.ConcurrentModification,
                         else => |e| return e,
                     };
-                    try self.setRef(arena, try recordRef(arena, remote, .merged, .issues, id), remote_tip);
-                    try self.setRef(arena, try recordRef(arena, remote, .pushed, .issues, id), remote_tip);
+                    const merged_ref = try recordRef(arena, remote, .merged, ns, id);
+                    try self.setRef(arena, merged_ref, remote_tip);
+                    const pushed_ref = try recordRef(arena, remote, .pushed, ns, id);
+                    try self.setRef(arena, pushed_ref, remote_tip);
                     try self.deleteRef(arena, kept_name);
                     return local;
                 },
                 .keep_local => if (reason == .rewound) {
                     // The remote started over from an older point. Take it
                     // as the baseline so the next sync pushes ours back.
-                    try self.setRef(arena, try recordRef(arena, remote, .merged, .issues, id), remote_tip);
-                    try self.setRef(arena, try recordRef(arena, remote, .pushed, .issues, id), remote_tip);
+                    const merged_ref = try recordRef(arena, remote, .merged, ns, id);
+                    try self.setRef(arena, merged_ref, remote_tip);
+                    const pushed_ref = try recordRef(arena, remote, .pushed, ns, id);
+                    try self.setRef(arena, pushed_ref, remote_tip);
                     try self.deleteRef(arena, marker_name);
                     try self.deleteRef(arena, kept_name);
                 } else {
@@ -958,11 +983,12 @@ pub fn recordRef(
 pub fn replacedRef(
     arena: Allocator,
     remote: []const u8,
+    ns: Namespace,
     id: []const u8,
     tip: Oid,
 ) Allocator.Error![]const u8 {
     const hex = tip.hex();
-    const prefix = try recordRef(arena, remote, .replaced, .issues, id);
+    const prefix = try recordRef(arena, remote, .replaced, ns, id);
     return std.fmt.allocPrint(arena, "{s}/{s}", .{ prefix, hex.slice() });
 }
 
@@ -1302,7 +1328,7 @@ test "quarantine" {
     // accept_remote: Alice's version wins and Bob's is kept in a ref.
     _ = try bob.sync.resolve(arena, "origin", id, .accept_remote);
     try testing.expect((try bob.sim.resolveRef(ref_name)).?.eql(created.tip));
-    const backup = try replacedRef(arena, "origin", id, bobs);
+    const backup = try replacedRef(arena, "origin", .issues, id, bobs);
     try testing.expect((try bob.sim.resolveRef(backup)).?.eql(bobs));
 
     // Accepting again keeps both replaced versions.
@@ -1314,7 +1340,7 @@ test "quarantine" {
     try testing.expectEqual(@as(usize, 1), (try bob.sync.merge(arena, "origin", .{})).count(.quarantined));
     _ = try bob.sync.resolve(arena, "origin", id, .accept_remote);
     try testing.expect((try bob.sim.resolveRef(backup)).?.eql(bobs));
-    const backup_again = try replacedRef(arena, "origin", id, again);
+    const backup_again = try replacedRef(arena, "origin", .issues, id, again);
     try testing.expect((try bob.sim.resolveRef(backup_again)).?.eql(again));
     try testing.expectEqual(@as(usize, 0), (try bob.sync.status(arena, "origin")).quarantined.len);
     const after = try bob.sync.sync(arena, "origin");
@@ -1325,6 +1351,46 @@ test "quarantine" {
         error.NotQuarantined,
         bob.sync.resolve(arena, "origin", id, .keep_local),
     );
+}
+
+test "quarantined milestones are reported and resolved" {
+    var arena_state: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var world = testWorld();
+
+    var a = try onClone(arena, &world, 0);
+    const cat = @import("milestone.zig").Catalog(GitSim).of(a.sync.repo);
+    const created = try cat.create(arena, .{ .name = "v1" });
+    const id = created.id.slice();
+    const ref_name = try std.fmt.allocPrint(arena, "refs/milestones/{s}", .{id});
+    _ = try a.sync.push(arena, "origin");
+    try a.sim.commit();
+
+    // Bob has an unrelated milestone under the same UUID.
+    var bob = try onClone(arena, &world, 1);
+    const r = repo_mod.Repo(GitSim).init(bob.sim);
+    const bobs = try r.writeCommit(
+        arena,
+        &.{},
+        try bob.sim.identity(arena),
+        "Create milestone v1\n\nName: Bob's v1\nFormat-Version: 1\n",
+    );
+    try bob.sim.updateRefs(&.{.{ .name = ref_name, .op = .{ .create = bobs } }});
+    const merged = try bob.sync.merge(arena, "origin", .{});
+    try testing.expectEqual(@as(usize, 1), merged.count(.quarantined));
+
+    const st = try bob.sync.status(arena, "origin");
+    try testing.expectEqual(@as(usize, 1), st.quarantined.len);
+    try testing.expectEqual(Namespace.milestones, st.quarantined[0].namespace);
+    try testing.expectEqualStrings("Bob's v1", st.quarantined[0].title);
+    try testing.expectEqual(Reason.unrelated_history, st.quarantined[0].reason.?);
+
+    _ = try bob.sync.resolve(arena, "origin", id, .accept_remote);
+    try testing.expect((try bob.sim.resolveRef(ref_name)).?.eql(created.tip));
+    const backup = try replacedRef(arena, "origin", .milestones, id, bobs);
+    try testing.expect((try bob.sim.resolveRef(backup)).?.eql(bobs));
+    try testing.expectEqual(@as(usize, 0), (try bob.sync.status(arena, "origin")).quarantined.len);
 }
 
 test "keep_local on a rewound remote" {

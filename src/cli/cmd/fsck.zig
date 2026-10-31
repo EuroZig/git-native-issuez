@@ -16,6 +16,8 @@ pub const help =
     \\   - one root commit, carrying State: and Format-Version: trailers
     \\   - the whole history is readable
     \\
+    \\Milestones get the same checks, with Name: in place of State:.
+    \\
     \\Quarantined issues (see `git issue status`) and hierarchy or blocker
     \\problems (see `git issue ls --problems`) are noted, not counted as errors.
     \\
@@ -42,7 +44,9 @@ pub fn main(comptime B: type, ctx: *context.Context(B), argv: []const []const u8
 
     const repo = common.openRepo(B, ctx) orelse return common.exit_fatal;
     const refs = repo.refs(arena) catch |e| return common.repoFailed(B, ctx, e);
-    if (refs.len == 0) {
+    const milestones = issuez.Catalog(B).of(repo).refs(arena) catch |e|
+        return common.repoFailed(B, ctx, e);
+    if (refs.len == 0 and milestones.len == 0) {
         ctx.out.writeAll("No issues found.\n") catch {};
         return common.exit_ok;
     }
@@ -51,41 +55,11 @@ pub fn main(comptime B: type, ctx: *context.Context(B), argv: []const []const u8
     for (refs) |ref| {
         const short = uuid.shortId(ref.id());
         const problems = repo.check(arena, ref) catch return common.oom(ctx.err);
-        for (problems) |p| {
-            errors += 1;
-            switch (p) {
-                .invalid_uuid => ctx.err.print(
-                    "error: {s}: invalid UUID format: {s}\n",
-                    .{ short, ref.id() },
-                ) catch {},
-                .non_empty_tree => |oid| ctx.err.print(
-                    "error: {s}: commit {s} does not use empty tree\n",
-                    .{ short, oid.hex().short() },
-                ) catch {},
-                .root_count => |n| ctx.err.print(
-                    "error: {s}: expected 1 root commit, found {d}\n",
-                    .{ short, n },
-                ) catch {},
-                .missing_state => ctx.err.print(
-                    "error: {s}: root commit missing State: trailer\n",
-                    .{short},
-                ) catch {},
-                .missing_format_version => ctx.err.print(
-                    "error: {s}: root commit missing Format-Version: trailer\n",
-                    .{short},
-                ) catch {},
-                .missing_root_trailer => |k| ctx.err.print(
-                    "error: {s}: root commit missing {s}: trailer\n",
-                    .{ short, k },
-                ) catch {},
-                .unreadable => |e| ctx.err.print(
-                    "error: {s}: history unreadable ({t})\n",
-                    .{ short, e },
-                ) catch {},
-            }
-        }
+        errors += problems.len;
+        printProblems(B, ctx.err, short, ref, problems);
         if (problems.len == 0 and !quiet) ctx.out.print("ok {s}\n", .{short}) catch {};
     }
+    errors += checkMilestones(B, ctx, repo, milestones, quiet) orelse return common.oom(ctx.err);
     reportQuarantine(B, ctx, repo.backend);
     reportProjection(B, ctx, repo);
     if (errors == 0) {
@@ -94,6 +68,74 @@ pub fn main(comptime B: type, ctx: *context.Context(B), argv: []const []const u8
     }
     ctx.err.print("Checked {d} issues, {d} errors found.\n", .{ refs.len, errors }) catch {};
     return common.exit_error;
+}
+
+/// Like issues, with `Name:` in place of `State:`. Returns the error
+/// count, null when out of memory.
+fn checkMilestones(
+    comptime B: type,
+    ctx: *context.Context(B),
+    repo: issuez.engine.Repo(B),
+    refs: []const issuez.engine.IssueRef,
+    quiet: bool,
+) ?usize {
+    var errors: usize = 0;
+    for (refs) |ref| {
+        const id = uuid.shortId(ref.id());
+        const short = std.fmt.allocPrint(ctx.arena, "milestone {s}", .{id}) catch return null;
+        const problems = repo.checkWith(ctx.arena, ref, &.{ "Name", "Format-Version" }) catch
+            return null;
+        errors += problems.len;
+        printProblems(B, ctx.err, short, ref, problems);
+        if (problems.len == 0 and !quiet) ctx.out.print("ok {s}\n", .{short}) catch {};
+        // Readers take an unknown status as `open`: worth a note.
+        const m = repo.load(ctx.arena, ref) catch continue;
+        const status = m.field("X-Milestone-Status") orelse continue;
+        if (issuez.format.fields.MilestoneStatus.parse(status) == null) ctx.err.print(
+            "note: {s}: X-Milestone-Status '{s}' is not valid and reads as open\n",
+            .{ short, status },
+        ) catch {};
+    }
+    return errors;
+}
+
+fn printProblems(
+    comptime B: type,
+    err: *std.Io.Writer,
+    short: []const u8,
+    ref: issuez.engine.IssueRef,
+    problems: []const issuez.engine.Repo(B).Problem,
+) void {
+    for (problems) |p| switch (p) {
+        .invalid_uuid => err.print(
+            "error: {s}: invalid UUID format: {s}\n",
+            .{ short, ref.id() },
+        ) catch {},
+        .non_empty_tree => |oid| err.print(
+            "error: {s}: commit {s} does not use empty tree\n",
+            .{ short, oid.hex().short() },
+        ) catch {},
+        .root_count => |n| err.print(
+            "error: {s}: expected 1 root commit, found {d}\n",
+            .{ short, n },
+        ) catch {},
+        .missing_state => err.print(
+            "error: {s}: root commit missing State: trailer\n",
+            .{short},
+        ) catch {},
+        .missing_format_version => err.print(
+            "error: {s}: root commit missing Format-Version: trailer\n",
+            .{short},
+        ) catch {},
+        .missing_root_trailer => |k| err.print(
+            "error: {s}: root commit missing {s}: trailer\n",
+            .{ short, k },
+        ) catch {},
+        .unreadable => |e| err.print(
+            "error: {s}: history unreadable ({t})\n",
+            .{ short, e },
+        ) catch {},
+    };
 }
 
 /// Quarantine is a sync state, not damage: noted, not counted.

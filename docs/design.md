@@ -95,7 +95,8 @@ ignored and reported, never an error: other tools write these issues too.
 
 Some questions need every issue at once: children, blockers, progress,
 workflow states, effective milestones, and problems such as a parent that
-is missing or loops back, or a milestone that is missing or retired. `projection.build` (`src/engine/projection.zig`) answers them from the
+is missing or loops back, or a milestone that is missing or retired.
+`projection.build` (`src/engine/projection.zig`) answers them from the
 loaded issues and nothing else. Merges and other tools can produce any
 graph, so it accepts every input and never loops: a parent that is missing,
 the issue itself, or part of a cycle is reported and the issue becomes a
@@ -224,9 +225,10 @@ way, to go unnoticed.
   - per command: what `create`, `comment` (and its edit, delete and
     restore events), `edit` (with the extension fields and the
     description and the milestone fields), `state`, `close`, `reopen`,
-    `delete`, `restore`, `milestone` and `init` may write, and that read-only commands change nothing. Messages are
-    checked where the format depends on them (the root message, trailers,
-    text the user wrote). Subjects the CLI picks itself are not;
+    `delete`, `restore`, `milestone` and `init` may write, and that
+    read-only commands change nothing. Messages are checked where the
+    format depends on them (the root message, trailers, text the user
+    wrote). Subjects the CLI picks itself are not;
   - for `merge`, `push`, `sync` and `quarantine`: issue refs are never
     deleted or rewound on either side, a merge commit has the deterministic
     shape and restates the oracle's own resolution of its parents (and

@@ -3,16 +3,17 @@
 const std = @import("std");
 const context = @import("../context.zig");
 const common = @import("../common.zig");
+const sync_output = @import("../sync_output.zig");
 const issuez = @import("issuez");
 const uuid = issuez.format.uuid;
 
 pub const help =
     \\usage: git issue quarantine <remote> (--accept-remote | --keep-local) <issue-id>
     \\
-    \\Resolve an issue that a merge from <remote> quarantined (see
+    \\Resolve an issue or milestone that a merge from <remote> quarantined (see
     \\`git issue status`). Sync never force-pushes and never drops a version:
     \\--accept-remote keeps the replaced local version in
-    \\refs/issuez-sync/<remote>/replaced/issues/<id>/<commit>.
+    \\refs/issuez-sync/<remote>/replaced/<issues|milestones>/<id>/<commit>.
     \\
     \\Options:
     \\   --accept-remote <issue-id>  Replace the local issue with the remote version
@@ -92,10 +93,11 @@ pub fn main(comptime B: type, ctx: *context.Context(B), argv: []const []const u8
         },
         else => return common.repoFailed(B, ctx, e),
     };
-    const short = uuid.shortId(q.id);
+    var buf: [32]u8 = undefined;
+    const short = sync_output.label(&buf, q.namespace, q.id);
     switch (resolution) {
         .accept_remote => if (replaced) |tip| {
-            const backup = issuez.sync.replacedRef(arena, r, q.id, tip) catch
+            const backup = issuez.sync.replacedRef(arena, r, q.namespace, q.id, tip) catch
                 return common.exit_fatal;
             ctx.out.print(
                 "Accepted the remote version of {s}; the local one is kept in {s}\n",

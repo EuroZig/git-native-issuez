@@ -23,15 +23,17 @@ pub const Options = struct {
     max_progress_leaves: u32 = 2_000,
     /// In order. The first is the state of an open issue without one.
     workflow: []const []const u8 = &fields_fmt.default_workflow,
-    /// For effective milestones.
-    milestones: []const MilestoneInfo = &.{},
+    /// Every milestone, for effective milestones and their problems. Null
+    /// when not known: `X-Milestone-Id`s are then taken as they are, and
+    /// no milestone problems are reported.
+    milestones: ?[]const MilestoneInfo = null,
     /// Besides `closed`. See `core.State.isDone`.
     done_states: []const []const u8 = &core_fmt.default_done_states,
 };
 
 pub const MilestoneInfo = struct {
     id: []const u8,
-    status: enum { open, completed, retired },
+    status: fields_fmt.MilestoneStatus,
 };
 
 pub const Problem = struct {
@@ -401,35 +403,32 @@ pub fn build(arena: Allocator, issues: []const Issue, options: Options) Allocato
     try blockerCycles(arena, issues, blockers, &problems);
 
     // Parents first. `pass` is what an inheriting child gets: a deleted
-    // node passes its parent's through.
+    // node passes its parent's through. Inheriting has no depth limit, as
+    // in the guards.
     const eff = try arena.alloc(?[]const u8, n);
     const pass = try arena.alloc(?[]const u8, n);
-    const status_of = struct {
-        fn f(o: Options, id: []const u8) ?MilestoneInfo {
-            for (o.milestones) |m| if (std.mem.eql(u8, m.id, id)) return m;
-            return null;
-        }
-    }.f;
+    var statuses: std.StringHashMapUnmanaged(fields_fmt.MilestoneStatus) = .empty;
+    for (options.milestones orelse &.{}) |m| try statuses.put(arena, m.id, m.status);
     for (post.items) |i| {
         const issue = issues[i];
+        const ext = issue.ext;
         const up: ?[]const u8 = if (parent[i] == none) null else pass[parent[i]];
-        const default_mode: fields_fmt.MilestoneMode = if (issue.ext.milestone_id != null)
-            .explicit
-        else if (parent[i] != none) .inherit else .none;
-        const mode = issue.ext.milestone_mode orelse default_mode;
-        eff[i] = switch (mode) {
+        const has_id = ext.milestone_id != null;
+        const has_parent = parent[i] != none;
+        eff[i] = switch (fields_fmt.MilestoneMode.of(ext.milestone_mode, has_id, has_parent)) {
             .none => null,
-            .inherit => if (depth[i] > options.max_depth) null else up,
+            .inherit => up,
             .explicit => blk: {
-                const id = issue.ext.milestone_id orelse break :blk null;
-                const info = status_of(options, id) orelse {
+                const id = ext.milestone_id orelse break :blk null;
+                if (options.milestones == null) break :blk id;
+                const status = statuses.get(id) orelse {
                     if (!issue.deleted) try problems.append(
                         arena,
                         .{ .id = issue.id, .kind = .milestone_missing, .other = id },
                     );
                     break :blk null;
                 };
-                if (info.status == .retired) {
+                if (status == .retired) {
                     if (!issue.deleted) try problems.append(
                         arena,
                         .{ .id = issue.id, .kind = .milestone_retired, .other = id },
@@ -440,8 +439,8 @@ pub fn build(arena: Allocator, issues: []const Issue, options: Options) Allocato
             },
         };
         pass[i] = if (issue.deleted) up else eff[i];
-        if (active(options, issue)) if (eff[i]) |m| if (status_of(options, m)) |info| {
-            if (info.status == .completed) try problems.append(arena, .{
+        if (active(options, issue)) if (eff[i]) |m| if (statuses.get(m)) |status| {
+            if (status == .completed) try problems.append(arena, .{
                 .id = issue.id,
                 .kind = .open_in_completed_milestone,
                 .other = m,
@@ -782,4 +781,11 @@ test "effective milestones" {
         &.{ .open_in_completed_milestone, .milestone_missing }, // late, lost (post-order)
         kinds.items,
     );
+
+    // Without the catalog, links are taken as they are and nothing is
+    // reported about them.
+    const bare = try build(arena, &issues, .{});
+    try testing.expectEqualStrings("m9", eff(bare, "lost").?);
+    try testing.expectEqualStrings("m1", eff(bare, "kid").?);
+    try testing.expectEqual(@as(usize, 0), bare.problems.len);
 }

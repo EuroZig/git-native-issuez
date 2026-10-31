@@ -111,19 +111,21 @@ Writers keep the hierarchy sound. This tool refuses a write that would:
   restore, move) under a closed ancestor;
 - delete an issue with sub-issues that aren't deleted;
 - link a completed or retired milestone, or put open work (create, reopen,
-  restore, move) into a completed milestone, directly or through a parent;
+  restore, move) into a completed milestone, directly or through a parent.
+  Moving, relinking or restoring a closed issue counts as putting its open
+  sub-issues there;
 - complete a milestone that still has open issues (§6).
 
-Each issue or milestone a guard reads is pinned in the same ref transaction (git's
-`update-ref` `verify`), so a concurrent change to any of them aborts the
-write, which is then retried. A `verify` can't pin that something is
-absent, like a new child of the issue being closed. So creating or moving
-an issue also moves `refs/issuez-guard/<uuid>` of each ancestor, and closing
-or deleting an issue moves its own before reading the children: two such
-writes in one clone conflict, and the retry sees the child. Milestones
-work the same way: putting open work into a milestone and completing it
-both move the milestone's guard ref. The guard refs
-carry no data, are never pushed, and can be deleted at any time.
+Each issue or milestone a guard reads is pinned in the same ref
+transaction (git's `update-ref` `verify`), so a concurrent change to any of
+them aborts the write, which is then retried. A `verify` can't pin that
+something is absent, like a new child of the issue being closed. So
+creating or moving an issue also moves `refs/issuez-guard/<uuid>` of each
+ancestor, and closing or deleting an issue moves its own before reading
+the children: two such writes in one clone conflict, and the retry sees the
+child. Milestones work the same way: changing what is in a milestone and
+completing it both move the milestone's guard ref. The guard refs carry no
+data, are never pushed, and can be deleted at any time.
 
 Other tools and concurrent clones can still produce violations; readers
 report them and never fail on them.
@@ -161,11 +163,12 @@ pair write the identical commit:
   later parent's committer time, offset `+0000`;
 - trailers restate the resolved fields, as written (invalid values too). A
   field that was written and is now empty is restated empty (`Key: `), so a
-  reader that takes the newest value finds no older one. The order: `State`, `Title` (only when it overrides the
-  root subject), `Labels`, `Assignee`, `Priority`, `Milestone`, then
-  `X-Parent`, `X-Start-Date`, `X-Due-Date`, `X-Estimate-Minutes`,
-  `X-Workflow-State`, `X-Milestone-Id`, `X-Milestone-Mode`, `X-Deleted`,
-  `X-Blocked-By`. Other fields and events follow from the parents.
+  reader that takes the newest value finds no older one. The order:
+  `State`, `Title` (only when it overrides the root subject), `Labels`,
+  `Assignee`, `Priority`, `Milestone`, then `X-Parent`, `X-Start-Date`,
+  `X-Due-Date`, `X-Estimate-Minutes`, `X-Workflow-State`, `X-Milestone-Id`,
+  `X-Milestone-Mode`, `X-Deleted`, `X-Blocked-By`. Other fields and events
+  follow from the parents.
 
 Restating the values lets upstream, which reads the newest trailer it
 finds, show the merged state, extension fields included. For this tool
@@ -214,12 +217,13 @@ Format-Version: 1
 ```
 
 - The root carries `Name:` and `Format-Version: 1`. The root's body is the
-  description, changed later with `X-Event: description-edit` (§5).
+  description, changed later with `X-Event: description-edit` (§5), in the
+  same commit as other changes.
 - `Name` is the display name and may change; the UUID never does. Names are
   not blank and at most 256 bytes.
 - `X-Due-Date` is a date as for issues. An empty value clears it.
 - `X-Milestone-Status` is `open`, `completed` or `retired`. A missing or
-  unknown value reads as `open`.
+  unknown value reads as `open`, and `fsck` notes an unknown one.
 - Merge commits are `Merge milestone` with no trailers, with the same
   parents, identity and date as issue merges (§4). Only this tool reads
   milestones, so nothing is restated.
@@ -237,14 +241,16 @@ doesn't exist, or a retired milestone, gives no effective milestone and is
 reported (`ls --problems`).
 
 Writers that link a milestone also write `Milestone: <name>`, so upstream,
-which only knows `Milestone`, shows the name. Clearing it (`none`, or
-`inherit` without an ID) writes `Milestone: ` empty. A plain `Milestone`
-written by upstream or by hand stays text and links nothing.
+which only knows `Milestone`, shows the name. It is the name when the link
+was written: renaming the milestone doesn't rewrite its issues. Clearing it
+(`none`, or `inherit` without an ID) writes `Milestone: ` empty. A plain
+`Milestone` written by upstream or by hand stays text and links nothing.
 
 Completing a milestone needs every non-deleted issue whose effective
-milestone it is to be done (§3). Retiring one is for milestones that won't
-be finished: their issues keep their trailers, but no longer count as in
-the milestone, and new issues can't be added.
+milestone it is to be done (§3), counted as if it were open when it is
+retired. Retiring one is for milestones that won't be finished: their
+issues keep their trailers, but no longer count as in the milestone, and
+new issues can't be added.
 
 ## 7. Sync
 
@@ -253,7 +259,8 @@ the milestone, and new issues can't be added.
 Only refs named by a UUID there are issues: a remote branch `issues/...`,
 which git's default refspec also tracks there, is left alone. Milestones
 sync the same way, through `refs/remotes/<remote>/milestones/`, with the
-same outcomes.
+same outcomes: `status` lists a quarantined milestone and `quarantine`
+resolves it like an issue.
 
 - no local issue: created;
 - local is an ancestor of remote: fast-forwarded;
@@ -267,11 +274,11 @@ same outcomes.
   resolves it.
 
 `git issue push <remote>` first fetches the remote's issue refs to see
-what it has, then pushes the local issues and milestones that differ, in atomic batches
-and never with force. When the remote moved, it merges and tries again, a
-bounded number of times. A ref the remote refuses (a hook, permissions)
-fails the push with the remote's message. `git issue sync` is merge, then
-push.
+what it has, then pushes the local issues and milestones that differ, in
+atomic batches and never with force. When the remote moved, it merges and
+tries again, a bounded number of times. A ref the remote refuses (a hook,
+permissions) fails the push with the remote's message. `git issue sync` is
+merge, then push.
 
 ### Bookkeeping refs
 

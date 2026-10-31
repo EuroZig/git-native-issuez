@@ -300,14 +300,20 @@ fn generateMilestoneWork(
     arena: Allocator,
     rand: std.Random,
     ids: []const []const u8,
-    /// Used to keep duplicate names rare.
-    milestones: usize,
+    /// Few, to keep duplicate names rare. Named by ID now and then, which
+    /// reaches retired milestones too.
+    milestones: []const []const u8,
 ) Allocator.Error!Generated {
     const id = try genPrefix(arena, rand, ids);
-    const name = if (rand.uintLessThan(u8, 4) == 0) "v2" else "v1";
+    const by_id = milestones.len > 0 and rand.uintLessThan(u8, 3) == 0;
+    const named = if (rand.uintLessThan(u8, 4) == 0) "v2" else "v1";
     var kind = rand.uintLessThan(u8, 8);
-    if (milestones == 0 and rand.boolean()) kind = 0;
-    if (kind == 0 and milestones > 0 and rand.uintLessThan(u8, 8) != 0) kind = 1;
+    if (milestones.len == 0 and rand.boolean()) kind = 0;
+    if (kind == 0 and milestones.len > 0 and rand.uintLessThan(u8, 8) != 0) kind = 1;
+    const name = if (by_id and kind != 0 and kind != 2)
+        pick(rand, milestones)[0..8]
+    else
+        named;
     const cmd: Command = switch (kind) {
         0 => .{ .milestone = .{ .sub = .create, .name = name } },
         1 => .{ .milestone = .{
@@ -602,9 +608,12 @@ fn fuzzCommands(
             _ = try step(io, gpa, arena, environ_map, &world, clone_index, cmd, true);
             continue;
         }
-        var milestone_count: usize = 0;
+        var milestone_ids: std.ArrayList([]const u8) = .empty;
         for (world.clones[clone_index].refs) |r| {
-            if (std.mem.startsWith(u8, r.name, "refs/milestones/")) milestone_count += 1;
+            if (std.mem.startsWith(u8, r.name, "refs/milestones/")) try milestone_ids.append(
+                arena,
+                r.name["refs/milestones/".len..],
+            );
         }
         // So comment events sometimes target a real comment.
         var commits: std.ArrayList([]const u8) = .empty;
@@ -613,7 +622,7 @@ fn fuzzCommands(
             try commits.append(arena, try arena.dupe(u8, oid.hex().slice()));
         };
         const gen = if (milestone_focus and rand.uintLessThan(u8, 2) == 0)
-            try generateMilestoneWork(arena, rand, ids.items, milestone_count)
+            try generateMilestoneWork(arena, rand, ids.items, milestone_ids.items)
         else if (rand.uintLessThan(u8, 6) == 0)
             try generateLifecycle(arena, rand, ids.items, commits.items)
         else
@@ -808,16 +817,18 @@ fn foreignStep(
     try crossCheckModel(arena, world, clone_index);
 }
 
-/// A force-push to the hub: one issue goes back to an older commit of its
-/// history, maybe with a new commit on top, or is replaced by an unrelated
-/// one. Clones that merged the lost commits push them back after a plain
-/// reset, and must quarantine the others.
+/// A force-push to the hub: one issue or milestone goes back to an older
+/// commit of its history, maybe with a new commit on top, or is replaced by
+/// an unrelated one. Clones that merged the lost commits push them back
+/// after a plain reset, and must quarantine the others.
 fn rewriteHub(arena: Allocator, rand: std.Random, world: *World, hub_index: usize) CaseError!void {
     const before = world.*;
     var hub = try GitSim.init(arena, world, hub_index);
-    const issues = try hub.listRefs(arena, "refs/issues/");
-    if (issues.len == 0) return;
-    const target = issues[rand.uintLessThan(usize, issues.len)];
+    const milestones = try hub.listRefs(arena, "refs/milestones/");
+    const milestone = milestones.len > 0 and rand.uintLessThan(u8, 3) == 0;
+    const refs = if (milestone) milestones else try hub.listRefs(arena, "refs/issues/");
+    if (refs.len == 0) return;
+    const target = refs[rand.uintLessThan(usize, refs.len)];
     const tip_object = (try hub.readObject(arena, target.oid)).?;
     const tip = object.Commit.parse(arena, world.format, tip_object.data) catch
         return error.ModelMismatch;
@@ -852,8 +863,8 @@ fn rewriteHub(arena: Allocator, rand: std.Random, world: *World, hub_index: usiz
             .committer = sig,
             .message = try std.fmt.allocPrint(
                 arena,
-                "Started over {d}\n\nState: open\nFormat-Version: 1\n",
-                .{rand.int(u32)},
+                "Started over {d}\n\n{s}\nFormat-Version: 1\n",
+                .{ rand.int(u32), if (milestone) "Name: Over" else "State: open" },
             ),
         };
         break :blk try hub.writeObject(.commit, try commit.serializeAlloc(arena));
@@ -872,11 +883,13 @@ fn rewriteHub(arena: Allocator, rand: std.Random, world: *World, hub_index: usiz
     }
 }
 
-/// Issue IDs quarantined from origin on this clone.
+/// Issue and milestone IDs quarantined from origin on this clone.
 fn quarantinedIds(arena: Allocator, clone: World.Clone) Allocator.Error![]const []const u8 {
-    const prefix = "refs/issuez-sync/origin/quarantined/issues/";
     var out: std.ArrayList([]const u8) = .empty;
-    for (clone.refs) |r| if (std.mem.startsWith(u8, r.name, prefix)) {
+    for ([_][]const u8{
+        "refs/issuez-sync/origin/quarantined/issues/",
+        "refs/issuez-sync/origin/quarantined/milestones/",
+    }) |prefix| for (clone.refs) |r| if (std.mem.startsWith(u8, r.name, prefix)) {
         try out.append(arena, r.name[prefix.len..]);
     };
     return out.items;

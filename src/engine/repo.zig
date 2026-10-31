@@ -297,7 +297,8 @@ pub fn Repo(comptime B: type) type {
             MilestoneRetired,
             /// Completing a milestone with open work.
             OpenWorkInMilestone,
-            /// Not `refs/issues/<valid ref component>`.
+            /// Not `refs/issues/<valid ref component>`, or `refs/milestones/`
+            /// for the catalog's writes.
             InvalidIssueRef,
             /// The tip is no longer the `expect`ed one.
             VersionMismatch,
@@ -347,6 +348,25 @@ pub fn Repo(comptime B: type) type {
             const issues = try arena.alloc(Issue, all.len);
             for (all, issues) |r, *i| i.* = try self.load(arena, r);
             return issues;
+        }
+
+        /// For guards: issues that can't be loaded are skipped (fsck reports
+        /// them), and at most `Limits.max_guard_scan` are read.
+        pub fn loadForGuards(self: Self, arena: Allocator) Error![]Issue {
+            const all = try self.refs(arena);
+            if (all.len > self.limits.max_guard_scan) return error.GuardScanTooLarge;
+            var out: std.ArrayList(Issue) = .empty;
+            for (all) |r| {
+                try out.append(arena, self.load(arena, r) catch |err| switch (err) {
+                    error.CorruptIssue,
+                    error.HistoryTooLong,
+                    error.MissingParent,
+                    error.NoRoot,
+                    => continue,
+                    else => |e| return e,
+                });
+            }
+            return out.items;
         }
 
         pub const Page = struct {
@@ -494,7 +514,7 @@ pub fn Repo(comptime B: type) type {
                 try checkSelectable(info.status);
                 milestone_text = info.name;
             }
-            if (spec.milestone_mode == .explicit and spec.milestone_id == null)
+            if (spec.milestone_mode) |m| if ((m == .explicit) != (spec.milestone_id != null))
                 return error.InvalidValue;
 
             var list: std.ArrayList(trailers.Trailer) = .empty;
@@ -541,7 +561,7 @@ pub fn Repo(comptime B: type) type {
             }
             if (spec.milestone_id) |mid| {
                 try list.append(arena, .{ .key = "X-Milestone-Id", .value = mid });
-                try list.append(arena, .{ .key = "X-Milestone-Mode", .value = "explicit" });
+                try list.append(arena, .{ .key = "X-Milestone-Mode", .value = explicit_mode });
             } else if (spec.milestone_mode) |m| {
                 try list.append(arena, .{ .key = "X-Milestone-Mode", .value = @tagName(m) });
             }
@@ -843,11 +863,9 @@ pub fn Repo(comptime B: type) type {
             const milestone_changes = spec.milestone != null or spec.milestone_id != null or
                 spec.milestone_mode != null;
             if (milestone_changes) try changes.append(arena, .milestone);
-            if (spec.milestone_id) |mid| {
-                const info = (try self.milestoneInfo(arena, mid)) orelse
-                    return error.ReferenceNotFound;
-                try checkSelectable(info.status);
-            }
+            // The guard checks that the milestone can be selected.
+            if (spec.milestone_id != null) if (spec.milestone_mode) |m| if (m != .explicit)
+                return error.InvalidValue;
             if (spec.assignee) |v| if (v.len > 0) try checkAssignee(v);
             if (spec.parent) |v| {
                 if (v.len > 0) try checkReference(v);
@@ -885,9 +903,6 @@ pub fn Repo(comptime B: type) type {
             return .{ .tip = tip, .changes = changes.items };
         }
 
-        /// `builder.message` runs against the fresh tip on every attempt.
-        /// With `expect` there's a single attempt: if the ref moved, that's
-        /// the caller's conflict, not ours to rebase.
         fn appendCommit(
             self: Self,
             arena: Allocator,
@@ -896,10 +911,21 @@ pub fn Repo(comptime B: type) type {
             expect: ?Oid,
             builder: anytype,
         ) Error!Oid {
-            const prefix = if (std.mem.startsWith(u8, ref_name, milestone_ref_prefix))
-                milestone_ref_prefix
-            else
-                issue_ref_prefix;
+            return self.appendUnder(issue_ref_prefix, arena, ref_name, author, expect, builder);
+        }
+
+        /// `builder.message` runs against the fresh tip on every attempt.
+        /// With `expect` there's a single attempt: if the ref moved, that's
+        /// the caller's conflict, not ours to rebase.
+        fn appendUnder(
+            self: Self,
+            prefix: []const u8,
+            arena: Allocator,
+            ref_name: []const u8,
+            author: ?Signature,
+            expect: ?Oid,
+            builder: anytype,
+        ) Error!Oid {
             if (!std.mem.startsWith(u8, ref_name, prefix) or ref_name.len == prefix.len or
                 !contract.isValidRefName(ref_name)) return error.InvalidIssueRef;
             var attempt: u8 = 0;
@@ -945,18 +971,14 @@ pub fn Repo(comptime B: type) type {
 
         pub fn milestoneInfo(self: Self, arena: Allocator, id: []const u8) Error!?MilestoneInfo {
             if (!uuid_fmt.isCanonical(id)) return null;
-            const name = try std.fmt.allocPrint(arena, "{s}{s}", .{ milestone_ref_prefix, id });
+            const name = try milestoneRefName(arena, id);
             const tip = (try self.backend.resolveRef(name)) orelse return null;
-            const m = try self.load(arena, .{ .name = name, .tip = tip });
-            return .{
-                .name = m.field("Name") orelse m.title,
-                .status = fields_fmt.MilestoneStatus.parse(m.field("X-Milestone-Status")),
-                .tip = tip,
-            };
+            const header = milestoneHeader(try self.load(arena, .{ .name = name, .tip = tip }));
+            return .{ .name = header.name, .status = header.status, .tip = tip };
         }
 
-        /// For the milestone catalog, which brings its own builder.
-        pub fn appendWith(
+        /// For the milestone catalog: `appendWith` for `refs/milestones/`.
+        pub fn appendMilestone(
             self: Self,
             arena: Allocator,
             ref_name: []const u8,
@@ -965,24 +987,11 @@ pub fn Repo(comptime B: type) type {
             builder: anytype,
         ) Error!Oid {
             try self.checkLimits();
-            return self.appendCommit(arena, ref_name, author, expect, builder);
+            return self.appendUnder(milestone_ref_prefix, arena, ref_name, author, expect, builder);
         }
 
-        /// No guards. Used by the milestone catalog.
-        pub fn appendRaw(
-            self: Self,
-            arena: Allocator,
-            ref_name: []const u8,
-            author: ?Signature,
-            expect: ?Oid,
-            message: []const u8,
-        ) Error!Oid {
-            try self.checkLimits();
-            const fixed: FixedMessage = .{ .text = message };
-            return self.appendCommit(arena, ref_name, author, expect, fixed);
-        }
-
-        const FixedMessage = struct {
+        /// A builder with a message that doesn't depend on the tip.
+        pub const FixedMessage = struct {
             text: []const u8,
             pub fn message(b: FixedMessage, arena: Allocator, current: Issue) Error![]const u8 {
                 _ = arena;
@@ -1076,7 +1085,7 @@ pub fn Repo(comptime B: type) type {
                 );
                 if (spec.milestone_id) |mid| {
                     try list.append(arena, .{ .key = "X-Milestone-Id", .value = mid });
-                    try list.append(arena, .{ .key = "X-Milestone-Mode", .value = "explicit" });
+                    try list.append(arena, .{ .key = "X-Milestone-Mode", .value = explicit_mode });
                 } else if (mode) |m| {
                     if (m == .explicit and current.ext.milestone_id == null)
                         return error.InvalidValue;
@@ -1180,6 +1189,7 @@ pub fn Repo(comptime B: type) type {
             scanned: u32 = 0,
             /// Parent ID to children, built on first use.
             children: ?std.StringHashMapUnmanaged(std.ArrayList(Issue)) = null,
+            milestones: std.StringHashMapUnmanaged(?MilestoneInfo) = .empty,
 
             fn get(g: *Guard, id: []const u8) Error!?Issue {
                 if (g.cache.get(id)) |hit| return hit;
@@ -1215,23 +1225,28 @@ pub fn Repo(comptime B: type) type {
                 try g.verify.append(g.arena, .{ .name = name, .op = .{ .verify = tip } });
             }
 
+            /// Loaded once, and pinned.
+            fn milestone(g: *Guard, id: []const u8) Error!?MilestoneInfo {
+                if (g.milestones.get(id)) |hit| return hit;
+                const info = try g.repo.milestoneInfo(g.arena, id);
+                if (info) |i| try g.pin(try milestoneRefName(g.arena, id), id, i.tip);
+                try g.milestones.put(g.arena, id, info);
+                return info;
+            }
+
             /// Its own setting, or the first explicit/none up the parent
-            /// chain. Deleted ancestors pass through, cycles and missing
-            /// parents end the walk.
+            /// chain, as the projection reads it. Deleted ancestors pass
+            /// through, cycles and missing parents end the walk.
             fn effectiveMilestone(g: *Guard, p: Proposal) Error!?[]const u8 {
-                const default: fields_fmt.MilestoneMode = if (p.milestone_id != null)
-                    .explicit
-                else if (p.parent != null) .inherit else .none;
-                switch (p.milestone_mode orelse default) {
+                const has_id = p.milestone_id != null;
+                switch (fields_fmt.MilestoneMode.of(p.milestone_mode, has_id, p.parent != null)) {
                     .explicit => return p.milestone_id,
                     .none => return null,
                     .inherit => {},
                 }
                 var seen: std.StringHashMapUnmanaged(void) = .empty;
                 var next = p.parent;
-                var depth: u32 = 0;
-                while (next) |up| : (depth += 1) {
-                    if (depth > g.repo.limits.max_depth) return null;
+                while (next) |up| {
                     if (p.id) |id| if (std.mem.eql(u8, id, up)) return null;
                     if ((try seen.getOrPut(g.arena, up)).found_existing) return null;
                     const anc = (try g.get(up)) orelse return null;
@@ -1239,33 +1254,49 @@ pub fn Repo(comptime B: type) type {
                         next = anc.ext.parent;
                         continue;
                     }
-                    const anc_default: fields_fmt.MilestoneMode = if (anc.ext.milestone_id != null)
-                        .explicit
-                    else if (anc.ext.parent != null) .inherit else .none;
-                    switch (anc.ext.milestone_mode orelse anc_default) {
-                        .explicit => return anc.ext.milestone_id,
+                    const ext = anc.ext;
+                    switch (fields_fmt.MilestoneMode.of(
+                        ext.milestone_mode,
+                        ext.milestone_id != null,
+                        ext.parent != null,
+                    )) {
+                        .explicit => return ext.milestone_id,
                         .none => return null,
-                        .inherit => next = anc.ext.parent,
+                        .inherit => next = ext.parent,
                     }
                 }
                 return null;
             }
 
+            /// Whether an open descendant takes its milestone from `id`:
+            /// through children that inherit, and through deleted ones,
+            /// which pass it on whatever their own setting. Each one read
+            /// is pinned.
+            fn openHeir(g: *Guard, id: []const u8) Error!bool {
+                var seen: std.StringHashMapUnmanaged(void) = .empty;
+                try seen.put(g.arena, id, {});
+                var stack: std.ArrayList([]const u8) = .empty;
+                try stack.append(g.arena, id);
+                while (stack.pop()) |up| {
+                    for (try g.childrenOf(up)) |c| {
+                        if ((try seen.getOrPut(g.arena, c.id)).found_existing) continue;
+                        try g.pin(try refNameOf(g.arena, c.id), c.id, c.tip);
+                        if (!c.deleted) {
+                            const Mode = fields_fmt.MilestoneMode;
+                            const has_id = c.ext.milestone_id != null;
+                            if (Mode.of(c.ext.milestone_mode, has_id, true) != .inherit) continue;
+                            if (!g.repo.isDone(c)) return true;
+                        }
+                        try stack.append(g.arena, c.id);
+                    }
+                }
+                return false;
+            }
+
             fn childrenOf(g: *Guard, id: []const u8) Error![]const Issue {
                 if (g.children == null) {
-                    const all = try g.repo.refs(g.arena);
-                    if (all.len > g.repo.limits.max_guard_scan) return error.GuardScanTooLarge;
                     var index: std.StringHashMapUnmanaged(std.ArrayList(Issue)) = .empty;
-                    for (all) |r| {
-                        const issue = g.repo.load(g.arena, r) catch |err| switch (err) {
-                            // Can't be checked. fsck reports it.
-                            error.CorruptIssue,
-                            error.HistoryTooLong,
-                            error.MissingParent,
-                            error.NoRoot,
-                            => continue,
-                            else => |e| return e,
-                        };
+                    for (try g.repo.loadForGuards(g.arena)) |issue| {
                         const parent = issue.ext.parent orelse continue;
                         // Its own parent, from another tool: not a child.
                         if (std.mem.eql(u8, parent, issue.id)) continue;
@@ -1361,21 +1392,22 @@ pub fn Repo(comptime B: type) type {
             // Checked against a pinned tip.
             if (p.milestone_changed) if (p.milestone_id) |mid| {
                 if (p.milestone_mode == null or p.milestone_mode.? == .explicit) {
-                    const info = (try self.milestoneInfo(arena, mid)) orelse
-                        return error.ReferenceNotFound;
+                    const info = (try g.milestone(mid)) orelse return error.ReferenceNotFound;
                     try checkSelectable(info.status);
-                    const ref = try milestoneRefName(arena, mid);
-                    try g.pin(ref, mid, info.tip);
                 }
             };
-            // No open work in a completed milestone.
+            // No open work in a completed milestone: neither this issue nor
+            // the open descendants that inherit through it. Both kinds of
+            // write move the milestone's guard ref, like completing it.
             const placing = placing_open or (!p.closed and p.milestone_changed);
-            if (placing) if (try g.effectiveMilestone(p)) |mid| {
-                if (try self.milestoneInfo(arena, mid)) |info| {
-                    const ref = try milestoneRefName(arena, mid);
-                    try g.pin(ref, mid, info.tip);
-                    if (info.status == .completed) return error.MilestoneCompleted;
+            const moves = p.milestone_changed or p.parent_changed or p.restored;
+            if (placing or moves) if (try g.effectiveMilestone(p)) |mid| {
+                if (try g.milestone(mid)) |info| {
                     try g.bumpGuard(mid);
+                    if (info.status == .completed) {
+                        if (placing) return error.MilestoneCompleted;
+                        if (p.id) |id| if (try g.openHeir(id)) return error.MilestoneCompleted;
+                    }
                 }
             };
 
@@ -1475,11 +1507,26 @@ fn refNameOf(arena: Allocator, id: []const u8) Allocator.Error![]const u8 {
     return std.fmt.allocPrint(arena, "{s}{s}", .{ issue_ref_prefix, id });
 }
 
-fn milestoneRefName(arena: Allocator, id: []const u8) Allocator.Error![]const u8 {
+/// `refs/milestones/<id>`.
+pub fn milestoneRefName(arena: Allocator, id: []const u8) Allocator.Error![]const u8 {
     return std.fmt.allocPrint(arena, "{s}{s}", .{ milestone_ref_prefix, id });
 }
 
-fn checkSelectable(status: fields_fmt.MilestoneStatus) error{ MilestoneCompleted, MilestoneRetired }!void {
+/// What every reader takes from a loaded milestone: `Name` (else the
+/// subject) and `X-Milestone-Status` (`open` when missing or unknown).
+pub fn milestoneHeader(m: Issue) struct { name: []const u8, status: fields_fmt.MilestoneStatus } {
+    const status = if (m.field("X-Milestone-Status")) |v|
+        fields_fmt.MilestoneStatus.parse(v) orelse .open
+    else
+        .open;
+    return .{ .name = m.field("Name") orelse m.title, .status = status };
+}
+
+const explicit_mode = @tagName(fields_fmt.MilestoneMode.explicit);
+
+fn checkSelectable(
+    status: fields_fmt.MilestoneStatus,
+) error{ MilestoneCompleted, MilestoneRetired }!void {
     switch (status) {
         .open => {},
         .completed => return error.MilestoneCompleted,
@@ -1504,7 +1551,7 @@ fn defaultEditSubject(arena: Allocator, changes: []const Change) Allocator.Error
 
 /// First paragraph is the subject, the rest the body, so `-m a -m b` gives
 /// subject "a" and body "b".
-fn splitMessage(text: []const u8) struct { subject: []const u8, body: []const u8 } {
+pub fn splitMessage(text: []const u8) struct { subject: []const u8, body: []const u8 } {
     const trimmed = std.mem.trim(u8, text, "\n");
     var i: usize = 0;
     while (std.mem.findScalarPos(u8, trimmed, i, '\n')) |nl| {

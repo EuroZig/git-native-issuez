@@ -140,6 +140,7 @@ are installed.
 
 ## fsck
 
+- Milestones are checked too, with `Name:` in place of `State:`.
 - `-q` is accepted as `--quiet`, and unreadable histories are reported.
 - Invalid extension values and hierarchy or blocker problems are noted on
   stderr, not counted as errors: other tools can write them.
@@ -182,9 +183,9 @@ are installed.
 ## Commands upstream doesn't have
 
 - `push <remote>`: fetches to see what the remote has, then pushes the
-  issues and milestones that differ, never with force. When the remote moved, it merges
-  first and retries. When the remote refuses a ref (a hook, permissions),
-  it stops with the remote's message.
+  issues and milestones that differ, never with force. When the remote
+  moved, it merges first and retries. When the remote refuses a ref (a
+  hook, permissions), it stops with the remote's message.
 - `sync <remote>`: `merge`, then `push`.
 - `close` and `reopen <id>`: `state --close` and `state --open`.
 - `delete` and `restore <id>`: hide an issue from `ls`, `tree` and
@@ -194,10 +195,12 @@ are installed.
 - `milestone create|ls|show|edit|complete|reopen|retire`: manage
   milestones. `show` lists a milestone's issues, inherited ones included,
   and its progress. `complete` is refused while any of them is open.
+  `edit` writes one commit for all its changes. A retired milestone is
+  named by its ID only.
 - `status [<remote>]`: issues not pushed yet, quarantined issues and how to
   resolve them, and issues with conflicts. Local state only.
 - `quarantine <remote> --accept-remote|--keep-local <id>`: resolves a
-  quarantined issue. Nothing is force-pushed and no version is dropped: the
-  replaced local tip stays under `refs/issuez-sync/`.
+  quarantined issue or milestone. Nothing is force-pushed and no version
+  is dropped: the replaced local tip stays under `refs/issuez-sync/`.
 
 `fsck` notes quarantined issues on stderr without counting them as errors.

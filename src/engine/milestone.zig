@@ -68,23 +68,34 @@ pub fn Catalog(comptime B: type) type {
 
         pub fn load(self: Self, arena: Allocator, ref: repo_mod.IssueRef) Error!Milestone {
             const m = try self.repo.load(arena, ref);
+            const header = repo_mod.milestoneHeader(m);
             return .{
                 .id = ref.id(),
                 .tip = ref.tip,
-                .name = m.field("Name") orelse m.title,
+                .name = header.name,
                 .description = m.description,
                 .due = m.ext.due_date,
-                .status = fields_fmt.MilestoneStatus.parse(m.field("X-Milestone-Status")),
+                .status = header.status,
                 .created = m.created,
                 .conflicts = m.conflicts,
             };
         }
 
-        /// By due date (none last), then name.
+        /// By due date (none last), then name. Milestones whose history
+        /// can't be read are left out; `git issue fsck` reports them.
         pub fn list(self: Self, arena: Allocator) Error![]Milestone {
-            const all = try self.refs(arena);
-            const out = try arena.alloc(Milestone, all.len);
-            for (all, out) |r, *m| m.* = try self.load(arena, r);
+            var loaded: std.ArrayList(Milestone) = .empty;
+            for (try self.refs(arena)) |r| {
+                try loaded.append(arena, self.load(arena, r) catch |err| switch (err) {
+                    error.CorruptIssue,
+                    error.HistoryTooLong,
+                    error.MissingParent,
+                    error.NoRoot,
+                    => continue,
+                    else => |e| return e,
+                });
+            }
+            const out = loaded.items;
             std.mem.sort(Milestone, out, {}, struct {
                 fn lt(_: void, x: Milestone, y: Milestone) bool {
                     if (x.due != null and y.due != null) {
@@ -99,7 +110,7 @@ pub fn Catalog(comptime B: type) type {
 
         pub fn find(self: Self, arena: Allocator, id: []const u8) Error!?Milestone {
             if (!uuid_fmt.isCanonical(id)) return null;
-            const name = try std.fmt.allocPrint(arena, "{s}{s}", .{ ref_prefix, id });
+            const name = try repo_mod.milestoneRefName(arena, id);
             const tip = (try self.b().resolveRef(name)) orelse return null;
             return try self.load(arena, .{ .name = name, .tip = tip });
         }
@@ -145,7 +156,8 @@ pub fn Catalog(comptime B: type) type {
                 if (fields_fmt.Date.parse(d) == null) return error.InvalidValue;
                 try tl.append(arena, .{ .key = "X-Due-Date", .value = d });
             }
-            try tl.append(arena, .{ .key = "X-Milestone-Status", .value = @tagName(fields_fmt.MilestoneStatus.open) });
+            const open = @tagName(fields_fmt.MilestoneStatus.open);
+            try tl.append(arena, .{ .key = "X-Milestone-Status", .value = open });
             try tl.append(arena, .{ .key = "Format-Version", .value = "1" });
             const subject = try std.fmt.allocPrint(arena, "Create milestone {s}", .{spec.name});
             const message = try trailers.build(arena, subject, spec.description, tl.items);
@@ -156,7 +168,7 @@ pub fn Catalog(comptime B: type) type {
                 var random: [16]u8 = undefined;
                 self.b().randomBytes(&random);
                 const id = uuid_fmt.Uuid.fromRandom(random);
-                const name = try std.fmt.allocPrint(arena, "{s}{s}", .{ ref_prefix, id.slice() });
+                const name = try repo_mod.milestoneRefName(arena, id.slice());
                 self.b().updateRefs(&.{.{ .name = name, .op = .{ .create = oid } }}) catch |err|
                     switch (err) {
                         error.RefConflict => continue,
@@ -172,6 +184,9 @@ pub fn Catalog(comptime B: type) type {
             /// "" clears it.
             due: ?[]const u8 = null,
             status: ?fields_fmt.MilestoneStatus = null,
+            /// Replaces the description, with `X-Event: description-edit`.
+            description: ?[]const u8 = null,
+            /// The commit message. Defaults to "Complete milestone", ...
             message: ?[]const u8 = null,
             author: ?repo_mod.Signature = null,
             expect: ?Oid = null,
@@ -179,6 +194,7 @@ pub fn Catalog(comptime B: type) type {
 
         /// One commit for all of it.
         pub fn edit(self: Self, arena: Allocator, id: []const u8, spec: EditSpec) Error!Oid {
+            const limits = self.repo.limits;
             var tl: std.ArrayList(trailers.Trailer) = .empty;
             var what: std.ArrayList([]const u8) = .empty;
             if (spec.name) |n| {
@@ -194,7 +210,15 @@ pub fn Catalog(comptime B: type) type {
             if (spec.status) |s| {
                 try tl.append(arena, .{ .key = "X-Milestone-Status", .value = @tagName(s) });
             }
+            if (spec.description) |d| {
+                if (d.len > limits.max_body_bytes) return error.TooLong;
+                const event = fields_fmt.Event.description_edit.text();
+                try tl.append(arena, .{ .key = "X-Event", .value = event });
+                try what.append(arena, "description");
+            }
             if (tl.items.len == 0) return error.NothingToEdit;
+            for (tl.items) |x| if (x.value.len > limits.max_trailer_value_bytes)
+                return error.TooLong;
             const subject = spec.message orelse if (spec.status) |s| switch (s) {
                 .completed => "Complete milestone",
                 .retired => "Retire milestone",
@@ -204,16 +228,24 @@ pub fn Catalog(comptime B: type) type {
                 "Update {s}",
                 .{try std.mem.join(arena, ", ", what.items)},
             );
-            const message = try trailers.build(arena, subject, "", tl.items);
-            const name = try refName(arena, id);
-            if (spec.status == .completed) return self.repo.appendWith(
+            // With a new description, that is the body. Otherwise the
+            // message may have a body of its own, as for issues.
+            const message = if (spec.description) |d|
+                try trailers.build(arena, repo_mod.splitMessage(subject).subject, d, tl.items)
+            else blk: {
+                const split = repo_mod.splitMessage(subject);
+                break :blk try trailers.build(arena, split.subject, split.body, tl.items);
+            };
+            const name = try repo_mod.milestoneRefName(arena, id);
+            if (spec.status == .completed) return self.repo.appendMilestone(
                 arena,
                 name,
                 spec.author,
                 spec.expect,
                 CompleteBuilder{ .catalog = self, .id = id, .text = message },
             );
-            return self.repo.appendRaw(arena, name, spec.author, spec.expect, message);
+            const fixed: R.FixedMessage = .{ .text = message };
+            return self.repo.appendMilestone(arena, name, spec.author, spec.expect, fixed);
         }
 
         /// Every non-deleted issue in the milestone has to be done, and
@@ -244,7 +276,13 @@ pub fn Catalog(comptime B: type) type {
                 const bump = try arena.dupe(repo_mod.Guarded.Bump, &.{
                     try repo_mod.readGuardRef(c.catalog.repo.backend, arena, c.id),
                 });
-                const proj = try c.catalog.projection(arena);
+                // A retired milestone has no issues in the projection, but
+                // completing it brings them back: count them as if open.
+                const known = try c.catalog.infos(arena);
+                for (known) |*info| {
+                    if (std.mem.eql(u8, info.id, c.id)) info.status = .open;
+                }
+                const proj = try c.catalog.projectionWith(arena, known);
                 var verify: std.ArrayList(@import("../backend/contract.zig").RefUpdate) = .empty;
                 for (proj.issues, proj.milestone, 0..) |issue, m, i| {
                     if (issue.deleted) continue;
@@ -264,22 +302,26 @@ pub fn Catalog(comptime B: type) type {
         };
 
         /// For projection options.
-        pub fn infos(self: Self, arena: Allocator) Error![]const projection_mod.MilestoneInfo {
+        pub fn infos(self: Self, arena: Allocator) Error![]projection_mod.MilestoneInfo {
             const all = try self.list(arena);
             const out = try arena.alloc(projection_mod.MilestoneInfo, all.len);
-            for (all, out) |m, *info| info.* = .{ .id = m.id, .status = switch (m.status) {
-                .open => .open,
-                .completed => .completed,
-                .retired => .retired,
-            } };
+            for (all, out) |m, *info| info.* = .{ .id = m.id, .status = m.status };
             return out;
         }
 
+        /// Issues that can't be loaded are left out, as in the guards.
         pub fn projection(self: Self, arena: Allocator) Error!projection_mod.Projection {
-            const issues = try self.repo.loadAll(arena);
-            if (issues.len > self.repo.limits.max_guard_scan) return error.GuardScanTooLarge;
-            return projection_mod.build(arena, issues, .{
-                .milestones = try self.infos(arena),
+            return self.projectionWith(arena, try self.infos(arena));
+        }
+
+        fn projectionWith(
+            self: Self,
+            arena: Allocator,
+            milestones: []const projection_mod.MilestoneInfo,
+        ) Error!projection_mod.Projection {
+            return projection_mod.build(arena, try self.repo.loadForGuards(arena), .{
+                .max_depth = self.repo.limits.max_depth,
+                .milestones = milestones,
                 .done_states = self.repo.done_states,
             });
         }
@@ -305,13 +347,9 @@ pub fn Catalog(comptime B: type) type {
             id: []const u8,
             text: []const u8,
         ) Error!Oid {
-            return self.repo.editDescription(arena, try refName(arena, id), text, .{});
+            return self.edit(arena, id, .{ .description = text });
         }
     };
-}
-
-fn refName(arena: Allocator, id: []const u8) Allocator.Error![]const u8 {
-    return std.fmt.allocPrint(arena, "{s}{s}", .{ ref_prefix, id });
 }
 
 fn checkName(n: []const u8) error{InvalidText}!void {
@@ -484,4 +522,80 @@ test "issues in milestones" {
         if (p.kind == .milestone_retired) retired += 1;
     }
     try testing.expectEqual(@as(usize, 1), retired); // Epic: the explicit one
+}
+
+test "milestone guards: retired, inherited work, damaged issues" {
+    var arena_state: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var world: GitSim.World = .{ .seed = 57, .clones = &.{.{ .name = "a" }} };
+    var sim = try GitSim.init(arena, &world, 0);
+    const cat = Catalog(GitSim).init(&sim);
+    const repo = repo_mod.Repo(GitSim).init(&sim);
+    const refOf = struct {
+        fn f(a: Allocator, id: []const u8) ![]const u8 {
+            return std.fmt.allocPrint(a, "refs/issues/{s}", .{id});
+        }
+    }.f;
+
+    // Issue writes don't reach milestones, and an ID goes with explicit.
+    const m1 = (try cat.create(arena, .{ .name = "m1" })).id.slice();
+    const m2 = (try cat.create(arena, .{ .name = "m2" })).id.slice();
+    const m2_ref = try repo_mod.milestoneRefName(arena, m2);
+    try testing.expectError(
+        error.InvalidIssueRef,
+        repo.setState(arena, m2_ref, .{ .state = .closed }),
+    );
+    try testing.expectError(
+        error.InvalidValue,
+        repo.create(arena, .{ .title = "x", .milestone_id = m1, .milestone_mode = .none }),
+    );
+
+    // A retired milestone still needs its work closed to complete.
+    const open = try repo.create(arena, .{ .title = "Open", .milestone_id = m2 });
+    _ = try cat.edit(arena, m2, .{ .status = .retired });
+    try testing.expectError(error.OpenWorkInMilestone, complete(cat, arena, m2));
+    _ = try cat.edit(arena, m2, .{ .status = .open });
+    _ = try repo.setState(arena, try refOf(arena, open.id.slice()), .{ .state = .closed });
+
+    // Restoring a closed issue brings the open work below it along.
+    const root = try repo.create(arena, .{ .title = "Root", .milestone_id = m1 });
+    const mid = try repo.create(arena, .{
+        .title = "Mid",
+        .parent = root.id.slice(),
+        .milestone_id = m2,
+    });
+    const leaf = try repo.create(arena, .{ .title = "Leaf", .parent = mid.id.slice() });
+    for ([_][]const u8{ leaf.id.slice(), mid.id.slice() }) |id| {
+        _ = try repo.setState(arena, try refOf(arena, id), .{ .state = .closed });
+    }
+    for ([_][]const u8{ leaf.id.slice(), mid.id.slice() }) |id| {
+        _ = try repo.setDeleted(arena, try refOf(arena, id), true, .{});
+    }
+    // A damaged issue doesn't stop completing.
+    const blob = try sim.writeObject(.blob, "not a commit");
+    const damaged = "refs/issues/0b8c7a52-3f1e-4d2a-9b6c-5e4f3a2b1c0d";
+    try sim.updateRefs(&.{.{ .name = damaged, .op = .{ .create = blob } }});
+    _ = try complete(cat, arena, m2);
+    _ = try repo.setDeleted(arena, try refOf(arena, leaf.id.slice()), false, .{});
+    _ = try repo.setState(arena, try refOf(arena, leaf.id.slice()), .{ .state = .open });
+    try testing.expectError(
+        error.MilestoneCompleted,
+        repo.setDeleted(arena, try refOf(arena, mid.id.slice()), false, .{}),
+    );
+
+    // A name, a due date and a description in one commit.
+    const before = (try cat.find(arena, m1)).?.tip;
+    const tip = try cat.edit(arena, m1, .{
+        .name = "m1 GA",
+        .due = "2026-12-01",
+        .description = "All of it.",
+        .message = "Rename\n\nFor the release.",
+    });
+    const raw = (try sim.readObject(arena, tip)).?;
+    const c = try object.Commit.parse(arena, sim.objectFormat(), raw.data);
+    try testing.expect(c.parents.len == 1 and c.parents[0].eql(before));
+    const m = (try cat.find(arena, m1)).?;
+    try testing.expectEqualStrings("m1 GA", m.name);
+    try testing.expectEqualStrings("All of it.", m.description);
 }

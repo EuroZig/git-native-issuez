@@ -113,17 +113,22 @@ pub const MilestoneMode = enum {
     pub fn parse(s: []const u8) ?MilestoneMode {
         return std.meta.stringToEnum(MilestoneMode, s);
     }
+
+    /// The mode in effect: the written one, else `explicit` with an
+    /// `X-Milestone-Id`, else `inherit` under a parent, else `none`.
+    pub fn of(written: ?MilestoneMode, has_id: bool, has_parent: bool) MilestoneMode {
+        return written orelse if (has_id) .explicit else if (has_parent) .inherit else .none;
+    }
 };
 
-/// `X-Milestone-Status`.
+/// `X-Milestone-Status`. Readers take a missing or unknown value as `open`.
 pub const MilestoneStatus = enum {
     open,
     completed,
     retired,
 
-    /// `open` when missing or unknown.
-    pub fn parse(s: ?[]const u8) MilestoneStatus {
-        return std.meta.stringToEnum(MilestoneStatus, s orelse return .open) orelse .open;
+    pub fn parse(s: []const u8) ?MilestoneStatus {
+        return std.meta.stringToEnum(MilestoneStatus, s);
     }
 };
 
@@ -233,4 +238,20 @@ test isSlug {
     try testing.expect(!isSlug("In-Progress"));
     try testing.expect(!isSlug("1st"));
     try testing.expect(!isSlug(""));
+}
+
+test MilestoneMode {
+    try testing.expectEqual(MilestoneMode.none, MilestoneMode.of(.none, true, true));
+    try testing.expectEqual(MilestoneMode.explicit, MilestoneMode.of(null, true, true));
+    try testing.expectEqual(MilestoneMode.inherit, MilestoneMode.of(null, false, true));
+    try testing.expectEqual(MilestoneMode.none, MilestoneMode.of(null, false, false));
+}
+
+test MilestoneStatus {
+    for (std.enums.values(MilestoneStatus)) |s| {
+        try testing.expectEqual(s, MilestoneStatus.parse(@tagName(s)).?);
+    }
+    for ([_][]const u8{ "", "Completed", "done", "open " }) |s| {
+        try testing.expect(MilestoneStatus.parse(s) == null);
+    }
 }

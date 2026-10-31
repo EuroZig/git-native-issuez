@@ -4,6 +4,7 @@ const std = @import("std");
 const context = @import("../context.zig");
 const common = @import("../common.zig");
 const issuez = @import("issuez");
+const sync_output = @import("../sync_output.zig");
 const uuid = issuez.format.uuid;
 
 pub const help =
@@ -65,10 +66,12 @@ pub fn main(comptime B: type, ctx: *context.Context(B), argv: []const []const u8
         if (st.quarantined.len > 0) {
             w.print("  quarantined: {d}\n", .{st.quarantined.len}) catch {};
             for (st.quarantined) |q| {
+                var buf: [32]u8 = undefined;
+                const label = sync_output.label(&buf, q.namespace, q.id);
                 const short = uuid.shortId(q.id);
                 const why = if (q.reason) |r| r.describe() else "clears on the next merge";
                 w.print("    {s} {s} ({s}{s})\n", .{
-                    short,
+                    label,
                     q.title,
                     why,
                     if (q.kept_local) "; kept local" else "",

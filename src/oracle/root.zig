@@ -655,25 +655,34 @@ fn refChanges(
     return out.items;
 }
 
-/// Whether an issue matching `prefix` is quarantined and that remote
-/// version was already kept.
+/// Sync quarantines issues and milestones alike.
+const synced_namespaces = [_][]const u8{ "issues", "milestones" };
+
+/// Whether an issue or milestone matching `prefix` is quarantined and that
+/// remote version was already kept.
 fn alreadyKept(
     arena: Allocator,
     b: commands.Clone,
     remote: []const u8,
     prefix: []const u8,
 ) Allocator.Error!bool {
-    const qprefix = try std.fmt.allocPrint(arena, "refs/issuez-sync/{s}/quarantined/issues/", .{remote});
-    for (b.clone.refs) |r| {
-        if (!std.mem.startsWith(u8, r.name, qprefix)) continue;
-        const id = r.name[qprefix.len..];
-        if (!std.mem.startsWith(u8, id, prefix)) continue;
-        const kept = b.ref(try std.fmt.allocPrint(
+    for (synced_namespaces) |ns| {
+        const qprefix = try std.fmt.allocPrint(
             arena,
-            "refs/issuez-sync/{s}/kept/issues/{s}",
-            .{ remote, id },
-        )) orelse continue;
-        if (std.mem.eql(u8, kept, r.oid)) return true;
+            "refs/issuez-sync/{s}/quarantined/{s}/",
+            .{ remote, ns },
+        );
+        for (b.clone.refs) |r| {
+            if (!std.mem.startsWith(u8, r.name, qprefix)) continue;
+            const id = r.name[qprefix.len..];
+            if (!std.mem.startsWith(u8, id, prefix)) continue;
+            const kept = b.ref(try std.fmt.allocPrint(
+                arena,
+                "refs/issuez-sync/{s}/kept/{s}/{s}",
+                .{ remote, ns, id },
+            )) orelse continue;
+            if (std.mem.eql(u8, kept, r.oid)) return true;
+        }
     }
     return false;
 }
@@ -690,26 +699,32 @@ fn checkResolve(
 ) Allocator.Error!void {
     const r = x.remote;
     const accept = x.accept;
-    const qprefix = try std.fmt.allocPrint(arena, "refs/issuez-sync/{s}/quarantined/issues/", .{r});
 
-    var id: ?[]const u8 = null;
+    var id: ?SyncedId = null;
     for (try refChanges(arena, b, a)) |ch| {
         const this = issueIdOf(ch.name, r) orelse {
             try report.fail("quarantine changed unrelated ref {s}", .{ch.name});
             continue;
         };
         if (id) |seen| {
-            if (!std.mem.eql(u8, seen, this)) try report.fail("quarantine changed two issues", .{});
+            const same = std.mem.eql(u8, seen.id, this.id) and std.mem.eql(u8, seen.ns, this.ns);
+            if (!same) try report.fail("quarantine changed two issues", .{});
         } else id = this;
     }
-    const which = id orelse {
+    const resolved = id orelse {
         // Keeping a remote version that is already kept is a no-op.
         if (!accept and try alreadyKept(arena, b, r, x.id)) return;
         return report.fail("quarantine changed nothing", .{});
     };
-    const marker = b.ref(try std.fmt.allocPrint(arena, "{s}{s}", .{ qprefix, which })) orelse
+    const which = resolved.id;
+    const ns = resolved.ns;
+    const marker = b.ref(try std.fmt.allocPrint(
+        arena,
+        "refs/issuez-sync/{s}/quarantined/{s}/{s}",
+        .{ r, ns, which },
+    )) orelse
         return report.fail("quarantine resolved {s}, which wasn't quarantined", .{which});
-    const issue_ref = try std.fmt.allocPrint(arena, "refs/issues/{s}", .{which});
+    const issue_ref = try std.fmt.allocPrint(arena, "refs/{s}/{s}", .{ ns, which });
     const local_before = b.ref(issue_ref);
     const local_after = a.ref(issue_ref);
     if (accept) {
@@ -718,8 +733,8 @@ fn checkResolve(
         if (local_before) |old| {
             const backup = a.ref(try std.fmt.allocPrint(
                 arena,
-                "refs/issuez-sync/{s}/replaced/issues/{s}/{s}",
-                .{ r, which, old },
+                "refs/issuez-sync/{s}/replaced/{s}/{s}/{s}",
+                .{ r, ns, which, old },
             ));
             if (backup == null or !std.mem.eql(u8, backup.?, old))
                 try report.fail("--accept-remote: old local tip of {s} not kept", .{which});
@@ -733,19 +748,27 @@ fn checkResolve(
     }
 }
 
-/// When the ref is the issue's or one of its sync records for `remote`.
-fn issueIdOf(name: []const u8, remote: []const u8) ?[]const u8 {
-    if (std.mem.startsWith(u8, name, "refs/issues/")) return name["refs/issues/".len..];
+const SyncedId = struct { ns: []const u8, id: []const u8 };
+
+/// When the ref is an issue's or a milestone's, or one of its sync records
+/// for `remote`.
+fn issueIdOf(name: []const u8, remote: []const u8) ?SyncedId {
+    inline for (synced_namespaces) |ns| {
+        const own = "refs/" ++ ns ++ "/";
+        if (std.mem.startsWith(u8, name, own)) return .{ .ns = ns, .id = name[own.len..] };
+    }
     const sync_prefix = "refs/issuez-sync/";
     if (!std.mem.startsWith(u8, name, sync_prefix)) return null;
     const rest = name[sync_prefix.len..];
     if (!std.mem.startsWith(u8, rest, remote) or rest.len <= remote.len or rest[remote.len] != '/')
         return null;
-    const marker = "/issues/";
-    const at = std.mem.find(u8, rest, marker) orelse return null;
-    const id = rest[at + marker.len ..];
-    // `replaced/issues/<id>/<tip>`
-    return id[0 .. std.mem.findScalar(u8, id, '/') orelse id.len];
+    // `<record>/<ns>/<id>`, or `replaced/<ns>/<id>/<tip>`
+    var parts = std.mem.splitScalar(u8, rest[remote.len + 1 ..], '/');
+    _ = parts.next() orelse return null;
+    const ns = parts.next() orelse return null;
+    const id = parts.next() orelse return null;
+    for (synced_namespaces) |known| if (std.mem.eql(u8, ns, known)) return .{ .ns = known, .id = id };
+    return null;
 }
 
 fn configEqual(b: World.Clone, a: World.Clone) bool {

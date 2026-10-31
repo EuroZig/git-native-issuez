@@ -12,7 +12,8 @@ pub const help =
     \\usage: git issue milestone <subcommand> [options]
     \\
     \\Manage milestones. They live in refs/milestones/ and sync with the
-    \\issues. A milestone is named by an ID prefix or its exact name.
+    \\issues. A milestone is named by an ID prefix or its exact name (a
+    \\retired one by its ID only).
     \\
     \\Subcommands:
     \\   create <name>       Create a milestone (--due, -m)
@@ -27,7 +28,7 @@ pub const help =
     \\   --name <name>         New name (edit)
     \\   --due <date>          Due date, YYYY-MM-DD (create, edit)
     \\   --no-due              Clear the due date (edit)
-    \\   --description <text>  Replace the description (edit)
+    \\   --description <text>  The description (create), or replace it (edit)
     \\   -m, --message <text>  Description (create) or commit message
     \\   -a, --all             Include completed and retired milestones (ls)
     \\   -h, --help            Show this help
@@ -83,6 +84,19 @@ pub fn main(comptime B: type, ctx: *context.Context(B), argv: []const []const u8
         return common.exit_error;
     };
 
+    if (all and sub != .ls) return common.missing(ctx.err, "milestone", "--all goes with ls");
+    if (name != null and sub != .edit)
+        return common.missing(ctx.err, "milestone", "--name goes with edit");
+    if (due != null and sub != .create and sub != .edit)
+        return common.missing(ctx.err, "milestone", "--due goes with create and edit");
+    if (due != null and due.?.len == 0 and sub == .create)
+        return common.missing(ctx.err, "milestone", "--no-due goes with edit");
+    if (description != null and sub != .create and sub != .edit)
+        return common.missing(ctx.err, "milestone", "--description goes with create and edit");
+    if (message != null and (sub == .ls or sub == .show))
+        return common.missing(ctx.err, "milestone", "-m doesn't go with ls and show");
+    if (sub == .create and description != null and message != null)
+        return common.missing(ctx.err, "milestone", "give the description once");
     const repo = common.openRepo(B, ctx) orelse return common.exit_fatal;
     const cat = issuez.Catalog(B).of(repo);
     const w = ctx.out;
@@ -94,7 +108,7 @@ pub fn main(comptime B: type, ctx: *context.Context(B), argv: []const []const u8
             const created = cat.create(arena, .{
                 .name = text,
                 .due = due,
-                .description = message orelse "",
+                .description = description orelse message orelse "",
             }) catch |e| return common.repoFailed(B, ctx, e);
             w.print("Created milestone {s}: {s}\n", .{ created.id.short(), text }) catch {};
         },
@@ -151,13 +165,12 @@ pub fn main(comptime B: type, ctx: *context.Context(B), argv: []const []const u8
                     if (name == null and due == null and description == null) {
                         return common.missing(ctx.err, "milestone", "nothing to edit");
                     }
-                    if (name != null or due != null) _ = cat.edit(arena, m.id, .{
+                    _ = cat.edit(arena, m.id, .{
                         .name = name,
                         .due = due,
+                        .description = description,
                         .message = message,
                     }) catch |e| return common.repoFailed(B, ctx, e);
-                    if (description) |d| _ = cat.editDescription(arena, m.id, d) catch |e|
-                        return common.repoFailed(B, ctx, e);
                     w.print("Updated milestone {s}\n", .{short}) catch {};
                 },
                 .complete, .reopen, .retire => {

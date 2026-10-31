@@ -476,8 +476,8 @@ fn resolveMilestone(
         return true;
     };
     if (t.len == 0) {
-        // Invalid values link nothing.
-        const linked = if (previous) |p|
+        // Invalid values link nothing. A parent given now counts.
+        const linked = e.parent != null or if (previous) |p|
             isUuidShape(p.milestone_id) or isUuidShape(p.parent) or
                 eql(u8, p.milestone_mode, "inherit") or eql(u8, p.milestone_mode, "none") or
                 eql(u8, p.milestone_mode, "explicit")

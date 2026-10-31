@@ -236,7 +236,8 @@ pub fn resolveMilestone(
             return null;
         }
     }
-    const has_link = if (current) |c|
+    // A parent given in the same command counts: the issue would inherit.
+    const has_link = f.parent != null or if (current) |c|
         c.ext.milestone_id != null or c.ext.milestone_mode != null or c.ext.parent != null
     else
         false;
