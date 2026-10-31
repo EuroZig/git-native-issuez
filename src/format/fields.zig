@@ -104,6 +104,29 @@ pub fn isSlug(s: []const u8) bool {
     return true;
 }
 
+pub const MilestoneMode = enum {
+    inherit,
+    /// No milestone, and stop inheriting.
+    none,
+    explicit,
+
+    pub fn parse(s: []const u8) ?MilestoneMode {
+        return std.meta.stringToEnum(MilestoneMode, s);
+    }
+};
+
+/// `X-Milestone-Status`.
+pub const MilestoneStatus = enum {
+    open,
+    completed,
+    retired,
+
+    /// `open` when missing or unknown.
+    pub fn parse(s: ?[]const u8) MilestoneStatus {
+        return std.meta.stringToEnum(MilestoneStatus, s orelse return .open) orelse .open;
+    }
+};
+
 /// `X-Deleted`: exactly `true` or `false`.
 pub fn parseBool(s: []const u8) ?bool {
     if (std.mem.eql(u8, s, "true")) return true;

@@ -16,6 +16,8 @@ pub const help_create =
     \\   --estimate <duration>     Minutes, or e.g. 2h, 90m, 1h30m
     \\   --workflow <state>        Workflow state (git config issue.workflowStates;
     \\                             default backlog, ready, in-progress, review)
+    \\   --milestone-id <id>       Put it in a catalog milestone (ID prefix or name)
+    \\   --milestone-mode <mode>   inherit (the parent's milestone), none or explicit
     \\
 ;
 
@@ -29,7 +31,7 @@ pub const help_edit = help_create ++
     \\   --no-workflow             Clear the workflow state
     \\   --no-assignee             Clear the assignee
     \\   --no-priority             Clear the priority
-    \\   --no-milestone            Clear the milestone
+    \\   --no-milestone            Clear the milestone (and stop inheriting one)
     \\   --no-labels               Remove every label
     \\
 ;
@@ -42,6 +44,8 @@ pub const Flags = struct {
     due: ?[]const u8 = null,
     estimate: ?[]const u8 = null,
     workflow: ?[]const u8 = null,
+    milestone_id: ?[]const u8 = null,
+    milestone_mode: ?[]const u8 = null,
     // edit only
     no: std.EnumSet(Clear) = .initEmpty(),
 
@@ -76,6 +80,8 @@ pub const Flags = struct {
             .{ "--due", &f.due },
             .{ "--estimate", &f.estimate },
             .{ "--workflow", &f.workflow },
+            .{ "--milestone-id", &f.milestone_id },
+            .{ "--milestone-mode", &f.milestone_mode },
         };
         for (single) |s| if (eql(u8, arg, s[0])) {
             s[1].* = args.value(err, s[0]) orelse return .failed;
@@ -98,7 +104,7 @@ pub const Flags = struct {
     pub fn any(f: Flags) bool {
         return f.parent != null or f.blocked_by.items.len > 0 or f.unblock.items.len > 0 or
             f.start != null or f.due != null or f.estimate != null or f.workflow != null or
-            f.no.count() > 0;
+            f.milestone_id != null or f.milestone_mode != null or f.no.count() > 0;
     }
 
     pub const Resolved = struct {
@@ -170,6 +176,166 @@ pub const Flags = struct {
     }
 };
 
+pub const MilestoneChoice = struct {
+    /// null means unchanged.
+    text: ?[]const u8 = null,
+    id: ?[]const u8 = null,
+    mode: ?fields.MilestoneMode = null,
+};
+
+/// `--milestone <name>` links a catalog milestone when exactly one open
+/// milestone has that name, otherwise it stays plain text like upstream
+/// writes it. `current` is null on create.
+pub fn resolveMilestone(
+    comptime B: type,
+    ctx: *context.Context(B),
+    repo: issuez.engine.Repo(B),
+    f: Flags,
+    text: ?[]const u8,
+    current: ?issuez.engine.Issue,
+) ?MilestoneChoice {
+    var out: MilestoneChoice = .{ .text = text };
+    if (f.no.contains(.milestone)) out.text = "";
+    if (f.milestone_mode) |m| out.mode = fields.MilestoneMode.parse(m) orelse {
+        ctx.err.print(
+            "error: --milestone-mode must be inherit, none or explicit, not '{s}'\n",
+            .{m},
+        ) catch {};
+        return null;
+    };
+    const cat = issuez.Catalog(B).of(repo);
+    if (f.milestone_id) |key| {
+        if (out.text != null) {
+            ctx.err.writeAll(
+                "error: --milestone-id doesn't go with --milestone or --no-milestone\n",
+            ) catch {};
+            return null;
+        }
+        if (out.mode != null and out.mode.? != .explicit) {
+            ctx.err.print(
+                "error: --milestone-id doesn't go with --milestone-mode {t}\n",
+                .{out.mode.?},
+            ) catch {};
+            return null;
+        }
+        const m = findMilestone(B, ctx, cat, key) orelse return null;
+        out.id = m.id;
+        out.mode = null;
+        return out;
+    }
+    if (out.mode == .explicit and out.text != null and out.text.?.len == 0) {
+        ctx.err.writeAll("error: --milestone-mode explicit needs a milestone\n") catch {};
+        return null;
+    }
+    if (out.mode == .explicit and out.text == null) {
+        const has_id = if (current) |c| c.ext.milestone_id != null else false;
+        if (!has_id) {
+            ctx.err.writeAll(
+                "error: --milestone-mode explicit needs a milestone (--milestone-id)\n",
+            ) catch {};
+            return null;
+        }
+    }
+    const has_link = if (current) |c|
+        c.ext.milestone_id != null or c.ext.milestone_mode != null or c.ext.parent != null
+    else
+        false;
+    const name = out.text orelse return out;
+    if (name.len == 0) {
+        // Clearing also stops inheriting one.
+        if (out.mode == null and has_link) out.mode = .none;
+        return out;
+    }
+    // inherit/none with text: keep the text, no catalog link.
+    if (out.mode != null and out.mode.? != .explicit) return out;
+    const all = cat.list(ctx.arena) catch |e| {
+        common.reportRepoError(B, ctx, e);
+        return null;
+    };
+    var hits: std.ArrayList(issuez.milestone.Milestone) = .empty;
+    for (all) |m| if (m.status == .open and std.mem.eql(u8, m.name, name)) {
+        hits.append(ctx.arena, m) catch return null;
+    };
+    switch (hits.items.len) {
+        0 => {
+            for (all) |m| if (std.mem.eql(u8, m.name, name)) {
+                ctx.err.print("error: milestone '{s}' is {t}{s}\n", .{
+                    name,
+                    m.status,
+                    if (m.status == .completed) "; reopen it first" else "",
+                }) catch {};
+                return null;
+            };
+            if (out.mode == .explicit) {
+                ctx.err.print("error: no open milestone is named '{s}'\n", .{name}) catch {};
+                return null;
+            }
+            if (all.len > 0) ctx.err.print(
+                "hint: no open milestone is named '{s}'; it is kept as text only " ++
+                    "(see 'git issue milestone ls')\n",
+                .{name},
+            ) catch {};
+            if (current) |c| if (c.ext.milestone_id != null) {
+                out.mode = .none;
+            };
+        },
+        1 => {
+            out.id = hits.items[0].id;
+            out.text = null;
+            out.mode = null;
+        },
+        else => {
+            ctx.err.print("error: several open milestones are named '{s}':\n", .{name}) catch {};
+            for (hits.items) |m| ctx.err.print(
+                "  {s} {s}\n",
+                .{ issuez.format.uuid.shortId(m.id), m.name },
+            ) catch {};
+            ctx.err.writeAll("Name one with --milestone-id <id>.\n") catch {};
+            return null;
+        },
+    }
+    return out;
+}
+
+/// By ID prefix or exact name.
+pub fn findMilestone(
+    comptime B: type,
+    ctx: *context.Context(B),
+    cat: issuez.Catalog(B),
+    key: []const u8,
+) ?issuez.milestone.Milestone {
+    const uuid = issuez.format.uuid;
+    const match = cat.resolve(ctx.arena, key) catch |e| {
+        common.reportRepoError(B, ctx, e);
+        return null;
+    };
+    switch (match) {
+        .one => |m| return m,
+        .none => {
+            const all = cat.list(ctx.arena) catch &.{};
+            for (all) |m| if (std.mem.eql(u8, m.name, key)) {
+                ctx.err.print(
+                    "error: milestone '{s}' is retired; name it by its ID ({s})\n",
+                    .{ key, uuid.shortId(m.id) },
+                ) catch {};
+                return null;
+            };
+            ctx.err.print(
+                "error: no milestone '{s}' (see 'git issue milestone ls -a')\n",
+                .{key},
+            ) catch {};
+        },
+        .many => |ms| {
+            ctx.err.print("error: '{s}' matches several milestones:\n", .{key}) catch {};
+            for (ms) |m| ctx.err.print(
+                "  {s} [{t}] {s}\n",
+                .{ uuid.shortId(m.id), m.status, m.name },
+            ) catch {};
+        },
+    }
+    return null;
+}
+
 pub fn workflowStates(
     comptime B: type,
     ctx: *context.Context(B),
@@ -219,8 +385,14 @@ pub fn project(
         return null;
     };
     const states = workflowStates(B, ctx, repo) orelse return null;
+    const cat = issuez.Catalog(B).of(repo);
+    const milestones = cat.infos(ctx.arena) catch |e| {
+        common.reportRepoError(B, ctx, e);
+        return null;
+    };
     return issuez.projection.build(ctx.arena, issues, .{
         .workflow = states,
+        .milestones = milestones,
         .done_states = repo.done_states,
     }) catch null;
 }

@@ -43,9 +43,19 @@ pub const NaiveIssue = struct {
     due: []const u8 = "",
     estimate: []const u8 = "",
     workflow: []const u8 = "",
+    milestone_id: []const u8 = "",
+    milestone_mode: []const u8 = "",
     /// Of the fields a merge restates: written somewhere in the history,
     /// empty now.
     cleared: []const []const u8 = &.{},
+};
+
+/// `Name` and `X-Milestone-Status` by the same rule as issue fields.
+pub const NaiveMilestone = struct {
+    id: []const u8,
+    name: []const u8,
+    /// open, completed or retired. Anything else reads as open.
+    status: []const u8,
 };
 
 pub const Clone = struct {
@@ -86,6 +96,23 @@ pub const Clone = struct {
                 c.arena,
                 r.name,
             );
+        }
+        return out.items;
+    }
+
+    pub fn milestones(c: Clone) RuleError![]const NaiveMilestone {
+        var out: std.ArrayList(NaiveMilestone) = .empty;
+        for (c.clone.refs) |r| {
+            if (!std.mem.startsWith(u8, r.name, "refs/milestones/")) continue;
+            var dag = try Dag.load(c, &.{r.oid});
+            const status = (try dag.scalar("X-Milestone-Status")) orelse "open";
+            const known = std.mem.eql(u8, status, "completed") or
+                std.mem.eql(u8, status, "retired");
+            try out.append(c.arena, .{
+                .id = r.name["refs/milestones/".len..],
+                .name = (try dag.scalar("Name")) orelse "",
+                .status = if (known) status else "open",
+            });
         }
         return out.items;
     }
@@ -285,6 +312,8 @@ const Dag = struct {
             "X-Due-Date",
             "X-Estimate-Minutes",
             "X-Workflow-State",
+            "X-Milestone-Id",
+            "X-Milestone-Mode",
             "X-Deleted",
         }) |key| {
             const v = try d.scalar(key);
@@ -316,6 +345,8 @@ const Dag = struct {
             .due = (try d.scalar("X-Due-Date")) orelse "",
             .estimate = (try d.scalar("X-Estimate-Minutes")) orelse "",
             .workflow = (try d.scalar("X-Workflow-State")) orelse "",
+            .milestone_id = (try d.scalar("X-Milestone-Id")) orelse "",
+            .milestone_mode = (try d.scalar("X-Milestone-Mode")) orelse "",
         };
     }
 };
@@ -362,10 +393,22 @@ pub const ExtResolved = struct {
     blocked_by: []const []const u8 = &.{},
     unblock: []const []const u8 = &.{},
     estimate: ?[]const u8 = null,
+    /// null writes none.
+    milestone_text: ?[]const u8 = null,
+    milestone_id: ?[]const u8 = null,
+    milestone_mode: ?[]const u8 = null,
 };
 
-pub fn resolveExt(arena: Allocator, c: Clone, e: command.Ext) Allocator.Error!?ExtResolved {
+/// `previous` is null on create.
+pub fn resolveExt(
+    arena: Allocator,
+    c: Clone,
+    e: command.Ext,
+    text: ?[]const u8,
+    previous: ?NaiveIssue,
+) RuleError!?ExtResolved {
     var out: ExtResolved = .{};
+    if (!try resolveMilestone(c, e, text, previous, &out)) return null;
     if (e.parent) |p| out.parent = (try uniqueIssue(c, p)) orelse return null;
     var blocked: std.ArrayList([]const u8) = .empty;
     for (e.blocked_by) |p| try blocked.append(arena, (try uniqueIssue(c, p)) orelse return null);
@@ -380,6 +423,104 @@ pub fn resolveExt(arena: Allocator, c: Clone, e: command.Ext) Allocator.Error!?E
     }
     if (e.workflow) |w| if (!contains(try workflowStates(arena, c), w)) return null;
     return out;
+}
+
+/// The CLI's milestone rules again. False when the CLI must refuse.
+fn resolveMilestone(
+    c: Clone,
+    e: command.Ext,
+    text_arg: ?[]const u8,
+    previous: ?NaiveIssue,
+    out: *ExtResolved,
+) RuleError!bool {
+    const eql = std.mem.eql;
+    const text: ?[]const u8 = if (e.cleared("milestone")) "" else text_arg;
+    var mode: ?[]const u8 = null;
+    if (e.milestone_mode) |m| {
+        if (!eql(u8, m, "inherit") and !eql(u8, m, "none") and !eql(u8, m, "explicit"))
+            return false;
+        mode = m;
+    }
+    const all = try c.milestones();
+    const prev_id = if (previous) |p| p.milestone_id else "";
+    if (e.milestone_id) |key| {
+        if (text != null) return false;
+        if (mode != null and !eql(u8, mode.?, "explicit")) return false;
+        var hit: ?NaiveMilestone = null;
+        var hits: usize = 0;
+        if (key.len >= 4) for (all) |m| if (std.mem.startsWith(u8, m.id, key)) {
+            hit = m;
+            hits += 1;
+        };
+        if (hits == 0) for (all) |m| if (!eql(u8, m.status, "retired") and eql(u8, m.name, key)) {
+            hit = m;
+            hits += 1;
+        };
+        if (hits != 1) return false;
+        if (!eql(u8, hit.?.status, "open")) return false;
+        out.milestone_text = hit.?.name;
+        out.milestone_id = hit.?.id;
+        out.milestone_mode = "explicit";
+        return true;
+    }
+    const explicit = mode != null and eql(u8, mode.?, "explicit");
+    if (explicit and text != null and text.?.len == 0) return false;
+    if (explicit and text == null and prev_id.len == 0) return false;
+    const t = text orelse {
+        // Only a mode. On edit, inherit/none also clear the text and ID.
+        if (previous != null and mode != null and !explicit) {
+            out.milestone_text = "";
+            out.milestone_id = "";
+        }
+        out.milestone_mode = mode;
+        return true;
+    };
+    if (t.len == 0) {
+        // Invalid values link nothing.
+        const linked = if (previous) |p|
+            isUuidShape(p.milestone_id) or isUuidShape(p.parent) or
+                eql(u8, p.milestone_mode, "inherit") or eql(u8, p.milestone_mode, "none") or
+                eql(u8, p.milestone_mode, "explicit")
+        else
+            false;
+        const m: ?[]const u8 = mode orelse (if (linked) @as([]const u8, "none") else null);
+        // create writes no empty Milestone.
+        if (previous != null) out.milestone_text = "";
+        if (m != null and previous != null) out.milestone_id = "";
+        out.milestone_mode = m;
+        return true;
+    }
+    if (mode != null and !explicit) {
+        out.milestone_text = t;
+        out.milestone_id = "";
+        if (previous == null) out.milestone_id = null;
+        out.milestone_mode = mode;
+        return true;
+    }
+    var open_hit: ?NaiveMilestone = null;
+    var open_hits: usize = 0;
+    var any_named = false;
+    for (all) |m| if (eql(u8, m.name, t)) {
+        any_named = true;
+        if (eql(u8, m.status, "open")) {
+            open_hit = m;
+            open_hits += 1;
+        }
+    };
+    if (open_hits > 1) return false;
+    if (open_hits == 1) {
+        out.milestone_text = t;
+        out.milestone_id = open_hit.?.id;
+        out.milestone_mode = "explicit";
+        return true;
+    }
+    if (any_named or explicit) return false;
+    out.milestone_text = t;
+    if (prev_id.len > 0) {
+        out.milestone_id = "";
+        out.milestone_mode = "none";
+    }
+    return true;
 }
 
 fn uniqueIssue(c: Clone, prefix: []const u8) Allocator.Error!?[]const u8 {
@@ -468,7 +609,7 @@ pub fn expectedCreateMessage(
         .{v},
     ) catch return error.OutOfMemory;
     if (a.priority) |v| w.writer.print("Priority: {s}\n", .{v}) catch return error.OutOfMemory;
-    if (a.milestone) |v| if (v.len > 0) w.writer.print(
+    if (x.milestone_text) |v| if (v.len > 0) w.writer.print(
         "Milestone: {s}\n",
         .{v},
     ) catch return error.OutOfMemory;
@@ -518,6 +659,11 @@ fn extTrailers(
             try list.append(arena, .{ .key = s[0], .value = "" });
         } else if (s[2]) |v| try list.append(arena, .{ .key = s[0], .value = v });
     }
+    // create writes no empty X-Milestone-Id.
+    if (x.milestone_id) |v| if (v.len > 0 or previous != null) {
+        try list.append(arena, .{ .key = "X-Milestone-Id", .value = v });
+    };
+    if (x.milestone_mode) |v| try list.append(arena, .{ .key = "X-Milestone-Mode", .value = v });
     return list.items;
 }
 
@@ -563,13 +709,13 @@ pub fn expectedEditTrailers(
     const core = [_]struct { []const u8, []const u8, ?[]const u8 }{
         .{ "Assignee", "assignee", a.assignee },
         .{ "Priority", "priority", a.priority },
-        .{ "Milestone", "milestone", a.milestone },
     };
     for (core) |f| {
         if (a.ext.cleared(f[1])) {
             try list.append(arena, .{ .key = f[0], .value = "" });
         } else if (f[2]) |v| try list.append(arena, .{ .key = f[0], .value = v });
     }
+    if (x.milestone_text) |v| try list.append(arena, .{ .key = "Milestone", .value = v });
     try list.appendSlice(arena, try extTrailers(arena, a.ext, x, previous));
     return list.items;
 }

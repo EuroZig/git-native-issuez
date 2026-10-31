@@ -45,7 +45,7 @@ cli ──► engine ──► model ──► format
 | --------- | --------------------- | --------------------------------------------------------------------------------------------------------- |
 | `format`  | `src/format/`         | trailers exactly as git parses them, labels, UUIDs, hex, upstream's value rules, extension field grammars |
 | `model`   | `src/model/issue.zig` | one issue from its commit DAG: fields, comments, events, conflicts                                        |
-| `engine`  | `src/engine/`         | `Repo` (read, create, comment, edit, state, delete, check, guards), `Sync`, `query`, `projection`         |
+| `engine`  | `src/engine/`         | `Repo` (read, create, comment, edit, state, delete, check, guards), `Catalog`, `Sync`, `query`, `projection` |
 | `backend` | `src/backend/`        | the contract, `GitProcess`, `GitSim`, git objects                                                         |
 | `cli`     | `src/cli/`            | argument parsing, output, exit codes                                                                      |
 
@@ -94,13 +94,24 @@ ignored and reported, never an error: other tools write these issues too.
 ## The projection
 
 Some questions need every issue at once: children, blockers, progress,
-workflow states, and problems such as a parent that is missing or loops
-back. `projection.build` (`src/engine/projection.zig`) answers them from the
+workflow states, effective milestones, and problems such as a parent that
+is missing or loops back, or a milestone that is missing or retired. `projection.build` (`src/engine/projection.zig`) answers them from the
 loaded issues and nothing else. Merges and other tools can produce any
 graph, so it accepts every input and never loops: a parent that is missing,
 the issue itself, or part of a cycle is reported and the issue becomes a
 root, so the tree still shows every issue exactly once. `tree`,
-`ls --problems` and `fsck` read it.
+`ls --problems`, `fsck` and `milestone show` read it.
+
+## Milestones
+
+`Catalog(B)` (`src/engine/milestone.zig`) keeps milestones under
+`refs/milestones/`. A milestone is read and written by the same `Repo(B)`
+code as an issue (the model, compare and swap, merges), only under another
+prefix and with its own trailers ([format.md](format.md) §6). Issues
+reference a milestone by UUID; which milestone an issue is in, through its
+parents, is a question for the projection. Completing a milestone reads
+every issue in it and pins each one with a `verify` line, the same way the
+issue guards do.
 
 ## Writing an issue (compare and swap)
 
@@ -127,7 +138,9 @@ transaction as the write. When one of them moves concurrently, the
 transaction fails and the write starts again from step 1. A `verify` can't
 pin an absence, like no child under the issue being closed, so those
 writes also move a local guard ref (`refs/issuez-guard/<uuid>`) of the
-issue whose children matter, and two of them conflict. Concurrent writers
+issue whose children matter, and two of them conflict. Milestones are
+guarded the same way: no linking a completed or retired one, no open work
+into a completed one, and no completing one with open issues. Concurrent writers
 in one clone therefore can't break a guard; other clones still can, and the
 projection reports it. The number of issues a guard may read is bounded
 (`Limits.max_guard_scan`), and issues that can't be loaded are skipped, so
@@ -141,8 +154,10 @@ changed, like an HTTP ETag.
 
 `Sync(B)` (`src/engine/sync.zig`) sits on top of `Repo(B)`:
 
-1. Fetch into `refs/remotes/<remote>/issues/`. A fetch never writes
-   `refs/issues/` directly.
+1. Fetch into `refs/remotes/<remote>/issues/` and
+   `refs/remotes/<remote>/milestones/`. A fetch never writes `refs/issues/`
+   or `refs/milestones/` directly. Milestones go through the same steps as
+   issues.
 2. Classify each fetched issue against the local one: new, fast-forward, up
    to date, local ahead, diverged, or to be quarantined (unrelated history,
    rewritten since the last merge, fails `fsck`).
@@ -158,7 +173,7 @@ changed, like an HTTP ETag.
 The bookkeeping refs are a cache: they make rewound remotes detectable and
 `status` cheap, and losing them only costs a slower next sync. Nothing is
 force-pushed or deleted. Quarantine keeps the local issue, and resolving it
-keeps the version it replaces ([format.md](format.md) §6).
+keeps the version it replaces ([format.md](format.md) §7).
 
 Merge commits are deterministic, so every clone that merges the same pair
 writes the same commit. After all clones have exchanged everything, they
@@ -208,8 +223,8 @@ way, to go unnoticed.
     changes, and a failed command changes nothing;
   - per command: what `create`, `comment` (and its edit, delete and
     restore events), `edit` (with the extension fields and the
-    description), `state`, `close`, `reopen`, `delete`, `restore` and `init`
-    may write, and that read-only commands change nothing. Messages are
+    description and the milestone fields), `state`, `close`, `reopen`,
+    `delete`, `restore`, `milestone` and `init` may write, and that read-only commands change nothing. Messages are
     checked where the format depends on them (the root message, trailers,
     text the user wrote). Subjects the CLI picks itself are not;
   - for `merge`, `push`, `sync` and `quarantine`: issue refs are never

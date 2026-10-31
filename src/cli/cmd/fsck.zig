@@ -74,6 +74,10 @@ pub fn main(comptime B: type, ctx: *context.Context(B), argv: []const []const u8
                     "error: {s}: root commit missing Format-Version: trailer\n",
                     .{short},
                 ) catch {},
+                .missing_root_trailer => |k| ctx.err.print(
+                    "error: {s}: root commit missing {s}: trailer\n",
+                    .{ short, k },
+                ) catch {},
                 .unreadable => |e| ctx.err.print(
                     "error: {s}: history unreadable ({t})\n",
                     .{ short, e },

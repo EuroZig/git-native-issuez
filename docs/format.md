@@ -12,15 +12,17 @@ The key words MUST, MUST NOT, SHOULD and MAY are used as in RFC 2119.
 | Ref | Content |
 | --- | --- |
 | `refs/issues/<uuid>` | an issue |
-| `refs/remotes/<remote>/issues/<uuid>` | fetched issues, waiting to be merged |
-| `refs/issuez-sync/<remote>/<kind>/issues/<uuid>` | sync bookkeeping, local only (§6) |
+| `refs/milestones/<uuid>` | a milestone (§6) |
+| `refs/remotes/<remote>/{issues,milestones}/<uuid>` | fetched issues and milestones, waiting to be merged |
+| `refs/issuez-sync/<remote>/<kind>/{issues,milestones}/<uuid>` | sync bookkeeping, local only (§7) |
 | `refs/issuez-guard/<uuid>` | write serialization, local only (§3, Guards) |
 
-UUIDs are lowercase, hyphenated, version 4. Readers MUST NOT read issue
-data from any ref other than `refs/issues/*`.
+UUIDs are lowercase, hyphenated, version 4. Readers MUST NOT read data from
+any ref other than `refs/issues/*` and `refs/milestones/*`.
 
 `git issue merge`, `sync` and `git fetch` after `git issue init` fetch into
-`refs/remotes/<remote>/issues/`, never straight into `refs/issues/`.
+`refs/remotes/<remote>/issues/` and `refs/remotes/<remote>/milestones/`,
+never straight into `refs/issues/` or `refs/milestones/`.
 
 ## 2. Issue commits
 
@@ -70,6 +72,8 @@ Format-Version: 1
 | `Priority` | scalar | `low`, `medium`, `high`, `critical` |
 | `Milestone` | scalar | free text |
 | `Fixed-By`, `Release`, `Reason` | scalar | text (upstream's `state` options) |
+| `X-Milestone-Id` | scalar | milestone UUID (§6) |
+| `X-Milestone-Mode` | scalar | `inherit`, `none` or `explicit` (§6) |
 | `X-Parent` | scalar | issue UUID |
 | `X-Blocked-By` | set | issue UUIDs, comma-separated |
 | `X-Start-Date`, `X-Due-Date` | scalar | `YYYY-MM-DD`, a real calendar day |
@@ -84,10 +88,10 @@ Format-Version: 1
 - An `Assignee` whose first word isn't a UUID is an email as a whole, as
   format 1 reads it. The UUID form names a person independently of their
   address; upstream shows the whole value.
-- References (`X-Parent`, `X-Blocked-By`) are full UUIDs. Whether the target
-  exists, cycles and depth are questions across issues, answered when
-  reading (the projection, `ls --problems`, `tree`), never by refusing to
-  read.
+- References (`X-Parent`, `X-Blocked-By`, `X-Milestone-Id`) are full UUIDs.
+  Whether the target exists, cycles and depth are questions across issues,
+  answered when reading (the projection, `ls --problems`, `tree`), never by
+  refusing to read.
 - `closed` and the states in `git config issue.doneStates` (default
   `wontfix, duplicate`) count as done. `ls` hides them by default, and
   parents, blockers, progress and the guards treat them as closed. Every
@@ -105,15 +109,20 @@ Writers keep the hierarchy sound. This tool refuses a write that would:
 - block an issue by itself, by a missing issue, or close a blocker loop;
 - close an issue with open sub-issues, or open one (create, reopen,
   restore, move) under a closed ancestor;
-- delete an issue with sub-issues that aren't deleted.
+- delete an issue with sub-issues that aren't deleted;
+- link a completed or retired milestone, or put open work (create, reopen,
+  restore, move) into a completed milestone, directly or through a parent;
+- complete a milestone that still has open issues (§6).
 
-Each issue a guard reads is pinned in the same ref transaction (git's
+Each issue or milestone a guard reads is pinned in the same ref transaction (git's
 `update-ref` `verify`), so a concurrent change to any of them aborts the
 write, which is then retried. A `verify` can't pin that something is
 absent, like a new child of the issue being closed. So creating or moving
 an issue also moves `refs/issuez-guard/<uuid>` of each ancestor, and closing
 or deleting an issue moves its own before reading the children: two such
-writes in one clone conflict, and the retry sees the child. The guard refs
+writes in one clone conflict, and the retry sees the child. Milestones
+work the same way: putting open work into a milestone and completing it
+both move the milestone's guard ref. The guard refs
 carry no data, are never pushed, and can be deleted at any time.
 
 Other tools and concurrent clones can still produce violations; readers
@@ -155,8 +164,8 @@ pair write the identical commit:
   reader that takes the newest value finds no older one. The order: `State`, `Title` (only when it overrides the
   root subject), `Labels`, `Assignee`, `Priority`, `Milestone`, then
   `X-Parent`, `X-Start-Date`, `X-Due-Date`, `X-Estimate-Minutes`,
-  `X-Workflow-State`, `X-Deleted`, `X-Blocked-By`. Other fields and events
-  follow from the parents.
+  `X-Workflow-State`, `X-Milestone-Id`, `X-Milestone-Mode`, `X-Deleted`,
+  `X-Blocked-By`. Other fields and events follow from the parents.
 
 Restating the values lets upstream, which reads the newest trailer it
 finds, show the merged state, extension fields included. For this tool
@@ -187,12 +196,64 @@ Lifecycle changes are commits carrying `X-Event`, at most one per commit:
 - Upstream shows event commits as ordinary updates. Their subjects ("Edit
   comment 3f9a1c2", "Delete issue", ...) are written to read well there.
 
-## 6. Sync
+## 6. Milestones
+
+A milestone is a commit DAG under `refs/milestones/<uuid>`, built like an
+issue: empty tree, one root, the trailer rules of §2 and the merge rule of
+§4.
+
+```
+Create milestone v1.0
+
+Everything for the first release.
+
+Name: v1.0
+X-Due-Date: 2026-12-01
+X-Milestone-Status: open
+Format-Version: 1
+```
+
+- The root carries `Name:` and `Format-Version: 1`. The root's body is the
+  description, changed later with `X-Event: description-edit` (§5).
+- `Name` is the display name and may change; the UUID never does. Names are
+  not blank and at most 256 bytes.
+- `X-Due-Date` is a date as for issues. An empty value clears it.
+- `X-Milestone-Status` is `open`, `completed` or `retired`. A missing or
+  unknown value reads as `open`.
+- Merge commits are `Merge milestone` with no trailers, with the same
+  parents, identity and date as issue merges (§4). Only this tool reads
+  milestones, so nothing is restated.
+
+An issue links a milestone with `X-Milestone-Id` and `X-Milestone-Mode`:
+- `explicit`: the milestone in `X-Milestone-Id`;
+- `inherit`: the parent's milestone, through any number of levels;
+- `none`: no milestone, and sub-issues that inherit get none either.
+
+Without `X-Milestone-Mode`, the mode is `explicit` when `X-Milestone-Id` is
+set, else `inherit` under a parent, else `none`. The *effective* milestone
+is found by walking up the parent chain to the nearest `explicit` or `none`.
+A deleted issue passes its parent's value through. A milestone ID that
+doesn't exist, or a retired milestone, gives no effective milestone and is
+reported (`ls --problems`).
+
+Writers that link a milestone also write `Milestone: <name>`, so upstream,
+which only knows `Milestone`, shows the name. Clearing it (`none`, or
+`inherit` without an ID) writes `Milestone: ` empty. A plain `Milestone`
+written by upstream or by hand stays text and links nothing.
+
+Completing a milestone needs every non-deleted issue whose effective
+milestone it is to be done (§3). Retiring one is for milestones that won't
+be finished: their issues keep their trailers, but no longer count as in
+the milestone, and new issues can't be added.
+
+## 7. Sync
 
 `git issue merge <remote>` fetches the remote's issues into
 `refs/remotes/<remote>/issues/` and compares each one with the local issue.
 Only refs named by a UUID there are issues: a remote branch `issues/...`,
-which git's default refspec also tracks there, is left alone.
+which git's default refspec also tracks there, is left alone. Milestones
+sync the same way, through `refs/remotes/<remote>/milestones/`, with the
+same outcomes.
 
 - no local issue: created;
 - local is an ancestor of remote: fast-forwarded;
@@ -206,7 +267,7 @@ which git's default refspec also tracks there, is left alone.
   resolves it.
 
 `git issue push <remote>` first fetches the remote's issue refs to see
-what it has, then pushes the local issues that differ, in atomic batches
+what it has, then pushes the local issues and milestones that differ, in atomic batches
 and never with force. When the remote moved, it merges and tries again, a
 bounded number of times. A ref the remote refuses (a hook, permissions)
 fails the push with the remote's message. `git issue sync` is merge, then
@@ -215,7 +276,8 @@ push.
 ### Bookkeeping refs
 
 These refs are local and never pushed. Losing them only costs extra work on
-the next sync:
+the next sync. Milestones have the same refs, with `milestones` in place of
+`issues`:
 - `refs/issuez-sync/<remote>/merged/issues/<uuid>`: the remote tip last
   merged, used to detect rewritten history;
 - `.../pushed/issues/<uuid>`: the tip the remote has;
@@ -227,7 +289,7 @@ the next sync:
 - `.../seen/issues/<uuid>`: where `push` fetches the remote's refs, deleted
   right after.
 
-## 7. Compatibility
+## 8. Compatibility
 
 - Upstream reads every issue written here as format 1: `ls`, `show` and
   `fsck` work, and the extension trailers show as plain trailer lines.
@@ -237,6 +299,11 @@ the next sync:
 - Upstream doesn't know events or `X-Deleted`: it lists deleted issues and
   shows edited and deleted comments as they were first written, followed by
   the event commits.
+- Upstream doesn't know milestones. It neither syncs `refs/milestones/*`
+  nor checks the milestone guards. Issues that travel through upstream keep
+  their `X-Milestone-Id`, which stays unresolved (and is reported) until
+  the milestone itself arrives through this tool's sync. Upstream shows the
+  `Milestone` name written next to it.
 - Clones can sync through either tool. Upstream's `merge` and this tool's
   read each other's merge commits, and the `refs/issuez-sync/` refs are
   invisible to upstream.

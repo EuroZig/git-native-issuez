@@ -27,6 +27,7 @@ pub const text =
     \\   delete      Delete an issue (restore brings it back)
     \\   restore     Restore a deleted issue
     \\   tree        Show the parent/child tree with progress and blockers
+    \\   milestone   Create, list and manage milestones
     \\   status      Show unpushed, quarantined and conflicted issues
     \\   quarantine  Resolve a quarantined issue
     \\

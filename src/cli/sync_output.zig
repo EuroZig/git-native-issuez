@@ -18,7 +18,11 @@ pub fn printMerge(
         return;
     }
     for (report.entries) |e| {
-        const short = uuid.shortId(e.id);
+        var buf: [32]u8 = undefined;
+        const short = if (e.namespace == .milestones)
+            std.fmt.bufPrint(&buf, "milestone {s}", .{uuid.shortId(e.id)}) catch uuid.shortId(e.id)
+        else
+            uuid.shortId(e.id);
         switch (e.outcome) {
             .created => if (check)
                 out.print("[new] {s}: {s}\n", .{ short, e.title }) catch {}

@@ -21,6 +21,8 @@ pub const Oid = object.Oid;
 pub const Signature = object.Signature;
 
 pub const issue_ref_prefix = "refs/issues/";
+/// Milestones use the same engine.
+pub const milestone_ref_prefix = "refs/milestones/";
 /// Local only, never pushed. A guard can pin what it read but not that
 /// something is absent, like a child of the issue being closed. So writes
 /// that add work under an issue or to a milestone move that ID's guard ref,
@@ -106,6 +108,7 @@ pub const IssueRef = struct {
     name: []const u8,
     tip: Oid,
 
+    /// Also works for `refs/milestones/`.
     pub fn id(r: IssueRef) []const u8 {
         const slash = std.mem.findScalarLast(u8, r.name, '/') orelse return r.name;
         return r.name[slash + 1 ..];
@@ -134,6 +137,11 @@ pub const CreateSpec = struct {
     estimate_minutes: ?u32 = null,
     /// Callers check it against the configured workflow states.
     workflow: ?[]const u8 = null,
+    /// A catalog milestone. Written with mode `explicit` and its name as
+    /// `Milestone:`. Must be open.
+    milestone_id: ?[]const u8 = null,
+    /// `inherit` or `none`. `explicit` needs `milestone_id`.
+    milestone_mode: ?fields_fmt.MilestoneMode = null,
     /// Overrides the backend's identity.
     author: ?Signature = null,
 };
@@ -178,6 +186,10 @@ pub const EditSpec = struct {
     due_date: ?[]const u8 = null,
     estimate_minutes: ?EstimateEdit = null,
     workflow: ?[]const u8 = null,
+    milestone_id: ?[]const u8 = null,
+    /// `inherit` and `none` clear the ID and the name. `explicit` needs an
+    /// ID, given or already set.
+    milestone_mode: ?fields_fmt.MilestoneMode = null,
     /// Replaces the description, in the same commit as the other changes:
     /// a `description-edit` event that also sets their fields.
     description: ?[]const u8 = null,
@@ -196,7 +208,7 @@ pub const EditSpec = struct {
             spec.add_blocked_by.len == 0 and spec.remove_blocked_by.len == 0 and
             spec.start_date == null and spec.due_date == null and
             spec.estimate_minutes == null and spec.workflow == null and
-            spec.description == null;
+            spec.milestone_id == null and spec.milestone_mode == null and spec.description == null;
     }
 };
 
@@ -279,6 +291,12 @@ pub fn Repo(comptime B: type) type {
             /// Not a comment of this issue: the root, a merge, an event, or
             /// not in its history.
             CommentNotFound,
+            /// Selecting a completed milestone, or open work ending up in
+            /// one.
+            MilestoneCompleted,
+            MilestoneRetired,
+            /// Completing a milestone with open work.
+            OpenWorkInMilestone,
             /// Not `refs/issues/<valid ref component>`.
             InvalidIssueRef,
             /// The tip is no longer the `expect`ed one.
@@ -407,11 +425,23 @@ pub fn Repo(comptime B: type) type {
             root_count: usize,
             missing_state,
             missing_format_version,
+            /// Other than State and Format-Version, e.g. `Name` for
+            /// milestones.
+            missing_root_trailer: []const u8,
             unreadable: Error,
         };
 
         /// Upstream fsck's checks, with our trailer parsing.
         pub fn check(self: Self, arena: Allocator, ref: IssueRef) Allocator.Error![]const Problem {
+            return self.checkWith(arena, ref, &.{ "State", "Format-Version" });
+        }
+
+        pub fn checkWith(
+            self: Self,
+            arena: Allocator,
+            ref: IssueRef,
+            root_keys: []const []const u8,
+        ) Allocator.Error![]const Problem {
             var problems: std.ArrayList(Problem) = .empty;
             if (!uuid_fmt.isCanonical(ref.id())) try problems.append(arena, .invalid_uuid);
             const commits = self.loadCommits(arena, ref.tip) catch |e| switch (e) {
@@ -437,9 +467,15 @@ pub fn Repo(comptime B: type) type {
             if (roots != 1) try problems.append(arena, .{ .root_count = roots });
             if (root_message) |m| {
                 const block = try trailers.parse(arena, m, .{});
-                if (!trailers.has(block, "State")) try problems.append(arena, .missing_state);
-                if (!trailers.has(block, "Format-Version"))
-                    try problems.append(arena, .missing_format_version);
+                for (root_keys) |k| {
+                    if (trailers.has(block, k)) continue;
+                    try problems.append(arena, if (std.mem.eql(u8, k, "State"))
+                        .missing_state
+                    else if (std.mem.eql(u8, k, "Format-Version"))
+                        .missing_format_version
+                    else
+                        .{ .missing_root_trailer = k });
+                }
             }
             return problems.items;
         }
@@ -451,6 +487,15 @@ pub fn Repo(comptime B: type) type {
             try self.checkText(spec.title, self.limits.max_title_bytes);
             if (spec.body.len > self.limits.max_body_bytes) return error.TooLong;
             const normalized = try self.normalizeLabels(arena, spec.labels);
+            var milestone_text = spec.milestone;
+            if (spec.milestone_id) |mid| {
+                const info = (try self.milestoneInfo(arena, mid)) orelse
+                    return error.ReferenceNotFound;
+                try checkSelectable(info.status);
+                milestone_text = info.name;
+            }
+            if (spec.milestone_mode == .explicit and spec.milestone_id == null)
+                return error.InvalidValue;
 
             var list: std.ArrayList(trailers.Trailer) = .empty;
             try list.append(arena, .{ .key = "State", .value = "open" });
@@ -463,7 +508,7 @@ pub fn Repo(comptime B: type) type {
                 .{ .key = "Assignee", .value = v },
             );
             if (spec.priority) |v| try list.append(arena, .{ .key = "Priority", .value = v.text() });
-            if (spec.milestone) |v| if (v.len > 0) try list.append(
+            if (milestone_text) |v| if (v.len > 0) try list.append(
                 arena,
                 .{ .key = "Milestone", .value = v },
             );
@@ -494,6 +539,12 @@ pub fn Repo(comptime B: type) type {
                 if (!fields_fmt.isSlug(v)) return error.InvalidValue;
                 try list.append(arena, .{ .key = "X-Workflow-State", .value = v });
             }
+            if (spec.milestone_id) |mid| {
+                try list.append(arena, .{ .key = "X-Milestone-Id", .value = mid });
+                try list.append(arena, .{ .key = "X-Milestone-Mode", .value = "explicit" });
+            } else if (spec.milestone_mode) |m| {
+                try list.append(arena, .{ .key = "X-Milestone-Mode", .value = @tagName(m) });
+            }
             try list.append(arena, .{ .key = "Format-Version", .value = "1" });
             for (list.items) |t| try self.checkText(t.value, self.limits.max_trailer_value_bytes);
 
@@ -513,6 +564,9 @@ pub fn Repo(comptime B: type) type {
                     .closed = false,
                     .state_changed = false,
                     .was_closed = false,
+                    .milestone_id = spec.milestone_id,
+                    .milestone_mode = spec.milestone_mode,
+                    .milestone_changed = true,
                 });
                 var random: [16]u8 = undefined;
                 self.backend.randomBytes(&random);
@@ -605,6 +659,9 @@ pub fn Repo(comptime B: type) type {
                     .closed = b.closed,
                     .state_changed = b.closed != was_closed,
                     .was_closed = was_closed,
+                    .milestone_id = current.ext.milestone_id,
+                    .milestone_mode = current.ext.milestone_mode,
+                    .milestone_changed = false,
                 });
             }
         };
@@ -661,6 +718,9 @@ pub fn Repo(comptime B: type) type {
                     .closed = b.repo.isDone(current),
                     .state_changed = false,
                     .was_closed = b.repo.isDone(current),
+                    .milestone_id = current.ext.milestone_id,
+                    .milestone_mode = current.ext.milestone_mode,
+                    .milestone_changed = false,
                     .restored = true,
                 });
                 if (!b.deleted or current.deleted) return .{};
@@ -780,7 +840,14 @@ pub fn Repo(comptime B: type) type {
                 try changes.append(arena, .labels);
             if (spec.assignee != null) try changes.append(arena, .assignee);
             if (spec.priority != null) try changes.append(arena, .priority);
-            if (spec.milestone != null) try changes.append(arena, .milestone);
+            const milestone_changes = spec.milestone != null or spec.milestone_id != null or
+                spec.milestone_mode != null;
+            if (milestone_changes) try changes.append(arena, .milestone);
+            if (spec.milestone_id) |mid| {
+                const info = (try self.milestoneInfo(arena, mid)) orelse
+                    return error.ReferenceNotFound;
+                try checkSelectable(info.status);
+            }
             if (spec.assignee) |v| if (v.len > 0) try checkAssignee(v);
             if (spec.parent) |v| {
                 if (v.len > 0) try checkReference(v);
@@ -829,7 +896,10 @@ pub fn Repo(comptime B: type) type {
             expect: ?Oid,
             builder: anytype,
         ) Error!Oid {
-            const prefix = issue_ref_prefix;
+            const prefix = if (std.mem.startsWith(u8, ref_name, milestone_ref_prefix))
+                milestone_ref_prefix
+            else
+                issue_ref_prefix;
             if (!std.mem.startsWith(u8, ref_name, prefix) or ref_name.len == prefix.len or
                 !contract.isValidRefName(ref_name)) return error.InvalidIssueRef;
             var attempt: u8 = 0;
@@ -865,6 +935,51 @@ pub fn Repo(comptime B: type) type {
                 return oid;
             }
             return error.ConcurrentModification;
+        }
+
+        pub const MilestoneInfo = struct {
+            name: []const u8,
+            status: fields_fmt.MilestoneStatus,
+            tip: Oid,
+        };
+
+        pub fn milestoneInfo(self: Self, arena: Allocator, id: []const u8) Error!?MilestoneInfo {
+            if (!uuid_fmt.isCanonical(id)) return null;
+            const name = try std.fmt.allocPrint(arena, "{s}{s}", .{ milestone_ref_prefix, id });
+            const tip = (try self.backend.resolveRef(name)) orelse return null;
+            const m = try self.load(arena, .{ .name = name, .tip = tip });
+            return .{
+                .name = m.field("Name") orelse m.title,
+                .status = fields_fmt.MilestoneStatus.parse(m.field("X-Milestone-Status")),
+                .tip = tip,
+            };
+        }
+
+        /// For the milestone catalog, which brings its own builder.
+        pub fn appendWith(
+            self: Self,
+            arena: Allocator,
+            ref_name: []const u8,
+            author: ?Signature,
+            expect: ?Oid,
+            builder: anytype,
+        ) Error!Oid {
+            try self.checkLimits();
+            return self.appendCommit(arena, ref_name, author, expect, builder);
+        }
+
+        /// No guards. Used by the milestone catalog.
+        pub fn appendRaw(
+            self: Self,
+            arena: Allocator,
+            ref_name: []const u8,
+            author: ?Signature,
+            expect: ?Oid,
+            message: []const u8,
+        ) Error!Oid {
+            try self.checkLimits();
+            const fixed: FixedMessage = .{ .text = message };
+            return self.appendCommit(arena, ref_name, author, expect, fixed);
         }
 
         const FixedMessage = struct {
@@ -920,7 +1035,17 @@ pub fn Repo(comptime B: type) type {
                         .clear => "",
                     },
                 });
-                if (spec.milestone) |v| try list.append(arena, .{ .key = "Milestone", .value = v });
+                // The catalog name for an ID, the given text, or empty when
+                // the mode drops the milestone.
+                const mode = spec.milestone_mode;
+                const drops = spec.milestone_id == null and (mode == .inherit or mode == .none);
+                if (spec.milestone_id) |mid| {
+                    const info = (try b.repo.milestoneInfo(arena, mid)) orelse
+                        return error.ReferenceNotFound;
+                    try list.append(arena, .{ .key = "Milestone", .value = info.name });
+                } else if (spec.milestone) |v| {
+                    try list.append(arena, .{ .key = "Milestone", .value = v });
+                } else if (drops) try list.append(arena, .{ .key = "Milestone", .value = "" });
                 if (spec.parent) |v| try list.append(arena, .{ .key = "X-Parent", .value = v });
                 if (spec.set_blocked_by != null or spec.add_blocked_by.len > 0 or
                     spec.remove_blocked_by.len > 0)
@@ -949,6 +1074,16 @@ pub fn Repo(comptime B: type) type {
                     arena,
                     .{ .key = "X-Workflow-State", .value = v },
                 );
+                if (spec.milestone_id) |mid| {
+                    try list.append(arena, .{ .key = "X-Milestone-Id", .value = mid });
+                    try list.append(arena, .{ .key = "X-Milestone-Mode", .value = "explicit" });
+                } else if (mode) |m| {
+                    if (m == .explicit and current.ext.milestone_id == null)
+                        return error.InvalidValue;
+                    if (m != .explicit)
+                        try list.append(arena, .{ .key = "X-Milestone-Id", .value = "" });
+                    try list.append(arena, .{ .key = "X-Milestone-Mode", .value = @tagName(m) });
+                }
                 if (spec.description) |d| {
                     try list.append(arena, .{
                         .key = "X-Event",
@@ -988,6 +1123,16 @@ pub fn Repo(comptime B: type) type {
                         try added.append(arena, r);
                     }
                 }
+                const mode_after: ?fields_fmt.MilestoneMode = if (spec.milestone_id != null)
+                    .explicit
+                else
+                    spec.milestone_mode orelse current.ext.milestone_mode;
+                const id_after: ?[]const u8 = if (spec.milestone_id) |mid|
+                    mid
+                else if (spec.milestone_mode) |m|
+                    (if (m == .explicit) current.ext.milestone_id else null)
+                else
+                    current.ext.milestone_id;
                 return b.repo.runGuards(arena, .{
                     .id = current.id,
                     .parent = parent,
@@ -996,6 +1141,9 @@ pub fn Repo(comptime B: type) type {
                     .closed = b.repo.isDone(current),
                     .state_changed = false,
                     .was_closed = b.repo.isDone(current),
+                    .milestone_id = id_after,
+                    .milestone_mode = mode_after,
+                    .milestone_changed = spec.milestone_id != null or spec.milestone_mode != null,
                 });
             }
         };
@@ -1010,6 +1158,9 @@ pub fn Repo(comptime B: type) type {
             closed: bool,
             state_changed: bool,
             was_closed: bool,
+            milestone_id: ?[]const u8,
+            milestone_mode: ?fields_fmt.MilestoneMode,
+            milestone_changed: bool,
             /// A deleted issue comes back.
             restored: bool = false,
         };
@@ -1062,6 +1213,42 @@ pub fn Repo(comptime B: type) type {
                 if (g.self_id) |s| if (std.mem.eql(u8, s, id)) return;
                 for (g.verify.items) |v| if (std.mem.eql(u8, v.name, name)) return;
                 try g.verify.append(g.arena, .{ .name = name, .op = .{ .verify = tip } });
+            }
+
+            /// Its own setting, or the first explicit/none up the parent
+            /// chain. Deleted ancestors pass through, cycles and missing
+            /// parents end the walk.
+            fn effectiveMilestone(g: *Guard, p: Proposal) Error!?[]const u8 {
+                const default: fields_fmt.MilestoneMode = if (p.milestone_id != null)
+                    .explicit
+                else if (p.parent != null) .inherit else .none;
+                switch (p.milestone_mode orelse default) {
+                    .explicit => return p.milestone_id,
+                    .none => return null,
+                    .inherit => {},
+                }
+                var seen: std.StringHashMapUnmanaged(void) = .empty;
+                var next = p.parent;
+                var depth: u32 = 0;
+                while (next) |up| : (depth += 1) {
+                    if (depth > g.repo.limits.max_depth) return null;
+                    if (p.id) |id| if (std.mem.eql(u8, id, up)) return null;
+                    if ((try seen.getOrPut(g.arena, up)).found_existing) return null;
+                    const anc = (try g.get(up)) orelse return null;
+                    if (anc.deleted) {
+                        next = anc.ext.parent;
+                        continue;
+                    }
+                    const anc_default: fields_fmt.MilestoneMode = if (anc.ext.milestone_id != null)
+                        .explicit
+                    else if (anc.ext.parent != null) .inherit else .none;
+                    switch (anc.ext.milestone_mode orelse anc_default) {
+                        .explicit => return anc.ext.milestone_id,
+                        .none => return null,
+                        .inherit => next = anc.ext.parent,
+                    }
+                }
+                return null;
             }
 
             fn childrenOf(g: *Guard, id: []const u8) Error![]const Issue {
@@ -1171,6 +1358,27 @@ pub fn Repo(comptime B: type) type {
                 }
             };
 
+            // Checked against a pinned tip.
+            if (p.milestone_changed) if (p.milestone_id) |mid| {
+                if (p.milestone_mode == null or p.milestone_mode.? == .explicit) {
+                    const info = (try self.milestoneInfo(arena, mid)) orelse
+                        return error.ReferenceNotFound;
+                    try checkSelectable(info.status);
+                    const ref = try milestoneRefName(arena, mid);
+                    try g.pin(ref, mid, info.tip);
+                }
+            };
+            // No open work in a completed milestone.
+            const placing = placing_open or (!p.closed and p.milestone_changed);
+            if (placing) if (try g.effectiveMilestone(p)) |mid| {
+                if (try self.milestoneInfo(arena, mid)) |info| {
+                    const ref = try milestoneRefName(arena, mid);
+                    try g.pin(ref, mid, info.tip);
+                    if (info.status == .completed) return error.MilestoneCompleted;
+                    try g.bumpGuard(mid);
+                }
+            };
+
             for (p.blockers_added) |b| {
                 if (p.id) |id| if (eql(u8, id, b)) return error.BlocksItself;
                 const target = (try g.get(b)) orelse return error.ReferenceNotFound;
@@ -1265,6 +1473,18 @@ pub fn Repo(comptime B: type) type {
 
 fn refNameOf(arena: Allocator, id: []const u8) Allocator.Error![]const u8 {
     return std.fmt.allocPrint(arena, "{s}{s}", .{ issue_ref_prefix, id });
+}
+
+fn milestoneRefName(arena: Allocator, id: []const u8) Allocator.Error![]const u8 {
+    return std.fmt.allocPrint(arena, "{s}{s}", .{ milestone_ref_prefix, id });
+}
+
+fn checkSelectable(status: fields_fmt.MilestoneStatus) error{ MilestoneCompleted, MilestoneRetired }!void {
+    switch (status) {
+        .open => {},
+        .completed => return error.MilestoneCompleted,
+        .retired => return error.MilestoneRetired,
+    }
 }
 
 fn checkReference(r: []const u8) error{InvalidValue}!void {

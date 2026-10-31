@@ -22,6 +22,7 @@ const cmd_status = @import("cmd/status.zig");
 const cmd_tree = @import("cmd/tree.zig");
 const cmd_delete = @import("cmd/delete.zig");
 const cmd_close = @import("cmd/close.zig");
+const cmd_milestone = @import("cmd/milestone.zig");
 const cmd_quarantine = @import("cmd/quarantine.zig");
 
 pub const program = "git-issue";
@@ -55,6 +56,7 @@ pub const Command = enum {
     restore,
     close,
     reopen,
+    milestone,
 };
 
 pub const Invocation = struct {
@@ -108,6 +110,7 @@ pub fn run(
         .restore => cmd_delete.main(B, ctx, inv.args, false),
         .close => cmd_close.main(B, ctx, inv.args, true),
         .reopen => cmd_close.main(B, ctx, inv.args, false),
+        .milestone => cmd_milestone.main(B, ctx, inv.args),
         .quarantine => cmd_quarantine.main(B, ctx, inv.args),
         .sync => if (hasHelp(inv.args))
             cmd_merge.main(B, ctx, inv.args, .sync)

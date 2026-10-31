@@ -38,18 +38,20 @@ pub const Report = struct {
 /// What git-native-issuez may write. Nothing else may change.
 pub const owned_prefixes = [_][]const u8{
     "refs/issues/",
+    "refs/milestones/",
     "refs/issuez-sync/",
     "refs/issuez-guard/",
 };
 
 pub fn isOwnedRef(name: []const u8) bool {
     for (owned_prefixes) |p| if (std.mem.startsWith(u8, name, p)) return true;
-    // Fetch staging: refs/remotes/<remote>/issues/
+    // Fetch staging: refs/remotes/<remote>/{issues,milestones}/
     if (std.mem.startsWith(u8, name, "refs/remotes/")) {
         const rest = name["refs/remotes/".len..];
         const slash = std.mem.findScalar(u8, rest, '/') orelse return false;
         const ns = rest[slash + 1 ..];
-        if (std.mem.startsWith(u8, ns, "issues/")) return true;
+        for ([_][]const u8{ "issues/", "milestones/" }) |p|
+            if (std.mem.startsWith(u8, ns, p)) return true;
     }
     return false;
 }
@@ -111,7 +113,11 @@ fn checkClone(
             );
             continue;
         };
-        if (std.mem.startsWith(u8, r.name, "refs/issues/")) {
+        if (std.mem.startsWith(u8, r.name, "refs/issues/") or std.mem.startsWith(
+            u8,
+            r.name,
+            "refs/milestones/",
+        )) {
             try checkEmptyTreeHistory(arena, format, a.name, r.name, o, after_objects, report);
         }
     }
@@ -155,7 +161,7 @@ fn checkClone(
         try report.fail("clone '{s}': foreign ref {s} was created", .{ a.name, r.name });
 }
 
-/// Format 1 issues only use the empty tree.
+/// Format 1 issues and milestones only use the empty tree.
 fn checkEmptyTreeHistory(
     arena: Allocator,
     format: object.ObjectFormat,
@@ -272,6 +278,7 @@ pub fn checkTransition(
             return checkDeleted(arena, after, cb, ca, cmd == .delete, x, report);
         },
         .comment_event => |x| return checkCommentEvent(arena, after, cb, ca, x, report),
+        .milestone => |x| return checkMilestone(arena, after, cb, ca, x, report),
     }
 }
 
@@ -485,6 +492,8 @@ fn checkNewMerges(
             .{ .key = "X-Due-Date", .value = n.due },
             .{ .key = "X-Estimate-Minutes", .value = n.estimate },
             .{ .key = "X-Workflow-State", .value = n.workflow },
+            .{ .key = "X-Milestone-Id", .value = n.milestone_id },
+            .{ .key = "X-Milestone-Mode", .value = n.milestone_mode },
             .{ .key = "X-Deleted", .value = n.deleted },
         }) |t| if (t.value.len > 0 or was(n, t.key)) try want.append(arena, t);
         const block = try commands.trailersOf(arena, cm.message);
@@ -521,6 +530,8 @@ fn sameNaive(a: commands.NaiveIssue, b: commands.NaiveIssue) bool {
         .{ a.due, b.due },
         .{ a.estimate, b.estimate },
         .{ a.workflow, b.workflow },
+        .{ a.milestone_id, b.milestone_id },
+        .{ a.milestone_mode, b.milestone_mode },
         .{ a.deleted, b.deleted },
     };
     for (scalars) |s| if (!eql(u8, s[0], s[1])) return false;
@@ -760,12 +771,16 @@ fn checkInit(
     for (a.clone.config) |e| if (isFetchKey(e.key) and !containsEntry(b.clone.config, e)) {
         // And only the staging refspecs may be added.
         const remote = e.key["remote.".len .. e.key.len - ".fetch".len];
-        const expected = try std.fmt.allocPrint(
-            arena,
-            "+refs/issues/*:refs/remotes/{s}/issues/*",
-            .{remote},
-        );
-        if (!std.mem.eql(u8, e.value, expected)) try report.fail(
+        var ok = false;
+        for ([_][]const u8{ "issues", "milestones" }) |ns| {
+            const expected = try std.fmt.allocPrint(
+                arena,
+                "+refs/{s}/*:refs/remotes/{s}/{s}/*",
+                .{ ns, remote, ns },
+            );
+            if (std.mem.eql(u8, e.value, expected)) ok = true;
+        }
+        if (!ok) try report.fail(
             "init added unexpected refspec '{s}'",
             .{e.value},
         );
@@ -792,7 +807,7 @@ fn checkCreate(
     a: commands.Clone,
     x: command.Create,
     report: *Report,
-) Allocator.Error!void {
+) (Allocator.Error || error{NoRule})!void {
     if (!configEqual(b.clone, a.clone)) try report.fail("create changed config", .{});
     const changes = try refChanges(arena, b, a);
     if (changes.len != 1 or changes[0].old != null or changes[0].new == null) {
@@ -813,8 +828,15 @@ fn checkCreate(
     if (c.parents.len != 0) try report.fail("create: root commit has parents", .{});
     if (!c.tree.eql(object.emptyTree(world.format))) try report.fail("create: non-empty tree", .{});
     try checkIdentity(world, c, report);
-    const resolved = (try commands.resolveExt(arena, b, x.ext)) orelse return report.fail(
-        "create succeeded with a reference, date, estimate or workflow state the oracle rejects",
+    const resolved = (try commands.resolveExt(
+        arena,
+        b,
+        x.ext,
+        x.milestone,
+        null,
+    )) orelse return report.fail(
+        "create succeeded with a reference, date, estimate, workflow state or milestone " ++
+            "the oracle rejects",
         .{},
     );
     const expected = try commands.expectedCreateMessage(arena, x, resolved);
@@ -906,8 +928,15 @@ fn checkEdit(
 ) (Allocator.Error || error{NoRule})!void {
     const c = (try appendCommit(arena, world, b, a, "edit", x.id, report)) orelse return;
     const previous = try b.naive(c.parents[0].hex().slice());
-    const resolved = (try commands.resolveExt(arena, b, x.ext)) orelse return report.fail(
-        "edit succeeded with a reference, date, estimate or workflow state the oracle rejects",
+    const resolved = (try commands.resolveExt(
+        arena,
+        b,
+        x.ext,
+        x.milestone,
+        previous,
+    )) orelse return report.fail(
+        "edit succeeded with a reference, date, estimate, workflow state or milestone " ++
+            "the oracle rejects",
         .{},
     );
     try expectBlock(
@@ -938,6 +967,66 @@ fn expectSubject(
 fn afterSubject(message: []const u8) []const u8 {
     const at = std.mem.find(u8, message, "\n\n") orelse return "";
     return message[at + 2 ..];
+}
+
+/// Reads change nothing. Writes only touch refs/milestones/*, with the
+/// exact root message on create and the status trailer otherwise.
+fn checkMilestone(
+    arena: Allocator,
+    world: World,
+    b: commands.Clone,
+    a: commands.Clone,
+    x: command.Milestone,
+    report: *Report,
+) Allocator.Error!void {
+    const sub = @tagName(x.sub);
+    const changes = try refChanges(arena, b, a);
+    for (changes) |ch| if (!std.mem.startsWith(u8, ch.name, "refs/milestones/"))
+        try report.fail("milestone {s} changed {s}", .{ sub, ch.name });
+    if (changes.len != 1) {
+        // A no-op ("already completed") writes nothing, anything else one ref.
+        if (changes.len > 1)
+            try report.fail("milestone {s} changed {d} refs", .{ sub, changes.len });
+        return;
+    }
+    const ch = changes[0];
+    const new = ch.new orelse return report.fail("milestone {s} deleted a ref", .{sub});
+    const c = a.commit(new) orelse return report.fail("milestone: ref points at a non-commit", .{});
+    try checkIdentity(world, c, report);
+    if (!c.tree.eql(object.emptyTree(world.format)))
+        try report.fail("milestone: non-empty tree", .{});
+    if (x.sub == .create) {
+        if (ch.old != null) return report.fail("milestone create moved an existing ref", .{});
+        if (!isV4Uuid(ch.name["refs/milestones/".len..]))
+            try report.fail("milestone: bad UUID", .{});
+        // Body and trailers of the root message. The subject is the CLI's.
+        var w: std.Io.Writer.Allocating = .init(arena);
+        const ww = &w.writer;
+        const d = std.mem.trimEnd(u8, x.message orelse "", " \t\r\n");
+        if (d.len > 0) ww.print("{s}\n\n", .{d}) catch return error.OutOfMemory;
+        ww.print("Name: {s}\n", .{x.name}) catch return error.OutOfMemory;
+        if (x.due) |v| ww.print("X-Due-Date: {s}\n", .{v}) catch return error.OutOfMemory;
+        ww.writeAll("X-Milestone-Status: open\nFormat-Version: 1\n") catch return error.OutOfMemory;
+        if (!std.mem.eql(u8, w.written(), afterSubject(c.message)))
+            try report.fail(
+                "milestone create wrote\n{s}\nexpected after the subject\n{s}",
+                .{ c.message, w.written() },
+            );
+        return;
+    }
+    const status: ?[]const u8 = switch (x.sub) {
+        .complete => "completed",
+        .retire => "retired",
+        .reopen => "open",
+        .create, .edit => null,
+    };
+    if (status) |s| {
+        const block = try commands.trailersOf(arena, c.message);
+        const want = [_]commands.Trailer{.{ .key = "X-Milestone-Status", .value = s }};
+        try expectBlock(report, "milestone", block, &want);
+        if (c.parents.len != 1 or !std.mem.eql(u8, c.parents[0].hex().slice(), ch.old.?))
+            try report.fail("milestone {s}: not one commit on the old tip", .{sub});
+    }
 }
 
 /// The one issue `id` names, as its ref. Null after reporting otherwise.
@@ -1108,7 +1197,7 @@ fn checkDescription(
     var want: std.ArrayList(commands.Trailer) = .empty;
     if (x.changesFields()) {
         const previous = try b.naive(desc.parents[0].hex().slice());
-        const resolved = (try commands.resolveExt(arena, b, x.ext)) orelse
+        const resolved = (try commands.resolveExt(arena, b, x.ext, x.milestone, previous)) orelse
             return report.fail("edit succeeded with values the oracle rejects", .{});
         try want.appendSlice(arena, try commands.expectedEditTrailers(arena, x, resolved, previous));
     }

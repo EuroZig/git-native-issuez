@@ -1,5 +1,5 @@
 //! Everything that needs all issues at once: the hierarchy, blocking,
-//! progress, workflow states and the problems.
+//! progress, workflow states, effective milestones and the problems.
 //!
 //! Merges and other tools can produce any graph, so this works on every
 //! input and never loops. A parent that is missing, the issue itself or
@@ -23,8 +23,15 @@ pub const Options = struct {
     max_progress_leaves: u32 = 2_000,
     /// In order. The first is the state of an open issue without one.
     workflow: []const []const u8 = &fields_fmt.default_workflow,
+    /// For effective milestones.
+    milestones: []const MilestoneInfo = &.{},
     /// Besides `closed`. See `core.State.isDone`.
     done_states: []const []const u8 = &core_fmt.default_done_states,
+};
+
+pub const MilestoneInfo = struct {
+    id: []const u8,
+    status: enum { open, completed, retired },
 };
 
 pub const Problem = struct {
@@ -57,6 +64,11 @@ pub const Problem = struct {
         pending_event,
         /// The target is a comment of another issue.
         event_in_other_issue,
+        /// `X-Milestone-Id` names no milestone we know.
+        milestone_missing,
+        milestone_retired,
+        /// Open work in a completed milestone.
+        open_in_completed_milestone,
 
         pub fn describe(k: Kind) []const u8 {
             return switch (k) {
@@ -75,6 +87,9 @@ pub const Problem = struct {
                 .invalid_event => "event commit can't apply",
                 .pending_event => "event waits for a comment not here yet",
                 .event_in_other_issue => "event targets a comment of another issue",
+                .milestone_missing => "milestone not found",
+                .milestone_retired => "milestone is retired",
+                .open_in_completed_milestone => "open in a completed milestone",
             };
         }
     };
@@ -97,6 +112,8 @@ pub const Projection = struct {
     roots: []const u32,
     options: Options,
     index: std.StringHashMapUnmanaged(u32),
+    /// Null for none or unresolved.
+    milestone: []const ?[]const u8,
     /// Done and total leaves below each issue, uncapped.
     leaves: []const Progress,
     /// `problems` per issue, in the same order.
@@ -145,6 +162,24 @@ pub const Projection = struct {
         if (p.issues[i].ext.workflow) |w| return w;
         if (p.isDone(i) or p.options.workflow.len == 0) return null;
         return p.options.workflow[0];
+    }
+
+    /// Non-deleted leaves in milestone `id`: what progress and completion
+    /// count.
+    pub fn milestoneLeaves(
+        p: Projection,
+        arena: Allocator,
+        id: []const u8,
+    ) Allocator.Error![]const u32 {
+        var out: std.ArrayList(u32) = .empty;
+        for (p.issues, 0..) |issue, i| {
+            if (issue.deleted) continue;
+            const m = p.milestone[i] orelse continue;
+            if (!std.mem.eql(u8, m, id)) continue;
+            // Like progress: nothing counted below it.
+            if (p.leaves[i].total == 0) try out.append(arena, @intCast(i));
+        }
+        return out.items;
     }
 
     pub fn problemsOf(p: Projection, i: u32) []const Problem {
@@ -365,6 +400,55 @@ pub fn build(arena: Allocator, issues: []const Issue, options: Options) Allocato
     }
     try blockerCycles(arena, issues, blockers, &problems);
 
+    // Parents first. `pass` is what an inheriting child gets: a deleted
+    // node passes its parent's through.
+    const eff = try arena.alloc(?[]const u8, n);
+    const pass = try arena.alloc(?[]const u8, n);
+    const status_of = struct {
+        fn f(o: Options, id: []const u8) ?MilestoneInfo {
+            for (o.milestones) |m| if (std.mem.eql(u8, m.id, id)) return m;
+            return null;
+        }
+    }.f;
+    for (post.items) |i| {
+        const issue = issues[i];
+        const up: ?[]const u8 = if (parent[i] == none) null else pass[parent[i]];
+        const default_mode: fields_fmt.MilestoneMode = if (issue.ext.milestone_id != null)
+            .explicit
+        else if (parent[i] != none) .inherit else .none;
+        const mode = issue.ext.milestone_mode orelse default_mode;
+        eff[i] = switch (mode) {
+            .none => null,
+            .inherit => if (depth[i] > options.max_depth) null else up,
+            .explicit => blk: {
+                const id = issue.ext.milestone_id orelse break :blk null;
+                const info = status_of(options, id) orelse {
+                    if (!issue.deleted) try problems.append(
+                        arena,
+                        .{ .id = issue.id, .kind = .milestone_missing, .other = id },
+                    );
+                    break :blk null;
+                };
+                if (info.status == .retired) {
+                    if (!issue.deleted) try problems.append(
+                        arena,
+                        .{ .id = issue.id, .kind = .milestone_retired, .other = id },
+                    );
+                    break :blk null;
+                }
+                break :blk id;
+            },
+        };
+        pass[i] = if (issue.deleted) up else eff[i];
+        if (active(options, issue)) if (eff[i]) |m| if (status_of(options, m)) |info| {
+            if (info.status == .completed) try problems.append(arena, .{
+                .id = issue.id,
+                .kind = .open_in_completed_milestone,
+                .other = m,
+            });
+        };
+    }
+
     var per_issue = try arena.alloc(std.ArrayList(Problem), n);
     for (per_issue) |*l| l.* = .empty;
     for (problems.items) |pr| try per_issue[index.get(pr.id).?].append(arena, pr);
@@ -374,6 +458,7 @@ pub fn build(arena: Allocator, issues: []const Issue, options: Options) Allocato
     return .{
         .issues = issues,
         .problems_of = problems_of,
+        .milestone = eff,
         .parent = parent,
         .children = children,
         .blockers = blockers,
@@ -659,4 +744,42 @@ test "deleted issues" {
     try testing.expect(std.mem.findScalar(Problem.Kind, kinds.items, .parent_deleted) != null);
     const has = std.mem.findScalar(Problem.Kind, kinds.items, .open_under_closed_ancestor);
     try testing.expect(has != null);
+}
+
+test "effective milestones" {
+    var arena_state: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var issues = [_]Issue{
+        fakeIssue("root", 1, "open", .{ .milestone_id = "m1" }),
+        fakeIssue("kid", 2, "open", .{ .parent = "root" }), // inherits m1
+        fakeIssue("gone", 3, "open", .{ .parent = "root", .milestone_id = "m2" }),
+        fakeIssue("grandkid", 4, "closed", .{ .parent = "gone" }), // m1 through gone
+        fakeIssue("out", 5, "open", .{ .parent = "root", .milestone_mode = .none }),
+        fakeIssue("lost", 6, "open", .{ .milestone_id = "m9" }),
+        fakeIssue("late", 7, "open", .{ .milestone_id = "m2" }),
+    };
+    issues[2].deleted = true;
+    const p = try build(arena, &issues, .{ .milestones = &.{
+        .{ .id = "m1", .status = .open },
+        .{ .id = "m2", .status = .completed },
+    } });
+    const eff = struct {
+        fn f(q: Projection, id: []const u8) ?[]const u8 {
+            return q.milestone[q.find(id).?];
+        }
+    }.f;
+    try testing.expectEqualStrings("m1", eff(p, "kid").?);
+    try testing.expectEqualStrings("m1", eff(p, "grandkid").?);
+    try testing.expect(eff(p, "out") == null);
+    try testing.expect(eff(p, "lost") == null);
+    // m1's leaves: kid and grandkid. root has live children, gone is deleted.
+    try testing.expectEqual(@as(usize, 2), (try p.milestoneLeaves(arena, "m1")).len);
+    var kinds: std.ArrayList(Problem.Kind) = .empty;
+    for (p.problems) |pr| try kinds.append(arena, pr.kind);
+    try testing.expectEqualSlices(
+        Problem.Kind,
+        &.{ .open_in_completed_milestone, .milestone_missing }, // late, lost (post-order)
+        kinds.items,
+    );
 }

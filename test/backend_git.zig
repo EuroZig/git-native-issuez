@@ -239,7 +239,7 @@ test "ref transactions" {
     try testing.expectEqual(@as(usize, 2), refs.len);
     try testing.expectEqualStrings(a, refs[0].name);
     try testing.expectEqualStrings(b, refs[1].name);
-    try testing.expectEqual(@as(usize, 0), (try git.listRefs(arena, "refs/notes/")).len);
+    try testing.expectEqual(@as(usize, 0), (try git.listRefs(arena, "refs/milestones/")).len);
 
     try git.updateRefs(&.{.{ .name = a, .op = .{ .delete = c1 } }});
     try testing.expect(try git.resolveRef(a) == null);

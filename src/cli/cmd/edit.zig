@@ -142,7 +142,6 @@ pub fn main(comptime B: type, ctx: *context.Context(B), argv: []const []const u8
     const clears = ext.no;
     if (clears.contains(.assignee)) spec.assignee = "";
     if (clears.contains(.priority)) spec.priority = .clear;
-    if (clears.contains(.milestone)) spec.milestone = "";
     if (clears.contains(.labels)) spec.set_labels = &.{};
     if (description.items.len > 0) {
         spec.description = std.mem.join(arena, "\n\n", description.items) catch
@@ -163,6 +162,12 @@ pub fn main(comptime B: type, ctx: *context.Context(B), argv: []const []const u8
         prefix,
     ) orelse return common.exit_error;
     const x = ext.resolve(B, ctx, repo) orelse return common.exit_error;
+    const current = repo.load(arena, ref) catch |e| return common.repoFailed(B, ctx, e);
+    const ms = ext_flags.resolveMilestone(B, ctx, repo, ext, spec.milestone, current) orelse
+        return common.exit_error;
+    spec.milestone = ms.text;
+    spec.milestone_id = ms.id;
+    spec.milestone_mode = ms.mode;
     if (x.parent) |p| spec.parent = p;
     if (clears.contains(.parent)) spec.parent = "";
     spec.add_blocked_by = x.blocked_by;

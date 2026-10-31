@@ -23,6 +23,7 @@ pub const Command = union(enum) {
     delete: Lifecycle,
     restore: Lifecycle,
     comment_event: CommentEvent,
+    milestone: Milestone,
 
     /// The CLI's name for it, for messages and statistics.
     pub fn verb(c: Command) []const u8 {
@@ -33,7 +34,7 @@ pub const Command = union(enum) {
         };
     }
 
-    /// Writes to issues or attachments when it succeeds.
+    /// Writes to issues, milestones or attachments when it succeeds.
     pub fn writes(c: Command) bool {
         return switch (c) {
             .read, .init, .merge, .push, .sync, .quarantine => false,
@@ -57,6 +58,7 @@ pub const Command = union(enum) {
             .quarantine => |x| try x.render(&out),
             .close, .reopen, .delete, .restore => |x| try x.render(&out, @tagName(c)),
             .comment_event => |x| try x.render(&out),
+            .milestone => |x| try x.render(&out),
         }
         return out.list.items;
     }
@@ -122,6 +124,8 @@ pub const Ext = struct {
     due: ?[]const u8 = null,
     estimate: ?[]const u8 = null,
     workflow: ?[]const u8 = null,
+    milestone_id: ?[]const u8 = null,
+    milestone_mode: ?[]const u8 = null,
     /// `--no-<field>`, edit only.
     clear: []const []const u8 = &.{},
 
@@ -133,7 +137,7 @@ pub const Ext = struct {
     pub fn isEmpty(e: Ext) bool {
         return e.parent == null and e.blocked_by.len == 0 and e.unblock.len == 0 and
             e.start == null and e.due == null and e.estimate == null and e.workflow == null and
-            e.clear.len == 0;
+            e.milestone_id == null and e.milestone_mode == null and e.clear.len == 0;
     }
 
     fn render(e: Ext, out: *Argv) Allocator.Error!void {
@@ -144,6 +148,8 @@ pub const Ext = struct {
         try out.opt("--due", e.due);
         try out.opt("--estimate", e.estimate);
         try out.opt("--workflow", e.workflow);
+        try out.opt("--milestone-id", e.milestone_id);
+        try out.opt("--milestone-mode", e.milestone_mode);
         for (e.clear) |f| try out.word(try std.fmt.allocPrint(out.arena, "--no-{s}", .{f}));
     }
 };
@@ -276,6 +282,25 @@ pub const CommentEvent = struct {
         };
         try out.words(&.{ "comment", x.id, flag, x.target });
         try out.opt("-m", x.text);
+    }
+};
+
+/// `milestone <sub> <name>`. `ls` and `show` are reads.
+pub const Milestone = struct {
+    sub: enum { create, edit, complete, reopen, retire },
+    name: []const u8,
+    /// create only.
+    due: ?[]const u8 = null,
+    /// create only.
+    message: ?[]const u8 = null,
+    /// edit only.
+    new_name: ?[]const u8 = null,
+
+    fn render(x: Milestone, out: *Argv) Allocator.Error!void {
+        try out.words(&.{ "milestone", @tagName(x.sub), x.name });
+        try out.opt("--due", x.due);
+        try out.opt("-m", x.message);
+        try out.opt("--name", x.new_name);
     }
 };
 

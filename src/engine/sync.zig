@@ -35,6 +35,8 @@ pub const restated_extensions = [_][]const u8{
     "X-Due-Date",
     "X-Estimate-Minutes",
     "X-Workflow-State",
+    "X-Milestone-Id",
+    "X-Milestone-Mode",
     "X-Deleted",
 };
 
@@ -71,10 +73,12 @@ pub const Outcome = union(enum) {
 
 pub const Namespace = enum {
     issues,
+    milestones,
 
     pub fn refPrefix(ns: Namespace) []const u8 {
         return switch (ns) {
             .issues => "refs/issues/",
+            .milestones => "refs/milestones/",
         };
     }
 };
@@ -95,7 +99,7 @@ pub const Record = enum {
     replaced,
 };
 
-pub const namespaces = [_]Namespace{.issues};
+pub const namespaces = [_]Namespace{ .issues, .milestones };
 
 pub const Entry = struct {
     namespace: Namespace = .issues,
@@ -261,7 +265,7 @@ pub fn Sync(comptime B: type) type {
                 .ok => |issue| issue,
                 .refused => |r| return q.quarantine(r.title, remote_tip, r.reason, options),
             };
-            const title = loaded.title;
+            const title = titleIn(ns, loaded);
 
             var attempt: u8 = 0;
             while (attempt < self.repo.limits.cas_retries) : (attempt += 1) {
@@ -290,8 +294,9 @@ pub fn Sync(comptime B: type) type {
                     },
                     .ahead => .local_ahead,
                     .diverged => |base| blk: {
-                        if (!options.check) new_tip = try self.mergeCommit(
+                        if (!options.check) new_tip = try self.mergeCommitIn(
                             arena,
+                            ns,
                             id,
                             local_tip.?,
                             remote_tip,
@@ -392,6 +397,40 @@ pub fn Sync(comptime B: type) type {
             const l = local orelse return true;
             if (l.eql(remote_tip)) return false;
             return !try self.b().isAncestor(remote_tip, l);
+        }
+
+        fn mergeCommitIn(
+            self: Self,
+            arena: Allocator,
+            ns: Namespace,
+            id: []const u8,
+            local: Oid,
+            remote: Oid,
+        ) Error!Oid {
+            if (ns == .issues) return self.mergeCommit(arena, id, local, remote);
+            // Only we read milestones, and every field follows from the
+            // parents, so nothing is restated.
+            var time: i64 = std.math.minInt(i64);
+            for ([_]Oid{ local, remote }) |p| {
+                const o = (try self.b().readObject(arena, p)) orelse return error.CorruptIssue;
+                const c = object.Commit.parse(arena, self.b().objectFormat(), o.data) catch
+                    return error.CorruptIssue;
+                time = @max(time, c.committer.time);
+            }
+            const parents = try arena.dupe(Oid, &.{ local, remote });
+            if (parents[1].order(parents[0]) == .lt) std.mem.swap(Oid, &parents[0], &parents[1]);
+            const sig: object.Signature = .{
+                .name = merge_identity_name,
+                .email = merge_identity_email,
+                .time = time,
+                .tz_offset_minutes = 0,
+            };
+            return self.repo.writeCommit(
+                arena,
+                parents,
+                .{ .author = sig, .committer = sig },
+                "Merge milestone\n",
+            );
         }
 
         fn mergeCommit(
@@ -562,11 +601,11 @@ pub fn Sync(comptime B: type) type {
             };
             const invalid: Vetted = .{ .refused = .{ .reason = .invalid_issue, .title = "?" } };
             const loaded = (try self.loadRemote(arena, as_issue)) orelse return invalid;
-            if ((try self.repo.check(arena, as_issue)).len > 0) return invalid;
+            if ((try self.repo.checkWith(arena, as_issue, rootKeys(ns))).len > 0) return invalid;
             const merged_ref = try recordRef(arena, remote, .merged, ns, id);
             if (try self.b().resolveRef(merged_ref)) |before| {
                 if (try self.isRewound(before, remote_tip, local)) {
-                    return .{ .refused = .{ .reason = .rewound, .title = loaded.title } };
+                    return .{ .refused = .{ .reason = .rewound, .title = titleIn(ns, loaded) } };
                 }
             }
             return .{ .ok = loaded };
@@ -890,6 +929,17 @@ fn findPending(list: anytype, name: []const u8) ?@TypeOf(list[0]) {
 
 fn stagingPrefix(arena: Allocator, remote: []const u8, ns: Namespace) Allocator.Error![]const u8 {
     return std.fmt.allocPrint(arena, "refs/remotes/{s}/{t}/", .{ remote, ns });
+}
+
+fn titleIn(ns: Namespace, loaded: issue_model.Issue) []const u8 {
+    return if (ns == .milestones) loaded.field("Name") orelse "?" else loaded.title;
+}
+
+fn rootKeys(ns: Namespace) []const []const u8 {
+    return switch (ns) {
+        .issues => &.{ "State", "Format-Version" },
+        .milestones => &.{ "Name", "Format-Version" },
+    };
 }
 
 /// `refs/issuez-sync/<remote>/<record>/<ns>/<id>`. An empty `id` gives
