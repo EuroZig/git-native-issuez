@@ -62,7 +62,7 @@ pub fn main(init: std.process.Init) !u8 {
         for (issues) |issue| {
             try out.print("{s} [{s}] {s}", .{
                 issuez.format.uuid.shortId(issue.id),
-                issue.state,
+                issue.state.text(),
                 issue.title,
             });
             if (issue.labels.len > 0) {

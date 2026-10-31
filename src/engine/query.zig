@@ -4,28 +4,46 @@ const std = @import("std");
 const Allocator = std.mem.Allocator;
 const issue_model = @import("../model/issue.zig");
 const labels_fmt = @import("../format/labels.zig");
+const fields_fmt = @import("../format/fields.zig");
 
 const Issue = issue_model.Issue;
+const core_fmt = @import("../format/core.zig");
+const State = core_fmt.State;
+const Priority = core_fmt.Priority;
 
 /// All set criteria must match, exactly, like upstream compares.
 pub const Filter = struct {
-    /// Null for any state.
-    state: ?[]const u8 = "open",
+    /// Null for any state. Compared as text, so `wontfix` finds `wontfix`.
+    state: ?State = null,
+    /// false: only work that isn't done, the default like `ls`. true: only
+    /// done issues. Null for both.
+    done: ?bool = false,
+    /// Besides `closed`. See `core.State.isDone`.
+    done_states: []const []const u8 = &core_fmt.default_done_states,
     label: ?[]const u8 = null,
-    /// "" matches unassigned issues.
+    /// "" matches unassigned issues. Also matches the email of a
+    /// `<uuid> <email>` value.
     assignee: ?[]const u8 = null,
-    priority: ?[]const u8 = null,
+    priority: ?Priority = null,
+    /// false hides deleted issues, true shows only those, null both.
+    deleted: ?bool = false,
 
     pub fn matches(f: Filter, issue: Issue) bool {
-        if (f.state) |s| if (!std.mem.eql(u8, issue.state, s)) return false;
+        if (f.deleted) |d| if (issue.deleted != d) return false;
+        if (f.state) |s| if (!issue.state.eql(s)) return false;
+        if (f.done) |d| if (issue.state.isDone(f.done_states) != d) return false;
         if (f.label) |l| if (!labels_fmt.contains(issue.labels, l)) return false;
-        if (f.assignee) |a| if (!std.mem.eql(u8, issue.field("Assignee") orelse "", a)) {
+        if (f.assignee) |a| if (!assigneeMatches(issue.field("Assignee") orelse "", a)) {
             return false;
         };
-        if (f.priority) |p| if (!std.mem.eql(u8, issue.field("Priority") orelse "", p)) {
-            return false;
-        };
+        if (f.priority) |p| if (issue.priority() != p) return false;
         return true;
+    }
+
+    fn assigneeMatches(value: []const u8, wanted: []const u8) bool {
+        if (std.mem.eql(u8, value, wanted)) return true;
+        const parsed = fields_fmt.Assignee.parse(value) orelse return false;
+        return parsed.uuid != null and std.mem.eql(u8, parsed.email, wanted);
     }
 };
 
@@ -33,8 +51,10 @@ pub const SortKey = enum { created, updated, priority, state };
 
 pub const Order = struct {
     key: SortKey = .created,
-    /// Newest, highest or open first by default. Ties go by ID.
+    /// Newest, highest or not done first by default. Ties go by ID.
     reverse: bool = false,
+    /// For `.state`.
+    done_states: []const []const u8 = &core_fmt.default_done_states,
 };
 
 /// Returns a new slice. The issues aren't copied.
@@ -51,29 +71,20 @@ pub fn list(
 }
 
 fn lessThan(order: Order, a: Issue, b: Issue) bool {
-    const ka = sortKey(a, order.key);
-    const kb = sortKey(b, order.key);
+    const ka = sortKey(a, order);
+    const kb = sortKey(b, order);
     if (ka != kb) return if (order.reverse) ka < kb else ka > kb;
     return std.mem.lessThan(u8, a.id, b.id);
 }
 
-fn sortKey(issue: Issue, key: SortKey) i64 {
-    return switch (key) {
+fn sortKey(issue: Issue, order: Order) i64 {
+    return switch (order.key) {
         .created => issue.created,
         .updated => issue.updated,
-        .priority => priorityRank(issue.field("Priority")),
-        .state => if (std.mem.eql(u8, issue.state, "open")) 1 else 0,
+        // Values outside the four levels sort below `low`, like upstream.
+        .priority => if (issue.priority()) |p| p.rank() else 0,
+        .state => if (issue.state.isDone(order.done_states)) 0 else 1,
     };
-}
-
-/// critical 4, high 3, medium 2, low 1, anything else 0.
-pub fn priorityRank(priority: ?[]const u8) u8 {
-    const p = priority orelse return 0;
-    const ranks = [_]struct { []const u8, u8 }{
-        .{ "critical", 4 }, .{ "high", 3 }, .{ "medium", 2 }, .{ "low", 1 },
-    };
-    for (ranks) |r| if (std.mem.eql(u8, r[0], p)) return r[1];
-    return 0;
 }
 
 pub const SearchOptions = struct {
@@ -81,8 +92,10 @@ pub const SearchOptions = struct {
     ignore_case: bool = false,
 };
 
-/// Matching lines of the issue's commit messages, trailers included, newest
-/// commit first.
+/// Matching lines of what the issue says now: the title, the fields as
+/// `Key: value`, the description, and the comments that aren't deleted,
+/// edited ones as edited, oldest first. Unlike upstream's `search`, which
+/// greps every commit message, replaced text and event commits don't match.
 pub fn searchLines(
     arena: Allocator,
     issue: Issue,
@@ -91,15 +104,37 @@ pub fn searchLines(
 ) Allocator.Error![]const []const u8 {
     var out: std.ArrayList([]const u8) = .empty;
     if (needle.len == 0) return out.items;
-    for (issue.log) |message| {
-        var lines = std.mem.splitScalar(u8, std.mem.trimEnd(u8, message, "\n"), '\n');
-        while (lines.next()) |line| {
-            const hit = if (options.ignore_case)
-                std.ascii.findIgnoreCase(line, needle) != null
-            else
-                std.mem.find(u8, line, needle) != null;
-            if (hit) try out.append(arena, line);
+    const S = struct {
+        arena: Allocator,
+        needle: []const u8,
+        options: SearchOptions,
+        out: *std.ArrayList([]const u8),
+
+        fn text(s: @This(), value: []const u8) Allocator.Error!void {
+            var lines = std.mem.splitScalar(u8, value, '\n');
+            while (lines.next()) |l| try s.line(l);
         }
+
+        fn line(s: @This(), l: []const u8) Allocator.Error!void {
+            const hit = if (s.options.ignore_case)
+                std.ascii.findIgnoreCase(l, s.needle) != null
+            else
+                std.mem.find(u8, l, s.needle) != null;
+            if (hit) try s.out.append(s.arena, l);
+        }
+    };
+    const s: S = .{ .arena = arena, .needle = needle, .options = options, .out = &out };
+    try s.line(issue.title);
+    try s.line(try std.fmt.allocPrint(arena, "State: {s}", .{issue.state.text()}));
+    if (issue.labels.len > 0) try s.line(
+        try std.fmt.allocPrint(arena, "Labels: {s}", .{try labels_fmt.join(arena, issue.labels)}),
+    );
+    for (issue.fields) |f| try s.line(try std.fmt.allocPrint(arena, "{s}: {s}", .{ f.key, f.value }));
+    try s.text(issue.description);
+    for (issue.comments) |c| {
+        if (c.deleted or c.is_merge) continue;
+        try s.line(c.subject);
+        for (c.body) |l| try s.line(l);
     }
     return out.items;
 }
@@ -125,7 +160,7 @@ fn testIssue(
         .title = id,
         .title_override = null,
         .description = "",
-        .state = state,
+        .state = State.parse(state),
         .labels = &.{},
         .fields = fields,
         .conflicts = &.{},
@@ -151,21 +186,23 @@ test "filter and sort like git issue ls" {
     };
 
     const open = try list(arena, &issues, .{}, .{});
+    const closed = try list(arena, &issues, .{ .done = true }, .{});
+    try testing.expectEqual(@as(usize, 1), closed.len);
     try testing.expectEqual(@as(usize, 3), open.len);
     // Newest first, the tie at 20 goes to the lower ID.
     try testing.expectEqualStrings("c", open[0].id);
     try testing.expectEqualStrings("d", open[1].id);
     try testing.expectEqualStrings("a", open[2].id);
 
-    const by_priority = try list(arena, &issues, .{ .state = null }, .{ .key = .priority });
+    const by_priority = try list(arena, &issues, .{ .done = null }, .{ .key = .priority });
     try testing.expectEqualStrings("b", by_priority[0].id);
     try testing.expectEqualStrings("d", by_priority[1].id);
     try testing.expectEqualStrings("c", by_priority[3].id);
 
-    const reversed = try list(arena, &issues, .{ .state = null }, .{ .reverse = true });
+    const reversed = try list(arena, &issues, .{ .done = null }, .{ .reverse = true });
     try testing.expectEqualStrings("a", reversed[0].id);
 
-    const critical = try list(arena, &issues, .{ .state = null, .priority = "critical" }, .{});
+    const critical = try list(arena, &issues, .{ .done = null, .priority = .critical }, .{});
     try testing.expectEqual(@as(usize, 2), critical.len);
     const unassigned = try list(arena, &issues, .{ .assignee = "" }, .{});
     try testing.expectEqual(@as(usize, 3), unassigned.len);
@@ -176,9 +213,31 @@ test "search finds fixed strings line by line" {
     defer arena_state.deinit();
     const arena = arena_state.allocator();
     var issue = try testIssue(arena, "a", "open", 1, null);
-    issue.log = &.{ "Fix the Login page\n\nLogin fails twice.\n", "login retry\n" };
-    try testing.expectEqual(@as(usize, 2), (try searchLines(arena, issue, "Login", .{})).len);
+    issue.title = "Fix the Login page";
+    issue.description = "Login fails twice.\nlogin retry";
+    issue.fields = &.{.{ .key = "Assignee", .value = "login@example.com" }};
+    const sig: @import("../backend/object.zig").Signature = .{ .name = "T", .email = "t@e.x", .time = 1, .tz_offset_minutes = 0 };
+    const comment: issue_model.Comment = .{
+        .oid = undefined,
+        .author = sig,
+        .subject = "Seen it",
+        .text = &.{},
+        .body = &.{"Login again"},
+        .state_change = null,
+        .is_merge = false,
+    };
+    var gone = comment;
+    gone.deleted = true;
+    gone.body = &.{"Login secret"};
+    issue.comments = &.{ comment, gone };
+    try testing.expectEqual(@as(usize, 3), (try searchLines(arena, issue, "Login", .{})).len);
     const folded = try searchLines(arena, issue, "LOGIN", .{ .ignore_case = true });
-    try testing.expectEqual(@as(usize, 3), folded.len);
+    try testing.expectEqual(@as(usize, 5), folded.len);
+    try testing.expectEqual(@as(usize, 0), (try searchLines(arena, issue, "secret", .{})).len);
     try testing.expectEqual(@as(usize, 0), (try searchLines(arena, issue, "", .{})).len);
+
+    // An assignee with a UUID matches by email too.
+    issue.fields = &.{.{ .key = "Assignee", .value = "a7f3b2c1-4e5d-4a8b-9c1e-2f3a4b5c6d7e ada@e.x" }};
+    try testing.expect((Filter{ .assignee = "ada@e.x" }).matches(issue));
+    try testing.expect(!(Filter{ .assignee = "bob@e.x" }).matches(issue));
 }

@@ -46,7 +46,7 @@ pub fn main(init: std.process.Init) !void {
 
     // Both edit the issue without talking to each other.
     alice = try Clone.open(arena, &world, "alice");
-    _ = try alice.sync.repo.edit(arena, ref_name, .{ .priority = "high" });
+    _ = try alice.sync.repo.edit(arena, ref_name, .{ .priority = .{ .set = .high } });
     try alice.close();
 
     bob = try Clone.open(arena, &world, "bob");

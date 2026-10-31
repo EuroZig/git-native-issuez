@@ -34,7 +34,7 @@ pub fn main(init: std.process.Init) !void {
         .title = "Login page crashes",
         .body = "Clicking \"Sign in\" with an empty password crashes the app.",
         .labels = &.{ "bug", "ui" },
-        .priority = "high",
+        .priority = .high,
     });
     const docs = try repo.create(arena, .{
         .title = "Document the sync protocol",
@@ -58,21 +58,21 @@ pub fn main(init: std.process.Init) !void {
         .remove_labels = &.{"ui"},
         .assignee = "ada@example.invalid",
     });
-    _ = try repo.setState(arena, ref.name, .{ .state = "closed", .fixed_by = "abc1234" });
+    _ = try repo.setState(arena, ref.name, .{ .state = .closed, .fixed_by = "abc1234" });
 
     // List.
     try out.writeAll("ID       STATE   TITLE\n");
     for (try repo.loadAll(arena)) |issue| {
         try out.print("{s}  {s:<6}  {s}\n", .{
             issuez.format.uuid.shortId(issue.id),
-            issue.state,
+            issue.state.text(),
             issue.title,
         });
     }
 
     // Show one issue in full.
     const issue = try repo.load(arena, (try repo.resolve(arena, login.id.short())).one);
-    try out.print("\n{s} ({s})\n", .{ issue.title, issue.state });
+    try out.print("\n{s} ({s})\n", .{ issue.title, issue.state.text() });
     try out.writeAll("labels:");
     for (issue.labels) |l| try out.print(" {s}", .{l});
     try out.writeAll("\n");

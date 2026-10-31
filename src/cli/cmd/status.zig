@@ -87,9 +87,9 @@ pub fn main(comptime B: type, ctx: *context.Context(B), argv: []const []const u8
     for (issues) |issue| for (issue.conflicts) |c| {
         if (!header) w.writeAll("Conflicts (concurrent edits, decided by last writer):\n") catch {};
         header = true;
-        w.print("  {s} {s}: kept '{s}', not '{s}'\n", .{
+        w.print("  {s} {f}: kept '{s}', not '{s}'\n", .{
             uuid.shortId(issue.id),
-            c.field,
+            c.target,
             c.value,
             c.lost,
         }) catch {};

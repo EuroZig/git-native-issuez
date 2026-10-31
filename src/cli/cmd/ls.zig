@@ -6,6 +6,7 @@ const common = @import("../common.zig");
 const core = @import("issuez").format.core;
 const issuez = @import("issuez");
 const query = issuez.query;
+const ext_flags = @import("../ext_flags.zig");
 const labels_fmt = issuez.format.labels;
 const uuid = issuez.format.uuid;
 
@@ -15,7 +16,10 @@ pub const help =
     \\List issues.
     \\
     \\Options:
-    \\   -s, --state <state>     open, closed, any custom state, or all [default: open]
+    \\   -s, --state <state>     open, closed, any custom state, or all [default: every
+    \\                           issue that isn't done; git config issue.doneStates
+    \\                           lists the states besides closed that are done,
+    \\                           default wontfix,duplicate]
     \\   -l, --label <label>     Only issues with this label
     \\   --assignee <email>      Only issues assigned to this address
     \\   --priority <level>      Only issues with this priority
@@ -23,8 +27,12 @@ pub const help =
     \\   -f, --format <format>   short (default), full or oneline
     \\   --sort <field>          created (default), updated, priority or state
     \\   --reverse               Reverse the sort order
+    \\   --problems              Only issues with problems (a parent or blocker that
+    \\                           is missing or loops back, invalid values, ...), each
+    \\                           with the problem, in any state unless --state
     \\   --conflicts             Only issues with fields edited concurrently, each
     \\                           with the conflict
+    \\   --deleted               Only deleted issues (see git issue restore)
     \\   -h, --help              Show this help
     \\
     \\Formats:
@@ -38,14 +46,18 @@ const Format = enum { short, full, oneline };
 
 pub fn main(comptime B: type, ctx: *context.Context(B), argv: []const []const u8) u8 {
     const arena = ctx.arena;
-    var state_filter: []const u8 = "open";
+    // Unset: what isn't done.
+    var state_filter: ?core.State = null;
+    var state_given = false;
     var label_filter: ?[]const u8 = null;
     var assignee_filter: ?[]const u8 = null;
-    var priority_filter: ?[]const u8 = null;
+    var priority_filter: ?core.Priority = null;
     var format: Format = .short;
     var sort: query.SortKey = .created;
     var reverse = false;
+    var only_problems = false;
     var only_conflicts = false;
+    var only_deleted = false;
 
     var args: common.Args = .{ .list = argv };
     while (args.next()) |arg| {
@@ -53,20 +65,22 @@ pub fn main(comptime B: type, ctx: *context.Context(B), argv: []const []const u8
             ctx.out.writeAll(help) catch {};
             return common.exit_ok;
         } else if (std.mem.eql(u8, arg, "-s") or std.mem.eql(u8, arg, "--state")) {
-            state_filter = args.value(ctx.err, "-s") orelse return common.exit_error;
+            state_filter = common.stateFilter(args.value(ctx.err, "-s") orelse return common.exit_error);
+            state_given = true;
         } else if (std.mem.eql(u8, arg, "-l") or std.mem.eql(u8, arg, "--label")) {
             label_filter = args.value(ctx.err, "-l") orelse return common.exit_error;
         } else if (std.mem.eql(u8, arg, "--assignee")) {
             assignee_filter = args.value(ctx.err, "--assignee") orelse return common.exit_error;
         } else if (std.mem.eql(u8, arg, "--priority")) {
             const v = args.value(ctx.err, "--priority") orelse return common.exit_error;
-            if (!core.isPriority(v)) return common.fail(
+            const p = core.Priority.parse(v) orelse return common.fail(
                 ctx.err,
                 "error: priority must be low, medium, high, or critical\n",
             );
-            priority_filter = v;
+            priority_filter = p;
         } else if (std.mem.eql(u8, arg, "-a") or std.mem.eql(u8, arg, "--all")) {
-            state_filter = "all";
+            state_filter = null;
+            state_given = true;
         } else if (std.mem.eql(u8, arg, "-f") or std.mem.eql(u8, arg, "--format")) {
             const v = args.value(ctx.err, "-f") orelse return common.exit_error;
             format = std.meta.stringToEnum(Format, v) orelse return common.fail(
@@ -81,8 +95,12 @@ pub fn main(comptime B: type, ctx: *context.Context(B), argv: []const []const u8
             );
         } else if (std.mem.eql(u8, arg, "--reverse")) {
             reverse = true;
+        } else if (std.mem.eql(u8, arg, "--problems")) {
+            only_problems = true;
         } else if (std.mem.eql(u8, arg, "--conflicts")) {
             only_conflicts = true;
+        } else if (std.mem.eql(u8, arg, "--deleted")) {
+            only_deleted = true;
         } else {
             return common.unknownOption(ctx.err, "ls", arg);
         }
@@ -92,16 +110,30 @@ pub fn main(comptime B: type, ctx: *context.Context(B), argv: []const []const u8
     const all = repo.loadAll(arena) catch |e| return common.repoFailed(B, ctx, e);
 
     const filter: query.Filter = .{
-        .state = if (std.mem.eql(u8, state_filter, "all")) null else state_filter,
+        .state = state_filter,
+        .done = if (state_given or only_problems) null else false,
+        .done_states = repo.done_states,
         .label = label_filter,
         .assignee = assignee_filter,
         .priority = priority_filter,
+        .deleted = only_deleted,
     };
-    const sorted = query.list(arena, all, filter, .{ .key = sort, .reverse = reverse }) catch
-        return common.exit_error;
+    const sorted = query.list(arena, all, filter, .{
+        .key = sort,
+        .reverse = reverse,
+        .done_states = repo.done_states,
+    }) catch return common.exit_error;
+    const proj = if (only_problems)
+        ext_flags.project(B, ctx, repo) orelse return common.exit_error
+    else
+        null;
     var kept: std.ArrayList(issuez.engine.Issue) = .empty;
     for (sorted) |issue| {
         if (only_conflicts and issue.conflicts.len == 0) continue;
+        if (only_problems) {
+            const p = proj.?;
+            if (p.problemsOf(p.find(issue.id).?).len == 0) continue;
+        }
         kept.append(arena, issue) catch return common.oom(ctx.err);
     }
     const listed = kept.items;
@@ -111,14 +143,14 @@ pub fn main(comptime B: type, ctx: *context.Context(B), argv: []const []const u8
         switch (format) {
             .oneline => ctx.out.print(
                 "{s} {s} {s}\n",
-                .{ short, issue.state, issue.title },
+                .{ short, issue.state.text(), issue.title },
             ) catch {},
             .short => ctx.out.print(
                 "{s} [{s}] {s}\n",
-                .{ short, issue.state, issue.title },
+                .{ short, issue.state.text(), issue.title },
             ) catch {},
             .full => {
-                ctx.out.print("{s} [{s}] {s}\n", .{ short, issue.state, issue.title }) catch {};
+                ctx.out.print("{s} [{s}] {s}\n", .{ short, issue.state.text(), issue.title }) catch {};
                 var detail: std.Io.Writer.Allocating = .init(arena);
                 if (issue.labels.len > 0) detail.writer.print(
                     " labels:{s}",
@@ -143,9 +175,15 @@ pub fn main(comptime B: type, ctx: *context.Context(B), argv: []const []const u8
             },
         }
         if (format == .oneline) continue;
+        if (proj) |p| {
+            for (p.problemsOf(p.find(issue.id).?)) |pr| ctx.out.print(
+                "       problem: {s}\n",
+                .{ext_flags.describeProblem(arena, pr)},
+            ) catch {};
+        }
         if (only_conflicts) for (issue.conflicts) |c| ctx.out.print(
-            "       conflict: {s} kept '{s}', not '{s}'\n",
-            .{ c.field, c.value, c.lost },
+            "       conflict: {f} kept '{s}', not '{s}'\n",
+            .{ c.target, c.value, c.lost },
         ) catch {};
     }
     return common.exit_ok;

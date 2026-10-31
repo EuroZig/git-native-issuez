@@ -13,6 +13,7 @@ const trailers = @import("../format/trailers.zig");
 const labels_fmt = @import("../format/labels.zig");
 const uuid_fmt = @import("../format/uuid.zig");
 const core_fmt = @import("../format/core.zig");
+const fields_fmt = @import("../format/fields.zig");
 const issue_model = @import("../model/issue.zig");
 
 pub const Issue = issue_model.Issue;
@@ -20,6 +21,42 @@ pub const Oid = object.Oid;
 pub const Signature = object.Signature;
 
 pub const issue_ref_prefix = "refs/issues/";
+/// Local only, never pushed. A guard can pin what it read but not that
+/// something is absent, like a child of the issue being closed. So writes
+/// that add work under an issue or to a milestone move that ID's guard ref,
+/// and so do the writes that need its absence: closing or deleting the
+/// issue, completing the milestone. Two such writes then conflict.
+pub const guard_ref_prefix = "refs/issuez-guard/";
+
+/// What a builder's `guard` returns.
+pub const Guarded = struct {
+    /// Refs it read.
+    verify: []const contract.RefUpdate = &.{},
+    /// Guard refs to move to the new commit.
+    bump: []const Bump = &.{},
+
+    pub const Bump = struct { name: []const u8, old: ?Oid };
+
+    pub fn ops(
+        g: Guarded,
+        arena: Allocator,
+        new: Oid,
+    ) Allocator.Error![]const contract.RefUpdate {
+        var out: std.ArrayList(contract.RefUpdate) = .empty;
+        try out.appendSlice(arena, g.verify);
+        for (g.bump) |b| try out.append(arena, .{ .name = b.name, .op = if (b.old) |old|
+            .{ .update = .{ .new = new, .old = old } }
+        else
+            .{ .create = new } });
+        return out.items;
+    }
+};
+
+/// Reads the guard ref of `id`, to move it in the same transaction.
+pub fn readGuardRef(backend: anytype, arena: Allocator, id: []const u8) !Guarded.Bump {
+    const name = try std.fmt.allocPrint(arena, "{s}{s}", .{ guard_ref_prefix, id });
+    return .{ .name = name, .old = try backend.resolveRef(name) };
+}
 
 pub const Limits = struct {
     /// No truncation: more commits than this is an error.
@@ -32,6 +69,10 @@ pub const Limits = struct {
     max_body_bytes: u32 = 1024 * 1024,
     max_trailer_value_bytes: u32 = 4096,
     max_labels: u16 = 64,
+    max_blockers: u16 = 256,
+    /// For our writes. A root has depth 0.
+    max_depth: u8 = 8,
+    max_guard_scan: u32 = 100_000,
 
     /// So no limit can be raised to the point of meaning nothing.
     pub const maximum: Limits = .{
@@ -43,6 +84,9 @@ pub const Limits = struct {
         .max_body_bytes = 64 * 1024 * 1024,
         .max_trailer_value_bytes = 64 * 1024,
         .max_labels = 4096,
+        .max_blockers = 4096,
+        .max_depth = 64,
+        .max_guard_scan = 10_000_000,
     };
 
     pub fn valid(l: Limits) bool {
@@ -78,9 +122,18 @@ pub const CreateSpec = struct {
     title: []const u8,
     body: []const u8 = "",
     labels: []const []const u8 = &.{},
+    /// `email` or `<uuid> <email>`.
     assignee: ?[]const u8 = null,
-    priority: ?[]const u8 = null,
+    priority: ?core_fmt.Priority = null,
     milestone: ?[]const u8 = null,
+    // References are full UUIDs. Callers resolve short IDs first.
+    parent: ?[]const u8 = null,
+    blocked_by: []const []const u8 = &.{},
+    start_date: ?[]const u8 = null,
+    due_date: ?[]const u8 = null,
+    estimate_minutes: ?u32 = null,
+    /// Callers check it against the configured workflow states.
+    workflow: ?[]const u8 = null,
     /// Overrides the backend's identity.
     author: ?Signature = null,
 };
@@ -95,7 +148,8 @@ pub const CommentSpec = struct {
 };
 
 pub const StateSpec = struct {
-    state: []const u8,
+    /// `.other` takes letters, digits, `-` and `_`, like upstream.
+    state: core_fmt.State,
     /// Defaults to "Close issue", "Reopen issue", ...
     message: ?[]const u8 = null,
     fixed_by: ?[]const u8 = null,
@@ -113,16 +167,36 @@ pub const EditSpec = struct {
     remove_labels: []const []const u8 = &.{},
     /// Empty clears it.
     assignee: ?[]const u8 = null,
-    priority: ?[]const u8 = null,
+    priority: ?PriorityEdit = null,
     milestone: ?[]const u8 = null,
+    // null leaves a field alone, "" or `.clear` clears it.
+    parent: ?[]const u8 = null,
+    set_blocked_by: ?[]const []const u8 = null,
+    add_blocked_by: []const []const u8 = &.{},
+    remove_blocked_by: []const []const u8 = &.{},
+    start_date: ?[]const u8 = null,
+    due_date: ?[]const u8 = null,
+    estimate_minutes: ?EstimateEdit = null,
+    workflow: ?[]const u8 = null,
+    /// Replaces the description, in the same commit as the other changes:
+    /// a `description-edit` event that also sets their fields.
+    description: ?[]const u8 = null,
+    /// The subject. With a description it can't have a body.
     message: ?[]const u8 = null,
     author: ?Signature = null,
     expect: ?Oid = null,
 
+    pub const EstimateEdit = union(enum) { set: u32, clear };
+    pub const PriorityEdit = union(enum) { set: core_fmt.Priority, clear };
+
     pub fn isEmpty(spec: EditSpec) bool {
         return spec.title == null and spec.set_labels == null and spec.add_labels.len == 0 and
             spec.remove_labels.len == 0 and spec.assignee == null and spec.priority == null and
-            spec.milestone == null;
+            spec.milestone == null and spec.parent == null and spec.set_blocked_by == null and
+            spec.add_blocked_by.len == 0 and spec.remove_blocked_by.len == 0 and
+            spec.start_date == null and spec.due_date == null and
+            spec.estimate_minutes == null and spec.workflow == null and
+            spec.description == null;
     }
 };
 
@@ -132,10 +206,21 @@ pub const Change = enum {
     assignee,
     priority,
     milestone,
+    parent,
+    blockers,
+    start_date,
+    due_date,
+    estimate,
+    workflow,
+    description,
 
-    /// For default subjects like "Update title, assignee".
+    /// For default subjects like "Update title, due date".
     pub fn name(c: Change) []const u8 {
-        return @tagName(c);
+        return switch (c) {
+            .start_date => "start date",
+            .due_date => "due date",
+            else => @tagName(c),
+        };
     }
 };
 
@@ -146,6 +231,8 @@ pub fn Repo(comptime B: type) type {
 
         backend: *B,
         limits: Limits = .{},
+        /// Besides `closed`. See `core.State.isDone`.
+        done_states: []const []const u8 = &core_fmt.default_done_states,
 
         pub const Error = B.Error || error{
             /// More commits than `Limits.max_commits_per_issue`.
@@ -164,9 +251,34 @@ pub fn Repo(comptime B: type) type {
             /// Over a `Limits` bound.
             TooLong,
             TooManyLabels,
+            TooManyBlockers,
             NothingToEdit,
-            /// A value upstream doesn't allow, like an unknown priority.
+            /// A value the format or upstream doesn't allow, like an unknown
+            /// priority or a reference that isn't a full UUID.
             InvalidValue,
+            /// A parent or blocker that isn't here.
+            ReferenceNotFound,
+            ParentIsSelf,
+            /// The new parent is the issue itself or below it.
+            ParentCycle,
+            /// Deeper than `Limits.max_depth`, counting the subtree.
+            TooDeep,
+            BlocksItself,
+            /// The new blocker is (transitively) blocked by this issue.
+            BlockerCycle,
+            /// Closing an issue with open descendants.
+            OpenDescendants,
+            /// Open work under a closed ancestor. Reopen the ancestors first.
+            ClosedAncestor,
+            GuardScanTooLarge,
+            /// Deleting an issue whose sub-issues aren't deleted.
+            ActiveChildren,
+            /// Creating or moving under a deleted parent. Restoring a child
+            /// under one is allowed.
+            ParentDeleted,
+            /// Not a comment of this issue: the root, a merge, an event, or
+            /// not in its history.
+            CommentNotFound,
             /// Not `refs/issues/<valid ref component>`.
             InvalidIssueRef,
             /// The tip is no longer the `expect`ed one.
@@ -178,6 +290,11 @@ pub fn Repo(comptime B: type) type {
 
         pub fn init(backend: *B) Self {
             return .{ .backend = backend };
+        }
+
+        /// `closed` or one of `done_states`.
+        pub fn isDone(self: Self, issue: Issue) bool {
+            return issue.state.isDone(self.done_states);
         }
 
         /// Sorted by name, so by UUID.
@@ -334,7 +451,6 @@ pub fn Repo(comptime B: type) type {
             try self.checkText(spec.title, self.limits.max_title_bytes);
             if (spec.body.len > self.limits.max_body_bytes) return error.TooLong;
             const normalized = try self.normalizeLabels(arena, spec.labels);
-            if (spec.priority) |v| if (!core_fmt.isPriority(v)) return error.InvalidValue;
 
             var list: std.ArrayList(trailers.Trailer) = .empty;
             try list.append(arena, .{ .key = "State", .value = "open" });
@@ -346,12 +462,38 @@ pub fn Repo(comptime B: type) type {
                 arena,
                 .{ .key = "Assignee", .value = v },
             );
-            if (spec.priority) |v| try list.append(arena, .{ .key = "Priority", .value = v });
+            if (spec.priority) |v| try list.append(arena, .{ .key = "Priority", .value = v.text() });
             if (spec.milestone) |v| if (v.len > 0) try list.append(
                 arena,
                 .{ .key = "Milestone", .value = v },
             );
             if (spec.assignee) |v| if (v.len > 0) try checkAssignee(v);
+            if (spec.parent) |v| {
+                try checkReference(v);
+                try list.append(arena, .{ .key = "X-Parent", .value = v });
+            }
+            if (spec.blocked_by.len > 0) try list.append(arena, .{
+                .key = "X-Blocked-By",
+                .value = try self.referenceSet(arena, spec.blocked_by, &.{}),
+            });
+            for ([_]struct { []const u8, ?[]const u8 }{
+                .{ "X-Start-Date", spec.start_date },
+                .{ "X-Due-Date", spec.due_date },
+            }) |d| if (d[1]) |v| {
+                if (fields_fmt.Date.parse(v) == null) return error.InvalidValue;
+                try list.append(arena, .{ .key = d[0], .value = v });
+            };
+            if (spec.estimate_minutes) |m| {
+                if (m > fields_fmt.max_estimate_minutes) return error.InvalidValue;
+                try list.append(arena, .{
+                    .key = "X-Estimate-Minutes",
+                    .value = try std.fmt.allocPrint(arena, "{d}", .{m}),
+                });
+            }
+            if (spec.workflow) |v| {
+                if (!fields_fmt.isSlug(v)) return error.InvalidValue;
+                try list.append(arena, .{ .key = "X-Workflow-State", .value = v });
+            }
             try list.append(arena, .{ .key = "Format-Version", .value = "1" });
             for (list.items) |t| try self.checkText(t.value, self.limits.max_trailer_value_bytes);
 
@@ -359,9 +501,19 @@ pub fn Repo(comptime B: type) type {
             const who = try self.identity(arena, spec.author);
             const oid = try self.writeCommit(arena, &.{}, who, message);
 
-            // A UUID collision is a CAS conflict: retry with a new UUID.
+            // A UUID collision or a change to an issue the guards read is a
+            // CAS conflict: retry with a new UUID and fresh reads.
             var attempt: u8 = 0;
             while (attempt < self.limits.cas_retries) : (attempt += 1) {
+                const guarded = try self.runGuards(arena, .{
+                    .id = null,
+                    .parent = spec.parent,
+                    .parent_changed = spec.parent != null,
+                    .blockers_added = spec.blocked_by,
+                    .closed = false,
+                    .state_changed = false,
+                    .was_closed = false,
+                });
                 var random: [16]u8 = undefined;
                 self.backend.randomBytes(&random);
                 const id = uuid_fmt.Uuid.fromRandom(random);
@@ -370,7 +522,10 @@ pub fn Repo(comptime B: type) type {
                     "{s}{s}",
                     .{ issue_ref_prefix, id.slice() },
                 );
-                self.backend.updateRefs(&.{.{ .name = name, .op = .{ .create = oid } }}) catch |err| switch (err) {
+                var ops: std.ArrayList(contract.RefUpdate) = .empty;
+                try ops.append(arena, .{ .name = name, .op = .{ .create = oid } });
+                try ops.appendSlice(arena, try guarded.ops(arena, oid));
+                self.backend.updateRefs(ops.items) catch |err| switch (err) {
                     error.RefConflict => continue,
                     else => |e| return e,
                 };
@@ -401,26 +556,209 @@ pub fn Repo(comptime B: type) type {
             spec: StateSpec,
         ) Error!Oid {
             try self.checkLimits();
-            try self.checkText(spec.state, 64);
-            if (!core_fmt.isState(spec.state)) return error.InvalidValue;
+            // `.{ .other = "closed" }` is `.closed`.
+            const state = core_fmt.State.parse(spec.state.text());
+            try self.checkText(state.text(), 64);
+            if (!core_fmt.isState(state.text())) return error.InvalidValue;
             var list: std.ArrayList(trailers.Trailer) = .empty;
-            try list.append(arena, .{ .key = "State", .value = spec.state });
+            try list.append(arena, .{ .key = "State", .value = state.text() });
             if (spec.fixed_by) |v| try list.append(arena, .{ .key = "Fixed-By", .value = v });
             if (spec.release) |v| try list.append(arena, .{ .key = "Release", .value = v });
             if (spec.reason) |v| try list.append(arena, .{ .key = "Reason", .value = v });
             for (list.items) |t| try self.checkText(t.value, self.limits.max_trailer_value_bytes);
-            const default_subject = if (std.mem.eql(u8, spec.state, "open"))
-                "Reopen issue"
-            else if (std.mem.eql(u8, spec.state, "closed"))
-                "Close issue"
-            else
-                try std.fmt.allocPrint(arena, "Change state to {s}", .{spec.state});
+            const default_subject = switch (state) {
+                .open => "Reopen issue",
+                .closed => "Close issue",
+                .other => |s| try std.fmt.allocPrint(arena, "Change state to {s}", .{s}),
+            };
             const split = splitMessage(spec.message orelse default_subject);
             const message = try trailers.build(arena, split.subject, split.body, list.items);
-            return self.appendCommit(arena, ref_name, spec.author, spec.expect, FixedMessage{
+            return self.appendCommit(arena, ref_name, spec.author, spec.expect, StateBuilder{
+                .repo = self,
                 .text = message,
+                .closed = state.isDone(self.done_states),
             });
         }
+
+        const StateBuilder = struct {
+            repo: Self,
+            text: []const u8,
+            closed: bool,
+
+            pub fn message(b: StateBuilder, arena: Allocator, current: Issue) Error![]const u8 {
+                _ = arena;
+                _ = current;
+                return b.text;
+            }
+
+            pub fn guard(
+                b: StateBuilder,
+                arena: Allocator,
+                current: Issue,
+            ) Error!Guarded {
+                const was_closed = b.repo.isDone(current);
+                return b.repo.runGuards(arena, .{
+                    .id = current.id,
+                    .parent = current.ext.parent,
+                    .parent_changed = false,
+                    .blockers_added = &.{},
+                    .closed = b.closed,
+                    .state_changed = b.closed != was_closed,
+                    .was_closed = was_closed,
+                });
+            }
+        };
+
+        pub const LifecycleSpec = struct {
+            /// Defaults to "Delete issue", "Edit description", ...
+            message: ?[]const u8 = null,
+            author: ?Signature = null,
+            expect: ?Oid = null,
+        };
+
+        /// Refused while sub-issues aren't deleted.
+        pub fn setDeleted(
+            self: Self,
+            arena: Allocator,
+            ref_name: []const u8,
+            deleted: bool,
+            spec: LifecycleSpec,
+        ) Error!Oid {
+            try self.checkLimits();
+            const subject = spec.message orelse if (deleted) "Delete issue" else "Restore issue";
+            const split = splitMessage(subject);
+            const message = try trailers.build(arena, split.subject, split.body, &.{
+                .{ .key = "X-Deleted", .value = if (deleted) "true" else "false" },
+            });
+            return self.appendCommit(arena, ref_name, spec.author, spec.expect, DeleteBuilder{
+                .repo = self,
+                .text = message,
+                .deleted = deleted,
+            });
+        }
+
+        const DeleteBuilder = struct {
+            repo: Self,
+            text: []const u8,
+            deleted: bool,
+
+            pub fn message(b: DeleteBuilder, arena: Allocator, current: Issue) Error![]const u8 {
+                _ = arena;
+                _ = current;
+                return b.text;
+            }
+
+            pub fn guard(
+                b: DeleteBuilder,
+                arena: Allocator,
+                current: Issue,
+            ) Error!Guarded {
+                if (!b.deleted and current.deleted) return b.repo.runGuards(arena, .{
+                    .id = current.id,
+                    .parent = current.ext.parent,
+                    .parent_changed = false,
+                    .blockers_added = &.{},
+                    .closed = b.repo.isDone(current),
+                    .state_changed = false,
+                    .was_closed = b.repo.isDone(current),
+                    .restored = true,
+                });
+                if (!b.deleted or current.deleted) return .{};
+                var g: Guard = .{ .repo = b.repo, .arena = arena, .self_id = current.id };
+                // Before reading the children, so a new one conflicts.
+                try g.bumpGuard(current.id);
+                for (try g.childrenOf(current.id)) |c| {
+                    if (!c.deleted) return error.ActiveChildren;
+                    try g.pin(try refNameOf(arena, c.id), c.id, c.tip);
+                }
+                return g.result();
+            }
+        };
+
+        pub fn editDescription(
+            self: Self,
+            arena: Allocator,
+            ref_name: []const u8,
+            text: []const u8,
+            spec: LifecycleSpec,
+        ) Error!Oid {
+            const result = try self.edit(arena, ref_name, .{
+                .description = text,
+                .message = spec.message,
+                .author = spec.author,
+                .expect = spec.expect,
+            });
+            return result.tip;
+        }
+
+        /// The `X-Event`s that target a comment.
+        pub const CommentEvent = enum {
+            edit,
+            delete,
+            restore,
+
+            pub fn event(e: CommentEvent) fields_fmt.Event {
+                return switch (e) {
+                    .edit => .comment_edit,
+                    .delete => .comment_delete,
+                    .restore => .comment_restore,
+                };
+            }
+        };
+
+        /// `comment` is the full ID of the comment's commit. An edit
+        /// replaces the whole text.
+        pub fn commentEvent(
+            self: Self,
+            arena: Allocator,
+            ref_name: []const u8,
+            comment_oid: Oid,
+            event: CommentEvent,
+            text: []const u8,
+            spec: LifecycleSpec,
+        ) Error!Oid {
+            try self.checkLimits();
+            if (text.len > self.limits.max_body_bytes) return error.TooLong;
+            return self.appendCommit(arena, ref_name, spec.author, spec.expect, CommentEventBuilder{
+                .comment = comment_oid,
+                .event = event,
+                .text = text,
+                .subject = spec.message,
+            });
+        }
+
+        const CommentEventBuilder = struct {
+            comment: Oid,
+            event: CommentEvent,
+            text: []const u8,
+            subject: ?[]const u8,
+
+            pub fn message(
+                b: CommentEventBuilder,
+                arena: Allocator,
+                current: Issue,
+            ) Error![]const u8 {
+                var found = false;
+                for (current.comments) |c| if (c.oid.eql(b.comment) and !c.is_merge) {
+                    found = true;
+                };
+                if (!found) return error.CommentNotFound;
+                const hex = b.comment.hex();
+                const short = hex.short();
+                const verb = switch (b.event) {
+                    .edit => "Edit",
+                    .delete => "Delete",
+                    .restore => "Restore",
+                };
+                const subject = b.subject orelse
+                    try std.fmt.allocPrint(arena, "{s} comment {s}", .{ verb, short });
+                const kind = b.event.event();
+                return trailers.build(arena, subject, if (kind.carriesText()) b.text else "", &.{
+                    .{ .key = "X-Event", .value = kind.text() },
+                    .{ .key = "X-Comment", .value = try arena.dupe(u8, hex.slice()) },
+                });
+            }
+        };
 
         pub const EditResult = struct { tip: Oid, changes: []const Change };
 
@@ -433,12 +771,8 @@ pub fn Repo(comptime B: type) type {
             try self.checkLimits();
             if (spec.isEmpty()) return error.NothingToEdit;
             if (spec.title) |t| try self.checkText(t, self.limits.max_title_bytes);
-            for ([_]?[]const u8{ spec.assignee, spec.priority, spec.milestone }) |v| {
+            for ([_]?[]const u8{ spec.assignee, spec.milestone }) |v| {
                 if (v) |value| try self.checkText(value, self.limits.max_trailer_value_bytes);
-            }
-            // An empty priority clears it.
-            if (spec.priority) |v| {
-                if (v.len > 0 and !core_fmt.isPriority(v)) return error.InvalidValue;
             }
             var changes: std.ArrayList(Change) = .empty;
             if (spec.title != null) try changes.append(arena, .title);
@@ -448,6 +782,37 @@ pub fn Repo(comptime B: type) type {
             if (spec.priority != null) try changes.append(arena, .priority);
             if (spec.milestone != null) try changes.append(arena, .milestone);
             if (spec.assignee) |v| if (v.len > 0) try checkAssignee(v);
+            if (spec.parent) |v| {
+                if (v.len > 0) try checkReference(v);
+                try changes.append(arena, .parent);
+            }
+            if (spec.set_blocked_by != null or spec.add_blocked_by.len > 0 or
+                spec.remove_blocked_by.len > 0)
+            {
+                for (spec.set_blocked_by orelse &.{}) |r| try checkReference(r);
+                for (spec.add_blocked_by) |r| try checkReference(r);
+                try changes.append(arena, .blockers);
+            }
+            for ([_]struct { Change, ?[]const u8 }{
+                .{ .start_date, spec.start_date },
+                .{ .due_date, spec.due_date },
+            }) |d| if (d[1]) |v| {
+                if (v.len > 0 and fields_fmt.Date.parse(v) == null) return error.InvalidValue;
+                try changes.append(arena, d[0]);
+            };
+            if (spec.estimate_minutes) |e| {
+                const too_big = e == .set and e.set > fields_fmt.max_estimate_minutes;
+                if (too_big) return error.InvalidValue;
+                try changes.append(arena, .estimate);
+            }
+            if (spec.workflow) |v| {
+                if (v.len > 0 and !fields_fmt.isSlug(v)) return error.InvalidValue;
+                try changes.append(arena, .workflow);
+            }
+            if (spec.description) |d| {
+                if (d.len > self.limits.max_body_bytes) return error.TooLong;
+                try changes.append(arena, .description);
+            }
             const builder: EditBuilder = .{ .repo = self, .spec = spec, .changes = changes.items };
             const tip = try self.appendCommit(arena, ref_name, spec.author, spec.expect, builder);
             return .{ .tip = tip, .changes = changes.items };
@@ -474,16 +839,27 @@ pub fn Repo(comptime B: type) type {
                 if (expect) |want| if (!want.eql(tip)) return error.VersionMismatch;
                 const current = try self.load(arena, .{ .name = ref_name, .tip = tip });
                 const message = try builder.message(arena, current);
+                const guarded: Guarded = if (@hasDecl(@TypeOf(builder), "guard"))
+                    try builder.guard(arena, current)
+                else
+                    .{};
                 const who = try self.identity(arena, author);
                 const oid = try self.writeCommit(arena, &.{tip}, who, message);
-                self.backend.updateRefs(&.{.{
+                var ops: std.ArrayList(contract.RefUpdate) = .empty;
+                try ops.append(arena, .{
                     .name = ref_name,
                     .op = .{ .update = .{ .new = oid, .old = tip } },
-                }}) catch |err| switch (err) {
-                    error.RefConflict => if (expect != null)
-                        return error.VersionMismatch
-                    else
-                        continue,
+                });
+                try ops.appendSlice(arena, try guarded.ops(arena, oid));
+                self.backend.updateRefs(ops.items) catch |err| switch (err) {
+                    // Our ref moved, or an issue a guard read changed. With
+                    // `expect` only the first is the caller's problem.
+                    error.RefConflict => if (expect) |want| {
+                        const now = (try self.backend.resolveRef(ref_name)) orelse
+                            return error.IssueDisappeared;
+                        if (!now.eql(want)) return error.VersionMismatch;
+                        continue;
+                    } else continue,
                     else => |e| return e,
                 };
                 return oid;
@@ -537,13 +913,282 @@ pub fn Repo(comptime B: type) type {
                     );
                 }
                 if (spec.assignee) |v| try list.append(arena, .{ .key = "Assignee", .value = v });
-                if (spec.priority) |v| try list.append(arena, .{ .key = "Priority", .value = v });
+                if (spec.priority) |v| try list.append(arena, .{
+                    .key = "Priority",
+                    .value = switch (v) {
+                        .set => |p| p.text(),
+                        .clear => "",
+                    },
+                });
                 if (spec.milestone) |v| try list.append(arena, .{ .key = "Milestone", .value = v });
+                if (spec.parent) |v| try list.append(arena, .{ .key = "X-Parent", .value = v });
+                if (spec.set_blocked_by != null or spec.add_blocked_by.len > 0 or
+                    spec.remove_blocked_by.len > 0)
+                {
+                    // From the fresh state, like labels.
+                    var next: std.ArrayList([]const u8) = .empty;
+                    try next.appendSlice(arena, spec.set_blocked_by orelse current.ext.blocked_by);
+                    try next.appendSlice(arena, spec.add_blocked_by);
+                    try list.append(arena, .{
+                        .key = "X-Blocked-By",
+                        .value = try b.repo.referenceSet(arena, next.items, spec.remove_blocked_by),
+                    });
+                }
+                for ([_]struct { []const u8, ?[]const u8 }{
+                    .{ "X-Start-Date", spec.start_date },
+                    .{ "X-Due-Date", spec.due_date },
+                }) |d| if (d[1]) |v| try list.append(arena, .{ .key = d[0], .value = v });
+                if (spec.estimate_minutes) |e| try list.append(arena, .{
+                    .key = "X-Estimate-Minutes",
+                    .value = switch (e) {
+                        .set => |m| try std.fmt.allocPrint(arena, "{d}", .{m}),
+                        .clear => "",
+                    },
+                });
+                if (spec.workflow) |v| try list.append(
+                    arena,
+                    .{ .key = "X-Workflow-State", .value = v },
+                );
+                if (spec.description) |d| {
+                    try list.append(arena, .{
+                        .key = "X-Event",
+                        .value = fields_fmt.Event.description_edit.text(),
+                    });
+                    const only = b.changes.len == 1;
+                    const subject = spec.message orelse if (only)
+                        "Edit description"
+                    else
+                        try defaultEditSubject(arena, b.changes);
+                    return trailers.build(arena, subject, d, list.items);
+                }
                 const subject = spec.message orelse try defaultEditSubject(arena, b.changes);
                 const split = splitMessage(subject);
                 return trailers.build(arena, split.subject, split.body, list.items);
             }
+
+            pub fn guard(
+                b: EditBuilder,
+                arena: Allocator,
+                current: Issue,
+            ) Error!Guarded {
+                const spec = b.spec;
+                const parent: ?[]const u8 = if (spec.parent) |p|
+                    (if (p.len == 0) null else p)
+                else
+                    current.ext.parent;
+                var added: std.ArrayList([]const u8) = .empty;
+                const parts = [_][]const []const u8{
+                    spec.set_blocked_by orelse &.{},
+                    spec.add_blocked_by,
+                };
+                for (parts) |part| {
+                    for (part) |r| {
+                        if (labels_fmt.contains(current.ext.blocked_by, r)) continue;
+                        if (labels_fmt.contains(spec.remove_blocked_by, r)) continue;
+                        try added.append(arena, r);
+                    }
+                }
+                return b.repo.runGuards(arena, .{
+                    .id = current.id,
+                    .parent = parent,
+                    .parent_changed = spec.parent != null and parent != null,
+                    .blockers_added = added.items,
+                    .closed = b.repo.isDone(current),
+                    .state_changed = false,
+                    .was_closed = b.repo.isDone(current),
+                });
+            }
         };
+
+        /// The issue as a write would leave it.
+        const Proposal = struct {
+            /// Null on create.
+            id: ?[]const u8,
+            parent: ?[]const u8,
+            parent_changed: bool,
+            blockers_added: []const []const u8,
+            closed: bool,
+            state_changed: bool,
+            was_closed: bool,
+            /// A deleted issue comes back.
+            restored: bool = false,
+        };
+
+        /// Every issue a guard reads is loaded once and gets a verify line,
+        /// so a concurrent change aborts the write. What it can't pin, a
+        /// new child or new milestone work, goes through the guard refs.
+        const Guard = struct {
+            repo: Self,
+            arena: Allocator,
+            /// The issue being written never gets a verify line: the update
+            /// itself checks its ref, and a ref can't appear twice.
+            self_id: ?[]const u8,
+            cache: std.StringHashMapUnmanaged(?Issue) = .empty,
+            verify: std.ArrayList(contract.RefUpdate) = .empty,
+            bump: std.ArrayList(Guarded.Bump) = .empty,
+            scanned: u32 = 0,
+            /// Parent ID to children, built on first use.
+            children: ?std.StringHashMapUnmanaged(std.ArrayList(Issue)) = null,
+
+            fn get(g: *Guard, id: []const u8) Error!?Issue {
+                if (g.cache.get(id)) |hit| return hit;
+                g.scanned += 1;
+                if (g.scanned > g.repo.limits.max_guard_scan) return error.GuardScanTooLarge;
+                const name = try std.fmt.allocPrint(g.arena, "{s}{s}", .{ issue_ref_prefix, id });
+                const found: ?Issue = if (uuid_fmt.isCanonical(id))
+                    if (try g.repo.backend.resolveRef(name)) |tip| blk: {
+                        try g.pin(name, id, tip);
+                        break :blk try g.repo.load(g.arena, .{ .name = name, .tip = tip });
+                    } else null
+                else
+                    null;
+                try g.cache.put(g.arena, id, found);
+                return found;
+            }
+
+            /// See `guard_ref_prefix`.
+            fn bumpGuard(g: *Guard, id: []const u8) Error!void {
+                for (g.bump.items) |b| {
+                    if (std.mem.eql(u8, b.name[guard_ref_prefix.len..], id)) return;
+                }
+                try g.bump.append(g.arena, try readGuardRef(g.repo.backend, g.arena, id));
+            }
+
+            fn result(g: *Guard) Guarded {
+                return .{ .verify = g.verify.items, .bump = g.bump.items };
+            }
+
+            fn pin(g: *Guard, name: []const u8, id: []const u8, tip: Oid) Error!void {
+                if (g.self_id) |s| if (std.mem.eql(u8, s, id)) return;
+                for (g.verify.items) |v| if (std.mem.eql(u8, v.name, name)) return;
+                try g.verify.append(g.arena, .{ .name = name, .op = .{ .verify = tip } });
+            }
+
+            fn childrenOf(g: *Guard, id: []const u8) Error![]const Issue {
+                if (g.children == null) {
+                    const all = try g.repo.refs(g.arena);
+                    if (all.len > g.repo.limits.max_guard_scan) return error.GuardScanTooLarge;
+                    var index: std.StringHashMapUnmanaged(std.ArrayList(Issue)) = .empty;
+                    for (all) |r| {
+                        const issue = g.repo.load(g.arena, r) catch |err| switch (err) {
+                            // Can't be checked. fsck reports it.
+                            error.CorruptIssue,
+                            error.HistoryTooLong,
+                            error.MissingParent,
+                            error.NoRoot,
+                            => continue,
+                            else => |e| return e,
+                        };
+                        const parent = issue.ext.parent orelse continue;
+                        // Its own parent, from another tool: not a child.
+                        if (std.mem.eql(u8, parent, issue.id)) continue;
+                        const gop = try index.getOrPut(g.arena, parent);
+                        if (!gop.found_existing) gop.value_ptr.* = .empty;
+                        try gop.value_ptr.append(g.arena, issue);
+                    }
+                    g.children = index;
+                }
+                const list = g.children.?.get(id) orelse return &.{};
+                return list.items;
+            }
+
+            /// Each one pinned with a verify line. Cycle-safe. `height` gets
+            /// the subtree's height.
+            fn descendants(g: *Guard, id: []const u8, height: *u32) Error![]const Issue {
+                var out: std.ArrayList(Issue) = .empty;
+                var seen: std.StringHashMapUnmanaged(void) = .empty;
+                try seen.put(g.arena, id, {});
+                const Item = struct { id: []const u8, depth: u32 };
+                var stack: std.ArrayList(Item) = .empty;
+                try stack.append(g.arena, .{ .id = id, .depth = 0 });
+                height.* = 0;
+                while (stack.pop()) |it| {
+                    for (try g.childrenOf(it.id)) |c| {
+                        if ((try seen.getOrPut(g.arena, c.id)).found_existing) continue;
+                        try out.append(g.arena, c);
+                        const name = try std.fmt.allocPrint(
+                            g.arena,
+                            "{s}{s}",
+                            .{ issue_ref_prefix, c.id },
+                        );
+                        try g.pin(name, c.id, c.tip);
+                        height.* = @max(height.*, it.depth + 1);
+                        try stack.append(g.arena, .{ .id = c.id, .depth = it.depth + 1 });
+                    }
+                }
+                return out.items;
+            }
+        };
+
+        /// Returns verify lines for every issue it read.
+        fn runGuards(self: Self, arena: Allocator, p: Proposal) Error!Guarded {
+            var g: Guard = .{ .repo = self, .arena = arena, .self_id = p.id };
+            const eql = std.mem.eql;
+
+            if (p.parent_changed) if (p.parent) |parent| {
+                if (p.id) |id| if (eql(u8, id, parent)) return error.ParentIsSelf;
+                var cur = (try g.get(parent)) orelse return error.ReferenceNotFound;
+                if (cur.deleted) return error.ParentDeleted;
+                // Finding our own ID above the new parent means a cycle.
+                var depth_of_parent: u32 = 0;
+                var seen: std.StringHashMapUnmanaged(void) = .empty;
+                while (true) {
+                    if (p.id) |id| if (eql(u8, cur.id, id)) return error.ParentCycle;
+                    if ((try seen.getOrPut(arena, cur.id)).found_existing) break; // foreign cycle
+                    // Work arrives under every ancestor.
+                    try g.bumpGuard(cur.id);
+                    const up = cur.ext.parent orelse break;
+                    cur = (try g.get(up)) orelse break; // dangling: treated as a root
+                    depth_of_parent += 1;
+                }
+                var height: u32 = 0;
+                if (p.id) |id| _ = try g.descendants(id, &height);
+                if (depth_of_parent + 1 + height > self.limits.max_depth) return error.TooDeep;
+            };
+
+            // No open issue under a closed ancestor.
+            const placing_open = !p.closed and (p.id == null or p.parent_changed or p.restored or
+                (p.state_changed and p.was_closed));
+            if (placing_open) if (p.parent) |parent| {
+                var seen: std.StringHashMapUnmanaged(void) = .empty;
+                var next: ?[]const u8 = parent;
+                while (next) |up| {
+                    // Back at ourselves: a cycle someone else made.
+                    if (p.id) |id| if (std.mem.eql(u8, up, id)) break;
+                    if ((try seen.getOrPut(arena, up)).found_existing) break;
+                    const anc = (try g.get(up)) orelse break;
+                    // Deleted ancestors don't count.
+                    if (self.isDone(anc) and !anc.deleted) return error.ClosedAncestor;
+                    next = anc.ext.parent;
+                }
+            };
+
+            if (p.closed and p.state_changed) if (p.id) |id| {
+                try g.bumpGuard(id);
+                var height: u32 = 0;
+                for (try g.descendants(id, &height)) |d| {
+                    if (!self.isDone(d) and !d.deleted) return error.OpenDescendants;
+                }
+            };
+
+            for (p.blockers_added) |b| {
+                if (p.id) |id| if (eql(u8, id, b)) return error.BlocksItself;
+                const target = (try g.get(b)) orelse return error.ReferenceNotFound;
+                // Is the new blocker waiting for us, directly or not?
+                const id = p.id orelse continue;
+                var seen: std.StringHashMapUnmanaged(void) = .empty;
+                var stack: std.ArrayList(Issue) = .empty;
+                try stack.append(arena, target);
+                while (stack.pop()) |x| {
+                    if ((try seen.getOrPut(arena, x.id)).found_existing) continue;
+                    for (x.ext.blocked_by) |y| {
+                        if (eql(u8, y, id)) return error.BlockerCycle;
+                        if (try g.get(y)) |next| try stack.append(arena, next);
+                    }
+                }
+            }
+            return g.result();
+        }
 
         pub fn writeCommit(
             self: Self,
@@ -576,6 +1221,24 @@ pub fn Repo(comptime B: type) type {
             return defaults;
         }
 
+        /// Full UUIDs, deduplicated, minus `remove`, at most
+        /// `Limits.max_blockers`.
+        fn referenceSet(
+            self: Self,
+            arena: Allocator,
+            members: []const []const u8,
+            remove: []const []const u8,
+        ) Error![]const u8 {
+            var out: std.ArrayList([]const u8) = .empty;
+            for (members) |r| {
+                try checkReference(r);
+                if (labels_fmt.contains(out.items, r) or labels_fmt.contains(remove, r)) continue;
+                try out.append(arena, r);
+            }
+            if (out.items.len > self.limits.max_blockers) return error.TooManyBlockers;
+            return labels_fmt.join(arena, out.items);
+        }
+
         fn normalizeLabels(
             self: Self,
             arena: Allocator,
@@ -600,8 +1263,17 @@ pub fn Repo(comptime B: type) type {
     };
 }
 
+fn refNameOf(arena: Allocator, id: []const u8) Allocator.Error![]const u8 {
+    return std.fmt.allocPrint(arena, "{s}{s}", .{ issue_ref_prefix, id });
+}
+
+fn checkReference(r: []const u8) error{InvalidValue}!void {
+    if (!uuid_fmt.isCanonical(r)) return error.InvalidValue;
+}
+
 fn checkAssignee(v: []const u8) error{InvalidValue}!void {
-    if (core_fmt.checkEmail(v) != null) return error.InvalidValue;
+    const a = fields_fmt.Assignee.parse(v) orelse return error.InvalidValue;
+    if (core_fmt.checkEmail(a.email) != null) return error.InvalidValue;
 }
 
 fn defaultEditSubject(arena: Allocator, changes: []const Change) Allocator.Error![]const u8 {
@@ -669,14 +1341,14 @@ test "create, comment, state, edit and read back" {
         .body = "First paragraph.\n\nSecond.",
         .labels = &.{ "bug", " auth ", "bug" },
         .assignee = "bob@e.x",
-        .priority = "high",
+        .priority = .high,
     });
     const ref_name = try std.fmt.allocPrint(arena, "refs/issues/{s}", .{created.id.slice()});
     _ = try repo.comment(arena, ref_name, .{ .text = "Repro on Firefox\n\nDetail line" });
     _ = try repo.setState(
         arena,
         ref_name,
-        .{ .state = "closed", .message = "Fixed in abc", .fixed_by = "abc123" },
+        .{ .state = .closed, .message = "Fixed in abc", .fixed_by = "abc123" },
     );
     const edited = try repo.edit(
         arena,
@@ -689,7 +1361,7 @@ test "create, comment, state, edit and read back" {
     const issue = try repo.load(arena, res.one);
     try testing.expectEqualStrings("Crash on login", issue.title);
     try testing.expectEqualStrings("First paragraph.\n\nSecond.", issue.description);
-    try testing.expectEqualStrings("closed", issue.state);
+    try testing.expectEqualStrings("closed", issue.state.text());
     try testing.expectEqual(@as(usize, 2), issue.labels.len);
     try testing.expectEqualStrings("bug", issue.labels[0]);
     try testing.expectEqualStrings("regression", issue.labels[1]);
@@ -711,6 +1383,61 @@ test "create, comment, state, edit and read back" {
     try testing.expect(c.tree.eql(object.emptyTree(.sha1)));
 }
 
+test "extension fields" {
+    var arena_state: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var world: GitSim.World = .{ .seed = 21, .clones = &.{.{ .name = "a" }} };
+    var sim = try GitSim.init(arena, &world, 0);
+    const repo = Repo(GitSim).init(&sim);
+    const parent = try repo.create(arena, .{ .title = "Epic" });
+    const blocker = try repo.create(arena, .{ .title = "Blocker" });
+    const other = try repo.create(arena, .{ .title = "Other" });
+
+    const child = try repo.create(arena, .{
+        .title = "Child",
+        .assignee = "a7f3b2c1-4e5d-4a8b-9c1e-2f3a4b5c6d7e ada@e.x",
+        .parent = parent.id.slice(),
+        .blocked_by = &.{ blocker.id.slice(), blocker.id.slice() },
+        .start_date = "2026-11-01",
+        .due_date = "2026-12-01",
+        .estimate_minutes = 90,
+        .workflow = "ready",
+    });
+    const ref_name = try std.fmt.allocPrint(arena, "refs/issues/{s}", .{child.id.slice()});
+    var issue = try repo.load(arena, .{ .name = ref_name, .tip = child.tip });
+    try testing.expectEqualStrings(parent.id.slice(), issue.ext.parent.?);
+    try testing.expectEqual(@as(usize, 1), issue.ext.blocked_by.len); // deduplicated
+    try testing.expectEqual(@as(?u32, 90), issue.ext.estimate_minutes);
+    try testing.expectEqualStrings("ready", issue.ext.workflow.?);
+    try testing.expectEqual(@as(usize, 0), issue.ext.invalid.len);
+
+    const edited = try repo.edit(arena, ref_name, .{
+        .add_blocked_by = &.{other.id.slice()},
+        .remove_blocked_by = &.{blocker.id.slice()},
+        .due_date = "",
+        .estimate_minutes = .clear,
+        .parent = "",
+    });
+    issue = try repo.load(arena, .{ .name = ref_name, .tip = edited.tip });
+    try testing.expectEqual(@as(usize, 1), issue.ext.blocked_by.len);
+    try testing.expectEqualStrings(other.id.slice(), issue.ext.blocked_by[0]);
+    try testing.expect(issue.ext.due_date == null and issue.ext.estimate_minutes == null);
+    try testing.expect(issue.ext.parent == null);
+    try testing.expectEqual(@as(u8, 11), issue.ext.start_date.?.month);
+    const subject = (try sim.readObject(arena, edited.tip)).?.data;
+    const want = "Update parent, blockers, due date, estimate";
+    try testing.expect(std.mem.find(u8, subject, want) != null);
+
+    for ([_]CreateSpec{
+        .{ .title = "x", .parent = "a7f3b2c" }, // short IDs must be resolved first
+        .{ .title = "x", .due_date = "2026-02-30" },
+        .{ .title = "x", .workflow = "In Progress" },
+        .{ .title = "x", .assignee = "a7f3b2c1-4e5d-4a8b-9c1e-2f3a4b5c6d7e" ++ " " },
+        .{ .title = "x", .blocked_by = &.{"nope"} },
+    }) |bad| try testing.expectError(error.InvalidValue, repo.create(arena, bad));
+}
+
 test "caller mistakes are errors, not panics" {
     var arena_state: std.heap.ArenaAllocator = .init(testing.allocator);
     defer arena_state.deinit();
@@ -726,25 +1453,23 @@ test "caller mistakes are errors, not panics" {
         try testing.expectError(error.InvalidIssueRef, repo.comment(arena, bad, .{ .text = "hi" }));
         try testing.expectError(
             error.InvalidIssueRef,
-            repo.setState(arena, bad, .{ .state = "closed" }),
+            repo.setState(arena, bad, .{ .state = .closed }),
         );
         try testing.expectError(error.InvalidIssueRef, repo.edit(arena, bad, .{ .title = "t" }));
     }
 
-    // Upstream's write rules hold for library callers too.
+    // Upstream's write rules hold for library callers too. Priorities
+    // can't be wrong: they're an enum.
     for ([_]CreateSpec{
-        .{ .title = "x", .priority = "urgent" },
-        .{ .title = "x", .priority = "" },
         .{ .title = "x", .assignee = "ada" },
         .{ .title = "x", .assignee = "ada@example." },
     }) |bad| try testing.expectError(error.InvalidValue, repo.create(arena, bad));
-    try testing.expectError(error.InvalidValue, repo.edit(arena, ref_name, .{ .priority = "p1" }));
     try testing.expectError(error.InvalidValue, repo.edit(arena, ref_name, .{ .assignee = "ada" }));
     try testing.expectError(
         error.InvalidValue,
-        repo.setState(arena, ref_name, .{ .state = "in progress" }),
+        repo.setState(arena, ref_name, .{ .state = .{ .other = "in progress" } }),
     );
-    _ = try repo.edit(arena, ref_name, .{ .priority = "", .assignee = "" });
+    _ = try repo.edit(arena, ref_name, .{ .priority = .clear, .assignee = "" });
 }
 
 test "expect" {
@@ -767,7 +1492,7 @@ test "expect" {
     );
     try testing.expectError(
         error.VersionMismatch,
-        repo.setState(arena, ref_name, .{ .state = "closed", .expect = seen }),
+        repo.setState(arena, ref_name, .{ .state = .closed, .expect = seen }),
     );
     try testing.expectError(
         error.VersionMismatch,
@@ -845,7 +1570,7 @@ test "comments that would read as trailers are refused" {
     _ = try repo.comment(arena, ref_name, .{ .text = "State: closed" });
     try testing.expectEqualStrings(
         "open",
-        (try repo.load(arena, (try repo.resolve(arena, created.id.short())).one)).state,
+        (try repo.load(arena, (try repo.resolve(arena, created.id.short())).one)).state.text(),
     );
     try testing.expectError(error.InvalidText, repo.create(arena, .{ .title = "two\nlines" }));
 }
@@ -854,7 +1579,13 @@ test "comments that would read as trailers are refused" {
 /// exercise the CAS retry.
 const RacingSim = struct {
     sim: *GitSim,
-    race: ?struct { ref: []const u8, message: []const u8, close: bool = false } = null,
+    race: ?struct {
+        ref: []const u8,
+        message: []const u8,
+        close: bool = false,
+        /// Creates an open child of this issue instead.
+        child_of: ?[]const u8 = null,
+    } = null,
 
     pub const Error = GitSim.Error;
 
@@ -881,8 +1612,10 @@ const RacingSim = struct {
             r.race = null;
             const other = Repo(GitSim).init(r.sim);
             const a = r.sim.arena;
-            if (race.close) {
-                _ = other.setState(a, race.ref, .{ .state = "closed" }) catch unreachable;
+            if (race.child_of) |parent| {
+                _ = other.create(a, .{ .title = "Late child", .parent = parent }) catch unreachable;
+            } else if (race.close) {
+                _ = other.setState(a, race.ref, .{ .state = .closed }) catch unreachable;
             } else {
                 _ = other.comment(a, race.ref, .{ .text = race.message }) catch unreachable;
             }
@@ -937,6 +1670,227 @@ const RacingSim = struct {
         r.sim.randomBytes(buf);
     }
 };
+
+test "guards" {
+    var arena_state: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var world: GitSim.World = .{ .seed = 31, .clones = &.{.{ .name = "a" }} };
+    var sim = try GitSim.init(arena, &world, 0);
+    const repo = Repo(GitSim).init(&sim);
+    const refOf = struct {
+        fn f(a: Allocator, c: Repo(GitSim).Created) ![]const u8 {
+            return std.fmt.allocPrint(a, "refs/issues/{s}", .{c.id.slice()});
+        }
+    }.f;
+
+    const epic = try repo.create(arena, .{ .title = "Epic" });
+    const task = try repo.create(arena, .{ .title = "Task", .parent = epic.id.slice() });
+    const sub = try repo.create(arena, .{ .title = "Sub", .parent = task.id.slice() });
+
+    try testing.expectError(error.ParentIsSelf, repo.edit(arena, try refOf(arena, epic), .{
+        .parent = epic.id.slice(),
+    }));
+    try testing.expectError(error.ParentCycle, repo.edit(arena, try refOf(arena, epic), .{
+        .parent = sub.id.slice(),
+    }));
+    try testing.expectError(error.ReferenceNotFound, repo.create(arena, .{
+        .title = "x",
+        .parent = "0f0f0f0f-0f0f-4f0f-8f0f-0f0f0f0f0f0f",
+    }));
+    // A chain of depth 8 is fine, a ninth level isn't.
+    var chain = sub; // depth 2
+    for (3..9) |_| chain = try repo.create(arena, .{ .title = "deep", .parent = chain.id.slice() });
+    try testing.expectError(error.TooDeep, repo.create(arena, .{
+        .title = "too deep",
+        .parent = chain.id.slice(),
+    }));
+    // Moving a subtree counts its height.
+    const side = try repo.create(arena, .{ .title = "Side" });
+    try testing.expectError(error.TooDeep, repo.edit(arena, try refOf(arena, epic), .{
+        .parent = side.id.slice(),
+    }));
+
+    const b1 = try repo.create(arena, .{ .title = "B1", .blocked_by = &.{side.id.slice()} });
+    try testing.expectError(error.BlocksItself, repo.edit(arena, try refOf(arena, b1), .{
+        .add_blocked_by = &.{b1.id.slice()},
+    }));
+    try testing.expectError(error.BlockerCycle, repo.edit(arena, try refOf(arena, side), .{
+        .add_blocked_by = &.{b1.id.slice()},
+    }));
+
+    try testing.expectError(
+        error.OpenDescendants,
+        repo.setState(arena, try refOf(arena, task), .{ .state = .closed }),
+    );
+    const leaf = try repo.create(arena, .{ .title = "Leaf", .parent = side.id.slice() });
+    // Any state but open is done: a `wontfix` leaf doesn't hold its parent
+    // open, and counts as closing.
+    _ = try repo.setState(arena, try refOf(arena, leaf), .{ .state = .{ .other = "wontfix" } });
+    _ = try repo.setState(arena, try refOf(arena, leaf), .{ .state = .closed });
+    _ = try repo.setState(arena, try refOf(arena, side), .{ .state = .closed });
+    try testing.expectError(error.ClosedAncestor, repo.create(arena, .{
+        .title = "Under closed",
+        .parent = side.id.slice(),
+    }));
+    try testing.expectError(
+        error.ClosedAncestor,
+        repo.setState(arena, try refOf(arena, leaf), .{ .state = .open }),
+    );
+    try testing.expectError(error.ClosedAncestor, repo.edit(arena, try refOf(arena, b1), .{
+        .parent = side.id.slice(),
+    }));
+    _ = try repo.setState(arena, try refOf(arena, side), .{ .state = .open });
+    _ = try repo.setState(arena, try refOf(arena, leaf), .{ .state = .open });
+
+    // Whatever the guards let through leaves no violation.
+    const issues = try repo.loadAll(arena);
+    const proj = try @import("projection.zig").build(arena, issues, .{});
+    try testing.expectEqual(@as(usize, 0), proj.problems.len);
+}
+
+test "guards on foreign cycles" {
+    var arena_state: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var world: GitSim.World = .{ .seed = 35, .clones = &.{.{ .name = "a" }} };
+    var sim = try GitSim.init(arena, &world, 0);
+    const repo = Repo(GitSim).init(&sim);
+    const a = try repo.create(arena, .{ .title = "A" });
+    const b = try repo.create(arena, .{ .title = "B", .parent = a.id.slice() });
+    const a_ref = try std.fmt.allocPrint(arena, "refs/issues/{s}", .{a.id.slice()});
+
+    // Someone else closes A and makes it B's child: an A, B cycle.
+    const who = try sim.identity(arena);
+    const msg = try std.fmt.allocPrint(
+        arena,
+        "Edit\n\nState: closed\nX-Parent: {s}\n",
+        .{b.id.slice()},
+    );
+    const foreign = try repo.writeCommit(arena, &.{a.tip}, who, msg);
+    try sim.updateRefs(&.{.{
+        .name = a_ref,
+        .op = .{ .update = .{ .new = foreign, .old = a.tip } },
+    }});
+
+    // Reopening A walks up through B back to A. That must neither put A's
+    // ref in the transaction twice nor fail because A was closed.
+    _ = try repo.setState(arena, a_ref, .{ .state = .open });
+    const now = try repo.load(arena, .{ .name = a_ref, .tip = (try sim.resolveRef(a_ref)).? });
+    try testing.expectEqualStrings("open", now.state.text());
+}
+
+test "lifecycle" {
+    var arena_state: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var world: GitSim.World = .{ .seed = 41, .clones = &.{.{ .name = "a" }} };
+    var sim = try GitSim.init(arena, &world, 0);
+    const repo = Repo(GitSim).init(&sim);
+    const parent = try repo.create(arena, .{ .title = "Parent", .body = "Old." });
+    const child = try repo.create(arena, .{ .title = "Child", .parent = parent.id.slice() });
+    const ref = try refNameOf(arena, parent.id.slice());
+    const latest = struct {
+        fn f(r: Repo(GitSim), a: Allocator, s: *GitSim, name: []const u8) !Issue {
+            return r.load(a, .{ .name = name, .tip = (try s.resolveRef(name)).? });
+        }
+    }.f;
+
+    const c = try repo.comment(arena, ref, .{ .text = "Tpyo here" });
+    _ = try repo.commentEvent(arena, ref, c, .edit, "Typo fixed", .{});
+    var issue = try latest(repo, arena, &sim, ref);
+    try testing.expectEqualStrings("Typo fixed", issue.comments[0].subject);
+    try testing.expect(issue.comments[0].edited);
+    _ = try repo.commentEvent(arena, ref, c, .delete, "", .{});
+    issue = try latest(repo, arena, &sim, ref);
+    try testing.expect(issue.comments[0].deleted);
+    _ = try repo.commentEvent(arena, ref, c, .restore, "", .{});
+    try testing.expectError(
+        error.CommentNotFound,
+        repo.commentEvent(arena, ref, parent.tip, .delete, "", .{}), // the root
+    );
+
+    _ = try repo.editDescription(arena, ref, "New.\n\nTwo paragraphs.", .{});
+    issue = try latest(repo, arena, &sim, ref);
+    try testing.expectEqualStrings("New.\n\nTwo paragraphs.", issue.description);
+    try testing.expectEqual(@as(usize, 1), issue.comments.len); // events aren't comments
+
+    // A parent with an active child can't be deleted, bottom-up works.
+    try testing.expectError(error.ActiveChildren, repo.setDeleted(arena, ref, true, .{}));
+    _ = try repo.setDeleted(arena, try refNameOf(arena, child.id.slice()), true, .{});
+    _ = try repo.setDeleted(arena, ref, true, .{});
+    issue = try latest(repo, arena, &sim, ref);
+    try testing.expect(issue.deleted);
+    _ = try repo.setDeleted(arena, ref, false, .{});
+    try testing.expect(!(try latest(repo, arena, &sim, ref)).deleted);
+}
+
+test "guards under concurrent change" {
+    var arena_state: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var world: GitSim.World = .{ .seed = 33, .clones = &.{.{ .name = "a" }} };
+    var sim = try GitSim.init(arena, &world, 0);
+    const parent = try Repo(GitSim).init(&sim).create(arena, .{ .title = "Parent" });
+    const parent_ref = try std.fmt.allocPrint(arena, "refs/issues/{s}", .{parent.id.slice()});
+
+    // The parent gets closed between our guard read and our write. The
+    // verify line fails and the retry sees it closed.
+    var racing: RacingSim = .{
+        .sim = &sim,
+        .race = .{ .ref = parent_ref, .message = "", .close = true },
+    };
+    const repo = Repo(RacingSim).init(&racing);
+    try testing.expectError(error.ClosedAncestor, repo.create(arena, .{
+        .title = "Child",
+        .parent = parent.id.slice(),
+    }));
+    try testing.expectEqual(@as(usize, 1), (try repo.refs(arena)).len);
+
+    // A child appears between our scan of the children and our write. A
+    // verify line can't pin that absence. The guard ref makes the write
+    // conflict, and the retry sees the child.
+    for ([_]bool{ false, true }) |delete| {
+        const epic = try Repo(GitSim).init(&sim).create(arena, .{ .title = "Epic" });
+        const epic_ref = try refNameOf(arena, epic.id.slice());
+        racing.race = .{ .ref = epic_ref, .message = "", .child_of = epic.id.slice() };
+        if (delete) {
+            try testing.expectError(error.ActiveChildren, repo.setDeleted(arena, epic_ref, true, .{}));
+        } else {
+            try testing.expectError(error.OpenDescendants, repo.setState(arena, epic_ref, .{
+                .state = .closed,
+            }));
+        }
+        try testing.expect(racing.race == null);
+    }
+}
+
+test "guards skip what they can't read" {
+    var arena_state: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var world: GitSim.World = .{ .seed = 37, .clones = &.{.{ .name = "a" }} };
+    var sim = try GitSim.init(arena, &world, 0);
+    const repo = Repo(GitSim).init(&sim);
+    const leaf = try repo.create(arena, .{ .title = "Leaf" });
+
+    // A damaged issue elsewhere doesn't stop closing a healthy one.
+    const blob = try sim.writeObject(.blob, "not a commit");
+    try sim.updateRefs(&.{.{
+        .name = "refs/issues/0f0f0f0f-0f0f-4f0f-8f0f-0f0f0f0f0f0f",
+        .op = .{ .create = blob },
+    }});
+    _ = try repo.setState(arena, try refNameOf(arena, leaf.id.slice()), .{ .state = .closed });
+
+    // Its own parent, from another tool, isn't its own child.
+    const selfish = try repo.create(arena, .{ .title = "Selfish" });
+    const ref = try refNameOf(arena, selfish.id.slice());
+    const who = try sim.identity(arena);
+    const msg = try std.fmt.allocPrint(arena, "Edit\n\nX-Parent: {s}\n", .{selfish.id.slice()});
+    const foreign = try repo.writeCommit(arena, &.{selfish.tip}, who, msg);
+    try sim.updateRefs(&.{.{ .name = ref, .op = .{ .update = .{ .new = foreign, .old = selfish.tip } } }});
+    _ = try repo.setDeleted(arena, ref, true, .{});
+}
 
 test "CAS conflict rebuilds the commit" {
     var arena_state: std.heap.ArenaAllocator = .init(testing.allocator);

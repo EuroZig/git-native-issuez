@@ -19,6 +19,9 @@ const cmd_fsck = @import("cmd/fsck.zig");
 const cmd_init = @import("cmd/init.zig");
 const cmd_merge = @import("cmd/merge.zig");
 const cmd_status = @import("cmd/status.zig");
+const cmd_tree = @import("cmd/tree.zig");
+const cmd_delete = @import("cmd/delete.zig");
+const cmd_close = @import("cmd/close.zig");
 const cmd_quarantine = @import("cmd/quarantine.zig");
 
 pub const program = "git-issue";
@@ -47,6 +50,11 @@ pub const Command = enum {
     push,
     status,
     quarantine,
+    tree,
+    delete,
+    restore,
+    close,
+    reopen,
 };
 
 pub const Invocation = struct {
@@ -95,6 +103,11 @@ pub fn run(
         .merge => cmd_merge.main(B, ctx, inv.args, .merge),
         .push => cmd_merge.main(B, ctx, inv.args, .push),
         .status => cmd_status.main(B, ctx, inv.args),
+        .tree => cmd_tree.main(B, ctx, inv.args),
+        .delete => cmd_delete.main(B, ctx, inv.args, true),
+        .restore => cmd_delete.main(B, ctx, inv.args, false),
+        .close => cmd_close.main(B, ctx, inv.args, true),
+        .reopen => cmd_close.main(B, ctx, inv.args, false),
         .quarantine => cmd_quarantine.main(B, ctx, inv.args),
         .sync => if (hasHelp(inv.args))
             cmd_merge.main(B, ctx, inv.args, .sync)

@@ -6,5 +6,6 @@ client B closes (same, now stale ETag):
   refused: VersionMismatch (reload, retry)
 client B retries with the fresh ETag:
   ref update refs/issues/df230b49-615d-4753-87d5-80c33d6fda61
+  ref create refs/issuez-guard/df230b49-615d-4753-87d5-80c33d6fda61
 
 Audit me: closed, 2 update(s)

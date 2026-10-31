@@ -9,7 +9,8 @@ const uuid = issuez.format.uuid;
 pub const help =
     \\usage: git issue search <pattern> [options]
     \\
-    \\Search issue titles, descriptions and comments for a fixed string.
+    \\Search issue titles, fields, descriptions and comments for a fixed string.
+    \\Edited text is searched as edited; deleted comments are left out.
     \\
     \\Options:
     \\   -s, --state <state>   open, closed, any custom state, or all [default: all]
@@ -23,7 +24,7 @@ const max_shown = 5;
 pub fn main(comptime B: type, ctx: *context.Context(B), argv: []const []const u8) u8 {
     const arena = ctx.arena;
     var pattern: ?[]const u8 = null;
-    var state_filter: []const u8 = "all";
+    var state_filter: ?issuez.format.core.State = null;
     var ignore_case = false;
 
     var args: common.Args = .{ .list = argv };
@@ -35,7 +36,7 @@ pub fn main(comptime B: type, ctx: *context.Context(B), argv: []const []const u8
             ctx.out.writeAll(help) catch {};
             return common.exit_ok;
         } else if (std.mem.eql(u8, arg, "-s") or std.mem.eql(u8, arg, "--state")) {
-            state_filter = args.value(ctx.err, "-s") orelse return common.exit_error;
+            state_filter = common.stateFilter(args.value(ctx.err, "-s") orelse return common.exit_error);
         } else if (std.mem.eql(u8, arg, "-i") or std.mem.eql(u8, arg, "--ignore-case")) {
             ignore_case = true;
         } else {
@@ -56,19 +57,16 @@ pub fn main(comptime B: type, ctx: *context.Context(B), argv: []const []const u8
         return common.exit_ok;
     }
 
+    const filter: issuez.query.Filter = .{ .state = state_filter, .done = null };
     for (issues) |issue| {
-        if (!std.mem.eql(u8, state_filter, "all") and !std.mem.eql(
-            u8,
-            issue.state,
-            state_filter,
-        )) continue;
+        if (!filter.matches(issue)) continue;
         const lines = issuez.query.searchLines(arena, issue, needle, .{
             .ignore_case = ignore_case,
         }) catch return common.oom(ctx.err);
         if (lines.len == 0) continue;
         ctx.out.print(
             "{s} [{s}] {s}\n",
-            .{ uuid.shortId(issue.id), issue.state, issue.title },
+            .{ uuid.shortId(issue.id), issue.state.text(), issue.title },
         ) catch {};
         for (lines[0..@min(lines.len, max_shown)], 1..) |line, n| {
             ctx.out.print("       {d}:{s}\n", .{ n, line }) catch {};

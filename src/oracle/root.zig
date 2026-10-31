@@ -7,19 +7,27 @@ const Allocator = std.mem.Allocator;
 const issuez = @import("issuez");
 const object = issuez.backend.object;
 const hex_fmt = issuez.format.hex;
+const trailers = issuez.format.trailers;
 const World = issuez.backend.GitSim.World;
 const Oid = object.Oid;
 
 pub const command = @import("command.zig");
 pub const Command = command.Command;
 
-/// Reasons a transition was rejected.
+/// Reasons a transition was rejected, and checks left out.
 pub const Report = struct {
     arena: Allocator,
     violations: std.ArrayList([]const u8) = .empty,
+    /// Parts of the transition the oracle has no rule for, so a gap in its
+    /// coverage shows up in the fuzzer's statistics.
+    skipped: std.ArrayList([]const u8) = .empty,
 
     pub fn fail(r: *Report, comptime fmt: []const u8, args: anytype) Allocator.Error!void {
         try r.violations.append(r.arena, try std.fmt.allocPrint(r.arena, fmt, args));
+    }
+
+    pub fn skip(r: *Report, reason: []const u8) Allocator.Error!void {
+        try r.skipped.append(r.arena, reason);
     }
 
     pub fn ok(r: Report) bool {
@@ -31,6 +39,7 @@ pub const Report = struct {
 pub const owned_prefixes = [_][]const u8{
     "refs/issues/",
     "refs/issuez-sync/",
+    "refs/issuez-guard/",
 };
 
 pub fn isOwnedRef(name: []const u8) bool {
@@ -44,6 +53,10 @@ pub fn isOwnedRef(name: []const u8) bool {
     }
     return false;
 }
+
+/// Local refs that serialize guarded writes, see the engine's
+/// `guard_ref_prefix`. The per-command rules ignore them.
+const guard_prefix = "refs/issuez-guard/";
 
 /// Must hold whatever the command.
 pub fn checkInvariants(
@@ -101,6 +114,35 @@ fn checkClone(
         if (std.mem.startsWith(u8, r.name, "refs/issues/")) {
             try checkEmptyTreeHistory(arena, format, a.name, r.name, o, after_objects, report);
         }
+    }
+
+    // Guard refs stay, and only move to a tip this step wrote to an issue
+    // or milestone.
+    for (b.refs) |r| if (std.mem.startsWith(u8, r.name, guard_prefix)) {
+        const kept = for (a.refs) |n| {
+            if (std.mem.eql(u8, n.name, r.name)) break true;
+        } else false;
+        if (!kept) try report.fail("clone '{s}': guard ref {s} deleted", .{ a.name, r.name });
+    };
+    for (a.refs) |r| {
+        if (!std.mem.startsWith(u8, r.name, guard_prefix)) continue;
+        const old = for (b.refs) |o| {
+            if (std.mem.eql(u8, o.name, r.name)) break o.oid;
+        } else null;
+        if (old != null and std.mem.eql(u8, old.?, r.oid)) continue;
+        const written = for (a.refs) |t| {
+            if (!std.mem.startsWith(u8, t.name, "refs/issues/") and
+                !std.mem.startsWith(u8, t.name, "refs/milestones/")) continue;
+            if (!std.mem.eql(u8, t.oid, r.oid)) continue;
+            const was = for (b.refs) |o| {
+                if (std.mem.eql(u8, o.name, t.name)) break o.oid;
+            } else null;
+            if (was == null or !std.mem.eql(u8, was.?, t.oid)) break true;
+        } else false;
+        if (!written) try report.fail(
+            "clone '{s}': guard ref {s} moved to a commit no write made",
+            .{ a.name, r.name },
+        );
     }
 
     // Refs outside our namespaces never change.
@@ -213,11 +255,23 @@ pub fn checkTransition(
         .create => |x| return checkCreate(arena, after, cb, ca, x, report),
         .comment => |x| return checkComment(arena, after, cb, ca, x, report),
         .state => |x| return checkState(arena, after, cb, ca, x, report),
-        .edit => |x| return checkEdit(arena, after, cb, ca, x, report),
+        .edit => |x| if (x.description.len > 0)
+            return checkDescription(arena, after, cb, ca, x, report)
+        else
+            return checkEdit(arena, after, cb, ca, x, report),
         .merge, .push, .sync => |x| {
             try checkSync(arena, before, after, target, cmd, x, report);
         },
         .quarantine => |x| return checkResolve(arena, cb, ca, x, report),
+        .close, .reopen => |x| return checkState(arena, after, cb, ca, .{
+            .id = x.id,
+            .state = if (cmd == .close) "closed" else "open",
+            .message = x.message,
+        }, report),
+        .delete, .restore => |x| {
+            return checkDeleted(arena, after, cb, ca, cmd == .delete, x, report);
+        },
+        .comment_event => |x| return checkCommentEvent(arena, after, cb, ca, x, report),
     }
 }
 
@@ -404,21 +458,93 @@ fn checkNewMerges(
             try arena.dupe(u8, p0.slice()),
             try arena.dupe(u8, p1.slice()),
         });
+        // A field written before but empty now is restated empty.
         var want: std.ArrayList(commands.Trailer) = .empty;
+        const was = struct {
+            fn f(x: commands.NaiveIssue, key: []const u8) bool {
+                for (x.cleared) |k| if (std.mem.eql(u8, k, key)) return true;
+                return false;
+            }
+        }.f;
         try want.append(arena, .{ .key = "State", .value = n.state });
-        if (n.title_override) |t| try want.append(arena, .{ .key = "Title", .value = t });
+        if (n.title_override) |t| try want.append(arena, .{ .key = "Title", .value = t }) else if (was(n, "Title"))
+            try want.append(arena, .{ .key = "Title", .value = "" });
         if (n.labels.len > 0) try want.append(
             arena,
             .{ .key = "Labels", .value = try std.mem.join(arena, ", ", n.labels) },
-        );
-        if (n.assignee.len > 0) try want.append(arena, .{ .key = "Assignee", .value = n.assignee });
-        if (n.priority.len > 0) try want.append(arena, .{ .key = "Priority", .value = n.priority });
-        if (n.milestone.len > 0) try want.append(
-            arena,
+        ) else if (was(n, "Labels")) try want.append(arena, .{ .key = "Labels", .value = "" });
+        for ([_]commands.Trailer{
+            .{ .key = "Assignee", .value = n.assignee },
+            .{ .key = "Priority", .value = n.priority },
             .{ .key = "Milestone", .value = n.milestone },
+        }) |t| if (t.value.len > 0 or was(n, t.key)) try want.append(arena, t);
+        // Extension fields as written, then the blockers.
+        for ([_]commands.Trailer{
+            .{ .key = "X-Parent", .value = n.parent },
+            .{ .key = "X-Start-Date", .value = n.start },
+            .{ .key = "X-Due-Date", .value = n.due },
+            .{ .key = "X-Estimate-Minutes", .value = n.estimate },
+            .{ .key = "X-Workflow-State", .value = n.workflow },
+            .{ .key = "X-Deleted", .value = n.deleted },
+        }) |t| if (t.value.len > 0 or was(n, t.key)) try want.append(arena, t);
+        const block = try commands.trailersOf(arena, cm.message);
+        if (n.blocked_by.len > 0) {
+            // A set: the oracle doesn't model member order.
+            var value: []const u8 = try std.mem.join(arena, ", ", n.blocked_by);
+            if (trailers.lastValue(block, "X-Blocked-By")) |got| {
+                if (sameMembers(try splitSet(arena, got), n.blocked_by)) value = got;
+            }
+            try want.append(arena, .{ .key = "X-Blocked-By", .value = value });
+        } else if (was(n, "X-Blocked-By")) {
+            try want.append(arena, .{ .key = "X-Blocked-By", .value = "" });
+        }
+        try expectBlock(report, "merge", block, want.items);
+        // Restating changes nothing: the merge reads as its parents do.
+        if (!sameNaive(try c.naive(hex), n)) try report.fail(
+            "merge {s}: restating changed the resolved fields",
+            .{hex[0..7]},
         );
-        try expectBlock(report, "merge", try commands.trailersOf(arena, cm.message), want.items);
     }
+}
+
+/// Every field the merge restates, compared as written.
+fn sameNaive(a: commands.NaiveIssue, b: commands.NaiveIssue) bool {
+    const eql = std.mem.eql;
+    const scalars = [_][2][]const u8{
+        .{ a.state, b.state },
+        .{ a.title, b.title },
+        .{ a.assignee, b.assignee },
+        .{ a.priority, b.priority },
+        .{ a.milestone, b.milestone },
+        .{ a.parent, b.parent },
+        .{ a.start, b.start },
+        .{ a.due, b.due },
+        .{ a.estimate, b.estimate },
+        .{ a.workflow, b.workflow },
+        .{ a.deleted, b.deleted },
+    };
+    for (scalars) |s| if (!eql(u8, s[0], s[1])) return false;
+    return sameMembers(a.labels, b.labels) and sameMembers(a.blocked_by, b.blocked_by);
+}
+
+/// Same members, in any order. Members are unique.
+fn sameMembers(a: []const []const u8, b: []const []const u8) bool {
+    if (a.len != b.len) return false;
+    outer: for (a) |x| {
+        for (b) |y| if (std.mem.eql(u8, x, y)) continue :outer;
+        return false;
+    }
+    return true;
+}
+
+fn splitSet(arena: Allocator, value: []const u8) Allocator.Error![]const []const u8 {
+    var out: std.ArrayList([]const u8) = .empty;
+    var it = std.mem.splitScalar(u8, value, ',');
+    while (it.next()) |m| {
+        const t = std.mem.trim(u8, m, " \t");
+        if (t.len > 0) try out.append(arena, t);
+    }
+    return out.items;
 }
 
 /// Only unrelated histories, or a remote that lost what we merged before,
@@ -504,6 +630,7 @@ fn refChanges(
 ) Allocator.Error![]const RefChange {
     var out: std.ArrayList(RefChange) = .empty;
     for (a.clone.refs) |r| {
+        if (std.mem.startsWith(u8, r.name, guard_prefix)) continue;
         const old = b.ref(r.name);
         if (old == null or !std.mem.eql(u8, old.?, r.oid)) try out.append(
             arena,
@@ -686,7 +813,11 @@ fn checkCreate(
     if (c.parents.len != 0) try report.fail("create: root commit has parents", .{});
     if (!c.tree.eql(object.emptyTree(world.format))) try report.fail("create: non-empty tree", .{});
     try checkIdentity(world, c, report);
-    const expected = try commands.expectedCreateMessage(arena, x);
+    const resolved = (try commands.resolveExt(arena, b, x.ext)) orelse return report.fail(
+        "create succeeded with a reference, date, estimate or workflow state the oracle rejects",
+        .{},
+    );
+    const expected = try commands.expectedCreateMessage(arena, x, resolved);
     if (!std.mem.eql(u8, c.message, expected))
         try report.fail("create wrote message\n{s}\nexpected\n{s}", .{ c.message, expected });
 }
@@ -775,11 +906,15 @@ fn checkEdit(
 ) (Allocator.Error || error{NoRule})!void {
     const c = (try appendCommit(arena, world, b, a, "edit", x.id, report)) orelse return;
     const previous = try b.naive(c.parents[0].hex().slice());
+    const resolved = (try commands.resolveExt(arena, b, x.ext)) orelse return report.fail(
+        "edit succeeded with a reference, date, estimate or workflow state the oracle rejects",
+        .{},
+    );
     try expectBlock(
         report,
         "edit",
         try commands.trailersOf(arena, c.message),
-        try commands.expectedEditTrailers(arena, x, previous),
+        try commands.expectedEditTrailers(arena, x, resolved, previous),
     );
 }
 
@@ -797,6 +932,214 @@ fn expectSubject(
     const got = try commands.subjectOf(arena, message);
     if (!std.mem.eql(u8, want, got))
         try report.fail("{s}: subject '{s}', expected '{s}'", .{ cmd, got, want });
+}
+
+/// What follows the subject: the body and the trailers.
+fn afterSubject(message: []const u8) []const u8 {
+    const at = std.mem.find(u8, message, "\n\n") orelse return "";
+    return message[at + 2 ..];
+}
+
+/// The one issue `id` names, as its ref. Null after reporting otherwise.
+fn targetRef(
+    b: commands.Clone,
+    id: []const u8,
+    report: *Report,
+    cmd: []const u8,
+) Allocator.Error!?[]const u8 {
+    const m = try b.matching(id);
+    if (m.len != 1) {
+        try report.fail("{s} succeeded although '{s}' matches {d} issues", .{ cmd, id, m.len });
+        return null;
+    }
+    return m[0];
+}
+
+/// Oldest first, along first parents.
+fn appended(
+    arena: Allocator,
+    b: commands.Clone,
+    a: commands.Clone,
+    name: []const u8,
+    report: *Report,
+    cmd: []const u8,
+) Allocator.Error!?[]const object.Commit {
+    const changes = try refChanges(arena, b, a);
+    if (changes.len != 1 or !std.mem.eql(u8, changes[0].name, name) or changes[0].new == null) {
+        try report.fail("{s} must advance exactly {s}", .{ cmd, name });
+        return null;
+    }
+    const old = changes[0].old.?;
+    var chain: std.ArrayList(object.Commit) = .empty;
+    var hex = changes[0].new.?;
+    while (!std.mem.eql(u8, hex, old)) {
+        const c = a.commit(hex) orelse {
+            try report.fail("{s}: new tip is not a commit chain onto the old one", .{cmd});
+            return null;
+        };
+        if (c.parents.len != 1 or chain.items.len > 2) {
+            try report.fail("{s}: wrote something other than a short linear chain", .{cmd});
+            return null;
+        }
+        try chain.insert(arena, 0, c);
+        hex = try arena.dupe(u8, c.parents[0].hex().slice());
+    }
+    return chain.items;
+}
+
+fn checkDeleted(
+    arena: Allocator,
+    world: World,
+    b: commands.Clone,
+    a: commands.Clone,
+    deleted: bool,
+    x: command.Lifecycle,
+    report: *Report,
+) Allocator.Error!void {
+    const cmd = if (deleted) "delete" else "restore";
+    const name = (try targetRef(b, x.id, report, cmd)) orelse return;
+    const before_tip = b.ref(name).?;
+    const naive = b.naive(before_tip) catch |e| switch (e) {
+        error.OutOfMemory => return error.OutOfMemory,
+        error.NoRule => return report.skip("delete/restore on a history the oracle can't read"),
+    };
+    const was = std.mem.eql(u8, naive.deleted, "true");
+    if (was == deleted) {
+        // Already in that state, nothing to write.
+        const changed = (try refChanges(arena, b, a)).len;
+        if (changed != 0) try report.fail("{s}: no-op wrote refs", .{cmd});
+        return;
+    }
+    const chain = (try appended(arena, b, a, name, report, cmd)) orelse return;
+    if (chain.len != 1) return report.fail("{s}: expected one commit", .{cmd});
+    try checkIdentity(world, chain[0], report);
+    const block = try commands.trailersOf(arena, chain[0].message);
+    try expectBlock(report, cmd, block, &.{.{
+        .key = "X-Deleted",
+        .value = if (deleted) "true" else "false",
+    }});
+    try expectSubject(arena, report, cmd, x.message, chain[0].message);
+}
+
+/// Non-root, single-parent commits without `X-Event`.
+fn commentCommits(
+    arena: Allocator,
+    c: commands.Clone,
+    tip: []const u8,
+) Allocator.Error![]const []const u8 {
+    var out: std.ArrayList([]const u8) = .empty;
+    var seen: std.StringHashMapUnmanaged(void) = .empty;
+    var stack: std.ArrayList([]const u8) = .empty;
+    try stack.append(arena, tip);
+    while (stack.pop()) |hex| {
+        if ((try seen.getOrPut(arena, hex)).found_existing) continue;
+        const cm = c.commit(hex) orelse continue;
+        const block = try commands.trailersOf(arena, cm.message);
+        var event = false;
+        for (block.trailers) |t| if (std.ascii.eqlIgnoreCase(t.key, "X-Event")) {
+            event = true;
+        };
+        if (cm.parents.len == 1 and !event) try out.append(arena, hex);
+        for (cm.parents) |p| try stack.append(arena, try arena.dupe(u8, p.hex().slice()));
+    }
+    return out.items;
+}
+
+fn checkCommentEvent(
+    arena: Allocator,
+    world: World,
+    b: commands.Clone,
+    a: commands.Clone,
+    x: command.CommentEvent,
+    report: *Report,
+) Allocator.Error!void {
+    const kind = switch (x.kind) {
+        .edit => "comment-edit",
+        .delete => "comment-delete",
+        .restore => "comment-restore",
+    };
+    const name = (try targetRef(b, x.id, report, "comment")) orelse return;
+    // Resolves among the issue's comments, 4+ characters.
+    var target: ?[]const u8 = null;
+    for (try commentCommits(arena, b, b.ref(name).?)) |hex| {
+        if (x.target.len >= 4 and std.mem.startsWith(u8, hex, x.target)) {
+            if (target != null)
+                return report.fail("comment event: '{s}' is ambiguous", .{x.target});
+            target = hex;
+        }
+    }
+    const t = target orelse
+        return report.fail("comment event succeeded on unknown '{s}'", .{x.target});
+    const chain = (try appended(arena, b, a, name, report, "comment")) orelse return;
+    if (chain.len != 1) return report.fail("comment event: expected one commit", .{});
+    try checkIdentity(world, chain[0], report);
+    const block = try commands.trailersOf(arena, chain[0].message);
+    try expectBlock(report, "comment", block, &.{
+        .{ .key = "X-Event", .value = kind },
+        .{ .key = "X-Comment", .value = t },
+    });
+    if (x.kind == .edit) {
+        // The new text is the body, exactly.
+        const want = try eventBody(arena, x.text orelse "", &.{
+            .{ "X-Event", kind },
+            .{ "X-Comment", t },
+        });
+        if (!std.mem.eql(u8, want, afterSubject(chain[0].message))) try report.fail(
+            "comment edit wrote\n{s}\nexpected after the subject\n{s}",
+            .{ chain[0].message, want },
+        );
+    }
+}
+
+fn checkDescription(
+    arena: Allocator,
+    world: World,
+    b: commands.Clone,
+    a: commands.Clone,
+    x: command.Edit,
+    report: *Report,
+) (Allocator.Error || error{NoRule})!void {
+    const name = (try targetRef(b, x.id, report, "edit")) orelse return;
+    const chain = (try appended(arena, b, a, name, report, "edit")) orelse return;
+    // One commit: the other changes ride along on the event.
+    if (chain.len != 1) return report.fail("edit --description wrote {d} commits", .{chain.len});
+    const desc = chain[0];
+    try checkIdentity(world, desc, report);
+    var want: std.ArrayList(commands.Trailer) = .empty;
+    if (x.changesFields()) {
+        const previous = try b.naive(desc.parents[0].hex().slice());
+        const resolved = (try commands.resolveExt(arena, b, x.ext)) orelse
+            return report.fail("edit succeeded with values the oracle rejects", .{});
+        try want.appendSlice(arena, try commands.expectedEditTrailers(arena, x, resolved, previous));
+    }
+    try want.append(arena, .{ .key = "X-Event", .value = "description-edit" });
+    const block = try commands.trailersOf(arena, desc.message);
+    try expectBlock(report, "edit", block, want.items);
+    var pairs: std.ArrayList([2][]const u8) = .empty;
+    for (want.items) |t| try pairs.append(arena, .{ t.key, t.value });
+    const text = try std.mem.join(arena, "\n\n", x.description);
+    const body = try eventBody(arena, text, pairs.items);
+    if (!std.mem.eql(u8, body, afterSubject(desc.message))) try report.fail(
+        "description edit wrote\n{s}\nexpected after the subject\n{s}",
+        .{ desc.message, body },
+    );
+}
+
+/// What follows the subject: `<text>\n\nK: v\n...`, with the text trimmed
+/// at the end and left out when empty, the way format 1 messages are laid
+/// out.
+fn eventBody(
+    arena: Allocator,
+    text: []const u8,
+    trailer_list: []const [2][]const u8,
+) Allocator.Error![]const u8 {
+    var w: std.Io.Writer.Allocating = .init(arena);
+    const body = std.mem.trimEnd(u8, text, " \t\r\n");
+    if (body.len > 0) w.writer.print("{s}\n\n", .{body}) catch return error.OutOfMemory;
+    for (trailer_list) |t| {
+        w.writer.print("{s}: {s}\n", .{ t[0], t[1] }) catch return error.OutOfMemory;
+    }
+    return w.written();
 }
 
 fn expectBlock(

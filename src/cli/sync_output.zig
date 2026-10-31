@@ -46,8 +46,8 @@ pub fn printMerge(
             }) catch {},
         }
         for (e.conflicts) |c| err.print(
-            "Conflict {s}: {s} was edited concurrently; kept '{s}', not '{s}'\n",
-            .{ short, c.field, c.value, c.lost },
+            "Conflict {s}: {f} was edited concurrently; kept '{s}', not '{s}'\n",
+            .{ short, c.target, c.value, c.lost },
         ) catch {};
     }
     const up_to_date = report.count(.up_to_date) + report.count(.local_ahead);

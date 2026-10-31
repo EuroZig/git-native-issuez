@@ -2,8 +2,8 @@
 
 The format git-native-issuez reads and writes. It is
 [git-native-issue](https://github.com/remenoscodes/git-native-issue)'s
-format 1 (its `ISSUE-FORMAT.md`). Every issue this tool writes is a valid
-format-1 issue, and upstream's `fsck` passes on it.
+format 1 (its `ISSUE-FORMAT.md`) with additive extensions. Every issue this
+tool writes stays a valid format-1 issue, and upstream's `fsck` passes on it.
 
 The key words MUST, MUST NOT, SHOULD and MAY are used as in RFC 2119.
 
@@ -13,7 +13,8 @@ The key words MUST, MUST NOT, SHOULD and MAY are used as in RFC 2119.
 | --- | --- |
 | `refs/issues/<uuid>` | an issue |
 | `refs/remotes/<remote>/issues/<uuid>` | fetched issues, waiting to be merged |
-| `refs/issuez-sync/<remote>/<kind>/issues/<uuid>` | sync bookkeeping, local only (§5) |
+| `refs/issuez-sync/<remote>/<kind>/issues/<uuid>` | sync bookkeeping, local only (§6) |
+| `refs/issuez-guard/<uuid>` | write serialization, local only (§3, Guards) |
 
 UUIDs are lowercase, hyphenated, version 4. Readers MUST NOT read issue
 data from any ref other than `refs/issues/*`.
@@ -37,8 +38,8 @@ data from any ref other than `refs/issues/*`.
 - Writers MUST NOT write a body whose last paragraph would itself parse as
   trailers (any key): it would be read as metadata.
 - An empty value explicitly clears a field. A missing trailer never clears
-  one. Upstream's readers skip empty values, so a cleared field may still
-  show the old value there.
+  one. Upstream's readers skip empty values for its core fields, so a
+  cleared core field may still show the old value there.
 - Unknown trailers are kept through merges and ignored by readers that don't
   know them. They appear as plain fields in `show`.
 - Per-commit provenance trailers (`Provider-Comment-ID`, `Exported-Commit`,
@@ -65,12 +66,58 @@ Format-Version: 1
 | `State` | scalar | `open`, `closed`, or another state |
 | `Title` | scalar | overrides the root subject |
 | `Labels` | set | `a, b, c` (comma-separated) |
-| `Assignee` | scalar | an email address |
+| `Assignee` | scalar | `<email>` or `<uuid> <email>` |
 | `Priority` | scalar | `low`, `medium`, `high`, `critical` |
 | `Milestone` | scalar | free text |
 | `Fixed-By`, `Release`, `Reason` | scalar | text (upstream's `state` options) |
+| `X-Parent` | scalar | issue UUID |
+| `X-Blocked-By` | set | issue UUIDs, comma-separated |
+| `X-Start-Date`, `X-Due-Date` | scalar | `YYYY-MM-DD`, a real calendar day |
+| `X-Estimate-Minutes` | scalar | decimal minutes, `0` allowed, no leading zeros, at most 10 × 366 days |
+| `X-Workflow-State` | scalar | slug: lowercase letter, then lowercase letters, digits, `-` (at most 64 bytes) |
+| `X-Deleted` | scalar | `true` or `false` |
+| `X-Event`, `X-Comment` | event | §5 |
 
-Keys match case-insensitively, as in git.
+- Keys match case-insensitively, as in git.
+- A value that doesn't follow its grammar is ignored on read and reported
+  (`fsck`, `ls --problems`).
+- An `Assignee` whose first word isn't a UUID is an email as a whole, as
+  format 1 reads it. The UUID form names a person independently of their
+  address; upstream shows the whole value.
+- References (`X-Parent`, `X-Blocked-By`) are full UUIDs. Whether the target
+  exists, cycles and depth are questions across issues, answered when
+  reading (the projection, `ls --problems`, `tree`), never by refusing to
+  read.
+- `closed` and the states in `git config issue.doneStates` (default
+  `wontfix, duplicate`) count as done. `ls` hides them by default, and
+  parents, blockers, progress and the guards treat them as closed. Every
+  other state (`open`, `in-review`, ...) is open work.
+- Workflow states come from `git config issue.workflowStates` (default
+  `backlog, ready, in-progress, review`). An open issue without a value
+  reads as the first one.
+
+### Guards
+
+Writers keep the hierarchy sound. This tool refuses a write that would:
+- make an issue its own parent, close a parent loop, or nest deeper than
+  `Limits.max_depth` (8 levels by default);
+- give an issue a parent that is missing or deleted;
+- block an issue by itself, by a missing issue, or close a blocker loop;
+- close an issue with open sub-issues, or open one (create, reopen,
+  restore, move) under a closed ancestor;
+- delete an issue with sub-issues that aren't deleted.
+
+Each issue a guard reads is pinned in the same ref transaction (git's
+`update-ref` `verify`), so a concurrent change to any of them aborts the
+write, which is then retried. A `verify` can't pin that something is
+absent, like a new child of the issue being closed. So creating or moving
+an issue also moves `refs/issuez-guard/<uuid>` of each ancestor, and closing
+or deleting an issue moves its own before reading the children: two such
+writes in one clone conflict, and the retry sees the child. The guard refs
+carry no data, are never pushed, and can be deleted at any time.
+
+Other tools and concurrent clones can still produce violations; readers
+report them and never fail on them.
 
 ## 4. Merging: the causal ordering rule
 
@@ -89,9 +136,10 @@ parents first:
   the merge resolved to keeps a conflict visible; a different value resolves
   it.
 
-`Labels` is a set: each label's presence has its own setter. A `Labels`
-trailer lists the whole set, adding and removing relative to the parent
-state. A concurrent add and remove resolves to add.
+Sets (`Labels`, `X-Blocked-By`): each member's presence has its own setter.
+A set trailer lists the whole set, adding and removing relative to the
+parent state. A concurrent add and remove resolves to add. Events follow the
+same rule per target comment (§5).
 
 No merge base is needed, and criss-cross histories are well defined.
 
@@ -102,14 +150,44 @@ pair write the identical commit:
 - subject `Merge issue`, two parents sorted by OID, the empty tree;
 - author and committer `git-issue <git-issue@invalid>`, both dated with the
   later parent's committer time, offset `+0000`;
-- trailers restate only the resolved, non-empty fields: `State`, `Title`
-  (only when it overrides the root subject), `Labels`, `Assignee`,
-  `Priority`, `Milestone`. Other fields follow from the parents.
+- trailers restate the resolved fields, as written (invalid values too). A
+  field that was written and is now empty is restated empty (`Key: `), so a
+  reader that takes the newest value finds no older one. The order: `State`, `Title` (only when it overrides the
+  root subject), `Labels`, `Assignee`, `Priority`, `Milestone`, then
+  `X-Parent`, `X-Start-Date`, `X-Due-Date`, `X-Estimate-Minutes`,
+  `X-Workflow-State`, `X-Deleted`, `X-Blocked-By`. Other fields and events
+  follow from the parents.
 
 Restating the values lets upstream, which reads the newest trailer it
-finds, show the merged state.
+finds, show the merged state, extension fields included. For this tool
+restating changes nothing: the merge reads as its parents do.
 
-## 5. Sync
+## 5. Events
+
+Lifecycle changes are commits carrying `X-Event`, at most one per commit:
+
+| Event | Trailers | Message text |
+| --- | --- | --- |
+| edit a comment | `X-Event: comment-edit`, `X-Comment: <full oid>` | the full new comment |
+| delete a comment | `X-Event: comment-delete`, `X-Comment: <full oid>` | none |
+| restore a comment | `X-Event: comment-restore`, `X-Comment: <full oid>` | none |
+| edit the description | `X-Event: description-edit` | the full new description |
+| delete or restore the issue | `X-Deleted: true` or `false` (an ordinary field) | none |
+
+- A comment's ID is the full OID of its commit (40 or 64 hex digits;
+  abbreviations are invalid). The target MUST be a non-root, non-merge,
+  non-event commit of the same issue.
+- Events are resolved by §4 per target. Delete hides a comment; restore, or
+  any later edit, shows it again.
+- An event whose target isn't in the DAG yet is kept and applies once sync
+  brings the target in. An event whose target belongs to another issue is
+  invalid.
+- A deleted issue is hidden from `ls`, `tree` and `search` and kept in
+  history. Its sub-issues take its place in `tree`.
+- Upstream shows event commits as ordinary updates. Their subjects ("Edit
+  comment 3f9a1c2", "Delete issue", ...) are written to read well there.
+
+## 6. Sync
 
 `git issue merge <remote>` fetches the remote's issues into
 `refs/remotes/<remote>/issues/` and compares each one with the local issue.
@@ -149,12 +227,16 @@ the next sync:
 - `.../seen/issues/<uuid>`: where `push` fetches the remote's refs, deleted
   right after.
 
-## 6. Compatibility
+## 7. Compatibility
 
-- Upstream reads every issue written here: `ls`, `show` and `fsck` work.
+- Upstream reads every issue written here as format 1: `ls`, `show` and
+  `fsck` work, and the extension trailers show as plain trailer lines.
 - Upstream's writes (comments, edits, state changes, merges) never lose
-  data, because fields come from the whole history and a missing trailer
-  never clears a field.
+  data, extension fields included, because fields come from the whole
+  history and a missing trailer never clears a field.
+- Upstream doesn't know events or `X-Deleted`: it lists deleted issues and
+  shows edited and deleted comments as they were first written, followed by
+  the event commits.
 - Clones can sync through either tool. Upstream's `merge` and this tool's
   read each other's merge commits, and the `refs/issuez-sync/` refs are
   invisible to upstream.

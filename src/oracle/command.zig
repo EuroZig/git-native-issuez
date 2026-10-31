@@ -18,12 +18,26 @@ pub const Command = union(enum) {
     push: Sync,
     sync: Sync,
     quarantine: Quarantine,
+    close: Lifecycle,
+    reopen: Lifecycle,
+    delete: Lifecycle,
+    restore: Lifecycle,
+    comment_event: CommentEvent,
 
     /// The CLI's name for it, for messages and statistics.
     pub fn verb(c: Command) []const u8 {
         return switch (c) {
             .read => |words| if (words.len > 0) words[0] else "help",
+            .comment_event => "comment",
             else => @tagName(c),
+        };
+    }
+
+    /// Writes to issues or attachments when it succeeds.
+    pub fn writes(c: Command) bool {
+        return switch (c) {
+            .read, .init, .merge, .push, .sync, .quarantine => false,
+            else => true,
         };
     }
 
@@ -41,6 +55,8 @@ pub const Command = union(enum) {
             .edit => |x| try x.render(&out),
             .merge, .push, .sync => |x| try x.render(&out, @tagName(c)),
             .quarantine => |x| try x.render(&out),
+            .close, .reopen, .delete, .restore => |x| try x.render(&out, @tagName(c)),
+            .comment_event => |x| try x.render(&out),
         }
         return out.list.items;
     }
@@ -81,6 +97,7 @@ pub const Create = struct {
     assignee: ?[]const u8 = null,
     priority: ?[]const u8 = null,
     milestone: ?[]const u8 = null,
+    ext: Ext = .{},
 
     fn render(x: Create, out: *Argv) Allocator.Error!void {
         try out.word("create");
@@ -89,8 +106,45 @@ pub const Create = struct {
         try out.opt("-a", x.assignee);
         try out.opt("-p", x.priority);
         try out.opt("--milestone", x.milestone);
+        try x.ext.render(out);
         // Last, so a title like `--` can't turn options into title words.
         if (x.title.len > 0) try out.word(x.title);
+    }
+};
+
+/// Planning fields. References stay prefixes until the oracle resolves them.
+pub const Ext = struct {
+    parent: ?[]const u8 = null,
+    blocked_by: []const []const u8 = &.{},
+    /// Edit only.
+    unblock: []const []const u8 = &.{},
+    start: ?[]const u8 = null,
+    due: ?[]const u8 = null,
+    estimate: ?[]const u8 = null,
+    workflow: ?[]const u8 = null,
+    /// `--no-<field>`, edit only.
+    clear: []const []const u8 = &.{},
+
+    pub fn cleared(e: Ext, field: []const u8) bool {
+        for (e.clear) |c| if (std.mem.eql(u8, c, field)) return true;
+        return false;
+    }
+
+    pub fn isEmpty(e: Ext) bool {
+        return e.parent == null and e.blocked_by.len == 0 and e.unblock.len == 0 and
+            e.start == null and e.due == null and e.estimate == null and e.workflow == null and
+            e.clear.len == 0;
+    }
+
+    fn render(e: Ext, out: *Argv) Allocator.Error!void {
+        try out.opt("--parent", e.parent);
+        try out.each("--blocked-by", e.blocked_by);
+        try out.each("--unblock", e.unblock);
+        try out.opt("--start", e.start);
+        try out.opt("--due", e.due);
+        try out.opt("--estimate", e.estimate);
+        try out.opt("--workflow", e.workflow);
+        for (e.clear) |f| try out.word(try std.fmt.allocPrint(out.arena, "--no-{s}", .{f}));
     }
 };
 
@@ -142,6 +196,16 @@ pub const Edit = struct {
     assignee: ?[]const u8 = null,
     priority: ?[]const u8 = null,
     milestone: ?[]const u8 = null,
+    ext: Ext = .{},
+    /// `--description`, written in the same commit as the other changes.
+    description: []const []const u8 = &.{},
+
+    /// Anything besides the description.
+    pub fn changesFields(x: Edit) bool {
+        return x.title != null or x.set_labels != null or x.add.len > 0 or
+            x.remove.len > 0 or x.assignee != null or x.priority != null or
+            x.milestone != null or !x.ext.isEmpty();
+    }
 
     fn render(x: Edit, out: *Argv) Allocator.Error!void {
         try out.words(&.{ "edit", x.id });
@@ -152,6 +216,8 @@ pub const Edit = struct {
         try out.opt("-a", x.assignee);
         try out.opt("-p", x.priority);
         try out.opt("--milestone", x.milestone);
+        try x.ext.render(out);
+        try out.each("--description", x.description);
     }
 };
 
@@ -179,6 +245,37 @@ pub const Quarantine = struct {
     fn render(x: Quarantine, out: *Argv) Allocator.Error!void {
         const how = if (x.accept) "--accept-remote" else "--keep-local";
         try out.words(&.{ "quarantine", x.remote, how, x.id });
+    }
+};
+
+/// `close`, `reopen`, `delete` and `restore`.
+pub const Lifecycle = struct {
+    id: []const u8,
+    message: ?[]const u8 = null,
+
+    fn render(x: Lifecycle, out: *Argv, verb: []const u8) Allocator.Error!void {
+        try out.words(&.{ verb, x.id });
+        try out.opt("-m", x.message);
+    }
+};
+
+/// `comment <id> --edit|--delete|--restore <comment>`.
+pub const CommentEvent = struct {
+    id: []const u8,
+    kind: enum { edit, delete, restore },
+    /// A prefix of the comment's commit ID.
+    target: []const u8,
+    /// Edit only.
+    text: ?[]const u8 = null,
+
+    fn render(x: CommentEvent, out: *Argv) Allocator.Error!void {
+        const flag = switch (x.kind) {
+            .edit => "--edit",
+            .delete => "--delete",
+            .restore => "--restore",
+        };
+        try out.words(&.{ "comment", x.id, flag, x.target });
+        try out.opt("-m", x.text);
     }
 };
 

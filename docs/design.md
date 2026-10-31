@@ -16,7 +16,8 @@ How git-native-issuez is put together, and why.
    upstream where that is an improvement
    ([compatibility.md](compatibility.md)); the format may not.
 4. **Append-only.** State is computed from the whole history. Nothing is
-   rewritten.
+   rewritten or removed: editing a comment or deleting an issue is a new
+   commit (an event).
 5. **Deterministic.** The same git objects give the same state on every
    clone. Time and randomness are inputs, never ambient.
 6. **Bounded.** Every walk, buffer, count and retry has a limit, and going
@@ -40,15 +41,15 @@ cli ──► engine ──► model ──► format
           └──► backend (comptime parameter)
 ```
 
-| Layer     | Files                 | Does                                                                            |
-| --------- | --------------------- | ------------------------------------------------------------------------------- |
-| `format`  | `src/format/`         | trailers exactly as git parses them, labels, UUIDs, hex, upstream's value rules |
-| `model`   | `src/model/issue.zig` | one issue from its commit DAG: fields, comments, conflicts                      |
-| `engine`  | `src/engine/`         | `Repo` (read, create, comment, edit, state, check), `Sync`, `query`             |
-| `backend` | `src/backend/`        | the contract, `GitProcess`, `GitSim`, git objects                               |
-| `cli`     | `src/cli/`            | argument parsing, output, exit codes                                            |
+| Layer     | Files                 | Does                                                                                                      |
+| --------- | --------------------- | --------------------------------------------------------------------------------------------------------- |
+| `format`  | `src/format/`         | trailers exactly as git parses them, labels, UUIDs, hex, upstream's value rules, extension field grammars |
+| `model`   | `src/model/issue.zig` | one issue from its commit DAG: fields, comments, events, conflicts                                        |
+| `engine`  | `src/engine/`         | `Repo` (read, create, comment, edit, state, delete, check, guards), `Sync`, `query`, `projection`         |
+| `backend` | `src/backend/`        | the contract, `GitProcess`, `GitSim`, git objects                                                         |
+| `cli`     | `src/cli/`            | argument parsing, output, exit codes                                                                      |
 
-`format` and `model` are tested without git.
+`format`, `model` and the projection are tested without git.
 
 ## The backend contract
 
@@ -85,6 +86,22 @@ The trailer parser matches `git interpret-trailers --parse`, because
 upstream reads fields through git. Writers refuse text whose last paragraph
 would parse as trailers.
 
+Events (comment edit, delete and restore, description edit) are resolved
+the same way, per target comment. An event whose comment hasn't arrived yet
+waits for it. A value that doesn't parse (a date like `2026-02-30`) is kept,
+ignored and reported, never an error: other tools write these issues too.
+
+## The projection
+
+Some questions need every issue at once: children, blockers, progress,
+workflow states, and problems such as a parent that is missing or loops
+back. `projection.build` (`src/engine/projection.zig`) answers them from the
+loaded issues and nothing else. Merges and other tools can produce any
+graph, so it accepts every input and never loops: a parent that is missing,
+the issue itself, or part of a cycle is reported and the issue becomes a
+root, so the tree still shows every issue exactly once. `tree`,
+`ls --problems` and `fsck` read it.
+
 ## Writing an issue (compare and swap)
 
 1. Resolve the tip and read the issue.
@@ -101,6 +118,20 @@ Every write checks the values first: no newlines, the limits, and upstream's
 rules for priority, state and the assignee's email (`src/format/core.zig`).
 A program using the library can't write what upstream's commands would
 refuse. The CLI uses the same checks and adds upstream's error messages.
+
+Writes that touch the hierarchy also run guards
+([format.md](format.md) §3): no parent or blocker loops, no open issue under
+a closed one, no deleting an issue with live sub-issues. A guard reads other
+issues, and every issue it reads gets a `verify` line in the same ref
+transaction as the write. When one of them moves concurrently, the
+transaction fails and the write starts again from step 1. A `verify` can't
+pin an absence, like no child under the issue being closed, so those
+writes also move a local guard ref (`refs/issuez-guard/<uuid>`) of the
+issue whose children matter, and two of them conflict. Concurrent writers
+in one clone therefore can't break a guard; other clones still can, and the
+projection reports it. The number of issues a guard may read is bounded
+(`Limits.max_guard_scan`), and issues that can't be loaded are skipped, so
+one damaged issue doesn't block every close.
 
 A caller can pass `.expect` with the version it read (an issue's tip). The
 write then fails with `VersionMismatch` instead of retrying when the issue
@@ -127,7 +158,7 @@ changed, like an HTTP ETag.
 The bookkeeping refs are a cache: they make rewound remotes detectable and
 `status` cheap, and losing them only costs a slower next sync. Nothing is
 force-pushed or deleted. Quarantine keeps the local issue, and resolving it
-keeps the version it replaces ([format.md](format.md) §5).
+keeps the version it replaces ([format.md](format.md) §6).
 
 Merge commits are deterministic, so every clone that merges the same pair
 writes the same commit. After all clones have exchanged everything, they
@@ -175,13 +206,16 @@ way, to go unnoticed.
   - for every command: objects never disappear, issue refs only reach
     empty-tree commits, other refs never change, only the target clone
     changes, and a failed command changes nothing;
-  - per command: what `create`, `comment`, `edit`, `state` and `init` may
-    write, and that read-only commands change nothing. Messages are
+  - per command: what `create`, `comment` (and its edit, delete and
+    restore events), `edit` (with the extension fields and the
+    description), `state`, `close`, `reopen`, `delete`, `restore` and `init`
+    may write, and that read-only commands change nothing. Messages are
     checked where the format depends on them (the root message, trailers,
     text the user wrote). Subjects the CLI picks itself are not;
   - for `merge`, `push`, `sync` and `quarantine`: issue refs are never
     deleted or rewound on either side, a merge commit has the deterministic
-    shape and restates the oracle's own resolution of its parents, every
+    shape and restates the oracle's own resolution of its parents (and
+    reads exactly as its parents do), every
     remote issue arrives unless a real reason quarantines it, and after a
     push the remote has every local tip that isn't quarantined.
 
@@ -194,12 +228,18 @@ way, to go unnoticed.
 - **Fuzzer** (`git-issue-fuzz`, built with `-Dfuzz`): each case first runs
   random backend operations against a separate model of the contract, then
   random commands, valid and invalid, on a few clones that share a hub
-  remote, with some upstream merges mixed in. Now and then someone
+  remote, with some upstream merges mixed in, and commits from another
+  tool that writes extension fields without checking them (invalid
+  values, clears). Now and then someone
   force-pushes to the hub: it resets an issue to an older commit, which
   clones push back, or rewrites it from an older commit or replaces it with
   unrelated history, which clones quarantine and resolve.
   Every command is checked by the oracle, and the engine's reading of each
-  issue is compared with the oracle's. At the end every clone syncs, taking
+  issue is compared with the oracle's. After every write the projection
+  must show no new guard violation: a guard can only be broken by other
+  tools or concurrent clones, never by one of our own writes. What the
+  oracle has no rule for is counted as skipped, so gaps show up in the
+  statistics. At the end every clone syncs, taking
   the hub's version of anything quarantined, until nothing changes, and
   each must then hold exactly the hub's issues (convergence). The seed is
   printed, and `--seed <seed> --iterations 1` replays a failure.

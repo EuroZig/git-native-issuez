@@ -6,6 +6,7 @@ const common = @import("../common.zig");
 const core = @import("issuez").format.core;
 const issuez = @import("issuez");
 const uuid = issuez.format.uuid;
+const ext_flags = @import("../ext_flags.zig");
 
 pub const help =
     \\usage: git issue edit <issue-id> [options]
@@ -21,7 +22,10 @@ pub const help =
     \\   -p, --priority <level>    low, medium, high or critical
     \\   --milestone <name>        Change the milestone
     \\   -m, --message <text>      Commit message for the edit
+    \\   --description <text>      Replace the description; repeat for paragraphs.
+    \\                             Written in the same commit as the other changes
     \\
+++ ext_flags.help_edit ++
     \\   -h, --help                Show this help
     \\
 ;
@@ -34,6 +38,8 @@ pub fn main(comptime B: type, ctx: *context.Context(B), argv: []const []const u8
     var labels_given = false;
     var add: std.ArrayList([]const u8) = .empty;
     var remove: std.ArrayList([]const u8) = .empty;
+    var ext: ext_flags.Flags = .{};
+    var description: std.ArrayList([]const u8) = .empty;
 
     var args: common.Args = .{ .list = argv };
     while (args.next()) |arg| {
@@ -102,11 +108,11 @@ pub fn main(comptime B: type, ctx: *context.Context(B), argv: []const []const u8
             spec.assignee = v;
         } else if (std.mem.eql(u8, arg, "-p") or std.mem.eql(u8, arg, "--priority")) {
             const v = args.value(ctx.err, "-p") orelse return common.exit_error;
-            if (!core.isPriority(v)) return common.fail(
+            const p = core.Priority.parse(v) orelse return common.fail(
                 ctx.err,
                 "error: priority must be low, medium, high, or critical\n",
             );
-            spec.priority = v;
+            spec.priority = .{ .set = p };
         } else if (std.mem.eql(u8, arg, "--milestone")) {
             const v = args.value(ctx.err, "--milestone") orelse return common.exit_error;
             if (common.hasNewline(v)) return common.fail(
@@ -116,7 +122,14 @@ pub fn main(comptime B: type, ctx: *context.Context(B), argv: []const []const u8
             spec.milestone = v;
         } else if (std.mem.eql(u8, arg, "-m") or std.mem.eql(u8, arg, "--message")) {
             spec.message = args.value(ctx.err, "-m") orelse return common.exit_error;
-        } else return common.unknownOption(ctx.err, "edit", arg);
+        } else if (std.mem.eql(u8, arg, "--description")) {
+            const v = args.value(ctx.err, arg) orelse return common.exit_error;
+            description.append(arena, v) catch return common.oom(ctx.err);
+        } else switch (ext.parse(arena, ctx.err, &args, arg, true)) {
+            .yes => {},
+            .failed => return common.exit_error,
+            .no => return common.unknownOption(ctx.err, "edit", arg),
+        }
     }
     const prefix = issue_prefix orelse return common.missing(
         ctx.err,
@@ -126,7 +139,16 @@ pub fn main(comptime B: type, ctx: *context.Context(B), argv: []const []const u8
     if (labels_given) spec.set_labels = set_labels.items;
     spec.add_labels = add.items;
     spec.remove_labels = remove.items;
-    if (spec.isEmpty()) return common.missing(
+    const clears = ext.no;
+    if (clears.contains(.assignee)) spec.assignee = "";
+    if (clears.contains(.priority)) spec.priority = .clear;
+    if (clears.contains(.milestone)) spec.milestone = "";
+    if (clears.contains(.labels)) spec.set_labels = &.{};
+    if (description.items.len > 0) {
+        spec.description = std.mem.join(arena, "\n\n", description.items) catch
+            return common.oom(ctx.err);
+    }
+    if (spec.isEmpty() and !ext.any()) return common.missing(
         ctx.err,
         "edit",
         "at least one edit option is required",
@@ -140,9 +162,31 @@ pub fn main(comptime B: type, ctx: *context.Context(B), argv: []const []const u8
         ctx.err,
         prefix,
     ) orelse return common.exit_error;
+    const x = ext.resolve(B, ctx, repo) orelse return common.exit_error;
+    if (x.parent) |p| spec.parent = p;
+    if (clears.contains(.parent)) spec.parent = "";
+    spec.add_blocked_by = x.blocked_by;
+    spec.remove_blocked_by = x.unblock;
+    if (clears.contains(.blockers)) spec.set_blocked_by = &.{};
+    if (x.start) |v| spec.start_date = v;
+    if (clears.contains(.start)) spec.start_date = "";
+    if (x.due) |v| spec.due_date = v;
+    if (clears.contains(.due)) spec.due_date = "";
+    if (x.estimate) |m| spec.estimate_minutes = .{ .set = m };
+    if (clears.contains(.estimate)) spec.estimate_minutes = .clear;
+    if (x.workflow) |v| spec.workflow = v;
+    if (clears.contains(.workflow)) spec.workflow = "";
+    if (spec.description != null and spec.message != null and
+        common.hasBlankLine(spec.message.?)) return common.fail(
+        ctx.err,
+        "error: with --description, -m is only the subject (no blank lines)\n",
+    );
     var names: std.ArrayList([]const u8) = .empty;
-    const result = repo.edit(arena, ref.name, spec) catch |e| return common.repoFailed(B, ctx, e);
-    for (result.changes) |c| names.append(arena, c.name()) catch return common.oom(ctx.err);
+    if (!spec.isEmpty()) {
+        const result = repo.edit(arena, ref.name, spec) catch |e|
+            return common.repoFailed(B, ctx, e);
+        for (result.changes) |c| names.append(arena, c.name()) catch return common.oom(ctx.err);
+    }
     const joined = std.mem.join(arena, ", ", names.items) catch return common.oom(ctx.err);
     ctx.out.print("Updated {s} ({s})\n", .{ uuid.shortId(ref.id()), joined }) catch {};
     return common.exit_ok;

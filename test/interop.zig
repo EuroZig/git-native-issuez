@@ -303,7 +303,7 @@ test "we read upstream's issues" {
 
     try testing.expectEqualStrings("Upstream made this", issue.title);
     try testing.expectEqualStrings("Body", issue.description);
-    try testing.expectEqualStrings("open", issue.state);
+    try testing.expectEqualStrings("open", issue.state.text());
     try testing.expectEqual(@as(usize, 1), issue.labels.len);
     try testing.expectEqualStrings("bug", issue.labels[0]);
     try testing.expectEqualStrings("high", issue.field("Priority").?);
@@ -328,12 +328,12 @@ test "upstream reads our issues" {
         .title = "Written by git-native-issuez",
         .body = "Created through the library.",
         .labels = &.{ "interop", "p0" },
-        .priority = "medium",
+        .priority = .medium,
     });
     const id = created.id.short();
     const ref = try findIssue(issues, arena, id);
     _ = try issues.comment(arena, ref.name, .{ .text = "Reproduced on main." });
-    _ = try issues.setState(arena, ref.name, .{ .state = "closed", .fixed_by = "abc1234" });
+    _ = try issues.setState(arena, ref.name, .{ .state = .closed, .fixed_by = "abc1234" });
 
     // Upstream lists, shows and checks it.
     try expectContains(try repo.read(.upstream, "ls -s closed", .{}), id);
@@ -347,7 +347,7 @@ test "upstream reads our issues" {
     // Upstream adds to it, and the library sees that on top.
     try repo.upstream("comment {s} -m 'Upstream replies'", .{id});
     const issue = try issues.load(arena, try findIssue(issues, arena, id));
-    try testing.expectEqualStrings("closed", issue.state);
+    try testing.expectEqualStrings("closed", issue.state.text());
     try testing.expectEqual(@as(usize, 3), issue.comments.len);
     try testing.expectEqualStrings("Upstream replies", issue.comments[2].subject);
 }
@@ -841,4 +841,66 @@ test "upstream merge model" {
         try testing.expect(merge.parents[0].eql(predicted.local));
         try testing.expect(merge.parents[1].eql(predicted.remote));
     }
+}
+
+test "extension fields survive upstream" {
+    var sb = try Sandbox.init();
+    defer sb.deinit();
+    const hub = try sb.hub("hub.git", &.{});
+    const a = (try sb.repo("a", .{ .origin = hub })).at("1700000000 +0000");
+    const b = (try sb.repo("b", .{ .origin = hub })).at("1700000000 +0000");
+
+    // Our CLI writes an issue with every planning field.
+    const epic = try a.create(.ours, "Epic", .{});
+    const blocker = try a.create(.ours, "Blocker", .{});
+    const id = try a.create(.ours, "Child -l bug --parent {s} --blocked-by {s}" ++
+        " --due 2026-12-01 --estimate 2h --workflow ready", .{ epic, blocker });
+    try a.ours("push origin", .{});
+    try b.upstream("merge origin", .{});
+
+    // Upstream changes it in both clones, so its next merge diverges.
+    try a.at("1700000100 +0000").upstream("comment {s} -m 'From a'", .{id});
+    try a.at("1700000110 +0000").upstream("edit {s} -p high", .{id});
+    try b.at("1700000120 +0000").upstream("state {s} --close", .{id});
+    _ = try b.git("push -q origin refs/issues/*:refs/issues/*", .{});
+    const merged = try a.at("1700000200 +0000").read(.upstream, "merge origin", .{});
+    try expectContains(merged, "Merged ");
+
+    // Our fields come through upstream's edits and merge.
+    const shown = try a.read(.ours, "show {s}", .{id});
+    for ([_][]const u8{
+        "[closed]",        "Priority: high", "Due:     2026-12-01", "Estimate: 120 min (2h)",
+        "Workflow: ready", "Parent:  ",      "Blocked by: ",
+    }) |want| try expectContains(shown, want);
+    try a.upstream("fsck", .{});
+}
+
+test "lifecycle events" {
+    var sb = try Sandbox.init();
+    defer sb.deinit();
+    const repo = (try sb.repo("repo", .{})).at("1700000000 +0000");
+
+    const id = try repo.create(.ours, "Events", .{});
+    try repo.ours("comment {s} -m Tpyo", .{id});
+    // The comment is the issue's tip right now.
+    const comment = try repo.git("for-each-ref --format=%(objectname:short=8) refs/issues/", .{});
+    try repo.ours("comment {s} --edit {s} -m 'Typo fixed'", .{ id, comment });
+    try repo.ours("edit {s} --description 'Described now.'", .{id});
+    try repo.ours("delete {s}", .{id});
+
+    // Upstream: still a valid issue. The events read as ordinary updates.
+    try repo.upstream("fsck", .{});
+    const upstream_show = try repo.read(.upstream, "show {s}", .{id});
+    try expectContains(upstream_show, "Edit comment ");
+    try expectContains(upstream_show, "Edit description");
+    try expectContains(upstream_show, "Delete issue");
+
+    // An upstream comment afterwards doesn't undo any of it.
+    try repo.upstream("comment {s} -m 'From upstream'", .{id});
+    const shown = try repo.read(.ours, "show {s}", .{id});
+    for ([_][]const u8{ "(deleted)", "Described now.", "Typo fixed", "From upstream" }) |want| {
+        try expectContains(shown, want);
+    }
+    try expectLacks(shown, "Tpyo");
+    try testing.expectEqualStrings("", try repo.read(.ours, "ls", .{}));
 }
