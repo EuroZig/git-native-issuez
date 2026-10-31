@@ -17,6 +17,7 @@ pub const format = struct {
     pub const hex = @import("format/hex.zig");
     pub const core = @import("format/core.zig");
     pub const fields = @import("format/fields.zig");
+    pub const attachment = @import("format/attachment.zig");
 };
 
 pub const model = struct {
@@ -31,6 +32,8 @@ pub const query = @import("engine/query.zig");
 pub const projection = @import("engine/projection.zig");
 pub const milestone = @import("engine/milestone.zig");
 pub const Catalog = milestone.Catalog;
+pub const attachments = @import("engine/attachments.zig");
+pub const Attachments = attachments.Attachments;
 
 test {
     _ = backend.contract;
@@ -43,10 +46,12 @@ test {
     _ = format.hex;
     _ = format.core;
     _ = format.fields;
+    _ = format.attachment;
     _ = model.issue;
     _ = engine;
     _ = sync;
     _ = query;
     _ = projection;
     _ = milestone;
+    _ = attachments;
 }

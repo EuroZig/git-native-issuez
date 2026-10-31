@@ -16,7 +16,8 @@ jobs:
 
       # gawk: upstream's fsck needs awk interval regexes, which mawk lacks.
       # uuid-runtime: upstream's test-merge.sh uses uuidgen.
-      - run: sudo apt-get update -qq && sudo apt-get install -y -qq gawk uuid-runtime
+      # git-lfs: the attachment test in test/cli_git.zig (skipped without it).
+      - run: sudo apt-get update -qq && sudo apt-get install -y -qq gawk uuid-runtime git-lfs
 
       # `zig build ci -Dseed=<run id>` reproduces a run locally.
       - run: zig build ci -Dseed=${{ github.run_id }} --summary all

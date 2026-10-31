@@ -12,6 +12,7 @@ const Allocator = std.mem.Allocator;
 const Io = std.Io;
 const contract = @import("contract.zig");
 const object = @import("object.zig");
+const hex_fmt = @import("../format/hex.zig");
 const Oid = object.Oid;
 const ObjectFormat = object.ObjectFormat;
 const ObjectKind = object.ObjectKind;
@@ -23,6 +24,8 @@ env: std.process.Environ.Map,
 repo_path: []u8,
 format: ObjectFormat,
 cat_file: ?*CatFile,
+/// Resolved on first LFS use.
+common_dir: ?[]u8 = null,
 /// stderr of the last failed command, for error messages.
 last_stderr: [max_stderr_kept]u8,
 last_stderr_len: u16,
@@ -37,6 +40,8 @@ pub const Error = error{
     NotARepository,
     OutputTooLong,
     Canceled,
+    /// Reading or writing an LFS store file failed.
+    StoreFailed,
 };
 
 /// The oldest git whose trailer parsing matches current git, and that has
@@ -92,6 +97,7 @@ pub fn open(io: Io, gpa: Allocator, options: OpenOptions) Error!GitProcess {
 
 pub fn close(gp: *GitProcess) void {
     if (gp.cat_file) |cf| cf.deinit(gp.io, gp.gpa);
+    if (gp.common_dir) |d| gp.gpa.free(d);
     gp.env.deinit();
     gp.gpa.free(gp.repo_path);
     gp.* = undefined;
@@ -419,6 +425,193 @@ fn ident(
 
 pub fn randomBytes(gp: *GitProcess, buf: []u8) void {
     gp.io.random(buf);
+}
+
+const max_lfs_object_bytes = 64 * 1024 * 1024;
+
+/// The directory holding `ab/cd/<sha256>`.
+fn lfsObjectsDir(gp: *GitProcess, arena: Allocator, store: contract.LfsStore) Error![]const u8 {
+    if (gp.common_dir == null) {
+        const out = try gp.runOk(arena, &.{ "git", "rev-parse", "--git-common-dir" }, null);
+        const rel = std.mem.trimEnd(u8, out, "\n");
+        gp.common_dir = try std.fs.path.resolve(gp.gpa, &.{ gp.repo_path, rel });
+    }
+    const common = gp.common_dir.?;
+    return switch (store) {
+        .issuez => std.fs.path.join(arena, &.{ common, "issuez", "lfs", "objects" }),
+        .git_lfs => blk: {
+            // Relative to the git dir, like git-lfs does it.
+            if (try gp.configGet(arena, "lfs.storage")) |s| {
+                break :blk std.fs.path.resolve(arena, &.{ common, s, "objects" });
+            }
+            break :blk std.fs.path.join(arena, &.{ common, "lfs", "objects" });
+        },
+    };
+}
+
+fn lfsPath(arena: Allocator, objects: []const u8, sha256: []const u8) Error![]const u8 {
+    assert(isSha256Hex(sha256));
+    return std.fs.path.join(arena, &.{ objects, sha256[0..2], sha256[2..4], sha256 });
+}
+
+fn isSha256Hex(s: []const u8) bool {
+    return s.len == 64 and hex_fmt.isLower(s);
+}
+
+pub fn lfsRead(
+    gp: *GitProcess,
+    arena: Allocator,
+    store: contract.LfsStore,
+    sha256: []const u8,
+) Error!?[]const u8 {
+    const path = try lfsPath(arena, try gp.lfsObjectsDir(arena, store), sha256);
+    return Io.Dir.cwd().readFileAlloc(gp.io, path, arena, .limited(max_lfs_object_bytes)) catch |e|
+        switch (e) {
+            error.FileNotFound, error.NotDir => null,
+            error.OutOfMemory => error.OutOfMemory,
+            error.Canceled => error.Canceled,
+            else => error.StoreFailed,
+        };
+}
+
+/// Temp file, fsync, rename, so a crash leaves nothing or the whole
+/// object. An existing object is kept.
+pub fn lfsWrite(
+    gp: *GitProcess,
+    store: contract.LfsStore,
+    sha256: []const u8,
+    data: []const u8,
+) Error!void {
+    var arena_state: std.heap.ArenaAllocator = .init(gp.gpa);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const path = try lfsPath(arena, try gp.lfsObjectsDir(arena, store), sha256);
+    const cwd = Io.Dir.cwd();
+    if (cwd.access(gp.io, path, .{})) |_| return else |_| {}
+    const dir = std.fs.path.dirname(path).?;
+    cwd.createDirPath(gp.io, dir) catch |e| return storeError(e);
+    var suffix: [8]u8 = undefined;
+    gp.io.random(&suffix);
+    const tmp = try std.fmt.allocPrint(arena, "{s}.tmp-{x}", .{ path, suffix });
+    {
+        const file = cwd.createFile(gp.io, tmp, .{ .exclusive = true }) catch |e|
+            return storeError(e);
+        defer file.close(gp.io);
+        file.writeStreamingAll(gp.io, data) catch |e| {
+            cwd.deleteFile(gp.io, tmp) catch {};
+            return storeError(e);
+        };
+        file.sync(gp.io) catch |e| {
+            cwd.deleteFile(gp.io, tmp) catch {};
+            return storeError(e);
+        };
+    }
+    Io.Dir.rename(cwd, tmp, cwd, path, gp.io) catch |e| {
+        cwd.deleteFile(gp.io, tmp) catch {};
+        return storeError(e);
+    };
+}
+
+/// Only uploads what the server doesn't have yet.
+pub fn lfsPush(
+    gp: *GitProcess,
+    arena: Allocator,
+    remote: []const u8,
+    shas: []const []const u8,
+) (Error || contract.LfsTransportError)!void {
+    assert(contract.isValidRemoteName(remote));
+    try gp.requireGitLfs(arena);
+    var start: usize = 0;
+    while (start < shas.len) : (start += 64) {
+        var argv: std.ArrayList([]const u8) = .empty;
+        try argv.appendSlice(arena, &.{ "git", "lfs", "push", "--object-id", remote });
+        for (shas[start..@min(start + 64, shas.len)]) |s| {
+            assert(isSha256Hex(s));
+            try argv.append(arena, s);
+        }
+        const r = try gp.run(arena, argv.items, null);
+        if (!r.ok()) {
+            gp.keepStderr(r.stderr);
+            return error.LfsTransferFailed;
+        }
+    }
+}
+
+/// Downloads into git-lfs's store.
+pub fn lfsFetch(
+    gp: *GitProcess,
+    arena: Allocator,
+    remote: []const u8,
+    local_refs: []const []const u8,
+) (Error || contract.LfsTransportError)!void {
+    assert(contract.isValidRemoteName(remote));
+    try gp.requireGitLfs(arena);
+    var argv: std.ArrayList([]const u8) = .empty;
+    try argv.appendSlice(arena, &.{ "git", "lfs", "fetch", remote });
+    for (local_refs) |r| {
+        assert(contract.isValidRefName(r));
+        try argv.append(arena, r);
+    }
+    const r = try gp.run(arena, argv.items, null);
+    if (!r.ok()) {
+        gp.keepStderr(r.stderr);
+        return error.LfsTransferFailed;
+    }
+}
+
+fn requireGitLfs(gp: *GitProcess, arena: Allocator) (Error || contract.LfsTransportError)!void {
+    const r = gp.run(arena, &.{ "git", "lfs", "version" }, null) catch |e| switch (e) {
+        error.GitSpawnFailed => return error.LfsUnavailable,
+        else => |x| return x,
+    };
+    if (!r.ok()) return error.LfsUnavailable;
+}
+
+fn storeError(e: anyerror) Error {
+    return switch (e) {
+        error.OutOfMemory => error.OutOfMemory,
+        error.Canceled => error.Canceled,
+        else => error.StoreFailed,
+    };
+}
+
+pub fn lfsList(
+    gp: *GitProcess,
+    arena: Allocator,
+    store: contract.LfsStore,
+) Error![]const []const u8 {
+    const objects = try gp.lfsObjectsDir(arena, store);
+    var out: std.ArrayList([]const u8) = .empty;
+    var root = Io.Dir.cwd().openDir(gp.io, objects, .{ .iterate = true }) catch |e| switch (e) {
+        error.FileNotFound, error.NotDir => return &.{},
+        else => return storeError(e),
+    };
+    defer root.close(gp.io);
+    var level1 = root.iterate();
+    while (level1.next(gp.io) catch |e| return storeError(e)) |a| {
+        if (a.kind != .directory or a.name.len != 2) continue;
+        var da = root.openDir(gp.io, a.name, .{ .iterate = true }) catch continue;
+        defer da.close(gp.io);
+        var level2 = da.iterate();
+        while (level2.next(gp.io) catch |e| return storeError(e)) |b| {
+            if (b.kind != .directory or b.name.len != 2) continue;
+            var db = da.openDir(gp.io, b.name, .{ .iterate = true }) catch continue;
+            defer db.close(gp.io);
+            var files = db.iterate();
+            while (files.next(gp.io) catch |e| return storeError(e)) |f| {
+                if (f.kind == .file and isSha256Hex(f.name)) try out.append(
+                    arena,
+                    try arena.dupe(u8, f.name),
+                );
+            }
+        }
+    }
+    std.mem.sort([]const u8, out.items, {}, struct {
+        fn lt(_: void, x: []const u8, y: []const u8) bool {
+            return std.mem.lessThan(u8, x, y);
+        }
+    }.lt);
+    return out.items;
 }
 
 comptime {

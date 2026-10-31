@@ -12,9 +12,9 @@ tree. There is no server, no database and nothing in the working tree.
 showing, commenting on, editing, closing and searching issues, `fsck` and
 `init`, and sharing issues between clones through any git remote (`merge`,
 `push`, `sync`). On top of format 1 it adds planning fields (parent issues,
-blockers, dates, estimates, workflow states), milestones, and lifecycle
-events (editing and deleting comments, deleting and restoring issues), as
-extra trailers that upstream keeps and shows.
+blockers, dates, estimates, workflow states), milestones, lifecycle
+events (editing and deleting comments, deleting and restoring issues) and
+image attachments, as extra trailers that upstream keeps and shows.
 
 > [!WARNING]
 > Generative AI was used to edit and/or produce large portions of this code.
@@ -34,6 +34,8 @@ git issue tree                   # parents, sub-issues, progress, blockers
 git issue milestone create v1.0 --due 2026-12-01
 git issue edit 5e21 --milestone v1.0   # sub-issues inherit it
 git issue milestone show v1.0    # its issues and progress
+git issue comment a7f3 -m "Cut off on small screens." --attach login.png
+git issue attach cat a7f3 fc7b > login.png
 git issue close a7f3 --fixed-by 1a2b3c4
 git issue show a7f3
 git issue search -i safari
@@ -54,6 +56,13 @@ An issue is in a milestone directly or through its parent, and a
 milestone can only be completed once all of its issues are closed. Linking
 one also writes upstream's `Milestone:` field, so upstream shows its
 name.
+
+Attachments are PNG, JPEG or WebP images. The issue history records each
+one (ID, type, size, sha256, name), and the bytes are git-lfs objects:
+`git issue sync` uploads them with `git lfs push` and `attach cat` or
+`attach fetch` downloads them when needed. They are kept in a store that
+`git lfs prune` doesn't touch. Without git-lfs, attachments work but stay
+in the clone. See [docs/attachments.md](docs/attachments.md).
 
 `git issue sync <remote>` fetches the remote's issues and milestones,
 merges them, and pushes the local ones. Concurrent edits get a merge commit; which value
@@ -106,12 +115,15 @@ for (open) |issue| std.debug.print("{s} {s}\n", .{ issue.state.text(), issue.tit
 | ------------------------------------------------- | -------------------------------------------------------------------------------------- | ------------------------------------------ |
 | [quickstart.zig](examples/quickstart.zig)         | create, resolve by prefix, comment, edit, close, list, show (in memory, no git needed) | `zig build example-quickstart`             |
 | [sync.zig](examples/sync.zig)                     | two clones syncing through a remote, with a concurrent edit (in memory)                | `zig build example-sync`                   |
+| [attachments.zig](examples/attachments.zig)       | validate, attach with a comment, read bytes back, rename and remove (in memory)        | `zig build example-attachments`            |
 | [real_repo.zig](examples/real_repo.zig)           | the same API on a real repository through `GitProcess`                                 | `zig build example-real-repo -- <repo> ls` |
 | [custom_backend.zig](examples/custom_backend.zig) | your own backend (audit log, write policy) and ETag-style `.expect` versions           | `zig build example-custom-backend`         |
 
 ## Docs
 
 - [docs/format.md](docs/format.md): the format on disk.
+- [docs/attachments.md](docs/attachments.md): attachments in the CLI and
+  the library.
 - [docs/design.md](docs/design.md): how the library is put together.
 - [docs/compatibility.md](docs/compatibility.md): where the CLI differs from
   upstream on purpose.

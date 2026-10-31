@@ -904,3 +904,47 @@ test "lifecycle events" {
     try expectLacks(shown, "Tpyo");
     try testing.expectEqualStrings("", try repo.read(.ours, "ls", .{}));
 }
+
+test "attachments" {
+    var sb = try Sandbox.init();
+    defer sb.deinit();
+    const hub = try sb.hub("hub.git", &.{});
+    // a uses both tools. b uses upstream only, whose refspec doesn't fetch
+    // refs/attachments/*.
+    const a = (try sb.repo("a", .{ .origin = hub })).at("1700000000 +0000");
+    const b = (try sb.repo("b", .{ .origin = hub })).at("1700000000 +0000");
+    try std.Io.Dir.cwd().writeFile(io, .{
+        .sub_path = try std.fmt.allocPrint(sb.allocator(), "{s}/shot.png", .{a.path}),
+        .data = issuez.format.attachment.samples.png,
+    });
+
+    const id = try a.create(.ours, "Shots", .{});
+    try a.ours("comment {s} -m 'Screenshot attached' --attach shot.png", .{id});
+    try a.upstream("fsck", .{});
+    try a.ours("push origin", .{});
+
+    // Upstream works on it in both clones and merges.
+    try b.upstream("merge origin", .{});
+    try a.at("1700000100 +0000").upstream("comment {s} -m 'From a'", .{id});
+    try b.at("1700000120 +0000").upstream("edit {s} -p high", .{id});
+    try b.at("1700000130 +0000").upstream("state {s} --close", .{id});
+    _ = try b.git("push -q origin refs/issues/*:refs/issues/*", .{});
+    try a.at("1700000200 +0000").upstream("merge origin", .{});
+    try a.upstream("fsck", .{});
+
+    // In a, the attachment and its bytes are still there.
+    const listed = try a.read(.ours, "attach ls {s}", .{id});
+    try expectContains(listed, "image/png");
+    try expectContains(listed, "shot.png");
+    try expectLacks(listed, "not here");
+    try expectContains(try a.read(.upstream, "show {s}", .{id}), "Screenshot attached");
+
+    // In b, the attachment is listed but its bytes and derived ref are
+    // missing. fsck notes both, and --repair regenerates the ref.
+    try expectContains(try b.read(.ours, "attach ls {s}", .{id}), "(bytes not here)");
+    const fsck = try b.run(.ours, "fsck", .{});
+    try testing.expectEqual(@as(u8, 0), fsck.code);
+    try expectContains(fsck.stderr, "is missing (run 'git issue fsck --repair')");
+    try expectContains(try b.read(.ours, "fsck --repair -q", .{}), "repaired refs/attachments/");
+    try expectLacks((try b.run(.ours, "fsck -q", .{})).stderr, "--repair");
+}

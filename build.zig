@@ -7,7 +7,7 @@
 //!   zig build test-perf            `ls` over 10 000 issues
 //!   zig build ci [-Dseed=N]        what CI runs
 //!   zig build examples             library examples (examples/*.zig)
-//!   zig build example-<name>       run one (quickstart, sync, real-repo -- <path> ls)
+//!   zig build example-<name>       run one (quickstart, sync, attachments, real-repo -- <path> ls)
 //!   zig build update-snapshots     rewrite examples/*.out
 
 const std = @import("std");
@@ -174,6 +174,11 @@ pub fn build(b: *std.Build) void {
             .snapshot = "examples/quickstart.out",
         },
         .{ .name = "sync", .root = "examples/sync.zig", .snapshot = "examples/sync.out" },
+        .{
+            .name = "attachments",
+            .root = "examples/attachments.zig",
+            .snapshot = "examples/attachments.out",
+        },
         .{
             .name = "custom-backend",
             .root = "examples/custom_backend.zig",

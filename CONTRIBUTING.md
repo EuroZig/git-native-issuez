@@ -11,6 +11,8 @@ approach before you put in the work.
 - git ≥ 2.30.
 - For the upstream suite: bash, and on Debian-like systems gawk (upstream's
   `fsck` fails on mawk) and uuid-runtime.
+- For the attachment test in `test/cli_git.zig`: git-lfs. Without it the
+  test is skipped.
 
 ```sh
 zig build test                 # the quick check

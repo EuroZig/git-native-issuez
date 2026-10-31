@@ -20,6 +20,7 @@ const trailers = @import("../format/trailers.zig");
 const labels_fmt = @import("../format/labels.zig");
 const fields_fmt = @import("../format/fields.zig");
 const uuid_fmt = @import("../format/uuid.zig");
+const attachment_fmt = @import("../format/attachment.zig");
 const core_fmt = @import("../format/core.zig");
 const Oid = object.Oid;
 const Signature = object.Signature;
@@ -80,6 +81,35 @@ pub const Comment = struct {
     /// Set by events. `text` and `body` already hold the edited text.
     edited: bool = false,
     deleted: bool = false,
+    /// Attachments this commit added that are still present, in trailer
+    /// order.
+    attachments: []const []const u8 = &.{},
+};
+
+/// Read the bytes through `issuez.Attachments`.
+pub const Attachment = struct {
+    id: []const u8,
+    media: attachment_fmt.Media,
+    size: u32,
+    sha256: attachment_fmt.Sha256,
+    name: []const u8,
+    /// A comment, or a commit that only attaches.
+    added_in: Oid,
+    added_by: Signature,
+};
+
+/// An attachment trailer that is ignored, reported by `fsck`.
+pub const AttachmentProblem = struct {
+    oid: Oid,
+    kind: Kind,
+    value: []const u8,
+
+    pub const Kind = enum {
+        malformed,
+        /// A different hash, size or media type for an existing UUID.
+        /// Attachments are immutable.
+        changed_object,
+    };
 };
 
 pub const EventProblem = struct {
@@ -129,6 +159,12 @@ pub const Issue = struct {
     ext: Extensions = .{},
     deleted: bool = false,
     event_problems: []const EventProblem = &.{},
+    /// Oldest first.
+    attachments: []const Attachment = &.{},
+    /// History still references their bytes, and re-adding the same UUID
+    /// brings one back.
+    removed_attachments: []const Attachment = &.{},
+    attachment_problems: []const AttachmentProblem = &.{},
     /// Every other field with a value, sorted by key. Per-commit trailers
     /// (`per_commit_keys`) are not fields.
     fields: []const Field,
@@ -186,6 +222,17 @@ const SetState = struct {
 const FoldState = struct {
     scalars: std.array_hash_map.String(Cell) = .empty,
     sets: std.array_hash_map.String(SetState) = .empty,
+    /// Removed attachments stay: a UUID's object never changes.
+    attachments: std.array_hash_map.String(AttachmentCell) = .empty,
+};
+
+const AttachmentCell = struct {
+    spec: attachment_fmt.Spec,
+    present: bool,
+    /// Last add, rename or removal.
+    setter: u32,
+    /// First commit that added this object under this UUID.
+    added_in: u32,
 };
 
 pub const set_keys = [_][]const u8{ "Labels", "X-Blocked-By" };
@@ -227,7 +274,12 @@ pub fn materialize(
 
     const order = try topoOrder(arena, nodes);
     const ancestors = try ancestorSets(arena, nodes, order);
-    const ctx: Ctx = .{ .nodes = nodes, .ancestors = ancestors };
+    var attachment_problems: std.ArrayList(AttachmentProblem) = .empty;
+    const ctx: Ctx = .{
+        .nodes = nodes,
+        .ancestors = ancestors,
+        .attachment_problems = &attachment_problems,
+    };
     var event_problems: std.ArrayList(EventProblem) = .empty;
     const events = try classifyEvents(arena, nodes, &index, &event_problems);
 
@@ -241,7 +293,7 @@ pub fn materialize(
             for (n.parents[1..]) |p| merged = try ctx.mergeStates(arena, merged, states[p]);
             break :blk merged;
         };
-        try applyTrailers(arena, &s, n, i, events[i]);
+        try applyTrailers(arena, &s, n, i, events[i], &attachment_problems);
         states[i] = s;
     }
 
@@ -311,6 +363,9 @@ pub fn materialize(
         else
             false,
         .event_problems = event_problems.items,
+        .attachments = try attachmentList(arena, nodes, final, true),
+        .removed_attachments = try attachmentList(arena, nodes, final, false),
+        .attachment_problems = try dedupProblems(arena, attachment_problems.items),
         .state = state_value,
         .labels = labels,
         .ext = try extensions(arena, final, blocked_by),
@@ -330,6 +385,7 @@ pub fn materialize(
 const Ctx = struct {
     nodes: []const Node,
     ancestors: []const std.DynamicBitSetUnmanaged,
+    attachment_problems: *std.ArrayList(AttachmentProblem),
 
     fn isAncestor(ctx: Ctx, a: u32, b: u32) bool {
         if (a == none_setter) return true;
@@ -362,6 +418,47 @@ const Ctx = struct {
             }
             gop.value_ptr.* = try ctx.mergeSets(arena, gop.value_ptr.*, bset);
         }
+        for (b.attachments.keys(), b.attachments.values()) |id, bc| {
+            const gop = try out.attachments.getOrPut(arena, id);
+            if (!gop.found_existing) {
+                gop.value_ptr.* = bc;
+                continue;
+            }
+            gop.value_ptr.* = try ctx.mergeAttachment(arena, gop.value_ptr.*, bc);
+        }
+        return out;
+    }
+
+    /// Two different objects under one UUID can only come from concurrent
+    /// writes. The first one added stays, the other is reported.
+    fn mergeAttachment(
+        ctx: Ctx,
+        arena: Allocator,
+        a: AttachmentCell,
+        b: AttachmentCell,
+    ) Allocator.Error!AttachmentCell {
+        if (!a.spec.sameObject(b.spec)) {
+            const b_first = ctx.lwwWins(a.added_in, b.added_in);
+            const keep = if (b_first) b else a;
+            const drop = if (b_first) a else b;
+            try ctx.attachment_problems.append(arena, .{
+                .oid = ctx.nodes[drop.added_in].input.oid,
+                .kind = .changed_object,
+                .value = drop.spec.id,
+            });
+            return keep;
+        }
+        var out = if (a.setter == b.setter)
+            a
+        else if (ctx.isAncestor(a.setter, b.setter))
+            b
+        else if (ctx.isAncestor(b.setter, a.setter))
+            a
+        else if (a.present != b.present)
+            (if (a.present) a else b)
+        else if (ctx.lwwWins(b.setter, a.setter)) b else a;
+        out.added_in = if (ctx.lwwWins(a.added_in, b.added_in)) b.added_in else a.added_in;
+        if (a.added_in == b.added_in) out.added_in = a.added_in;
         return out;
     }
 
@@ -422,6 +519,7 @@ fn applyTrailers(
     n: Node,
     self: usize,
     event: ?Event,
+    attachment_problems: *std.ArrayList(AttachmentProblem),
 ) Allocator.Error!void {
     const setter: u32 = @intCast(self);
     const is_merge = n.parents.len > 1;
@@ -434,6 +532,12 @@ fn applyTrailers(
             continue;
         }
         if (isPerCommitKey(t.key) or isEventKey(t.key)) continue;
+        if (std.ascii.eqlIgnoreCase(t.key, attachment_fmt.add_key) or
+            std.ascii.eqlIgnoreCase(t.key, attachment_fmt.remove_key))
+        {
+            try applyAttachment(arena, s, n, setter, t, attachment_problems);
+            continue;
+        }
         const key = canonicalKey(t.key);
         const gop = try s.scalars.getOrPut(arena, key);
         if (gop.found_existing and is_merge and std.mem.eql(u8, gop.value_ptr.value, t.value)) {
@@ -443,6 +547,82 @@ fn applyTrailers(
             gop.value_ptr.* = .{ .value = t.value, .setter = setter };
         }
     }
+}
+
+fn applyAttachment(
+    arena: Allocator,
+    s: *FoldState,
+    n: Node,
+    setter: u32,
+    t: trailers.Trailer,
+    problems: *std.ArrayList(AttachmentProblem),
+) Allocator.Error!void {
+    const bad: AttachmentProblem = .{ .oid = n.input.oid, .kind = .malformed, .value = t.value };
+    if (std.ascii.eqlIgnoreCase(t.key, attachment_fmt.remove_key)) {
+        if (!uuid_fmt.isCanonical(t.value)) return problems.append(arena, bad);
+        const cell = s.attachments.getPtr(t.value) orelse return;
+        cell.present = false;
+        cell.setter = setter;
+        return;
+    }
+    const spec = attachment_fmt.parseSpec(t.value) orelse return problems.append(arena, bad);
+    const gop = try s.attachments.getOrPut(arena, spec.id);
+    if (gop.found_existing) {
+        if (!gop.value_ptr.spec.sameObject(spec)) return problems.append(arena, .{
+            .oid = n.input.oid,
+            .kind = .changed_object,
+            .value = spec.id,
+        });
+        gop.value_ptr.spec = spec;
+        gop.value_ptr.present = true;
+        gop.value_ptr.setter = setter;
+        return;
+    }
+    gop.value_ptr.* = .{ .spec = spec, .present = true, .setter = setter, .added_in = setter };
+}
+
+/// Criss-cross merges can run into the same conflict twice.
+fn dedupProblems(
+    arena: Allocator,
+    all: []const AttachmentProblem,
+) Allocator.Error![]const AttachmentProblem {
+    var out: std.ArrayList(AttachmentProblem) = .empty;
+    outer: for (all) |p| {
+        for (out.items) |q| if (q.oid.eql(p.oid) and q.kind == p.kind and
+            std.mem.eql(u8, q.value, p.value)) continue :outer;
+        try out.append(arena, p);
+    }
+    return out.items;
+}
+
+fn attachmentList(
+    arena: Allocator,
+    nodes: []const Node,
+    final: FoldState,
+    present: bool,
+) Allocator.Error![]const Attachment {
+    var out: std.ArrayList(Attachment) = .empty;
+    for (final.attachments.values()) |c| {
+        if (c.present != present) continue;
+        const added = nodes[c.added_in].input;
+        try out.append(arena, .{
+            .id = c.spec.id,
+            .media = c.spec.media,
+            .size = c.spec.size,
+            .sha256 = c.spec.sha256,
+            .name = c.spec.name,
+            .added_in = added.oid,
+            .added_by = added.author,
+        });
+    }
+    std.mem.sort(Attachment, out.items, {}, struct {
+        fn lt(_: void, x: Attachment, y: Attachment) bool {
+            if (x.added_by.time != y.added_by.time) return x.added_by.time < y.added_by.time;
+            // Same commit: trailer order, the sort is stable.
+            return x.added_in.order(y.added_in) == .lt;
+        }
+    }.lt);
+    return out.items;
 }
 
 /// Keys for event state. Trailer keys can't contain spaces, so these never
@@ -695,6 +875,7 @@ fn cloneState(arena: Allocator, s: FoldState) Allocator.Error!FoldState {
     return .{
         .scalars = try s.scalars.clone(arena),
         .sets = sets,
+        .attachments = try s.attachments.clone(arena),
     };
 }
 
@@ -805,6 +986,15 @@ fn comments(
             .is_merge = node.parents.len > 1,
             .deleted = visible != null and std.mem.eql(u8, visible.?.value, "0"),
         };
+        var added: std.ArrayList([]const u8) = .empty;
+        for (node.block.trailers) |t| {
+            if (!std.ascii.eqlIgnoreCase(t.key, attachment_fmt.add_key)) continue;
+            const spec = attachment_fmt.parseSpec(t.value) orelse continue;
+            const cell = final.attachments.get(spec.id) orelse continue;
+            if (cell.present and cell.added_in == n and !labels_fmt.contains(added.items, spec.id))
+                try added.append(arena, spec.id);
+        }
+        c.attachments = added.items;
         if (edited) |e| {
             // The edit replaces the whole comment.
             var lines = std.mem.splitScalar(u8, e.value, '\n');
@@ -1268,4 +1458,75 @@ test "concurrent and bad events" {
     try testing.expectEqual(@as(usize, 1), dangling);
     try testing.expectEqual(@as(usize, 3), invalid);
     try testing.expectEqual(@as(usize, 2), i.comments.len); // the comment and the merge
+}
+
+test "attachments" {
+    var arena_state: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena_state.deinit();
+    var d: TestDag = .{ .arena = arena_state.allocator() };
+    const id1 = "1b4e28ba-2fa1-4d3b-a3f5-ef19b5a7633b";
+    const id2 = "2c5f39cb-3ab2-4e4c-b4a6-f02ac6b8744c";
+    const h1 = " image/png 10 sha256:" ++ "a" ** 64 ++ " ";
+    const h2 = " image/jpeg 20 sha256:" ++ "b" ** 64 ++ " ";
+    const root = try d.add(&.{}, 100, "Crash\n\nState: open\nFormat-Version: 1\n");
+    const c1 = try d.add(&.{root}, 200, "Here's a screenshot\n\n" ++
+        "X-Attachment: " ++ id1 ++ h1 ++ "shot.png\n" ++
+        "X-Attachment: " ++ id2 ++ h2 ++ "photo.jpg\n");
+    const c2 = try d.add(
+        &.{c1},
+        300,
+        "Rename attachment\n\nX-Attachment: " ++ id1 ++ h1 ++ "login.png\n",
+    );
+    const c3 = try d.add(&.{c2}, 400, "Remove attachment\n\nX-Attachment-Removed: " ++ id2 ++ "\n");
+    // A different object under id1, and garbage. Both ignored and reported.
+    const c4 = try d.add(&.{c3}, 500, "Bad\n\n" ++
+        "X-Attachment: " ++ id1 ++ h2 ++ "other.jpg\n" ++
+        "X-Attachment: nonsense\nX-Attachment-Removed: nope\n");
+    var i = try d.issue(c4);
+    try testing.expectEqual(@as(usize, 1), i.attachments.len);
+    try testing.expectEqualStrings("login.png", i.attachments[0].name);
+    try testing.expectEqual(attachment_fmt.Media.png, i.attachments[0].media);
+    try testing.expect(i.attachments[0].added_in.eql(d.commits.items[c1].oid));
+    try testing.expectEqual(@as(usize, 3), i.attachment_problems.len);
+    try testing.expectEqual(AttachmentProblem.Kind.changed_object, i.attachment_problems[0].kind);
+    try testing.expect(i.field("X-Attachment") == null);
+    try testing.expectEqualStrings("Here's a screenshot", i.comments[0].subject);
+    try testing.expectEqual(@as(usize, 1), i.comments[0].attachments.len);
+    try testing.expectEqualStrings(id1, i.comments[0].attachments[0]);
+
+    const c5 = try d.add(&.{c4}, 600, "Re-add\n\nX-Attachment: " ++ id2 ++ h2 ++ "photo.jpg\n");
+    i = try d.issue(c5);
+    try testing.expectEqual(@as(usize, 2), i.attachments.len);
+}
+
+test "attachment merges" {
+    var arena_state: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena_state.deinit();
+    var d: TestDag = .{ .arena = arena_state.allocator() };
+    const id = "1b4e28ba-2fa1-4d3b-a3f5-ef19b5a7633b";
+    const h = " image/png 10 sha256:" ++ "a" ** 64 ++ " ";
+    const root = try d.add(&.{}, 100, "Crash\n\nState: open\nX-Attachment: " ++ id ++ h ++
+        "a.png\nFormat-Version: 1\n");
+    const removed = try d.add(&.{root}, 300, "Remove\n\nX-Attachment-Removed: " ++ id ++ "\n");
+    const renamed = try d.add(&.{root}, 200, "Rename\n\nX-Attachment: " ++ id ++ h ++ "b.png\n");
+    const merge = try d.add(&.{ removed, renamed }, 400, "Merge issue\n\nState: open\n");
+    var i = try d.issue(merge);
+    try testing.expectEqual(@as(usize, 1), i.attachments.len);
+    try testing.expectEqualStrings("b.png", i.attachments[0].name);
+
+    const r1 = try d.add(&.{merge}, 500, "Rename\n\nX-Attachment: " ++ id ++ h ++ "c.png\n");
+    const r2 = try d.add(&.{merge}, 600, "Rename\n\nX-Attachment: " ++ id ++ h ++ "d.png\n");
+    const m2 = try d.add(&.{ r1, r2 }, 700, "Merge issue\n\nState: open\n");
+    i = try d.issue(m2);
+    try testing.expectEqualStrings("d.png", i.attachments[0].name);
+
+    const h2 = " image/jpeg 20 sha256:" ++ "b" ** 64 ++ " ";
+    const other = "3d6a4adc-4bc3-4f5d-85b7-013bd7c9855d";
+    const x1 = try d.add(&.{m2}, 800, "X\n\nX-Attachment: " ++ other ++ h ++ "first.png\n");
+    const x2 = try d.add(&.{m2}, 900, "Y\n\nX-Attachment: " ++ other ++ h2 ++ "second.jpg\n");
+    const m3 = try d.add(&.{ x2, x1 }, 1000, "Merge issue\n\nState: open\n");
+    i = try d.issue(m3);
+    try testing.expectEqual(@as(usize, 2), i.attachments.len);
+    try testing.expectEqualStrings("first.png", i.attachments[1].name);
+    try testing.expectEqual(@as(usize, 1), i.attachment_problems.len);
 }

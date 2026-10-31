@@ -8,6 +8,7 @@ const issuez = @import("issuez");
 const object = issuez.backend.object;
 const hex_fmt = issuez.format.hex;
 const trailers = issuez.format.trailers;
+const attachment_fmt = issuez.format.attachment;
 const World = issuez.backend.GitSim.World;
 const Oid = object.Oid;
 
@@ -39,18 +40,19 @@ pub const Report = struct {
 pub const owned_prefixes = [_][]const u8{
     "refs/issues/",
     "refs/milestones/",
+    "refs/attachments/",
     "refs/issuez-sync/",
     "refs/issuez-guard/",
 };
 
 pub fn isOwnedRef(name: []const u8) bool {
     for (owned_prefixes) |p| if (std.mem.startsWith(u8, name, p)) return true;
-    // Fetch staging: refs/remotes/<remote>/{issues,milestones}/
+    // Fetch staging: refs/remotes/<remote>/{issues,milestones,attachments}/
     if (std.mem.startsWith(u8, name, "refs/remotes/")) {
         const rest = name["refs/remotes/".len..];
         const slash = std.mem.findScalar(u8, rest, '/') orelse return false;
         const ns = rest[slash + 1 ..];
-        for ([_][]const u8{ "issues/", "milestones/" }) |p|
+        for ([_][]const u8{ "issues/", "milestones/", "attachments/" }) |p|
             if (std.mem.startsWith(u8, ns, p)) return true;
     }
     return false;
@@ -148,6 +150,17 @@ fn checkClone(
         if (!written) try report.fail(
             "clone '{s}': guard ref {s} moved to a commit no write made",
             .{ a.name, r.name },
+        );
+    }
+
+    // LFS objects are never deleted, in either store.
+    for (b.lfs) |o| {
+        const kept = for (a.lfs) |n| {
+            if (n.store == o.store and std.mem.eql(u8, n.sha256, o.sha256)) break true;
+        } else false;
+        if (!kept) try report.fail(
+            "clone '{s}': LFS object {s} disappeared",
+            .{ a.name, o.sha256 },
         );
     }
 
@@ -267,6 +280,7 @@ pub fn checkTransition(
             return checkEdit(arena, after, cb, ca, x, report),
         .merge, .push, .sync => |x| {
             try checkSync(arena, before, after, target, cmd, x, report);
+            if (!x.check) try checkDerivedAfterSync(arena, before, after, target, report);
         },
         .quarantine => |x| return checkResolve(arena, cb, ca, x, report),
         .close, .reopen => |x| return checkState(arena, after, cb, ca, .{
@@ -279,6 +293,8 @@ pub fn checkTransition(
         },
         .comment_event => |x| return checkCommentEvent(arena, after, cb, ca, x, report),
         .milestone => |x| return checkMilestone(arena, after, cb, ca, x, report),
+        .attach => |x| return checkAttach(arena, after, cb, ca, x, report),
+        .repair => return checkRepair(arena, after, cb, ca, report),
     }
 }
 
@@ -795,7 +811,7 @@ fn checkInit(
         // And only the staging refspecs may be added.
         const remote = e.key["remote.".len .. e.key.len - ".fetch".len];
         var ok = false;
-        for ([_][]const u8{ "issues", "milestones" }) |ns| {
+        for ([_][]const u8{ "issues", "milestones", "attachments" }) |ns| {
             const expected = try std.fmt.allocPrint(
                 arena,
                 "+refs/{s}/*:refs/remotes/{s}/{s}/*",
@@ -1391,4 +1407,343 @@ test "foreign refs and lost objects" {
 test {
     _ = command;
     _ = upstream;
+}
+
+/// Magic bytes, no animation.
+fn sniffMedia(data: []const u8) ?[]const u8 {
+    if (std.mem.startsWith(u8, data, "\x89PNG\r\n\x1a\n")) {
+        const idat = std.mem.find(u8, data, "IDAT") orelse data.len;
+        const iend = std.mem.find(u8, data, "IEND") orelse data.len;
+        const actl = std.mem.find(u8, data, "acTL") orelse return "image/png";
+        return if (actl < @min(idat, iend)) null else "image/png";
+    }
+    if (data.len >= 3 and data[0] == 0xff and data[1] == 0xd8 and data[2] == 0xff)
+        return "image/jpeg";
+    if (data.len >= 12 and std.mem.eql(u8, data[0..4], "RIFF") and
+        std.mem.eql(u8, data[8..12], "WEBP"))
+    {
+        if (std.mem.find(u8, data, "ANIM") != null or std.mem.find(u8, data, "ANMF") != null)
+            return null;
+        if (std.mem.find(u8, data, "VP8X")) |p| {
+            if (p + 8 < data.len and data[p + 8] & 0x02 != 0) return null;
+        }
+        return "image/webp";
+    }
+    return null;
+}
+
+/// Basename, control characters as spaces, trimmed, "attachment" if empty.
+/// Fuzz names are ASCII.
+fn displayName(arena: Allocator, raw: []const u8) Allocator.Error![]const u8 {
+    var base = raw;
+    if (std.mem.findLastAny(u8, base, "/\\")) |i| base = base[i + 1 ..];
+    const out = try arena.dupe(u8, base);
+    for (out) |*ch| if (ch.* < 0x20 or ch.* == 0x7f) {
+        ch.* = ' ';
+    };
+    const t = std.mem.trim(u8, out, " ");
+    return if (t.len == 0) "attachment" else t[0..@min(t.len, attachment_fmt.max_name_bytes)];
+}
+
+fn worldFile(world: World, path: []const u8) ?[]const u8 {
+    for (world.files) |f| if (std.mem.eql(u8, f.path, path)) return f.data;
+    return null;
+}
+
+fn sha256Hex(data: []const u8) [64]u8 {
+    var digest: [32]u8 = undefined;
+    std.crypto.hash.sha2.Sha256.hash(data, &digest, .{});
+    return std.fmt.bytesToHex(digest, .lower);
+}
+
+fn lfsHas(clone: World.Clone, store: anytype, sha: []const u8) bool {
+    for (clone.lfs) |o| if (o.store == store and std.mem.eql(u8, o.sha256, sha)) return true;
+    return false;
+}
+
+/// One commit on the issue with exactly the expected trailers, the bytes in
+/// our LFS store, and for add and rm the derived ref moved to a tree with
+/// one pointer per present attachment.
+fn checkAttach(
+    arena: Allocator,
+    world: World,
+    b: commands.Clone,
+    a: commands.Clone,
+    parsed: command.Attach,
+    report: *Report,
+) (Allocator.Error || error{NoRule})!void {
+    const cmd = "attach";
+    const name = (try targetRef(b, parsed.id, report, cmd)) orelse return;
+    const id = name["refs/issues/".len..];
+    const derived = try std.fmt.allocPrint(arena, "refs/attachments/{s}", .{id});
+    const before = b.naive(b.ref(name).?) catch |e| switch (e) {
+        error.OutOfMemory => return error.OutOfMemory,
+        error.NoRule => return report.skip("attach on a history the oracle can't read"),
+    };
+
+    const changes = try refChanges(arena, b, a);
+    var issue_moved = false;
+    var derived_moved = false;
+    for (changes) |ch| {
+        if (std.mem.eql(u8, ch.name, name)) {
+            issue_moved = true;
+        } else if (std.mem.eql(u8, ch.name, derived)) {
+            derived_moved = true;
+        } else try report.fail("{s} changed {s}", .{ cmd, ch.name });
+    }
+    if (!issue_moved) return report.fail("{s} didn't write the issue", .{cmd});
+    const chain = (try appendedOne(arena, b, a, name, report, cmd)) orelse return;
+    try checkIdentity(world, chain, report);
+    const block = try commands.trailersOf(arena, chain.message);
+
+    var want: std.ArrayList(commands.Trailer) = .empty;
+    const is_add = parsed.sub == .add or parsed.sub == .comment;
+    if (parsed.sub == .comment and parsed.text == null)
+        return report.fail("comment --attach without -m succeeded", .{});
+    if (is_add) {
+        const files = parsed.words;
+        if (files.len == 0) return report.fail("{s} succeeded without files", .{cmd});
+        if (parsed.name != null and files.len != 1)
+            return report.fail("--name with several files", .{});
+        if (before.attachments.len + files.len > attachment_fmt.max_per_issue)
+            return report.fail(
+                "{s} exceeded {d} attachments",
+                .{ cmd, attachment_fmt.max_per_issue },
+            );
+        if (block.trailers.len != files.len) return report.fail(
+            "{s}: {d} trailers for {d} files",
+            .{ cmd, block.trailers.len, files.len },
+        );
+        var seen: std.ArrayList([]const u8) = .empty;
+        for (files, block.trailers) |path, t| {
+            const data = worldFile(world, path) orelse
+                return report.fail("{s} succeeded on missing file '{s}'", .{ cmd, path });
+            if (data.len == 0 or data.len > attachment_fmt.max_bytes)
+                return report.fail("{s} accepted a file of {d} bytes", .{ cmd, data.len });
+            const media = sniffMedia(data) orelse
+                return report.fail("{s} accepted '{s}' (not a still image)", .{ cmd, path });
+            const got = commands.parseAttachment(t.value) orelse
+                return report.fail("{s}: malformed trailer '{s}'", .{ cmd, t.value });
+            if (!std.mem.eql(u8, t.key, "X-Attachment"))
+                try report.fail("{s}: key {s}", .{ cmd, t.key });
+            if (!isV4Uuid(got.id)) try report.fail("{s}: non-v4 attachment id", .{cmd});
+            for (before.attachments) |p| if (std.mem.eql(u8, p.id, got.id))
+                try report.fail("{s}: reused attachment id", .{cmd});
+            for (seen.items) |s| {
+                if (std.mem.eql(u8, s, got.id)) try report.fail("{s}: duplicate id", .{cmd});
+            }
+            try seen.append(arena, got.id);
+            const sha = sha256Hex(data);
+            const exp: commands.NaiveAttachment = .{
+                .id = got.id,
+                .media = media,
+                .size = try std.fmt.allocPrint(arena, "{d}", .{data.len}),
+                .sha256 = &sha,
+                .name = try displayName(arena, parsed.name orelse path),
+            };
+            try want.append(arena, .{ .key = "X-Attachment", .value = try exp.value(arena) });
+            if (!lfsHas(a.clone, .issuez, &sha))
+                try report.fail("{s}: bytes of '{s}' not in the LFS store", .{ cmd, path });
+        }
+    } else {
+        const rm = parsed.sub == .rm;
+        const prefixes = if (rm) parsed.words else parsed.words[0..@min(1, parsed.words.len)];
+        if (prefixes.len == 0 or (!rm and parsed.words.len != 2))
+            return report.fail("{s} {t}: wrong arguments succeeded", .{ cmd, parsed.sub });
+        for (prefixes) |p| {
+            if (p.len < 4) return report.fail("{s}: short attachment id accepted", .{cmd});
+            var hit: ?commands.NaiveAttachment = null;
+            var n: usize = 0;
+            for (before.attachments) |x| if (std.mem.startsWith(u8, x.id, p)) {
+                hit = x;
+                n += 1;
+            };
+            if (n != 1) return report.fail("{s}: '{s}' matched {d} attachments", .{ cmd, p, n });
+            if (rm) {
+                try want.append(arena, .{ .key = "X-Attachment-Removed", .value = hit.?.id });
+            } else {
+                var renamed = hit.?;
+                renamed.name = try displayName(arena, parsed.words[1]);
+                const v = try renamed.value(arena);
+                try want.append(arena, .{ .key = "X-Attachment", .value = v });
+            }
+        }
+        if (!rm and derived_moved) try report.fail("rename moved the derived ref", .{});
+    }
+    try expectBlock(report, cmd, block, want.items);
+    try expectSubject(arena, report, cmd, parsed.text, chain.message);
+    if (is_add or parsed.sub == .rm) {
+        if (!derived_moved) return report.fail("{s} didn't move {s}", .{ cmd, derived });
+        try checkDerived(arena, world, b, a, id, report);
+    }
+}
+
+/// One commit on top of the old value, fixed identity, the issue tip
+/// recorded, one LFS pointer per present attachment.
+fn checkDerived(
+    arena: Allocator,
+    world: World,
+    b: commands.Clone,
+    a: commands.Clone,
+    id: []const u8,
+    report: *Report,
+) (Allocator.Error || error{NoRule})!void {
+    _ = world;
+    const derived = try std.fmt.allocPrint(arena, "refs/attachments/{s}", .{id});
+    const issue_ref = try std.fmt.allocPrint(arena, "refs/issues/{s}", .{id});
+    const tip = a.ref(derived) orelse return report.fail("{s} missing", .{derived});
+    const c = a.commit(tip) orelse return report.fail("{s}: not a commit", .{derived});
+    const old = b.ref(derived);
+    if (old) |o| {
+        if (c.parents.len != 1 or !std.mem.eql(u8, c.parents[0].hex().slice(), o))
+            try report.fail("{s}: not one commit on its old tip", .{derived});
+    } else if (c.parents.len != 0) try report.fail("{s}: new ref with parents", .{derived});
+    if (!std.mem.eql(u8, c.author.email, "git-issue@invalid") or
+        !std.mem.eql(u8, c.committer.email, "git-issue@invalid"))
+        try report.fail("{s}: identity {s}", .{ derived, c.author.email });
+    const issue_tip = a.ref(issue_ref).?;
+    const want_trailers = try std.fmt.allocPrint(
+        arena,
+        "X-Issue: {s}\nX-Issue-Tip: {s}\n",
+        .{ id, issue_tip },
+    );
+    if (!std.mem.eql(u8, afterSubject(c.message), want_trailers))
+        try report.fail("{s}: message\n{s}", .{ derived, c.message });
+    const naive = a.naive(issue_tip) catch |e| switch (e) {
+        error.OutOfMemory => return error.OutOfMemory,
+        error.NoRule => return report.skip("derived ref of a history the oracle can't read"),
+    };
+    const tree_hex = try arena.dupe(u8, c.tree.hex().slice());
+    const entries: []const object.Tree.Entry = if (c.tree.eql(object.emptyTree(a.format)))
+        &.{}
+    else blk: {
+        const o = a.objects.get(tree_hex) orelse
+            return report.fail("{s}: missing tree", .{derived});
+        break :blk object.Tree.parse(arena, a.format, o.data) catch
+            return report.fail("{s}: bad tree", .{derived});
+    };
+    if (entries.len != naive.attachments.len)
+        return report.fail(
+            "{s}: {d} entries for {d} attachments",
+            .{ derived, entries.len, naive.attachments.len },
+        );
+    for (naive.attachments) |att| {
+        const fname = try std.fmt.allocPrint(arena, "{s}.{s}", .{ att.id, att.extension() });
+        const e = for (entries) |e| {
+            if (std.mem.eql(u8, e.name, fname)) break e;
+        } else {
+            try report.fail("{s}: no entry {s}", .{ derived, fname });
+            continue;
+        };
+        const blob = a.objects.get(try arena.dupe(u8, e.oid.hex().slice())) orelse {
+            try report.fail("{s}: missing pointer blob", .{derived});
+            continue;
+        };
+        const pointer = try std.fmt.allocPrint(
+            arena,
+            "version https://git-lfs.github.com/spec/v1\noid sha256:{s}\nsize {s}\n",
+            .{ att.sha256, att.size },
+        );
+        if (blob.kind != .blob or !std.mem.eql(u8, blob.data, pointer))
+            try report.fail("{s}: wrong pointer for {s}", .{ derived, fname });
+    }
+}
+
+/// `fsck --repair` only touches derived refs, and gets them right.
+fn checkRepair(
+    arena: Allocator,
+    world: World,
+    b: commands.Clone,
+    a: commands.Clone,
+    report: *Report,
+) (Allocator.Error || error{NoRule})!void {
+    for (try refChanges(arena, b, a)) |ch| {
+        if (!std.mem.startsWith(u8, ch.name, "refs/attachments/")) {
+            try report.fail("fsck --repair changed {s}", .{ch.name});
+            continue;
+        }
+        const id = ch.name["refs/attachments/".len..];
+        if (a.ref(try std.fmt.allocPrint(arena, "refs/issues/{s}", .{id})) == null) {
+            try report.fail("fsck --repair wrote {s} for no issue", .{ch.name});
+            continue;
+        }
+        try checkDerived(arena, world, b, a, id, report);
+    }
+}
+
+/// After merge, push or sync every derived ref matches its issue and none
+/// was rewound.
+fn checkDerivedAfterSync(
+    arena: Allocator,
+    before: World,
+    after: World,
+    target: usize,
+    report: *Report,
+) (Allocator.Error || error{NoRule})!void {
+    const b = try commands.Clone.init(arena, before.format, before.clones[target]);
+    const a = try commands.Clone.init(arena, after.format, after.clones[target]);
+    for (a.clone.refs) |r| {
+        if (!std.mem.startsWith(u8, r.name, "refs/issues/")) continue;
+        const id = r.name["refs/issues/".len..];
+        const naive = a.naive(r.oid) catch |e| switch (e) {
+            error.OutOfMemory => return error.OutOfMemory,
+            error.NoRule => {
+                try report.skip("derived ref after sync of a history the oracle can't read");
+                continue;
+            },
+        };
+        const derived = try std.fmt.allocPrint(arena, "refs/attachments/{s}", .{id});
+        const tip = a.ref(derived) orelse {
+            if (naive.attachments.len > 0)
+                try report.fail("sync left {s} without {s}", .{ id, derived });
+            continue;
+        };
+        if (b.ref(derived)) |old| if (!try isAncestorIn(a, old, tip))
+            try report.fail("sync rewound {s}", .{derived});
+        // Hashed from our own reading of the issue.
+        var entries: std.ArrayList(object.Tree.Entry) = .empty;
+        for (naive.attachments) |att| {
+            const pointer = try std.fmt.allocPrint(
+                arena,
+                "version https://git-lfs.github.com/spec/v1\noid sha256:{s}\nsize {s}\n",
+                .{ att.sha256, att.size },
+            );
+            try entries.append(arena, .{
+                .name = try std.fmt.allocPrint(arena, "{s}.{s}", .{ att.id, att.extension() }),
+                .oid = object.hashObject(a.format, .blob, pointer),
+            });
+        }
+        const tree_data = try object.Tree.serializeAlloc(arena, entries.items);
+        const want = object.hashObject(a.format, .tree, tree_data);
+        const c = a.commit(tip) orelse {
+            try report.fail("{s} is not a commit", .{derived});
+            continue;
+        };
+        if (!c.tree.eql(want)) try report.fail("sync left {s} out of date", .{derived});
+    }
+}
+
+fn appendedOne(
+    arena: Allocator,
+    b: commands.Clone,
+    a: commands.Clone,
+    name: []const u8,
+    report: *Report,
+    cmd: []const u8,
+) Allocator.Error!?object.Commit {
+    const old = b.ref(name).?;
+    const new = a.ref(name) orelse {
+        try report.fail("{s} deleted {s}", .{ cmd, name });
+        return null;
+    };
+    _ = arena;
+    const c = a.commit(new) orelse {
+        try report.fail("{s}: {s} is not a commit", .{ cmd, name });
+        return null;
+    };
+    if (c.parents.len != 1 or !std.mem.eql(u8, c.parents[0].hex().slice(), old)) {
+        try report.fail("{s}: expected one commit on {s}", .{ cmd, name });
+        return null;
+    }
+    return c;
 }

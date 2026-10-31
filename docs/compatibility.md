@@ -97,6 +97,9 @@ are installed.
 - Edited comments show their current text, deleted ones are left out, and
   the event commits themselves are not listed as updates. Upstream shows
   every commit as it was written. `--ids` adds each comment's ID.
+- Attachments are listed after the fields, and each comment names the
+  images it added (`[attached 5b0c4e0e login.png]`) instead of showing its
+  `X-Attachment` trailer lines.
 
 ## comment
 
@@ -106,6 +109,8 @@ are installed.
 - `--edit <comment-id> -m <text>`, `--delete <comment-id>` and
   `--restore <comment-id>` change a comment by adding an event commit
   ([format.md](format.md) §5). Nothing is rewritten.
+- `--attach <file>` (repeatable) attaches images to the new comment, in
+  the same commit ([attachments.md](attachments.md)).
 
 ## edit
 
@@ -144,6 +149,11 @@ are installed.
 - `-q` is accepted as `--quiet`, and unreadable histories are reported.
 - Invalid extension values and hierarchy or blocker problems are noted on
   stderr, not counted as errors: other tools can write them.
+- Stored attachment bytes are checked against their hashes; damaged ones
+  are errors. Missing bytes, ignored attachment trailers, stored objects
+  no issue references, and missing or out-of-date `refs/attachments/*`
+  are noted. `--repair` rebuilds those derived refs and never touches an
+  issue.
 
 ## init
 
@@ -153,7 +163,9 @@ are installed.
   command warns while a remote still has it, and `git issue init <remote>
   --fix-refspec` replaces it.
 - A second refspec, `+refs/milestones/*:refs/remotes/<remote>/milestones/*`,
-  fetches milestones the same way.
+  fetches milestones the same way, and a third,
+  `+refs/attachments/*:refs/remotes/<remote>/attachments/*`, the derived
+  attachment refs.
 - Several remotes as arguments are refused. Upstream takes the last one.
 
 ## merge
@@ -175,6 +187,8 @@ are installed.
   restores the local tip.
 - Several remotes as arguments are refused, as for `push` and `sync`.
 - Milestones are merged too, by the same rules. Upstream ignores them.
+- Derived attachment refs are fetched and rebuilt from the merged issues
+  ([format.md](format.md) §8). Upstream ignores them.
 - The remote must be a configured remote name. URLs and paths are refused
   with a `git remote add` hint; upstream fails on them too, at the fetch.
 - `--no-fetch` keeps the staging refs, like upstream. A fetching merge
@@ -185,7 +199,10 @@ are installed.
 - `push <remote>`: fetches to see what the remote has, then pushes the
   issues and milestones that differ, never with force. When the remote
   moved, it merges first and retries. When the remote refuses a ref (a
-  hook, permissions), it stops with the remote's message.
+  hook, permissions), it stops with the remote's message. Attachment
+  bytes are uploaded with `git lfs push` before the refs; without git-lfs
+  the refs are pushed anyway, with a warning naming the objects that
+  weren't uploaded.
 - `sync <remote>`: `merge`, then `push`.
 - `close` and `reopen <id>`: `state --close` and `state --open`.
 - `delete` and `restore <id>`: hide an issue from `ls`, `tree` and
@@ -197,6 +214,10 @@ are installed.
   and its progress. `complete` is refused while any of them is open.
   `edit` writes one commit for all its changes. A retired milestone is
   named by its ID only.
+- `attach add|ls|cat|rename|rm|fetch`: images on issues
+  ([attachments.md](attachments.md)). `cat` writes the bytes to stdout and
+  downloads them first when they are missing; `fetch` downloads missing
+  bytes for one issue or all of them.
 - `status [<remote>]`: issues not pushed yet, quarantined issues and how to
   resolve them, and issues with conflicts. Local state only.
 - `quarantine <remote> --accept-remote|--keep-local <id>`: resolves a

@@ -10,6 +10,7 @@ const object = issuez.backend.object;
 const trailers = issuez.format.trailers;
 const hex_fmt = issuez.format.hex;
 const World = issuez.backend.GitSim.World;
+const attachment_fmt = issuez.format.attachment;
 const fields_fmt = issuez.format.fields;
 const command = @import("command.zig");
 
@@ -45,10 +46,57 @@ pub const NaiveIssue = struct {
     workflow: []const u8 = "",
     milestone_id: []const u8 = "",
     milestone_mode: []const u8 = "",
+    /// In no particular order.
+    attachments: []const NaiveAttachment = &.{},
     /// Of the fields a merge restates: written somewhere in the history,
     /// empty now.
     cleared: []const []const u8 = &.{},
 };
+
+/// Fields as text.
+pub const NaiveAttachment = struct {
+    id: []const u8,
+    media: []const u8,
+    size: []const u8,
+    sha256: []const u8,
+    name: []const u8,
+
+    pub fn value(a: NaiveAttachment, arena: Allocator) Allocator.Error![]const u8 {
+        return std.fmt.allocPrint(arena, "{s} {s} {s} sha256:{s} {s}", .{
+            a.id, a.media, a.size, a.sha256, a.name,
+        });
+    }
+
+    pub fn extension(a: NaiveAttachment) []const u8 {
+        if (std.mem.eql(u8, a.media, "image/png")) return "png";
+        if (std.mem.eql(u8, a.media, "image/jpeg")) return "jpg";
+        return "webp";
+    }
+};
+
+/// The oracle's own reading of the attachment grammar.
+pub fn parseAttachment(v: []const u8) ?NaiveAttachment {
+    var it = std.mem.splitScalar(u8, v, ' ');
+    const id = it.next() orelse return null;
+    const media = it.next() orelse return null;
+    const size = it.next() orelse return null;
+    const hash = it.next() orelse return null;
+    const name = it.rest();
+    if (!isUuidShape(id)) return null;
+    const medias = [_][]const u8{ "image/png", "image/jpeg", "image/webp" };
+    if (!contains(&medias, media)) return null;
+    if (size.len == 0 or size.len > 8 or size[0] == '0') return null;
+    for (size) |ch| if (!std.ascii.isDigit(ch)) return null;
+    const bytes = std.fmt.parseInt(u64, size, 10) catch return null;
+    if (bytes > attachment_fmt.max_object_bytes) return null;
+    if (!std.mem.startsWith(u8, hash, "sha256:") or hash.len != 7 + 64) return null;
+    if (!hex_fmt.isLower(hash[7..])) return null;
+    if (name.len == 0 or name.len > attachment_fmt.max_name_bytes) return null;
+    if (name[0] == ' ' or name[name.len - 1] == ' ') return null;
+    for (name) |ch| if (ch < 0x20 or ch == 0x7f) return null;
+    if (!std.unicode.utf8ValidateSlice(name)) return null;
+    return .{ .id = id, .media = media, .size = size, .sha256 = hash[7..], .name = name };
+}
 
 /// `Name` and `X-Milestone-Status` by the same rule as issue fields.
 pub const NaiveMilestone = struct {
@@ -230,6 +278,52 @@ const Dag = struct {
         return lastOf(d.commits[best].block, key).?;
     }
 
+    /// Per UUID, the commits that add or remove it. Present when a maximal
+    /// one adds it, with the newest add's value.
+    fn attachments(d: Dag) Allocator.Error![]const NaiveAttachment {
+        const Entry = struct { commit: usize, add: ?NaiveAttachment };
+        var per: std.array_hash_map.String(std.ArrayList(Entry)) = .empty;
+        for (d.commits, 0..) |n, i| {
+            if (!d.inHistory(i)) continue;
+            // The last trailer for a UUID in a commit counts.
+            var mine: std.array_hash_map.String(?NaiveAttachment) = .empty;
+            for (n.block.trailers) |t| {
+                if (std.ascii.eqlIgnoreCase(t.key, "X-Attachment")) {
+                    const a = parseAttachment(t.value) orelse continue;
+                    try mine.put(d.arena, a.id, a);
+                } else if (std.ascii.eqlIgnoreCase(t.key, "X-Attachment-Removed")) {
+                    if (isUuidShape(t.value)) try mine.put(d.arena, t.value, null);
+                }
+            }
+            for (mine.keys(), mine.values()) |id, a| {
+                const gop = try per.getOrPut(d.arena, id);
+                if (!gop.found_existing) gop.value_ptr.* = .empty;
+                try gop.value_ptr.append(d.arena, .{ .commit = i, .add = a });
+            }
+        }
+        var out: std.ArrayList(NaiveAttachment) = .empty;
+        for (per.values()) |entries| {
+            var ids: std.ArrayList(usize) = .empty;
+            for (entries.items) |e| try ids.append(d.arena, e.commit);
+            const top = try d.maximal(ids.items);
+            var best: ?Entry = null;
+            for (entries.items) |e| {
+                if (e.add == null or !containsIndex(top, e.commit)) continue;
+                if (best) |b| {
+                    const x = d.commits[e.commit];
+                    const y = d.commits[b.commit];
+                    const newer = x.commit.author.time > y.commit.author.time or
+                        (x.commit.author.time == y.commit.author.time and
+                            std.mem.order(u8, x.hex, y.hex) == .gt);
+                    if (!newer) continue;
+                }
+                best = e;
+            }
+            if (best) |b| try out.append(d.arena, b.add.?);
+        }
+        return out.items;
+    }
+
     const LabelSetter = struct { commit: usize, present: bool };
 
     fn member(d: Dag, setters: []const LabelSetter, scope_contains: anytype) Allocator.Error!bool {
@@ -347,6 +441,7 @@ const Dag = struct {
             .workflow = (try d.scalar("X-Workflow-State")) orelse "",
             .milestone_id = (try d.scalar("X-Milestone-Id")) orelse "",
             .milestone_mode = (try d.scalar("X-Milestone-Mode")) orelse "",
+            .attachments = try d.attachments(),
         };
     }
 };
@@ -355,6 +450,11 @@ pub fn sameSet(a: []const []const u8, b: []const []const u8) bool {
     if (a.len != b.len) return false;
     for (a) |x| if (!contains(b, x)) return false;
     return true;
+}
+
+fn containsIndex(list: []const usize, item: usize) bool {
+    for (list) |x| if (x == item) return true;
+    return false;
 }
 
 fn contains(list: []const []const u8, item: []const u8) bool {

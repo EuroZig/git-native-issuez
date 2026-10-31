@@ -21,6 +21,20 @@
 //! fn fetch(self, arena, remote, refspecs) (Error || error{FetchFailed})!void
 //! fn push(self, arena, remote, refspecs, atomic) (Error || error{PushFailed})!PushResult
 //! ```
+//!
+//! Attachments also need the LFS stores. Without them every other
+//! operation still works and attachments fail with AttachmentsUnsupported:
+//!
+//! ```
+//! fn lfsRead(self, arena, LfsStore, sha256_hex) Error!?[]const u8
+//! fn lfsWrite(self, LfsStore, sha256_hex, data) Error!void  // atomic
+//! fn lfsList(self, arena, LfsStore) Error![]const []const u8
+//! fn lfsPush(self, arena, remote, sha256_hexes) (Error || LfsTransportError)!void
+//! fn lfsFetch(self, arena, remote, local_refs) (Error || LfsTransportError)!void
+//! ```
+//!
+//! The last two are optional again: without them sync pushes the refs and
+//! reports the objects it couldn't upload.
 
 const std = @import("std");
 const object = @import("object.zig");
@@ -34,6 +48,29 @@ pub const Signature = object.Signature;
 pub const Identity = struct {
     author: Signature,
     committer: Signature,
+};
+
+pub const LfsStore = enum {
+    /// `$GIT_DIR/issuez/lfs/objects/`, the one that counts. `git lfs prune`
+    /// doesn't look there.
+    issuez,
+    /// git-lfs's store (`$GIT_DIR/lfs/objects/` or `lfs.storage`), only a
+    /// copy for transfers.
+    git_lfs,
+};
+
+pub fn hasLfs(comptime B: type) bool {
+    return @hasDecl(B, "lfsRead") and @hasDecl(B, "lfsWrite") and @hasDecl(B, "lfsList");
+}
+
+pub fn hasLfsTransport(comptime B: type) bool {
+    return hasLfs(B) and @hasDecl(B, "lfsPush") and @hasDecl(B, "lfsFetch");
+}
+
+pub const LfsTransportError = error{
+    /// No git-lfs, or no LFS server for this remote.
+    LfsUnavailable,
+    LfsTransferFailed,
 };
 
 pub const Object = struct {

@@ -1,0 +1,11 @@
+accepted: image/png
+rejected: UnsupportedType
+attached fc7b9aec
+
+fc7b9aec  image/png  45 bytes  login.png
+  read 45 bytes, same as written: true
+
+comment: Here's what it looks like on a small screen.
+  [image fc7b9aec]
+
+after removal: 0 present, 1 removed

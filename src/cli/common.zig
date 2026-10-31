@@ -247,6 +247,22 @@ pub fn reportEngineError(err: *std.Io.Writer, e: anyerror) void {
         error.MilestoneCompleted => "error: the milestone is completed; reopen it first " ++
             "('git issue milestone reopen')\n",
         error.MilestoneRetired => "error: the milestone is retired; pick another one\n",
+        error.AttachmentsUnsupported => "error: this backend has no attachment store\n",
+        error.UnsupportedType => "not a PNG, JPEG or WebP image\n",
+        error.AnimatedImage => "animated images aren't supported\n",
+        error.MediaMismatch => "the file's type doesn't match its contents\n",
+        error.AttachmentTooLarge => "larger than the attachment limit (5 MiB)\n",
+        error.EmptyAttachment => "the file is empty\n",
+        error.TooManyAttachments => "error: an issue can have at most 30 attachments\n",
+        error.AttachmentNotFound => "error: no such attachment on this issue\n",
+        error.NoAttachments => "error: no attachments given\n",
+        error.StoreFailed => "error: could not read or write the LFS store\n",
+        error.LfsUploadFailed => "error: git-lfs couldn't upload the attachments' objects, so " ++
+            "nothing was pushed\n" ++
+            "       (does the remote have an LFS server? see 'git lfs env')\n",
+        error.LfsUnavailable => "error: git-lfs isn't installed " ++
+            "(needed to fetch attachment bytes)\n",
+        error.LfsTransferFailed => "error: git-lfs couldn't transfer the attachment objects\n",
         error.OpenWorkInMilestone => "error: the milestone still has open issues; close or " ++
             "move them first (see 'git issue milestone show')\n",
         error.NothingToEdit => "error: at least one edit option is required\n",

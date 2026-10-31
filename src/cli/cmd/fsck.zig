@@ -16,12 +16,17 @@ pub const help =
     \\   - one root commit, carrying State: and Format-Version: trailers
     \\   - the whole history is readable
     \\
+    \\   - stored attachment bytes match their hashes
+    \\
     \\Milestones get the same checks, with Name: in place of State:.
     \\
-    \\Quarantined issues (see `git issue status`) and hierarchy or blocker
-    \\problems (see `git issue ls --problems`) are noted, not counted as errors.
+    \\Quarantined issues (see `git issue status`), hierarchy or blocker
+    \\problems (see `git issue ls --problems`), attachments whose bytes aren't
+    \\here yet, ignored attachment trailers and out-of-date derived
+    \\refs/attachments/* are noted, not counted as errors.
     \\
     \\Options:
+    \\   --repair     Regenerate out-of-date refs/attachments/* (never touches issues)
     \\   -q, --quiet  Only report problems
     \\   -h, --help   Show this help
     \\
@@ -30,6 +35,7 @@ pub const help =
 pub fn main(comptime B: type, ctx: *context.Context(B), argv: []const []const u8) u8 {
     const arena = ctx.arena;
     var quiet = false;
+    var repair = false;
     var args: common.Args = .{ .list = argv };
     while (args.next()) |arg| {
         if (common.isHelp(arg)) {
@@ -37,6 +43,8 @@ pub fn main(comptime B: type, ctx: *context.Context(B), argv: []const []const u8
             return common.exit_ok;
         } else if (std.mem.eql(u8, arg, "--quiet") or std.mem.eql(u8, arg, "-q")) {
             quiet = true;
+        } else if (std.mem.eql(u8, arg, "--repair")) {
+            repair = true;
         } else {
             return common.unknownOption(ctx.err, "fsck", arg);
         }
@@ -60,6 +68,7 @@ pub fn main(comptime B: type, ctx: *context.Context(B), argv: []const []const u8
         if (problems.len == 0 and !quiet) ctx.out.print("ok {s}\n", .{short}) catch {};
     }
     errors += checkMilestones(B, ctx, repo, milestones, quiet) orelse return common.oom(ctx.err);
+    errors += checkAttachments(B, ctx, repo, refs, repair);
     reportQuarantine(B, ctx, repo.backend);
     reportProjection(B, ctx, repo);
     if (errors == 0) {
@@ -136,6 +145,77 @@ fn printProblems(
             .{ short, e },
         ) catch {},
     };
+}
+
+/// Damaged bytes are errors, the rest are notes. Returns the error count.
+fn checkAttachments(
+    comptime B: type,
+    ctx: *context.Context(B),
+    repo: issuez.engine.Repo(B),
+    refs: []const issuez.engine.IssueRef,
+    repair: bool,
+) usize {
+    const A = issuez.Attachments(B);
+    const att = A.fromRepo(repo);
+    var errors: usize = 0;
+    var issues: std.ArrayList(issuez.engine.Issue) = .empty;
+    for (refs) |ref| {
+        const issue = repo.load(ctx.arena, ref) catch continue;
+        issues.append(ctx.arena, issue) catch return errors;
+        const short = uuid.shortId(issue.id);
+        for (issue.attachment_problems) |p| ctx.err.print(
+            "note: {s}: commit {s}: {s} attachment trailer ignored: {s}\n",
+            .{
+                short,
+                p.oid.hex().short(),
+                switch (p.kind) {
+                    .malformed => "malformed",
+                    .changed_object => "object-changing",
+                },
+                p.value,
+            },
+        ) catch {};
+        if (issue.attachments.len == 0 and issue.removed_attachments.len == 0) continue;
+        const entries = att.list(ctx.arena, issue) catch |e| {
+            if (e == error.AttachmentsUnsupported) return errors;
+            common.reportRepoError(B, ctx, e);
+            errors += 1;
+            continue;
+        };
+        for (entries) |e| switch (e.availability) {
+            .local => {},
+            .missing => ctx.err.print(
+                "note: {s}: attachment {s} ({s}): bytes not in this repository\n",
+                .{ short, uuid.shortId(e.attachment.id), e.attachment.name },
+            ) catch {},
+            .corrupt => {
+                errors += 1;
+                ctx.err.print(
+                    "error: {s}: attachment {s} ({s}): stored bytes don't match the hash\n",
+                    .{ short, uuid.shortId(e.attachment.id), e.attachment.name },
+                ) catch {};
+            },
+        };
+        const state = att.derivedState(ctx.arena, issue) catch continue;
+        if (state == .ok) continue;
+        if (repair) {
+            if (att.repair(ctx.arena, issue)) |_| {
+                ctx.out.print("repaired refs/attachments/{s}\n", .{issue.id}) catch {};
+            } else |e| {
+                common.reportRepoError(B, ctx, e);
+                errors += 1;
+            }
+        } else ctx.err.print(
+            "note: {s}: refs/attachments/{s} is {s} (run 'git issue fsck --repair')\n",
+            .{ short, issue.id, if (state == .absent) "missing" else "out of date" },
+        ) catch {};
+    }
+    const orphans = att.orphans(ctx.arena, issues.items) catch return errors;
+    if (orphans.len > 0) ctx.err.print(
+        "note: {d} stored attachment object(s) no issue references (from failed writes)\n",
+        .{orphans.len},
+    ) catch {};
+    return errors;
 }
 
 /// Quarantine is a sync state, not damage: noted, not counted.

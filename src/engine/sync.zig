@@ -19,6 +19,7 @@ const labels_fmt = @import("../format/labels.zig");
 const uuid_fmt = @import("../format/uuid.zig");
 const issue_model = @import("../model/issue.zig");
 const repo_mod = @import("repo.zig");
+const attachments_mod = @import("attachments.zig");
 
 const Oid = object.Oid;
 
@@ -71,14 +72,18 @@ pub const Outcome = union(enum) {
     quarantined: Reason,
 };
 
+/// `attachments` is fetched and pushed but never merged: the derived refs
+/// are rebuilt from the merged issues.
 pub const Namespace = enum {
     issues,
     milestones,
+    attachments,
 
     pub fn refPrefix(ns: Namespace) []const u8 {
         return switch (ns) {
             .issues => "refs/issues/",
             .milestones => "refs/milestones/",
+            .attachments => "refs/attachments/",
         };
     }
 };
@@ -100,6 +105,24 @@ pub const Record = enum {
 };
 
 pub const namespaces = [_]Namespace{ .issues, .milestones };
+pub const fetched_namespaces = [_]Namespace{ .issues, .milestones, .attachments };
+
+/// `before_push` gets the LFS objects that the pushed attachment refs
+/// point at, before any ref is pushed, so an embedder can upload them
+/// through its own LFS client. If it fails, nothing is pushed. Without it,
+/// sync uses `git lfs push` when the backend can.
+pub const PushOptions = struct {
+    before_push: ?BeforePush = null,
+};
+
+pub const BeforePush = struct {
+    context: *anyopaque,
+    run: *const fn (
+        context: *anyopaque,
+        remote: []const u8,
+        objects: []const attachments_mod.Upload,
+    ) anyerror!void,
+};
 
 pub const Entry = struct {
     namespace: Namespace = .issues,
@@ -150,6 +173,7 @@ pub const MergeOptions = struct {
 
 pub const MergeReport = struct {
     entries: []const Entry,
+    attachment_refs: usize = 0,
 
     pub fn count(r: MergeReport, tag: std.meta.Tag(Outcome)) usize {
         var n: usize = 0;
@@ -161,6 +185,13 @@ pub const MergeReport = struct {
 };
 
 pub const PushReport = struct {
+    /// Including objects handed to `before_push`.
+    lfs_uploaded: usize = 0,
+    /// sha256 of objects that couldn't be uploaded because git-lfs isn't
+    /// available.
+    lfs_not_uploaded: []const []const u8 = &.{},
+    /// Not counted in `pushed`.
+    attachment_refs: usize = 0,
     pushed: usize,
     up_to_date: usize,
     skipped_quarantined: usize,
@@ -203,6 +234,11 @@ pub fn Sync(comptime B: type) type {
             /// `accept_remote` on a remote issue that fails the integrity
             /// checks, so there's nothing valid to accept.
             RemoteIssueInvalid,
+            /// Nothing was pushed.
+            BeforePushFailed,
+            /// git-lfs is there but the upload failed, so nothing was
+            /// pushed.
+            LfsUploadFailed,
         };
 
         pub fn init(backend: *B) Self {
@@ -222,8 +258,8 @@ pub fn Sync(comptime B: type) type {
             if (!contract.isValidRemoteName(remote)) return error.InvalidRemoteName;
             if (options.fetch) {
                 try self.ensureRemote(arena, remote);
-                var specs: [namespaces.len][]const u8 = undefined;
-                for (namespaces, &specs) |ns, *spec| spec.* = try std.fmt.allocPrint(
+                var specs: [fetched_namespaces.len][]const u8 = undefined;
+                for (fetched_namespaces, &specs) |ns, *spec| spec.* = try std.fmt.allocPrint(
                     arena,
                     "+{s}*:{s}*",
                     .{ ns.refPrefix(), try stagingPrefix(arena, remote, ns) },
@@ -244,7 +280,48 @@ pub fn Sync(comptime B: type) type {
                     try entries.append(arena, e);
                 }
             }
-            return .{ .entries = entries.items };
+            if (options.check) return .{ .entries = entries.items };
+            return .{
+                .entries = entries.items,
+                .attachment_refs = try self.reconcileAttachments(arena, remote, options),
+            };
+        }
+
+        fn reconcileAttachments(
+            self: Self,
+            arena: Allocator,
+            remote: []const u8,
+            options: MergeOptions,
+        ) Error!usize {
+            const A = attachments_mod.Attachments(B);
+            const att = A.fromRepo(self.repo);
+            const staging_prefix = try stagingPrefix(arena, remote, .attachments);
+            const staged = try self.b().listRefs(arena, staging_prefix);
+            var moved: usize = 0;
+            for (try self.repo.refs(arena)) |r| {
+                const id = r.id();
+                const staged_name = try std.mem.concat(arena, u8, &.{ staging_prefix, id });
+                const remote_tip = try self.b().resolveRef(staged_name);
+                const issue = self.repo.load(arena, r) catch continue;
+                if (try att.reconcile(arena, issue, remote_tip)) moved += 1;
+                if (remote_tip) |t| try self.setRef(
+                    arena,
+                    try recordRef(arena, remote, .merged, .attachments, id),
+                    t,
+                );
+                const local = try self.b().resolveRef(try A.derivedRefName(arena, id));
+                const same = remote_tip != null and local != null and local.?.eql(remote_tip.?);
+                if (same) try self.setRef(
+                    arena,
+                    try recordRef(arena, remote, .pushed, .attachments, id),
+                    remote_tip.?,
+                );
+            }
+            if (options.fetch) for (staged) |s| {
+                if (uuid_fmt.isCanonical(s.name[staging_prefix.len..]))
+                    try self.deleteRef(arena, s.name);
+            };
+            return moved;
         }
 
         fn mergeOne(
@@ -731,9 +808,36 @@ pub fn Sync(comptime B: type) type {
         }
 
         pub fn push(self: Self, arena: Allocator, remote: []const u8) Error!PushReport {
+            return self.pushWith(arena, remote, .{});
+        }
+
+        pub fn syncWith(
+            self: Self,
+            arena: Allocator,
+            remote: []const u8,
+            options: PushOptions,
+        ) Error!SyncReport {
+            const merged = try self.merge(arena, remote, .{});
+            const pushed = try self.pushWith(arena, remote, options);
+            return .{ .merge = merged, .push = pushed };
+        }
+
+        pub fn pushWith(
+            self: Self,
+            arena: Allocator,
+            remote: []const u8,
+            options: PushOptions,
+        ) Error!PushReport {
             if (!contract.isValidRemoteName(remote)) return error.InvalidRemoteName;
             try self.ensureRemote(arena, remote);
             try self.refreshPushed(arena, remote);
+            // Pushed issues should carry their pointers. Issues that came in
+            // through upstream have no derived ref yet.
+            const att = attachments_mod.Attachments(B).fromRepo(self.repo);
+            for (try self.repo.refs(arena)) |r| {
+                const issue = self.repo.load(arena, r) catch continue;
+                _ = try att.reconcile(arena, issue, null);
+            }
             var report: PushReport = .{
                 .pushed = 0,
                 .up_to_date = 0,
@@ -742,6 +846,7 @@ pub fn Sync(comptime B: type) type {
             };
             var merges: std.ArrayList(MergeReport) = .empty;
             var skipped: std.ArrayList([]const u8) = .empty;
+            var lfs_missing: std.ArrayList([]const u8) = .empty;
 
             var round: usize = 0;
             while (round < push_rounds) : (round += 1) {
@@ -751,12 +856,19 @@ pub fn Sync(comptime B: type) type {
                 if (todo.len == 0) {
                     report.merges = merges.items;
                     report.skipped = skipped.items;
+                    report.lfs_not_uploaded = lfs_missing.items;
                     return report;
                 }
                 var rejected = false;
                 var start: usize = 0;
-                while (start < todo.len) : (start += push_chunk) {
-                    const chunk = todo[start..@min(start + push_chunk, todo.len)];
+                while (start < todo.len) {
+                    // An issue and its derived ref go in the same push.
+                    var end = @min(start + push_chunk, todo.len);
+                    while (end < todo.len and todo[end].ns == .attachments and
+                        std.mem.eql(u8, todo[end].id, todo[end - 1].id)) end += 1;
+                    const chunk = todo[start..end];
+                    start = end;
+                    try self.uploadFor(arena, remote, chunk, options, &report, &lfs_missing);
                     var specs: std.ArrayList([]const u8) = .empty;
                     for (chunk) |r| try specs.append(
                         arena,
@@ -769,7 +881,9 @@ pub fn Sync(comptime B: type) type {
                             continue;
                         }
                         const pushed = findPending(chunk, p.name) orelse continue;
-                        if (p.status == .ok) report.pushed += 1 else report.up_to_date += 1;
+                        if (pushed.ns == .attachments) {
+                            if (p.status == .ok) report.attachment_refs += 1;
+                        } else if (p.status == .ok) report.pushed += 1 else report.up_to_date += 1;
                         try self.setRef(
                             arena,
                             try recordRef(arena, remote, .pushed, pushed.ns, pushed.id),
@@ -781,6 +895,7 @@ pub fn Sync(comptime B: type) type {
                 if (!rejected) {
                     report.merges = merges.items;
                     report.skipped = skipped.items;
+                    report.lfs_not_uploaded = lfs_missing.items;
                     return report;
                 }
                 // The remote has changes we don't. Merge, then retry.
@@ -796,7 +911,7 @@ pub fn Sync(comptime B: type) type {
             // Left over from an interrupted push, they would read as what
             // the remote has.
             var stale: std.ArrayList(contract.RefUpdate) = .empty;
-            for (namespaces) |ns| {
+            for (fetched_namespaces) |ns| {
                 for (try self.b().listRefs(arena, try recordRef(arena, remote, .seen, ns, ""))) |e| {
                     try stale.append(arena, .{ .name = e.name, .op = .{ .delete = e.oid } });
                 }
@@ -805,8 +920,8 @@ pub fn Sync(comptime B: type) type {
                 error.RefConflict => return error.ConcurrentModification,
                 else => |e| return e,
             };
-            var specs: [namespaces.len][]const u8 = undefined;
-            for (namespaces, &specs) |ns, *spec| spec.* = try std.fmt.allocPrint(
+            var specs: [fetched_namespaces.len][]const u8 = undefined;
+            for (fetched_namespaces, &specs) |ns, *spec| spec.* = try std.fmt.allocPrint(
                 arena,
                 "+{s}*:{s}*",
                 .{ ns.refPrefix(), try recordRef(arena, remote, .seen, ns, "") },
@@ -814,7 +929,7 @@ pub fn Sync(comptime B: type) type {
             try self.b().fetch(arena, remote, &specs);
             // One transaction for all records, not a git call per issue.
             var ops: std.ArrayList(contract.RefUpdate) = .empty;
-            for (namespaces) |ns| {
+            for (fetched_namespaces) |ns| {
                 const seen_prefix = try recordRef(arena, remote, .seen, ns, "");
                 const remote_tips = try self.refsUnder(arena, seen_prefix);
                 const pushed_prefix = try recordRef(arena, remote, .pushed, ns, "");
@@ -859,6 +974,51 @@ pub fn Sync(comptime B: type) type {
 
         const Pending = struct { name: []const u8, tip: Oid, ns: Namespace, id: []const u8 };
 
+        /// Uploads the attachments of the issues whose derived refs are in
+        /// `chunk`, before the refs go out.
+        fn uploadFor(
+            self: Self,
+            arena: Allocator,
+            remote: []const u8,
+            chunk: []const Pending,
+            options: PushOptions,
+            report: *PushReport,
+            lfs_missing: *std.ArrayList([]const u8),
+        ) Error!void {
+            if (comptime !contract.hasLfs(B)) return;
+            const att = attachments_mod.Attachments(B).fromRepo(self.repo);
+            var issues: std.ArrayList(issue_model.Issue) = .empty;
+            for (chunk) |p| if (p.ns == .attachments) {
+                const name = try localRef(arena, .issues, p.id);
+                const tip = (try self.b().resolveRef(name)) orelse continue;
+                try issues.append(arena, try self.repo.load(arena, .{ .name = name, .tip = tip }));
+            };
+            if (issues.items.len == 0) return;
+            const ups = try att.uploads(arena, issues.items);
+            if (ups.len == 0) return;
+            if (options.before_push) |hook| {
+                hook.run(hook.context, remote, ups) catch return error.BeforePushFailed;
+                report.lfs_uploaded += ups.len;
+                return;
+            }
+            if (comptime contract.hasLfsTransport(B)) {
+                var shas: std.ArrayList([]const u8) = .empty;
+                for (ups) |u| try shas.append(arena, u.sha256);
+                if (self.b().lfsPush(arena, remote, shas.items)) |_| {
+                    report.lfs_uploaded += ups.len;
+                    return;
+                } else |e| switch (e) {
+                    error.LfsUnavailable => {},
+                    error.LfsTransferFailed => return error.LfsUploadFailed,
+                    else => |x| return x,
+                }
+            }
+            next: for (ups) |u| {
+                for (lfs_missing.items) |m| if (std.mem.eql(u8, m, u.sha256)) continue :next;
+                try lfs_missing.append(arena, u.sha256);
+            }
+        }
+
         /// What the remote doesn't have yet, by our records.
         fn pendingIn(
             self: Self,
@@ -887,7 +1047,31 @@ pub fn Sync(comptime B: type) type {
                     try out.append(arena, .{ .name = r.name, .tip = r.oid, .ns = ns, .id = id });
                 }
             }
-            return out.items;
+            // Derived refs right after their issue, or on their own if the
+            // issue is already pushed.
+            const ns: Namespace = .attachments;
+            var with_derived: std.ArrayList(Pending) = .empty;
+            var derived: std.ArrayList(Pending) = .empty;
+            for (try self.b().listRefs(arena, ns.refPrefix())) |r| {
+                const id = r.name[ns.refPrefix().len..];
+                const marker = try recordRef(arena, remote, .quarantined, .issues, id);
+                if (try self.b().resolveRef(marker) != null) continue;
+                const pushed_ref = try recordRef(arena, remote, .pushed, ns, id);
+                const pushed = try self.b().resolveRef(pushed_ref);
+                if (pushed != null and pushed.?.eql(r.oid)) continue;
+                try derived.append(arena, .{ .name = r.name, .tip = r.oid, .ns = ns, .id = id });
+            }
+            for (out.items) |p| {
+                try with_derived.append(arena, p);
+                if (p.ns != .issues) continue;
+                for (derived.items, 0..) |d, i| if (std.mem.eql(u8, d.id, p.id)) {
+                    try with_derived.append(arena, d);
+                    _ = derived.orderedRemove(i);
+                    break;
+                };
+            }
+            try with_derived.appendSlice(arena, derived.items);
+            return with_derived.items;
         }
 
         fn pendingRefs(
@@ -964,6 +1148,7 @@ fn rootKeys(ns: Namespace) []const []const u8 {
     return switch (ns) {
         .issues => &.{ "State", "Format-Version" },
         .milestones => &.{ "Name", "Format-Version" },
+        .attachments => &.{},
     };
 }
 
@@ -1512,4 +1697,136 @@ test "remote reset to an older tip gets the local tip again" {
     try testing.expectEqual(@as(usize, 0), again.merge.count(.quarantined));
     try testing.expectEqual(@as(usize, 1), again.merge.count(.local_ahead));
     try testing.expectEqual(@as(usize, 1), again.push.pushed);
+}
+
+test "attachment sync" {
+    var arena_state: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var world = testWorld();
+    const samples = @import("../format/attachment.zig").samples;
+    const A = attachments_mod.Attachments(GitSim);
+
+    var a = try onClone(arena, &world, 0);
+    const created = try a.sync.repo.create(arena, .{ .title = "Shots" });
+    const ref = try std.fmt.allocPrint(arena, "refs/issues/{s}", .{created.id.slice()});
+    const derived = try A.derivedRefName(arena, created.id.slice());
+    _ = try A.fromRepo(a.sync.repo).add(arena, ref, .{
+        .files = &.{.{ .name = "a.png", .data = samples.png }},
+    });
+    const first = try a.sync.sync(arena, "origin");
+    try testing.expectEqual(@as(usize, 1), first.push.lfs_uploaded);
+    try testing.expectEqual(@as(usize, 1), first.push.pushed);
+    try testing.expectEqual(@as(usize, 1), first.push.attachment_refs);
+    try a.sim.commit();
+    const hub = world.clones[2];
+    try testing.expect(for (hub.refs) |r| {
+        if (std.mem.eql(u8, r.name, derived)) break true;
+    } else false);
+    try testing.expectEqual(@as(usize, 1), hub.lfs.len);
+
+    // Bob gets the issue and the derived ref but not the bytes.
+    var bob = try onClone(arena, &world, 1);
+    const got = try bob.sync.merge(arena, "origin", .{});
+    try testing.expectEqual(@as(usize, 1), got.attachment_refs);
+    const bob_att = A.fromRepo(bob.sync.repo);
+    const bob_tip = (try bob.sim.resolveRef(ref)).?;
+    var issue = try bob.sync.repo.load(arena, .{ .name = ref, .tip = bob_tip });
+    try testing.expect(try bob_att.read(arena, issue.attachments[0]) == .missing);
+    const fetched = try bob_att.fetch(arena, "origin", &.{issue});
+    try testing.expectEqual(@as(usize, 1), fetched.fetched);
+    try testing.expect(try bob_att.read(arena, issue.attachments[0]) == .bytes);
+
+    _ = try bob_att.add(arena, ref, .{ .files = &.{.{ .name = "b.webp", .data = samples.webp }} });
+    try bob.sim.commit();
+    a = try onClone(arena, &world, 0);
+    _ = try A.fromRepo(a.sync.repo).add(arena, ref, .{
+        .files = &.{.{ .name = "c.jpg", .data = samples.jpeg }},
+    });
+    _ = try a.sync.sync(arena, "origin");
+    try a.sim.commit();
+    bob = try onClone(arena, &world, 1);
+    _ = try bob.sync.sync(arena, "origin"); // merges the issue, reconciles, pushes
+    try bob.sim.commit();
+    a = try onClone(arena, &world, 0);
+    const last = try a.sync.sync(arena, "origin");
+    try testing.expectEqual(@as(usize, 1), last.merge.attachment_refs); // fast-forward
+    try a.sim.commit();
+
+    const tipOf = struct {
+        fn f(clone: GitSim.World.Clone, name: []const u8) ?[]const u8 {
+            for (clone.refs) |r| if (std.mem.eql(u8, r.name, name)) return r.oid;
+            return null;
+        }
+    }.f;
+    for ([_][]const u8{ ref, derived }) |name| {
+        const h = tipOf(world.clones[2], name).?;
+        try testing.expectEqualStrings(h, tipOf(world.clones[0], name).?);
+        try testing.expectEqualStrings(h, tipOf(world.clones[1], name).?);
+    }
+    a = try onClone(arena, &world, 0);
+    issue = try a.sync.repo.load(arena, .{ .name = ref, .tip = (try a.sim.resolveRef(ref)).? });
+    try testing.expectEqual(@as(usize, 3), issue.attachments.len);
+    const state = try A.fromRepo(a.sync.repo).derivedState(arena, issue);
+    try testing.expectEqual(A.DerivedState.ok, state);
+    try testing.expectEqual(@as(usize, 3), world.clones[2].lfs.len);
+}
+
+test "before_push and no git-lfs" {
+    var arena_state: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var world: GitSim.World = .{ .seed = 12, .clones = &.{
+        .{ .name = "alice", .config = remote_config ++ &[_]GitSim.World.ConfigEntry{
+            .{ .key = "sim.lfs", .value = "false" },
+        } },
+        .{ .name = "hub" },
+    } };
+    const samples = @import("../format/attachment.zig").samples;
+    const A = attachments_mod.Attachments(GitSim);
+    var a = try onClone(arena, &world, 0);
+    const created = try a.sync.repo.create(arena, .{ .title = "Shots" });
+    const ref = try std.fmt.allocPrint(arena, "refs/issues/{s}", .{created.id.slice()});
+    _ = try A.fromRepo(a.sync.repo).add(arena, ref, .{
+        .files = &.{.{ .name = "a.png", .data = samples.png }},
+    });
+
+    // A failing hook stops the push before any ref moves.
+    const Hook = struct {
+        calls: usize = 0,
+        fail: bool,
+        fn run(
+            ctx: *anyopaque,
+            remote: []const u8,
+            objects: []const attachments_mod.Upload,
+        ) anyerror!void {
+            const h: *@This() = @ptrCast(@alignCast(ctx));
+            h.calls += 1;
+            try testing.expectEqualStrings("origin", remote);
+            try testing.expectEqual(@as(usize, 1), objects.len);
+            if (h.fail) return error.Offline;
+        }
+    };
+    var failing: Hook = .{ .fail = true };
+    try testing.expectError(error.BeforePushFailed, a.sync.pushWith(arena, "origin", .{
+        .before_push = .{ .context = &failing, .run = Hook.run },
+    }));
+    try a.sim.commit();
+    try testing.expectEqual(@as(usize, 0), world.clones[1].refs.len);
+    var ok: Hook = .{ .fail = false };
+    a = try onClone(arena, &world, 0);
+    const pushed = try a.sync.pushWith(arena, "origin", .{
+        .before_push = .{ .context = &ok, .run = Hook.run },
+    });
+    try testing.expectEqual(@as(usize, 1), ok.calls);
+    try testing.expectEqual(@as(usize, 1), pushed.lfs_uploaded);
+
+    // No hook and no git-lfs: pushed anyway, objects reported.
+    _ = try A.fromRepo(a.sync.repo).add(arena, ref, .{
+        .files = &.{.{ .name = "b.jpg", .data = samples.jpeg }},
+    });
+    const plain = try a.sync.push(arena, "origin");
+    try testing.expectEqual(@as(usize, 2), plain.lfs_not_uploaded.len);
+    try testing.expectEqual(@as(usize, 1), plain.pushed);
+    try testing.expectEqual(@as(usize, 1), plain.attachment_refs);
 }

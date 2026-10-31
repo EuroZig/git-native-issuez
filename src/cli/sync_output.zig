@@ -97,10 +97,23 @@ pub fn printPush(
         out.print("The remote had new issue changes; merged them first:\n", .{}) catch {};
         printMerge(out, err, remote, m, false);
     }
-    if (report.pushed == 0) {
+    if (report.pushed == 0 and report.attachment_refs == 0) {
         out.writeAll("Everything up-to-date\n") catch {};
-    } else {
+    } else if (report.pushed > 0) {
         out.print("Pushed {d} issue(s) to {s}.\n", .{ report.pushed, remote }) catch {};
+    }
+    if (report.lfs_uploaded > 0) out.print(
+        "Uploaded {d} attachment object(s) to {s}'s LFS server.\n",
+        .{ report.lfs_uploaded, remote },
+    ) catch {};
+    if (report.lfs_not_uploaded.len > 0) {
+        err.print(
+            "warning: git-lfs isn't available, so {d} attachment object(s) were not\n" ++
+                "         uploaded; other clones can't get their bytes until they are\n" ++
+                "         pushed with git-lfs (install it and run 'git issue push {s}'):\n",
+            .{ report.lfs_not_uploaded.len, remote },
+        ) catch {};
+        for (report.lfs_not_uploaded) |sha| err.print("           {s}\n", .{sha}) catch {};
     }
     if (report.skipped_quarantined > 0) {
         err.print(

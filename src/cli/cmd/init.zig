@@ -33,6 +33,11 @@ pub fn milestoneRefspec(arena: std.mem.Allocator, remote: []const u8) ![]const u
     return std.fmt.allocPrint(arena, "+refs/milestones/*:refs/remotes/{s}/milestones/*", .{remote});
 }
 
+pub fn attachmentRefspec(arena: std.mem.Allocator, remote: []const u8) ![]const u8 {
+    const spec = "+refs/attachments/*:refs/remotes/{s}/attachments/*";
+    return std.fmt.allocPrint(arena, spec, .{remote});
+}
+
 pub fn stagingRefspec(arena: std.mem.Allocator, remote: []const u8) ![]const u8 {
     return std.fmt.allocPrint(arena, "+refs/issues/*:refs/remotes/{s}/issues/*", .{remote});
 }
@@ -126,9 +131,12 @@ pub fn main(comptime B: type, ctx: *context.Context(B), argv: []const []const u8
     var has_unsafe = false;
     const milestones = milestoneRefspec(arena, remote) catch return common.oom(ctx.err);
     var has_milestones = false;
+    const attachments = attachmentRefspec(arena, remote) catch return common.oom(ctx.err);
+    var has_attachments = false;
     for (fetch) |spec| {
         if (std.mem.eql(u8, spec, staging)) has_staging = true;
         if (std.mem.eql(u8, spec, milestones)) has_milestones = true;
+        if (std.mem.eql(u8, spec, attachments)) has_attachments = true;
         if (std.mem.eql(
             u8,
             std.mem.trimStart(u8, spec, "+"),
@@ -146,6 +154,7 @@ pub fn main(comptime B: type, ctx: *context.Context(B), argv: []const []const u8
         ) catch {};
     }
     if (!has_milestones) backend.configAdd(key, milestones) catch return gitError(ctx);
+    if (!has_attachments) backend.configAdd(key, attachments) catch return gitError(ctx);
     if (!has_staging) {
         backend.configAdd(key, staging) catch return gitError(ctx);
         ctx.out.print(
