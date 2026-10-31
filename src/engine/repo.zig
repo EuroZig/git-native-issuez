@@ -633,14 +633,27 @@ pub fn Repo(comptime B: type) type {
             if (text.len > self.limits.max_body_bytes) return error.TooLong;
             const subject = spec.message orelse "Edit description";
             const message = try trailers.build(arena, subject, text, &.{
-                .{ .key = "X-Event", .value = "description-edit" },
+                .{ .key = "X-Event", .value = fields_fmt.Event.description_edit.text() },
             });
             return self.appendCommit(arena, ref_name, spec.author, spec.expect, FixedMessage{
                 .text = message,
             });
         }
 
-        pub const CommentEvent = enum { edit, delete, restore };
+        /// The `X-Event`s that target a comment.
+        pub const CommentEvent = enum {
+            edit,
+            delete,
+            restore,
+
+            pub fn event(e: CommentEvent) fields_fmt.Event {
+                return switch (e) {
+                    .edit => .comment_edit,
+                    .delete => .comment_delete,
+                    .restore => .comment_restore,
+                };
+            }
+        };
 
         /// `comment` is the full ID of the comment's commit. An edit
         /// replaces the whole text.
@@ -688,13 +701,9 @@ pub fn Repo(comptime B: type) type {
                 };
                 const subject = b.subject orelse
                     try std.fmt.allocPrint(arena, "{s} comment {s}", .{ verb, short });
-                const kind = switch (b.event) {
-                    .edit => "comment-edit",
-                    .delete => "comment-delete",
-                    .restore => "comment-restore",
-                };
-                return trailers.build(arena, subject, if (b.event == .edit) b.text else "", &.{
-                    .{ .key = "X-Event", .value = kind },
+                const kind = b.event.event();
+                return trailers.build(arena, subject, if (kind.carriesText()) b.text else "", &.{
+                    .{ .key = "X-Event", .value = kind.text() },
                     .{ .key = "X-Comment", .value = try arena.dupe(u8, hex.slice()) },
                 });
             }

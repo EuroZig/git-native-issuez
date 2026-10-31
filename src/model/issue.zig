@@ -265,7 +265,7 @@ pub fn materialize(
         .title_override = title,
         .description = description,
         .deleted = if (final.scalars.get("X-Deleted")) |c|
-            std.mem.eql(u8, c.value, "true")
+            fields_fmt.parseBool(c.value) orelse false
         else
             false,
         .event_problems = event_problems.items,
@@ -428,24 +428,11 @@ fn isEventKey(key: []const u8) bool {
     return std.ascii.eqlIgnoreCase(key, "X-Event") or std.ascii.eqlIgnoreCase(key, "X-Comment");
 }
 
-pub const EventKind = enum { comment_edit, comment_delete, comment_restore, description_edit };
-
 const Event = struct {
-    kind: EventKind,
+    kind: fields_fmt.Event,
     target: []const u8 = "",
     text: []const u8 = "",
 };
-
-pub fn parseEventKind(value: []const u8) ?EventKind {
-    const names = [_]struct { []const u8, EventKind }{
-        .{ "comment-edit", .comment_edit },
-        .{ "comment-delete", .comment_delete },
-        .{ "comment-restore", .comment_restore },
-        .{ "description-edit", .description_edit },
-    };
-    for (names) |n| if (std.mem.eql(u8, n[0], value)) return n[1];
-    return null;
-}
 
 fn classifyEvents(
     arena: Allocator,
@@ -464,7 +451,7 @@ fn classifyEvents(
         };
         if (count == 0) continue;
         const bad: EventProblem = .{ .oid = n.input.oid, .kind = .invalid };
-        const kind = parseEventKind(trailers.lastValue(n.block, "X-Event").?) orelse {
+        const kind = fields_fmt.Event.parse(trailers.lastValue(n.block, "X-Event").?) orelse {
             try problems.append(arena, bad);
             continue;
         };
@@ -473,11 +460,11 @@ fn classifyEvents(
             continue;
         }
         var e: Event = .{ .kind = kind };
-        if (kind == .comment_edit or kind == .description_edit) {
+        if (kind.carriesText()) {
             const body = try trailers.bodyLines(arena, n.input.message);
             e.text = try std.mem.join(arena, "\n", try trailers.textLines(arena, body, false));
         }
-        if (kind != .description_edit) {
+        if (kind.targetsComment()) {
             const target = trailers.lastValue(n.block, "X-Comment") orelse {
                 try problems.append(arena, bad);
                 continue;
@@ -593,6 +580,9 @@ fn extensions(
         if (fields_fmt.parseMinutes(v)) |m| ext.estimate_minutes = m else {
             try invalid.append(arena, .{ .key = "X-Estimate-Minutes", .value = v });
         }
+    }
+    if (value(s, "X-Deleted")) |v| {
+        if (fields_fmt.parseBool(v) == null) try invalid.append(arena, .{ .key = "X-Deleted", .value = v });
     }
     if (value(s, "X-Workflow-State")) |v| {
         if (fields_fmt.isSlug(v)) ext.workflow = v else {
@@ -1066,6 +1056,15 @@ test "invalid extension values" {
     try testing.expectEqual(@as(?u32, 90), i.ext.estimate_minutes);
     try testing.expectEqualStrings("in-progress", i.ext.workflow.?);
     try testing.expectEqual(@as(usize, 2), i.ext.invalid.len); // not-a-uuid, Feb 30
+
+    // Only exactly `true` deletes. Anything else but `false` is reported.
+    const maybe = try d.add(&.{root}, 200, "Delete?\n\nX-Deleted: True\n");
+    const m = try d.issue(maybe);
+    try testing.expect(!m.deleted);
+    try testing.expectEqual(@as(usize, 3), m.ext.invalid.len);
+    try testing.expectEqualStrings("X-Deleted", m.ext.invalid[2].key);
+    const cleared = try d.issue(try d.add(&.{maybe}, 300, "Undo\n\nX-Deleted:\n"));
+    try testing.expectEqual(@as(usize, 2), cleared.ext.invalid.len);
 }
 
 test "blocked-by merges per member" {

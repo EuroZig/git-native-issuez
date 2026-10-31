@@ -104,6 +104,42 @@ pub fn isSlug(s: []const u8) bool {
     return true;
 }
 
+/// `X-Deleted`: exactly `true` or `false`.
+pub fn parseBool(s: []const u8) ?bool {
+    if (std.mem.eql(u8, s, "true")) return true;
+    if (std.mem.eql(u8, s, "false")) return false;
+    return null;
+}
+
+/// `X-Event` values. A commit carries at most one.
+pub const Event = enum {
+    comment_edit,
+    comment_delete,
+    comment_restore,
+    description_edit,
+
+    const names = [_][]const u8{ "comment-edit", "comment-delete", "comment-restore", "description-edit" };
+
+    pub fn parse(s: []const u8) ?Event {
+        for (names, 0..) |n, i| if (std.mem.eql(u8, n, s)) return @enumFromInt(i);
+        return null;
+    }
+
+    pub fn text(e: Event) []const u8 {
+        return names[@intFromEnum(e)];
+    }
+
+    /// Needs `X-Comment`.
+    pub fn targetsComment(e: Event) bool {
+        return e != .description_edit;
+    }
+
+    /// The message text is the new content.
+    pub fn carriesText(e: Event) bool {
+        return e == .comment_edit or e == .description_edit;
+    }
+};
+
 /// Used when `issue.workflowStates` isn't set.
 pub const default_workflow = [_][]const u8{ "backlog", "ready", "in-progress", "review" };
 
@@ -141,6 +177,21 @@ test "minutes and durations" {
     try testing.expectEqual(@as(?u32, 90), parseDuration("90m"));
     try testing.expectEqual(@as(?u32, null), parseDuration("30m1h"));
     try testing.expectEqual(@as(?u32, null), parseDuration("2x"));
+}
+
+test parseBool {
+    try testing.expectEqual(true, parseBool("true").?);
+    try testing.expectEqual(false, parseBool("false").?);
+    for ([_][]const u8{ "", "True", "yes", "1", "maybe", "true " }) |s| {
+        try testing.expect(parseBool(s) == null);
+    }
+}
+
+test Event {
+    for (std.enums.values(Event)) |e| try testing.expectEqual(e, Event.parse(e.text()).?);
+    try testing.expectEqualStrings("comment-edit", Event.comment_edit.text());
+    try testing.expect(Event.parse("comment_edit") == null);
+    try testing.expect(Event.parse("Comment-Edit") == null);
 }
 
 test isSlug {
