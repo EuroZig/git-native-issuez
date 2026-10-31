@@ -25,9 +25,14 @@ pub const Priority = enum {
     }
 };
 
+/// States besides `closed` that count as done when `issue.doneStates`
+/// isn't set.
+pub const default_done_states = [_][]const u8{ "wontfix", "duplicate" };
+
 /// An issue's state. Format 1 knows `open` and `closed` and allows others
-/// (`wontfix`, `in-review`, ...). Anything but `open` counts as done: `ls`
-/// hides it, and parents, blockers and progress treat it as closed.
+/// (`wontfix`, `in-review`, ...). `closed` and the configured done states
+/// count as done: `ls` hides them, and parents, blockers and progress treat
+/// them as closed. Every other state is open work.
 pub const State = union(enum) {
     open,
     closed,
@@ -48,8 +53,17 @@ pub const State = union(enum) {
         };
     }
 
+    /// Exactly `open`, also as `.{ .other = "open" }`.
     pub fn isOpen(s: State) bool {
-        return s == .open;
+        return std.mem.eql(u8, s.text(), "open");
+    }
+
+    /// `closed`, or one of `done_states`.
+    pub fn isDone(s: State, done_states: []const []const u8) bool {
+        const t = s.text();
+        if (std.mem.eql(u8, t, "closed")) return true;
+        for (done_states) |d| if (std.mem.eql(u8, d, t)) return true;
+        return false;
     }
 
     /// Same text. `.{ .other = "open" }` equals `.open`.
@@ -105,6 +119,12 @@ test State {
     try std.testing.expectEqualStrings("wontfix", wontfix.text());
     try std.testing.expect(!wontfix.isOpen());
     try std.testing.expect(State.eql(.{ .other = "open" }, .open));
+    try std.testing.expect((State{ .other = "open" }).isOpen());
+    try std.testing.expect(wontfix.isDone(&default_done_states));
+    try std.testing.expect(!wontfix.isDone(&.{}));
+    try std.testing.expect((State{ .closed = {} }).isDone(&.{}));
+    try std.testing.expect(!State.parse("in-review").isDone(&default_done_states));
+    try std.testing.expect((State{ .other = "closed" }).isDone(&.{}));
     try std.testing.expect(!State.eql(wontfix, .closed));
 }
 

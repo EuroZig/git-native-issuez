@@ -34,7 +34,8 @@ fn Audited(comptime Inner: type) type {
                 // The library only writes issue and bookkeeping refs, so
                 // anything else is a bug.
                 const allowed = std.mem.startsWith(u8, u.name, "refs/issues/") or
-                    std.mem.startsWith(u8, u.name, "refs/issuez-sync/");
+                    std.mem.startsWith(u8, u.name, "refs/issuez-sync/") or
+                    std.mem.startsWith(u8, u.name, "refs/issuez-guard/");
                 if (!allowed) @panic("write outside the issue namespaces");
                 self.log.print("  ref {t} {s}\n", .{ u.op, u.name }) catch {};
             }

@@ -203,13 +203,14 @@ pub fn bodyLines(arena: Allocator, message: []const u8) Allocator.Error![]const 
 }
 
 /// The body without its trailer block. See `Options.has_title` for
-/// `body_has_title`.
+/// `body_has_title`. No divider, so the block removed is the one the fields
+/// were read from, even after a `---` line.
 pub fn textLines(
     arena: Allocator,
     body: []const []const u8,
     body_has_title: bool,
 ) Allocator.Error![]const []const u8 {
-    const block = try parseLines(arena, body, .{ .has_title = body_has_title, .divider = true });
+    const block = try parseLines(arena, body, .{ .has_title = body_has_title });
     const first = block.first_line orelse return body;
     var end = first;
     while (end > 0 and isBlank(body[end - 1])) end -= 1;
@@ -240,6 +241,10 @@ pub fn build(
     // line, which would move text into the body.
     const subject_trimmed = std.mem.trimEnd(u8, subject_text, " \t\r\n");
     if (subject_trimmed.len == 0) return error.InvalidText;
+    {
+        var lines = std.mem.splitScalar(u8, subject_trimmed, '\n');
+        while (lines.next()) |line| if (isBlank(line)) return error.InvalidText;
+    }
     w.writeAll(subject_trimmed) catch return error.OutOfMemory;
     if (body_trimmed.len > 0) w.print("\n\n{s}", .{body_trimmed}) catch return error.OutOfMemory;
     if (trailer_list.len > 0) {
@@ -444,4 +449,11 @@ test "build" {
     );
     const back = try parse(arena, dashes, .{});
     try testing.expectEqualStrings("bug", lastValue(back, "Labels").?);
+    // And the text is what's left without them.
+    const text = try textLines(arena, try bodyLines(arena, dashes), false);
+    try testing.expectEqual(@as(usize, 3), text.len);
+    try testing.expectEqualStrings("More", text[2]);
+    // A subject spans lines but not paragraphs.
+    _ = try build(arena, "one\ntwo", "", &.{});
+    try testing.expectError(error.InvalidText, build(arena, "one\n\ntwo", "", &.{}));
 }

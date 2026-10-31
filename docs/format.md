@@ -14,6 +14,7 @@ The key words MUST, MUST NOT, SHOULD and MAY are used as in RFC 2119.
 | `refs/issues/<uuid>` | an issue |
 | `refs/remotes/<remote>/issues/<uuid>` | fetched issues, waiting to be merged |
 | `refs/issuez-sync/<remote>/<kind>/issues/<uuid>` | sync bookkeeping, local only (§6) |
+| `refs/issuez-guard/<uuid>` | write serialization, local only (§3, Guards) |
 
 UUIDs are lowercase, hyphenated, version 4. Readers MUST NOT read issue
 data from any ref other than `refs/issues/*`.
@@ -87,9 +88,10 @@ Format-Version: 1
   exists, cycles and depth are questions across issues, answered when
   reading (the projection, `ls --problems`, `tree`), never by refusing to
   read.
-- Any `State` but `open` counts as done (`wontfix`, `duplicate`, ...).
-  `ls` hides it by default, as upstream does, and parents, blockers,
-  progress and the guards treat it as closed.
+- `closed` and the states in `git config issue.doneStates` (default
+  `wontfix, duplicate`) count as done. `ls` hides them by default, and
+  parents, blockers, progress and the guards treat them as closed. Every
+  other state (`open`, `in-review`, ...) is open work.
 - Workflow states come from `git config issue.workflowStates` (default
   `backlog, ready, in-progress, review`). An open issue without a value
   reads as the first one.
@@ -107,8 +109,15 @@ Writers keep the hierarchy sound. This tool refuses a write that would:
 
 Each issue a guard reads is pinned in the same ref transaction (git's
 `update-ref` `verify`), so a concurrent change to any of them aborts the
-write, which is then retried. Other tools and concurrent clones can still
-produce violations; readers report them and never fail on them.
+write, which is then retried. A `verify` can't pin that something is
+absent, like a new child of the issue being closed. So creating or moving
+an issue also moves `refs/issuez-guard/<uuid>` of each ancestor, and closing
+or deleting an issue moves its own before reading the children: two such
+writes in one clone conflict, and the retry sees the child. The guard refs
+carry no data, are never pushed, and can be deleted at any time.
+
+Other tools and concurrent clones can still produce violations; readers
+report them and never fail on them.
 
 ## 4. Merging: the causal ordering rule
 
@@ -141,8 +150,9 @@ pair write the identical commit:
 - subject `Merge issue`, two parents sorted by OID, the empty tree;
 - author and committer `git-issue <git-issue@invalid>`, both dated with the
   later parent's committer time, offset `+0000`;
-- trailers restate the resolved, non-empty fields, as written (invalid
-  values too), in this order: `State`, `Title` (only when it overrides the
+- trailers restate the resolved fields, as written (invalid values too). A
+  field that was written and is now empty is restated empty (`Key: `), so a
+  reader that takes the newest value finds no older one. The order: `State`, `Title` (only when it overrides the
   root subject), `Labels`, `Assignee`, `Priority`, `Milestone`, then
   `X-Parent`, `X-Start-Date`, `X-Due-Date`, `X-Estimate-Minutes`,
   `X-Workflow-State`, `X-Deleted`, `X-Blocked-By`. Other fields and events

@@ -93,7 +93,39 @@ pub fn openRepo(comptime B: type, ctx: *context.Context(B)) ?engine.Repo(B) {
         return null;
     };
     warnUnsafeRefspecs(B, backend, ctx.arena, ctx.err);
-    return engine.Repo(B).init(backend);
+    var repo = engine.Repo(B).init(backend);
+    repo.done_states = doneStates(B, backend, ctx.arena, ctx.err) orelse return null;
+    return repo;
+}
+
+/// `git config issue.doneStates "wontfix,duplicate"`: the states besides
+/// `closed` that count as done. Empty for none.
+fn doneStates(
+    comptime B: type,
+    backend: *B,
+    arena: std.mem.Allocator,
+    err: *std.Io.Writer,
+) ?[]const []const u8 {
+    const raw = backend.configGet(arena, "issue.doneStates") catch {
+        err.writeAll("error: could not read git config issue.doneStates\n") catch {};
+        return null;
+    } orelse return &issuez.format.core.default_done_states;
+    var out: std.ArrayList([]const u8) = .empty;
+    var it = std.mem.splitScalar(u8, raw, ',');
+    while (it.next()) |part| {
+        const s = std.mem.trim(u8, part, " \t");
+        if (s.len == 0) continue;
+        if (!issuez.format.core.isState(s) or std.mem.eql(u8, s, "open")) {
+            err.print(
+                "error: issue.doneStates has '{s}'; states are letters, digits, '-' " ++
+                    "and '_', and 'open' can't be done\n",
+                .{s},
+            ) catch {};
+            return null;
+        }
+        out.append(arena, s) catch return null;
+    }
+    return out.items;
 }
 
 /// For `init`, which deals with the refspec itself.
@@ -311,6 +343,12 @@ pub fn validateEmail(err: *std.Io.Writer, field: []const u8, email: []const u8) 
 
 pub fn hasNewline(s: []const u8) bool {
     return std.mem.findAny(u8, s, "\r\n") != null;
+}
+
+pub fn hasBlankLine(s: []const u8) bool {
+    var lines = std.mem.splitScalar(u8, std.mem.trim(u8, s, "\n"), '\n');
+    while (lines.next()) |line| if (std.mem.trim(u8, line, " \t\r").len == 0) return true;
+    return false;
 }
 
 /// git's `%ai` format, in the signature's own time zone.

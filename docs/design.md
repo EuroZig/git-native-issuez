@@ -124,9 +124,14 @@ Writes that touch the hierarchy also run guards
 a closed one, no deleting an issue with live sub-issues. A guard reads other
 issues, and every issue it reads gets a `verify` line in the same ref
 transaction as the write. When one of them moves concurrently, the
-transaction fails and the write starts again from step 1, so the guard
-never decides on stale data. The number of issues a guard may read is
-bounded (`Limits.max_guard_scan`).
+transaction fails and the write starts again from step 1. A `verify` can't
+pin an absence, like no child under the issue being closed, so those
+writes also move a local guard ref (`refs/issuez-guard/<uuid>`) of the
+issue whose children matter, and two of them conflict. Concurrent writers
+in one clone therefore can't break a guard; other clones still can, and the
+projection reports it. The number of issues a guard may read is bounded
+(`Limits.max_guard_scan`), and issues that can't be loaded are skipped, so
+one damaged issue doesn't block every close.
 
 A caller can pass `.expect` with the version it read (an issue's tip). The
 write then fails with `VersionMismatch` instead of retrying when the issue

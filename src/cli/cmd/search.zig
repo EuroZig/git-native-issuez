@@ -9,7 +9,8 @@ const uuid = issuez.format.uuid;
 pub const help =
     \\usage: git issue search <pattern> [options]
     \\
-    \\Search issue titles, descriptions and comments for a fixed string.
+    \\Search issue titles, fields, descriptions and comments for a fixed string.
+    \\Edited text is searched as edited; deleted comments are left out.
     \\
     \\Options:
     \\   -s, --state <state>   open, closed, any custom state, or all [default: all]
@@ -56,7 +57,7 @@ pub fn main(comptime B: type, ctx: *context.Context(B), argv: []const []const u8
         return common.exit_ok;
     }
 
-    const filter: issuez.query.Filter = .{ .state = state_filter };
+    const filter: issuez.query.Filter = .{ .state = state_filter, .done = null };
     for (issues) |issue| {
         if (!filter.matches(issue)) continue;
         const lines = issuez.query.searchLines(arena, issue, needle, .{

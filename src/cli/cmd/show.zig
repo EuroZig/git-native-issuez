@@ -186,21 +186,17 @@ fn reference(
     return std.fmt.allocPrint(arena, "{s} {s}", .{ short, target.title }) catch short;
 }
 
-/// Only builds the projection when the issue has references or invalid
-/// values: any problem with the issue involves one of those, so plain
-/// issues stay a single read.
+/// Problems can come from other issues too, like an open child of a
+/// closed issue, so this always builds the projection.
 fn printProblems(
     comptime B: type,
     ctx: *context.Context(B),
     repo: issuez.engine.Repo(B),
     issue: issuez.engine.Issue,
 ) void {
-    const x = issue.ext;
-    if (x.parent == null and x.blocked_by.len == 0 and x.invalid.len == 0) return;
     const proj = ext_flags.project(B, ctx, repo) orelse return;
     const i = proj.find(issue.id) orelse return;
-    const problems = proj.problemsOf(ctx.arena, i) catch return;
-    for (problems) |p| ctx.out.print(
+    for (proj.problemsOf(i)) |p| ctx.out.print(
         "Problem: {s}\n",
         .{ext_flags.describeProblem(ctx.arena, p)},
     ) catch {};

@@ -16,7 +16,10 @@ pub const help =
     \\List issues.
     \\
     \\Options:
-    \\   -s, --state <state>     open, closed, any custom state, or all [default: open]
+    \\   -s, --state <state>     open, closed, any custom state, or all [default: every
+    \\                           issue that isn't done; git config issue.doneStates
+    \\                           lists the states besides closed that are done,
+    \\                           default wontfix,duplicate]
     \\   -l, --label <label>     Only issues with this label
     \\   --assignee <email>      Only issues assigned to this address
     \\   --priority <level>      Only issues with this priority
@@ -26,7 +29,7 @@ pub const help =
     \\   --reverse               Reverse the sort order
     \\   --problems              Only issues with problems (a parent or blocker that
     \\                           is missing or loops back, invalid values, ...), each
-    \\                           with the problem
+    \\                           with the problem, in any state unless --state
     \\   --conflicts             Only issues with fields edited concurrently, each
     \\                           with the conflict
     \\   --deleted               Only deleted issues (see git issue restore)
@@ -43,7 +46,9 @@ const Format = enum { short, full, oneline };
 
 pub fn main(comptime B: type, ctx: *context.Context(B), argv: []const []const u8) u8 {
     const arena = ctx.arena;
-    var state_filter: ?core.State = .open;
+    // Unset: what isn't done.
+    var state_filter: ?core.State = null;
+    var state_given = false;
     var label_filter: ?[]const u8 = null;
     var assignee_filter: ?[]const u8 = null;
     var priority_filter: ?core.Priority = null;
@@ -61,6 +66,7 @@ pub fn main(comptime B: type, ctx: *context.Context(B), argv: []const []const u8
             return common.exit_ok;
         } else if (std.mem.eql(u8, arg, "-s") or std.mem.eql(u8, arg, "--state")) {
             state_filter = common.stateFilter(args.value(ctx.err, "-s") orelse return common.exit_error);
+            state_given = true;
         } else if (std.mem.eql(u8, arg, "-l") or std.mem.eql(u8, arg, "--label")) {
             label_filter = args.value(ctx.err, "-l") orelse return common.exit_error;
         } else if (std.mem.eql(u8, arg, "--assignee")) {
@@ -74,6 +80,7 @@ pub fn main(comptime B: type, ctx: *context.Context(B), argv: []const []const u8
             priority_filter = p;
         } else if (std.mem.eql(u8, arg, "-a") or std.mem.eql(u8, arg, "--all")) {
             state_filter = null;
+            state_given = true;
         } else if (std.mem.eql(u8, arg, "-f") or std.mem.eql(u8, arg, "--format")) {
             const v = args.value(ctx.err, "-f") orelse return common.exit_error;
             format = std.meta.stringToEnum(Format, v) orelse return common.fail(
@@ -104,13 +111,18 @@ pub fn main(comptime B: type, ctx: *context.Context(B), argv: []const []const u8
 
     const filter: query.Filter = .{
         .state = state_filter,
+        .done = if (state_given or only_problems) null else false,
+        .done_states = repo.done_states,
         .label = label_filter,
         .assignee = assignee_filter,
         .priority = priority_filter,
         .deleted = only_deleted,
     };
-    const sorted = query.list(arena, all, filter, .{ .key = sort, .reverse = reverse }) catch
-        return common.exit_error;
+    const sorted = query.list(arena, all, filter, .{
+        .key = sort,
+        .reverse = reverse,
+        .done_states = repo.done_states,
+    }) catch return common.exit_error;
     const proj = if (only_problems)
         ext_flags.project(B, ctx, repo) orelse return common.exit_error
     else
@@ -120,9 +132,7 @@ pub fn main(comptime B: type, ctx: *context.Context(B), argv: []const []const u8
         if (only_conflicts and issue.conflicts.len == 0) continue;
         if (only_problems) {
             const p = proj.?;
-            const problems = p.problemsOf(arena, p.find(issue.id).?) catch
-                return common.oom(ctx.err);
-            if (problems.len == 0) continue;
+            if (p.problemsOf(p.find(issue.id).?).len == 0) continue;
         }
         kept.append(arena, issue) catch return common.oom(ctx.err);
     }
@@ -166,8 +176,7 @@ pub fn main(comptime B: type, ctx: *context.Context(B), argv: []const []const u8
         }
         if (format == .oneline) continue;
         if (proj) |p| {
-            const problems = p.problemsOf(arena, p.find(issue.id).?) catch &.{};
-            for (problems) |pr| ctx.out.print(
+            for (p.problemsOf(p.find(issue.id).?)) |pr| ctx.out.print(
                 "       problem: {s}\n",
                 .{ext_flags.describeProblem(arena, pr)},
             ) catch {};

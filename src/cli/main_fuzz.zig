@@ -454,13 +454,19 @@ fn fuzzCommands(
     const work_count = rand.intRangeAtMost(usize, 1, 3);
     const clones = try arena.alloc(World.Clone, work_count + 1);
     const custom_workflow = rand.boolean();
+    // `in-review` done, `wontfix` and `duplicate` open work.
+    const custom_done = rand.uintLessThan(u8, 3) == 0;
     for (clones[0..work_count], 0..) |*c, idx| {
+        var config: std.ArrayList(World.ConfigEntry) = .empty;
+        try config.append(arena, .{ .key = "remote.origin.url", .value = "sim:hub" });
+        if (custom_workflow) try config.append(
+            arena,
+            .{ .key = "issue.workflowStates", .value = "backlog, doing, done" },
+        );
+        if (custom_done) try config.append(arena, .{ .key = "issue.doneStates", .value = "in-review" });
         c.* = .{
             .name = try std.fmt.allocPrint(arena, "c{d}", .{idx}),
-            .config = if (custom_workflow) &.{
-                .{ .key = "remote.origin.url", .value = "sim:hub" },
-                .{ .key = "issue.workflowStates", .value = "backlog, doing, done" },
-            } else &.{.{ .key = "remote.origin.url", .value = "sim:hub" }},
+            .config = config.items,
         };
     }
     clones[work_count] = .{ .name = "hub" };
@@ -859,9 +865,19 @@ fn guardViolations(
     clone_index: usize,
 ) CaseError![]const []const u8 {
     var sim = try GitSim.init(arena, world, clone_index);
-    const repo = issuez.Repo(GitSim).init(&sim);
+    var repo = issuez.Repo(GitSim).init(&sim);
+    // As the CLI reads it.
+    if (sim.configGet(arena, "issue.doneStates") catch null) |raw| {
+        var states: std.ArrayList([]const u8) = .empty;
+        var it = std.mem.splitScalar(u8, raw, ',');
+        while (it.next()) |part| {
+            const t = std.mem.trim(u8, part, " \t");
+            if (t.len > 0) try states.append(arena, t);
+        }
+        repo.done_states = states.items;
+    }
     const issues = repo.loadAll(arena) catch return error.ModelMismatch;
-    const proj = try issuez.projection.build(arena, issues, .{});
+    const proj = try issuez.projection.build(arena, issues, .{ .done_states = repo.done_states });
     var out: std.ArrayList([]const u8) = .empty;
     for (proj.problems) |p| switch (p.kind) {
         // Not guard rules: values from elsewhere, size limits, a parent

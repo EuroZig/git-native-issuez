@@ -22,7 +22,8 @@ pub const help =
     \\   -p, --priority <level>    low, medium, high or critical
     \\   --milestone <name>        Change the milestone
     \\   -m, --message <text>      Commit message for the edit
-    \\   --description <text>      Replace the description; repeat for paragraphs
+    \\   --description <text>      Replace the description; repeat for paragraphs.
+    \\                             Written in the same commit as the other changes
     \\
 ++ ext_flags.help_edit ++
     \\   -h, --help                Show this help
@@ -143,7 +144,11 @@ pub fn main(comptime B: type, ctx: *context.Context(B), argv: []const []const u8
     if (clears.contains(.priority)) spec.priority = .clear;
     if (clears.contains(.milestone)) spec.milestone = "";
     if (clears.contains(.labels)) spec.set_labels = &.{};
-    if (spec.isEmpty() and !ext.any() and description.items.len == 0) return common.missing(
+    if (description.items.len > 0) {
+        spec.description = std.mem.join(arena, "\n\n", description.items) catch
+            return common.oom(ctx.err);
+    }
+    if (spec.isEmpty() and !ext.any()) return common.missing(
         ctx.err,
         "edit",
         "at least one edit option is required",
@@ -171,18 +176,16 @@ pub fn main(comptime B: type, ctx: *context.Context(B), argv: []const []const u8
     if (clears.contains(.estimate)) spec.estimate_minutes = .clear;
     if (x.workflow) |v| spec.workflow = v;
     if (clears.contains(.workflow)) spec.workflow = "";
+    if (spec.description != null and spec.message != null and
+        common.hasBlankLine(spec.message.?)) return common.fail(
+        ctx.err,
+        "error: with --description, -m is only the subject (no blank lines)\n",
+    );
     var names: std.ArrayList([]const u8) = .empty;
     if (!spec.isEmpty()) {
         const result = repo.edit(arena, ref.name, spec) catch |e|
             return common.repoFailed(B, ctx, e);
         for (result.changes) |c| names.append(arena, c.name()) catch return common.oom(ctx.err);
-    }
-    if (description.items.len > 0) {
-        const text = std.mem.join(arena, "\n\n", description.items) catch
-            return common.oom(ctx.err);
-        _ = repo.editDescription(arena, ref.name, text, .{}) catch |e|
-            return common.repoFailed(B, ctx, e);
-        names.append(arena, "description") catch return common.oom(ctx.err);
     }
     const joined = std.mem.join(arena, ", ", names.items) catch return common.oom(ctx.err);
     ctx.out.print("Updated {s} ({s})\n", .{ uuid.shortId(ref.id()), joined }) catch {};

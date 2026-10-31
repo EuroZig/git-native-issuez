@@ -118,7 +118,18 @@ pub const Event = enum {
     comment_restore,
     description_edit,
 
-    const names = [_][]const u8{ "comment-edit", "comment-delete", "comment-restore", "description-edit" };
+    /// The tag names with `-` for `_`, so the two can't drift apart.
+    const names = blk: {
+        const tags = @typeInfo(Event).@"enum".fields;
+        var out: [tags.len][]const u8 = undefined;
+        for (tags, &out) |t, *o| {
+            var name: [t.name.len]u8 = t.name[0..t.name.len].*;
+            std.mem.replaceScalar(u8, &name, '_', '-');
+            const final = name;
+            o.* = &final;
+        }
+        break :blk out;
+    };
 
     pub fn parse(s: []const u8) ?Event {
         for (names, 0..) |n, i| if (std.mem.eql(u8, n, s)) return @enumFromInt(i);

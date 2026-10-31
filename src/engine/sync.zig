@@ -265,7 +265,12 @@ pub fn Sync(comptime B: type) type {
 
             var attempt: u8 = 0;
             while (attempt < self.repo.limits.cas_retries) : (attempt += 1) {
-                const local_tip = try self.b().resolveRef(local_name);
+                // The first attempt reuses the read above: if a local writer
+                // moved the ref since, the update below conflicts.
+                const local_tip = if (attempt == 0)
+                    local_before
+                else
+                    try self.b().resolveRef(local_name);
                 var new_tip: ?Oid = null;
                 const outcome: Outcome = switch (try self.relate(arena, local_tip, remote_tip)) {
                     .unrelated => return q.quarantine(
@@ -431,26 +436,37 @@ pub fn Sync(comptime B: type) type {
             });
             const resolved = try issue_model.materialize(arena, id, synthetic, all.items);
 
+            // Cleared fields are restated empty, so a reader that takes
+            // the newest value doesn't find an older one.
             var list: std.ArrayList(trailers.Trailer) = .empty;
+            const cleared = struct {
+                fn f(issue: issue_model.Issue, key: []const u8) ?[]const u8 {
+                    return if (labels_fmt.contains(issue.cleared, key)) "" else null;
+                }
+            }.f;
             try list.append(arena, .{ .key = "State", .value = resolved.state.text() });
-            if (resolved.title_override) |t| try list.append(
+            if (resolved.title_override orelse cleared(resolved, "Title")) |t| try list.append(
                 arena,
                 .{ .key = "Title", .value = t },
             );
             if (resolved.labels.len > 0) try list.append(
                 arena,
                 .{ .key = "Labels", .value = try labels_fmt.join(arena, resolved.labels) },
+            ) else if (cleared(resolved, "Labels")) |v| try list.append(
+                arena,
+                .{ .key = "Labels", .value = v },
             );
-            for ([_][]const u8{ "Assignee", "Priority", "Milestone" }) |key| {
-                if (resolved.field(key)) |v| try list.append(arena, .{ .key = key, .value = v });
-            }
-            for (restated_extensions) |key| {
-                if (resolved.field(key)) |v| try list.append(arena, .{ .key = key, .value = v });
+            for ([_][]const u8{ "Assignee", "Priority", "Milestone" } ++ restated_extensions) |key| {
+                const value = resolved.field(key) orelse cleared(resolved, key) orelse continue;
+                try list.append(arena, .{ .key = key, .value = value });
             }
             if (resolved.ext.blocked_by_written.len > 0) try list.append(arena, .{
                 .key = "X-Blocked-By",
                 .value = try labels_fmt.join(arena, resolved.ext.blocked_by_written),
-            });
+            }) else if (cleared(resolved, "X-Blocked-By")) |v| try list.append(
+                arena,
+                .{ .key = "X-Blocked-By", .value = v },
+            );
             const message = try trailers.build(arena, merge_subject, "", list.items);
             return self.repo.writeCommit(
                 arena,
@@ -1039,6 +1055,38 @@ test "merge commits restate extension fields" {
         \\
     , .{ epic.id.slice(), epic.id.slice() });
     try testing.expectEqualStrings(want, commit.message);
+}
+
+test "merge commits restate cleared fields as empty" {
+    var arena_state: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var world = testWorld();
+
+    var a = try onClone(arena, &world, 0);
+    const created = try a.sync.repo.create(arena, .{
+        .title = "Shared",
+        .labels = &.{"bug"},
+        .priority = .high,
+    });
+    const ref_name = try std.fmt.allocPrint(arena, "refs/issues/{s}", .{created.id.slice()});
+    _ = try a.sync.push(arena, "origin");
+    try a.sim.commit();
+    var bob = try onClone(arena, &world, 1);
+    _ = try bob.sync.merge(arena, "origin", .{});
+    _ = try bob.sync.repo.edit(arena, ref_name, .{ .set_labels = &.{}, .priority = .clear });
+    _ = try bob.sync.push(arena, "origin");
+    try bob.sim.commit();
+
+    a = try onClone(arena, &world, 0);
+    _ = try a.sync.repo.comment(arena, ref_name, .{ .text = "Meanwhile" });
+    const p = try a.sync.push(arena, "origin");
+    try testing.expectEqual(@as(usize, 1), p.merges[0].count(.merged));
+    const tip = (try a.sim.resolveRef(ref_name)).?;
+    const commit = try object.Commit.parse(arena, .sha1, (try a.sim.readObject(arena, tip)).?.data);
+    try a.sim.commit();
+    // A reader taking the newest value finds the cleared ones empty.
+    try testing.expectEqualStrings("Merge issue\n\nState: open\nLabels: \nPriority: \n", commit.message);
 }
 
 test "deterministic merge commits" {

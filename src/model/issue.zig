@@ -130,6 +130,9 @@ pub const Issue = struct {
     /// Every other field with a value, sorted by key. Per-commit trailers
     /// (`per_commit_keys`) are not fields.
     fields: []const Field,
+    /// Keys written and then cleared: their last value is empty. Sorted,
+    /// `State` and `Format-Version` left out. A merge restates them empty.
+    cleared: []const []const u8 = &.{},
     conflicts: []const Conflict,
     author: Signature,
     created: i64,
@@ -177,7 +180,8 @@ const SetState = struct {
     order: []const []const u8 = &.{},
 };
 
-const State = struct {
+/// What the fold carries from commit to commit: each field with its setter.
+const FoldState = struct {
     scalars: std.array_hash_map.String(Cell) = .empty,
     sets: std.array_hash_map.String(SetState) = .empty,
 };
@@ -225,10 +229,10 @@ pub fn materialize(
     var event_problems: std.ArrayList(EventProblem) = .empty;
     const events = try classifyEvents(arena, nodes, &index, &event_problems);
 
-    const states = try arena.alloc(State, nodes.len);
+    const states = try arena.alloc(FoldState, nodes.len);
     for (order) |i| {
         const n = nodes[i];
-        var s: State = if (n.parents.len == 0)
+        var s: FoldState = if (n.parents.len == 0)
             .{}
         else blk: {
             var merged = try cloneState(arena, states[n.parents[0]]);
@@ -261,6 +265,7 @@ pub fn materialize(
         try std.mem.join(arena, "\n", description_lines);
 
     var fields: std.ArrayList(Field) = .empty;
+    var cleared: std.ArrayList([]const u8) = .empty;
     var conflicts: std.ArrayList(Conflict) = .empty;
     const keys = try arena.dupe([]const u8, final.scalars.keys());
     std.mem.sort([]const u8, keys, {}, lessThan);
@@ -272,17 +277,22 @@ pub fn materialize(
             .lost = lost,
         });
         if (isInternalKey(k)) continue;
-        if (std.mem.eql(u8, k, "State") or std.mem.eql(u8, k, "Title") or std.mem.eql(
-            u8,
-            k,
-            "Format-Version",
-        )) continue;
-        if (c.value.len == 0) continue;
+        if (std.mem.eql(u8, k, "State") or std.mem.eql(u8, k, "Format-Version")) continue;
+        if (c.value.len == 0) {
+            try cleared.append(arena, k);
+            continue;
+        }
+        if (std.mem.eql(u8, k, "Title")) continue;
         try fields.append(arena, .{ .key = k, .value = c.value });
     }
 
     const labels = try setMembers(arena, final, "Labels");
     const blocked_by = try setMembers(arena, final, "X-Blocked-By");
+    for ([_]struct { []const u8, usize }{
+        .{ "Labels", labels.len },
+        .{ "X-Blocked-By", blocked_by.len },
+    }) |set| if (set[1] == 0 and final.sets.contains(set[0])) try cleared.append(arena, set[0]);
+    std.mem.sort([]const u8, cleared.items, {}, lessThan);
 
     const state_value = core_fmt.State.parse(nonEmpty(final.scalars.get("State")) orelse "open");
 
@@ -303,6 +313,7 @@ pub fn materialize(
         .labels = labels,
         .ext = try extensions(arena, final, blocked_by),
         .fields = try fields.toOwnedSlice(arena),
+        .cleared = cleared.items,
         .conflicts = try conflicts.toOwnedSlice(arena),
         .author = root_node.input.author,
         .created = root_node.input.author.time,
@@ -331,7 +342,7 @@ const Ctx = struct {
         return ctx.nodes[a].input.oid.order(ctx.nodes[b].input.oid) == .gt;
     }
 
-    fn mergeStates(ctx: Ctx, arena: Allocator, a: State, b: State) Allocator.Error!State {
+    fn mergeStates(ctx: Ctx, arena: Allocator, a: FoldState, b: FoldState) Allocator.Error!FoldState {
         var out = try cloneState(arena, a);
         for (b.scalars.keys(), b.scalars.values()) |k, bc| {
             const gop = try out.scalars.getOrPut(arena, k);
@@ -405,7 +416,7 @@ fn isPerCommitKey(key: []const u8) bool {
 
 fn applyTrailers(
     arena: Allocator,
-    s: *State,
+    s: *FoldState,
     n: Node,
     self: usize,
     event: ?Event,
@@ -432,16 +443,16 @@ fn applyTrailers(
     }
 }
 
-const description_key = "description";
-
 /// Keys for event state. Trailer keys can't contain spaces, so these never
-/// collide with one.
+/// collide with one, like a `description:` trailer from another tool.
+const description_key = "event description";
+
 fn commentKey(arena: Allocator, what: []const u8, target: []const u8) Allocator.Error![]const u8 {
     return std.fmt.allocPrint(arena, "comment-{s} {s}", .{ what, target });
 }
 
 fn isInternalKey(k: []const u8) bool {
-    return std.mem.eql(u8, k, description_key) or std.mem.findScalar(u8, k, ' ') != null;
+    return std.mem.findScalar(u8, k, ' ') != null;
 }
 
 /// Event keys name what they change: the description or a comment.
@@ -522,9 +533,9 @@ fn classifyEvents(
     return out;
 }
 
-fn applyEvent(arena: Allocator, s: *State, e: Event, setter: u32) Allocator.Error!void {
+fn applyEvent(arena: Allocator, s: *FoldState, e: Event, setter: u32) Allocator.Error!void {
     const put = struct {
-        fn f(a: Allocator, st: *State, key: []const u8, value: []const u8, by: u32) !void {
+        fn f(a: Allocator, st: *FoldState, key: []const u8, value: []const u8, by: u32) !void {
             try st.scalars.put(a, key, .{ .value = value, .setter = by });
         }
     }.f;
@@ -543,7 +554,7 @@ fn applyEvent(arena: Allocator, s: *State, e: Event, setter: u32) Allocator.Erro
 
 fn applySet(
     arena: Allocator,
-    s: *State,
+    s: *FoldState,
     key: []const u8,
     value: []const u8,
     setter: u32,
@@ -570,13 +581,13 @@ fn applySet(
 
 fn extensions(
     arena: Allocator,
-    s: State,
+    s: FoldState,
     blocked_by: []const []const u8,
 ) Allocator.Error!Extensions {
     var ext: Extensions = .{};
     var invalid: std.ArrayList(Field) = .empty;
     const value = struct {
-        fn of(st: State, key: []const u8) ?[]const u8 {
+        fn of(st: FoldState, key: []const u8) ?[]const u8 {
             const c = st.scalars.get(key) orelse return null;
             return if (c.value.len == 0) null else c.value;
         }
@@ -623,7 +634,7 @@ fn extensions(
     return ext;
 }
 
-fn setMembers(arena: Allocator, s: State, key: []const u8) Allocator.Error![]const []const u8 {
+fn setMembers(arena: Allocator, s: FoldState, key: []const u8) Allocator.Error![]const []const u8 {
     const set = s.sets.get(key) orelse return &.{};
     var out: std.ArrayList([]const u8) = .empty;
     for (set.order) |m| {
@@ -664,7 +675,7 @@ fn canonicalKey(key: []const u8) []const u8 {
     return key;
 }
 
-fn cloneState(arena: Allocator, s: State) Allocator.Error!State {
+fn cloneState(arena: Allocator, s: FoldState) Allocator.Error!FoldState {
     var sets: std.array_hash_map.String(SetState) = .empty;
     for (s.sets.keys(), s.sets.values()) |k, v| try sets.put(arena, k, try cloneSet(arena, v));
     return .{
@@ -740,7 +751,7 @@ fn comments(
     tip: u32,
     root: u32,
     events: []const ?Event,
-    final: State,
+    final: FoldState,
 ) Allocator.Error![]const Comment {
     const seen = try arena.alloc(bool, nodes.len);
     @memset(seen, false);
@@ -1180,6 +1191,33 @@ test "events" {
     i = try d.issue(back);
     try testing.expect(!i.deleted);
     try testing.expect(!i.comments[1].deleted);
+}
+
+test "event text with a divider line, and a lowercase description trailer" {
+    var arena_state: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena_state.deinit();
+    var d: TestDag = .{ .arena = arena_state.allocator() };
+    const root = try d.add(&.{}, 100, "T\n\nIntro\n\n---\n\nMore\n\nState: open\nFormat-Version: 1\n");
+    var i = try d.issue(root);
+    try testing.expectEqualStrings("Intro\n\n---\n\nMore", i.description);
+    // `---` doesn't end the text: the trailers after it are still fields,
+    // so they aren't text.
+    const desc = try d.add(&.{root}, 200, try eventMsg(
+        &d,
+        "Edit description\n\nOwner: bob\n\n---\n\nDetails",
+        "description-edit",
+        null,
+    ));
+    const c = try d.add(&.{desc}, 300, "Done\n\n---\n\nx\n\nState: closed\n");
+    // Another tool's `description:` trailer is just a field.
+    const foreign = try d.add(&.{c}, 400, "Note\n\ndescription: hijacked\n");
+    i = try d.issue(foreign);
+    try testing.expectEqualStrings("Owner: bob\n\n---\n\nDetails", i.description);
+    try testing.expectEqualStrings("hijacked", i.field("description").?);
+    try testing.expectEqual(core_fmt.State.closed, i.state);
+    const close = i.comments[0];
+    try testing.expectEqual(@as(usize, 3), close.body.len);
+    try testing.expectEqualStrings("x", close.body[2]);
 }
 
 test "concurrent and bad events" {

@@ -13,6 +13,7 @@ const std = @import("std");
 const Allocator = std.mem.Allocator;
 const issue_model = @import("../model/issue.zig");
 const fields_fmt = @import("../format/fields.zig");
+const core_fmt = @import("../format/core.zig");
 
 const Issue = issue_model.Issue;
 
@@ -22,6 +23,8 @@ pub const Options = struct {
     max_progress_leaves: u32 = 2_000,
     /// In order. The first is the state of an open issue without one.
     workflow: []const []const u8 = &fields_fmt.default_workflow,
+    /// Besides `closed`. See `core.State.isDone`.
+    done_states: []const []const u8 = &core_fmt.default_done_states,
 };
 
 pub const Problem = struct {
@@ -94,68 +97,73 @@ pub const Projection = struct {
     roots: []const u32,
     options: Options,
     index: std.StringHashMapUnmanaged(u32),
+    /// Done and total leaves below each issue, uncapped.
+    leaves: []const Progress,
+    /// `problems` per issue, in the same order.
+    problems_of: []const []const Problem,
 
     pub fn find(p: Projection, id: []const u8) ?u32 {
         return p.index.get(id);
     }
 
+    /// `closed` or one of `Options.done_states`.
+    pub fn isDone(p: Projection, i: u32) bool {
+        return p.issues[i].state.isDone(p.options.done_states);
+    }
+
+    /// Not done and not deleted: what blocks, and what the open/closed
+    /// rules look at.
+    pub fn isActive(p: Projection, i: u32) bool {
+        return !p.isDone(i) and !p.issues[i].deleted;
+    }
+
     /// Open, with at least one open blocker that exists.
     pub fn activelyBlocked(p: Projection, i: u32) bool {
-        if (isClosed(p.issues[i]) or p.issues[i].deleted) return false;
-        for (p.blockers[i]) |b| if (isActive(p.issues[b])) return true;
+        if (!p.isActive(i)) return false;
+        for (p.blockers[i]) |b| if (p.isActive(b)) return true;
         return false;
     }
 
-    /// Closed leaves out of all leaves below `i`. Null for a leaf, or over
-    /// the leaf limit.
-    pub fn progress(p: Projection, arena: Allocator, i: u32) Allocator.Error!?Progress {
-        if (p.children[i].len == 0) return null;
-        var closed: u32 = 0;
-        var total: u32 = 0;
-        var stack: std.ArrayList(u32) = .empty;
-        try stack.appendSlice(arena, p.children[i]);
-        while (stack.pop()) |n| {
-            if (p.children[n].len > 0) {
-                // A deleted node passes its children through.
-                try stack.appendSlice(arena, p.children[n]);
-                continue;
-            }
-            if (p.issues[n].deleted) continue; // counts in no denominator
-            total += 1;
-            if (total > p.options.max_progress_leaves) return null;
-            if (isClosed(p.issues[n])) closed += 1;
-        }
-        return .{ .closed = closed, .total = total };
+    /// The blockers `activelyBlocked` counts.
+    pub fn activeBlockers(p: Projection, arena: Allocator, i: u32) Allocator.Error![]const u32 {
+        var out: std.ArrayList(u32) = .empty;
+        for (p.blockers[i]) |b| if (p.isActive(b)) try out.append(arena, b);
+        return out.items;
     }
 
-    /// Its own, else the first state for open issues. Null when closed.
+    /// Done leaves out of all leaves below `i`. Null for a leaf, or over
+    /// the leaf limit.
+    pub fn progress(p: Projection, i: u32) ?Progress {
+        const l = p.leaves[i];
+        if (l.total == 0 or l.total > p.options.max_progress_leaves) return null;
+        return l;
+    }
+
+    /// Its own, else the first state for open issues. Null when done.
     pub fn workflow(p: Projection, i: u32) ?[]const u8 {
         if (p.issues[i].deleted) return null;
         if (p.issues[i].ext.workflow) |w| return w;
-        if (isClosed(p.issues[i]) or p.options.workflow.len == 0) return null;
+        if (p.isDone(i) or p.options.workflow.len == 0) return null;
         return p.options.workflow[0];
     }
 
-    pub fn problemsOf(p: Projection, arena: Allocator, i: u32) Allocator.Error![]const Problem {
-        var out: std.ArrayList(Problem) = .empty;
-        for (p.problems) |pr| if (std.mem.eql(u8, pr.id, p.issues[i].id)) try out.append(arena, pr);
-        return out.items;
+    pub fn problemsOf(p: Projection, i: u32) []const Problem {
+        return p.problems_of[i];
     }
 };
 
-/// Anything but `open` counts as done (`wontfix`, `duplicate`, ...), like
-/// `ls` hides it.
-pub fn isClosed(issue: Issue) bool {
-    return !issue.state.isOpen();
-}
-
-/// What blocks, and what the open/closed rules look at.
-pub fn isActive(issue: Issue) bool {
-    return !isClosed(issue) and !issue.deleted;
-}
-
 pub fn build(arena: Allocator, issues: []const Issue, options: Options) Allocator.Error!Projection {
     const n: u32 = @intCast(issues.len);
+    const done = struct {
+        fn f(o: Options, issue: Issue) bool {
+            return issue.state.isDone(o.done_states);
+        }
+    }.f;
+    const active = struct {
+        fn f(o: Options, issue: Issue) bool {
+            return !done(o, issue) and !issue.deleted;
+        }
+    }.f;
     var index: std.StringHashMapUnmanaged(u32) = .empty;
     for (issues, 0..) |issue, i| try index.put(arena, issue.id, @intCast(i));
     var problems: std.ArrayList(Problem) = .empty;
@@ -300,6 +308,7 @@ pub fn build(arena: Allocator, issues: []const Issue, options: Options) Allocato
 
     // Over the effective forest, which has no cycles.
     const open_below = try arena.alloc(bool, n);
+    const leaves = try arena.alloc(Progress, n);
     var post: std.ArrayList(u32) = .empty;
     try stack.appendSlice(arena, roots.items);
     while (stack.pop()) |i| {
@@ -311,16 +320,31 @@ pub fn build(arena: Allocator, issues: []const Issue, options: Options) Allocato
         k -= 1;
         const i = post.items[k];
         open_below[i] = false;
+        leaves[i] = .{ .closed = 0, .total = 0 };
         for (children[i]) |c| {
-            if (open_below[c] or isActive(issues[c])) open_below[i] = true;
+            if (open_below[c] or active(options, issues[c])) open_below[i] = true;
+            // A child with leaves below passes them through, deleted or
+            // not. Otherwise it is a leaf, unless deleted.
+            const add: Progress = if (leaves[c].total > 0)
+                leaves[c]
+            else if (issues[c].deleted)
+                .{ .closed = 0, .total = 0 }
+            else
+                .{ .closed = @intFromBool(done(options, issues[c])), .total = 1 };
+            leaves[i].closed +|= add.closed;
+            leaves[i].total +|= add.total;
         }
-        if (isClosed(issues[i]) and !issues[i].deleted and open_below[i]) try problems.append(
+        if (leaves[i].total > options.max_progress_leaves) try problems.append(
+            arena,
+            .{ .id = issues[i].id, .kind = .too_many_leaves },
+        );
+        if (done(options, issues[i]) and !issues[i].deleted and open_below[i]) try problems.append(
             arena,
             .{ .id = issues[i].id, .kind = .closed_with_open_descendants },
         );
     }
     for (post.items) |i| { // parents before children
-        if (!isActive(issues[i])) continue;
+        if (!active(options, issues[i])) continue;
         if (parent[i] != none and issues[parent[i]].deleted) try problems.append(arena, .{
             .id = issues[i].id,
             .kind = .parent_deleted,
@@ -329,7 +353,7 @@ pub fn build(arena: Allocator, issues: []const Issue, options: Options) Allocato
         var up = parent[i];
         while (up != none) : (up = parent[up]) {
             if (issues[up].deleted) continue; // the rule passes through
-            if (isClosed(issues[up])) {
+            if (done(options, issues[up])) {
                 try problems.append(arena, .{
                     .id = issues[i].id,
                     .kind = .open_under_closed_ancestor,
@@ -341,8 +365,15 @@ pub fn build(arena: Allocator, issues: []const Issue, options: Options) Allocato
     }
     try blockerCycles(arena, issues, blockers, &problems);
 
-    const proj: Projection = .{
+    var per_issue = try arena.alloc(std.ArrayList(Problem), n);
+    for (per_issue) |*l| l.* = .empty;
+    for (problems.items) |pr| try per_issue[index.get(pr.id).?].append(arena, pr);
+    const problems_of = try arena.alloc([]const Problem, n);
+    for (per_issue, problems_of) |l, *o| o.* = l.items;
+
+    return .{
         .issues = issues,
+        .problems_of = problems_of,
         .parent = parent,
         .children = children,
         .blockers = blockers,
@@ -352,17 +383,8 @@ pub fn build(arena: Allocator, issues: []const Issue, options: Options) Allocato
         .roots = roots.items,
         .options = options,
         .index = index,
+        .leaves = leaves,
     };
-    for (0..n) |i| {
-        if (proj.children[i].len == 0) continue;
-        if ((try proj.progress(arena, @intCast(i))) == null) try problems.append(arena, .{
-            .id = issues[i].id,
-            .kind = .too_many_leaves,
-        });
-    }
-    var out = proj;
-    out.problems = problems.items;
-    return out;
 }
 
 /// Tarjan's strongly connected components, iterative. A component with
@@ -470,7 +492,7 @@ test "hierarchy, blocking, progress and workflow" {
     const epic = p.find("a-epic").?;
     try testing.expectEqual(@as(usize, 2), p.children[epic].len);
     // The epic's leaves are b and e, both closed. c isn't a leaf.
-    try testing.expectEqual(Progress{ .closed = 2, .total = 2 }, (try p.progress(arena, epic)).?);
+    try testing.expectEqual(Progress{ .closed = 2, .total = 2 }, p.progress(epic).?);
     try testing.expect(p.activelyBlocked(p.find("c-task").?));
     try testing.expectEqual(@as(usize, 1), p.blocks[p.find("d-blocker").?].len);
     try testing.expectEqualStrings("backlog", p.workflow(epic).?);
@@ -478,15 +500,23 @@ test "hierarchy, blocking, progress and workflow" {
     try testing.expect(p.workflow(p.find("b-task").?) == null);
     try testing.expectEqual(@as(u32, 2), p.depth[p.find("e-sub").?]);
 
-    // Any state but open is done: a `wontfix` blocker no longer blocks, and
-    // a `wontfix` leaf counts as closed.
+    // The default done states: a `wontfix` blocker no longer blocks, and a
+    // `duplicate` leaf counts as done.
     var more = issues;
     more[3].state = .{ .other = "wontfix" };
     more[1].state = .{ .other = "duplicate" };
     const q = try build(arena, &more, .{});
     try testing.expect(!q.activelyBlocked(q.find("c-task").?));
-    try testing.expectEqual(Progress{ .closed = 2, .total = 2 }, (try q.progress(arena, epic)).?);
+    try testing.expectEqual(Progress{ .closed = 2, .total = 2 }, q.progress(epic).?);
     try testing.expect(q.workflow(q.find("d-blocker").?) != null); // as written
+
+    // Other states are open work, and the done states are configurable.
+    more[1].state = .{ .other = "in-review" };
+    const r = try build(arena, &more, .{});
+    try testing.expectEqual(Progress{ .closed = 1, .total = 2 }, r.progress(epic).?);
+    const s = try build(arena, &more, .{ .done_states = &.{"in-review"} });
+    try testing.expectEqual(Progress{ .closed = 2, .total = 2 }, s.progress(epic).?);
+    try testing.expect(s.activelyBlocked(s.find("c-task").?)); // wontfix isn't done here
 }
 
 test "broken graphs" {
@@ -572,7 +602,21 @@ test "random graphs" {
         try testing.expectEqual(n, seen.count());
         try testing.expectEqualSlices(u32, a.parent, b.parent);
         try testing.expectEqual(a.problems.len, b.problems.len);
-        for (0..n) |i| _ = try a.progress(arena, @intCast(i));
+        for (0..n) |i| {
+            // Against a plain walk of the subtree.
+            var want: Progress = .{ .closed = 0, .total = 0 };
+            var walk: std.ArrayList(u32) = .empty;
+            try walk.appendSlice(arena, a.children[i]);
+            while (walk.pop()) |c| {
+                if (a.leaves[c].total > 0) {
+                    try walk.appendSlice(arena, a.children[c]);
+                } else if (!a.issues[c].deleted) {
+                    want.total += 1;
+                    if (a.isDone(c)) want.closed += 1;
+                }
+            }
+            try testing.expectEqual(want, a.leaves[i]);
+        }
     }
 }
 
@@ -591,12 +635,21 @@ test "deleted issues" {
     issues[3].deleted = true;
     const p = try build(arena, &issues, .{});
     // Only c counts: b passes through and d is a deleted leaf.
-    try testing.expectEqual(Progress{ .closed = 1, .total = 1 }, (try p.progress(arena, 0)).?);
+    try testing.expectEqual(Progress{ .closed = 1, .total = 1 }, p.progress(0).?);
     // a is closed with open but deleted descendants: fine. c is closed under
     // a deleted parent: only active issues are reported.
     try testing.expectEqual(@as(usize, 0), p.problems.len);
     try testing.expect(!p.activelyBlocked(p.find("e").?));
     try testing.expect(p.workflow(1) == null);
+
+    // A live issue whose children are all deleted is a leaf again.
+    var flat = issues;
+    flat[1].deleted = false;
+    flat[2].deleted = true;
+    flat[1].state = .closed;
+    const f = try build(arena, &flat, .{});
+    try testing.expectEqual(Progress{ .closed = 1, .total = 1 }, f.progress(0).?);
+    try testing.expect(f.progress(1) == null);
 
     // Reopening c under the deleted b is allowed, and reported.
     issues[2].state = .open;

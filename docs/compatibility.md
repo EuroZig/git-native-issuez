@@ -69,8 +69,14 @@ are installed.
   [format.md](format.md) §4), so after merges they can differ from
   upstream's "last trailer found".
 - `--conflicts` lists issues with concurrent writes, and which value won.
+- Without `--state`, every issue that isn't done is listed: `closed` and
+  the states in `git config issue.doneStates` (default `wontfix,
+  duplicate`) are done, so `in-review` is listed too. Upstream lists `open`
+  only; `--state open` still does.
+- `--assignee <email>` also matches a `<uuid> <email>` value.
 - `--problems` lists issues with problems (a parent or blocker that is
-  missing or loops back, an invalid value, ...), each with the problem.
+  missing or loops back, an invalid value, ...), each with the problem, in
+  any state unless `--state` is given.
 - Deleted issues are left out. `--deleted` lists only them. Upstream doesn't
   know about deletion and lists them.
 
@@ -100,19 +106,26 @@ are installed.
 - `-l` together with `--add-label`/`--remove-label` applies the `-l` set
   first. Upstream silently drops `-l`.
 - `--description <text>` replaces the description with an event commit.
+  Other changes in the same `edit` go in that commit, and `-m` is its
+  subject.
 - The planning options of `create`, plus `--unblock` and `--no-<field>` to
   clear a field (`--no-parent`, `--no-blockers`, `--no-assignee`, ...).
 
 ## state
 
 - Closing an issue with open sub-issues, or opening one under a closed
-  ancestor, is refused. Upstream has no hierarchy. Any state but `open`
-  (`wontfix`, ...) counts as closed here.
+  ancestor, is refused. Upstream has no hierarchy. `closed` and the
+  `issue.doneStates` (`wontfix`, `duplicate` by default) count as closed
+  here; other states are open work.
 
 ## search
 
 - `-i` folds ASCII only, so results don't depend on the locale.
 - The subject is searched once. Upstream searches and counts it twice.
+- What the issue says now is searched: the title, the fields, the
+  description and the comments, edited ones as edited. Upstream greps every
+  commit message, so it also finds replaced or deleted text and event
+  trailers.
 - Long results end with `... N more matching lines`.
 - Deleted issues are left out.
 

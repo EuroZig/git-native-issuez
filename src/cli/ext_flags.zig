@@ -219,7 +219,10 @@ pub fn project(
         return null;
     };
     const states = workflowStates(B, ctx, repo) orelse return null;
-    return issuez.projection.build(ctx.arena, issues, .{ .workflow = states }) catch null;
+    return issuez.projection.build(ctx.arena, issues, .{
+        .workflow = states,
+        .done_states = repo.done_states,
+    }) catch null;
 }
 
 pub fn describeProblem(arena: Allocator, p: issuez.projection.Problem) []const u8 {

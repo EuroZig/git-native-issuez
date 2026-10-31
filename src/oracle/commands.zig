@@ -43,6 +43,9 @@ pub const NaiveIssue = struct {
     due: []const u8 = "",
     estimate: []const u8 = "",
     workflow: []const u8 = "",
+    /// Of the fields a merge restates: written somewhere in the history,
+    /// empty now.
+    cleared: []const []const u8 = &.{},
 };
 
 pub const Clone = struct {
@@ -270,7 +273,32 @@ const Dag = struct {
         const r = root orelse return error.NoRule;
         const title = try d.scalar("Title");
         const state = try d.scalar("State");
+        var cleared: std.ArrayList([]const u8) = .empty;
+        // Of the fields a merge restates.
+        for ([_][]const u8{
+            "Title",
+            "Assignee",
+            "Priority",
+            "Milestone",
+            "X-Parent",
+            "X-Start-Date",
+            "X-Due-Date",
+            "X-Estimate-Minutes",
+            "X-Workflow-State",
+            "X-Deleted",
+        }) |key| {
+            const v = try d.scalar(key);
+            if (v != null and v.?.len == 0) try cleared.append(d.arena, key);
+        }
+        for ([_][]const u8{ "Labels", "X-Blocked-By" }) |key| {
+            if ((try d.set(key)).len > 0) continue;
+            for (d.commits, 0..) |n, i| if (d.inHistory(i) and lastOf(n.block, key) != null) {
+                try cleared.append(d.arena, key);
+                break;
+            };
+        }
         return .{
+            .cleared = cleared.items,
             .title = if (title != null and title.?.len > 0) title.? else try trailers.subject(
                 d.arena,
                 d.commits[r].commit.message,

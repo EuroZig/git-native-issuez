@@ -52,18 +52,24 @@ pub fn main(comptime B: type, ctx: *context.Context(B), argv: []const []const u8
         start = &single;
         all = true; // an explicit subtree is shown whole
     }
-    var printer: Printer = .{ .ctx_out = ctx.out, .arena = ctx.arena, .proj = proj, .all = all };
+    var printer: Printer = .{
+        .ctx_out = ctx.out,
+        .arena = ctx.arena,
+        .proj = proj,
+        .all = all,
+        .shown = Printer.visibility(ctx.arena, proj, all) catch return common.oom(ctx.err),
+    };
     var top: std.ArrayList(u32) = .empty;
     for (start) |r| {
         if (!all and proj.issues[r].deleted) {
             printer.shownChildren(r, &top) catch return common.oom(ctx.err);
-        } else if (printer.visible(r)) top.append(ctx.arena, r) catch return common.oom(ctx.err);
+        } else if (printer.shown[r]) top.append(ctx.arena, r) catch return common.oom(ctx.err);
     }
     if (proj.issues.len == 0) {
         ctx.out.writeAll("No issues found.\n") catch {};
         return common.exit_ok;
     }
-    for (top.items) |r| printer.node(r, "", "") catch return common.exit_error;
+    printer.nodes(top.items) catch return common.exit_error;
     return common.exit_ok;
 }
 
@@ -72,31 +78,78 @@ const last_branch = "└── ";
 const pipe = "│   ";
 const gap = "    ";
 
+/// Iterative throughout: graphs from other tools can be deep.
 const Printer = struct {
     ctx_out: *std.Io.Writer,
     arena: std.mem.Allocator,
     proj: Projection,
     all: bool,
+    /// Per issue. Without --all, done issues with nothing open below them
+    /// are hidden.
+    shown: []const bool,
 
-    /// Closed issues with nothing open below them are hidden without --all.
-    fn visible(p: Printer, i: u32) bool {
-        if (p.all) return true;
-        const issue = p.proj.issues[i];
-        if (!issuez.projection.isClosed(issue) and !issue.deleted) return true;
-        for (p.proj.children[i]) |c| if (p.visible(c)) return true;
-        return false;
+    fn visibility(arena: std.mem.Allocator, proj: Projection, all: bool) ![]const bool {
+        const out = try arena.alloc(bool, proj.issues.len);
+        var order: std.ArrayList(u32) = .empty;
+        var stack: std.ArrayList(u32) = .empty;
+        try stack.appendSlice(arena, proj.roots);
+        while (stack.pop()) |i| {
+            try order.append(arena, i);
+            try stack.appendSlice(arena, proj.children[i]);
+        }
+        var k = order.items.len;
+        while (k > 0) { // children first
+            k -= 1;
+            const i = order.items[k];
+            out[i] = all or proj.isActive(i);
+            for (proj.children[i]) |c| if (out[c]) {
+                out[i] = true;
+            };
+        }
+        return out;
     }
 
     /// Without --all, a deleted child is replaced by its own children.
     fn shownChildren(p: *Printer, i: u32, out: *std.ArrayList(u32)) !void {
-        for (p.proj.children[i]) |c| {
+        var stack: std.ArrayList(u32) = .empty;
+        var k = p.proj.children[i].len;
+        while (k > 0) : (k -= 1) try stack.append(p.arena, p.proj.children[i][k - 1]);
+        while (stack.pop()) |c| {
             if (!p.all and p.proj.issues[c].deleted) {
-                try p.shownChildren(c, out);
-            } else if (p.visible(c)) try out.append(p.arena, c);
+                var j = p.proj.children[c].len;
+                while (j > 0) : (j -= 1) try stack.append(p.arena, p.proj.children[c][j - 1]);
+            } else if (p.shown[c]) try out.append(p.arena, c);
         }
     }
 
-    fn node(p: *Printer, i: u32, lead: []const u8, child_lead: []const u8) !void {
+    fn nodes(p: *Printer, top: []const u32) !void {
+        const Frame = struct { nodes: []const u32, next: usize = 0, lead: ?[]const u8 };
+        var stack: std.ArrayList(Frame) = .empty;
+        try stack.append(p.arena, .{ .nodes = top, .lead = null });
+        while (stack.items.len > 0) {
+            const f = &stack.items[stack.items.len - 1];
+            if (f.next == f.nodes.len) {
+                _ = stack.pop();
+                continue;
+            }
+            const i = f.nodes[f.next];
+            f.next += 1;
+            // Top-level nodes have no branch.
+            var lead: []const u8 = "";
+            var child_lead: []const u8 = "";
+            if (f.lead) |base| {
+                const last = f.next == f.nodes.len;
+                lead = try std.mem.concat(p.arena, u8, &.{ base, if (last) last_branch else branch });
+                child_lead = try std.mem.concat(p.arena, u8, &.{ base, if (last) gap else pipe });
+            }
+            try p.line(i, lead, child_lead);
+            var shown: std.ArrayList(u32) = .empty;
+            try p.shownChildren(i, &shown);
+            try stack.append(p.arena, .{ .nodes = shown.items, .lead = child_lead });
+        }
+    }
+
+    fn line(p: *Printer, i: u32, lead: []const u8, child_lead: []const u8) !void {
         const issue = p.proj.issues[i];
         const w = p.ctx_out;
         const short = uuid.shortId(issue.id);
@@ -107,32 +160,18 @@ const Printer = struct {
             issue.title,
             if (issue.deleted) " (deleted)" else "",
         });
-        if (try p.proj.progress(p.arena, i)) |pr| if (pr.total > 0) {
+        if (p.proj.progress(i)) |pr| {
             try w.print("  ({d}/{d} done)", .{ pr.closed, pr.total });
-        };
+        }
+        const blockers = try p.proj.activeBlockers(p.arena, i);
         if (p.proj.activelyBlocked(i)) {
             try w.writeAll("  [blocked by");
-            for (p.proj.blockers[i]) |b| {
-                if (!issuez.projection.isClosed(p.proj.issues[b]))
-                    try w.print(" {s}", .{uuid.shortId(p.proj.issues[b].id)});
-            }
+            for (blockers) |b| try w.print(" {s}", .{uuid.shortId(p.proj.issues[b].id)});
             try w.writeAll("]");
         }
         try w.writeAll("\n");
-        for (try p.proj.problemsOf(p.arena, i)) |pr| {
+        for (p.proj.problemsOf(i)) |pr| {
             try w.print("{s}  ! {s}\n", .{ child_lead, ext_flags.describeProblem(p.arena, pr) });
-        }
-        var shown: std.ArrayList(u32) = .empty;
-        try p.shownChildren(i, &shown);
-        for (shown.items, 0..) |c, k| {
-            const last = k + 1 == shown.items.len;
-            const own = if (last) last_branch else branch;
-            const below = if (last) gap else pipe;
-            try p.node(
-                c,
-                try std.mem.concat(p.arena, u8, &.{ child_lead, own }),
-                try std.mem.concat(p.arena, u8, &.{ child_lead, below }),
-            );
         }
     }
 };

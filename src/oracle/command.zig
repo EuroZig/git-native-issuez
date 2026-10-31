@@ -197,7 +197,7 @@ pub const Edit = struct {
     priority: ?[]const u8 = null,
     milestone: ?[]const u8 = null,
     ext: Ext = .{},
-    /// `--description`, written as its own commit after the other changes.
+    /// `--description`, written in the same commit as the other changes.
     description: []const []const u8 = &.{},
 
     /// Anything besides the description.
