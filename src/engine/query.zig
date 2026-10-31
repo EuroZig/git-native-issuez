@@ -15,8 +15,11 @@ pub const Filter = struct {
     /// "" matches unassigned issues.
     assignee: ?[]const u8 = null,
     priority: ?[]const u8 = null,
+    /// false hides deleted issues, true shows only those, null both.
+    deleted: ?bool = false,
 
     pub fn matches(f: Filter, issue: Issue) bool {
+        if (f.deleted) |d| if (issue.deleted != d) return false;
         if (f.state) |s| if (!std.mem.eql(u8, issue.state, s)) return false;
         if (f.label) |l| if (!labels_fmt.contains(issue.labels, l)) return false;
         if (f.assignee) |a| if (!std.mem.eql(u8, issue.field("Assignee") orelse "", a)) {

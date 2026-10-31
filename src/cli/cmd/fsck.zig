@@ -3,6 +3,7 @@
 const std = @import("std");
 const context = @import("../context.zig");
 const common = @import("../common.zig");
+const ext_flags = @import("../ext_flags.zig");
 const issuez = @import("issuez");
 const uuid = issuez.format.uuid;
 
@@ -15,8 +16,8 @@ pub const help =
     \\   - one root commit, carrying State: and Format-Version: trailers
     \\   - the whole history is readable
     \\
-    \\Quarantined issues (see `git issue status`) are noted, not counted as
-    \\errors.
+    \\Quarantined issues (see `git issue status`) and hierarchy or blocker
+    \\problems (see `git issue ls --problems`) are noted, not counted as errors.
     \\
     \\Options:
     \\   -q, --quiet  Only report problems
@@ -82,6 +83,7 @@ pub fn main(comptime B: type, ctx: *context.Context(B), argv: []const []const u8
         if (problems.len == 0 and !quiet) ctx.out.print("ok {s}\n", .{short}) catch {};
     }
     reportQuarantine(B, ctx, repo.backend);
+    reportProjection(B, ctx, repo);
     if (errors == 0) {
         ctx.out.print("Checked {d} issues, no errors found.\n", .{refs.len}) catch {};
         return common.exit_ok;
@@ -105,4 +107,18 @@ fn reportQuarantine(comptime B: type, ctx: *context.Context(B), backend: *B) voi
             .{ open, r, r },
         ) catch {};
     }
+}
+
+/// Same for hierarchy and blocker problems, which upstream's fsck doesn't
+/// know about.
+fn reportProjection(
+    comptime B: type,
+    ctx: *context.Context(B),
+    repo: issuez.engine.Repo(B),
+) void {
+    const proj = ext_flags.project(B, ctx, repo) orelse return;
+    for (proj.problems) |p| ctx.err.print("note: {s}: {s}\n", .{
+        uuid.shortId(p.id),
+        ext_flags.describeProblem(ctx.arena, p),
+    }) catch {};
 }

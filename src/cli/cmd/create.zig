@@ -4,6 +4,7 @@ const std = @import("std");
 const context = @import("../context.zig");
 const common = @import("../common.zig");
 const core = @import("issuez").format.core;
+const ext_flags = @import("../ext_flags.zig");
 
 pub const help =
     \\usage: git issue create [options] <title>
@@ -13,10 +14,11 @@ pub const help =
     \\Options:
     \\   -m, --message <text>      Description; repeat for more paragraphs
     \\   -l, --label <label>       Add a label (repeatable)
-    \\   -a, --assignee <email>    Assign to someone
+    \\   -a, --assignee <email>    Assign to someone ("<uuid> <email>" also works)
     \\   -p, --priority <level>    low, medium, high or critical
     \\   --milestone <name>        Set the milestone
     \\
+++ ext_flags.help_create ++
     \\   -h, --help                Show this help
     \\
 ;
@@ -29,6 +31,7 @@ pub fn main(comptime B: type, ctx: *context.Context(B), argv: []const []const u8
     var assignee: ?[]const u8 = null;
     var priority: ?[]const u8 = null;
     var milestone: ?[]const u8 = null;
+    var ext: ext_flags.Flags = .{};
 
     var args: common.Args = .{ .list = argv };
     while (args.next()) |arg| {
@@ -77,7 +80,11 @@ pub fn main(comptime B: type, ctx: *context.Context(B), argv: []const []const u8
                 "error: milestone must not contain newlines\n",
             );
             milestone = v;
-        } else return common.unknownOption(ctx.err, "create", arg);
+        } else switch (ext.parse(arena, ctx.err, &args, arg, false)) {
+            .yes => {},
+            .failed => return common.exit_error,
+            .no => return common.unknownOption(ctx.err, "create", arg),
+        }
     }
 
     const title_text = std.mem.join(arena, " ", title.items) catch return common.oom(ctx.err);
@@ -89,6 +96,7 @@ pub fn main(comptime B: type, ctx: *context.Context(B), argv: []const []const u8
 
     const repo = common.openRepo(B, ctx) orelse return common.exit_fatal;
     const body_text = std.mem.join(arena, "\n\n", body.items) catch return common.oom(ctx.err);
+    const x = ext.resolve(B, ctx, repo) orelse return common.exit_error;
     const created = repo.create(arena, .{
         .title = title_text,
         .body = body_text,
@@ -96,6 +104,12 @@ pub fn main(comptime B: type, ctx: *context.Context(B), argv: []const []const u8
         .assignee = assignee,
         .priority = priority,
         .milestone = milestone,
+        .parent = x.parent,
+        .blocked_by = x.blocked_by,
+        .start_date = x.start,
+        .due_date = x.due,
+        .estimate_minutes = x.estimate,
+        .workflow = x.workflow,
     }) catch |e| return common.repoFailed(B, ctx, e);
     ctx.out.print("Created issue {s}\n", .{created.id.short()}) catch {};
     return common.exit_ok;

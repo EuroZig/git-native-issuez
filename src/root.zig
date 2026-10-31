@@ -16,6 +16,7 @@ pub const format = struct {
     pub const uuid = @import("format/uuid.zig");
     pub const hex = @import("format/hex.zig");
     pub const core = @import("format/core.zig");
+    pub const fields = @import("format/fields.zig");
 };
 
 pub const model = struct {
@@ -27,6 +28,7 @@ pub const Repo = engine.Repo;
 pub const sync = @import("engine/sync.zig");
 pub const Sync = sync.Sync;
 pub const query = @import("engine/query.zig");
+pub const projection = @import("engine/projection.zig");
 
 test {
     _ = backend.contract;
@@ -38,8 +40,10 @@ test {
     _ = format.uuid;
     _ = format.hex;
     _ = format.core;
+    _ = format.fields;
     _ = model.issue;
     _ = engine;
     _ = sync;
     _ = query;
+    _ = projection;
 }

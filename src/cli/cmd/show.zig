@@ -10,13 +10,16 @@ const common = @import("../common.zig");
 const issuez = @import("issuez");
 const labels_fmt = issuez.format.labels;
 const uuid = issuez.format.uuid;
+const ext_flags = @import("../ext_flags.zig");
 
 pub const help =
     \\usage: git issue show <issue-id>
     \\
-    \\Show an issue with its comments and updates.
+    \\Show an issue with its comments and updates. Deleted comments are left
+    \\out; edited ones show their current text.
     \\
     \\   <issue-id>    Full UUID or a unique prefix
+    \\   --ids         Show each update's comment ID (for comment --edit, ...)
     \\   -h, --help    Show this help
     \\
 ;
@@ -29,6 +32,7 @@ const header_fields = [_][]const u8{ "Assignee", "Priority", "Milestone" };
 pub fn main(comptime B: type, ctx: *context.Context(B), argv: []const []const u8) u8 {
     const arena = ctx.arena;
     var issue_prefix: ?[]const u8 = null;
+    var ids = false;
     var args: common.Args = .{ .list = argv };
     while (args.next()) |arg| {
         if (!args.isOption(arg)) {
@@ -37,6 +41,8 @@ pub fn main(comptime B: type, ctx: *context.Context(B), argv: []const []const u8
         } else if (common.isHelp(arg)) {
             ctx.out.writeAll(help) catch {};
             return common.exit_ok;
+        } else if (std.mem.eql(u8, arg, "--ids")) {
+            ids = true;
         } else {
             return common.unknownOption(ctx.err, "show", arg);
         }
@@ -59,8 +65,13 @@ pub fn main(comptime B: type, ctx: *context.Context(B), argv: []const []const u8
 
     const w = ctx.out;
     w.print(
-        "Issue {s} [{s}]\n{s}\n",
-        .{ uuid.shortId(issue.id), issue.state, rule_heavy },
+        "Issue {s} [{s}]{s}\n{s}\n",
+        .{
+            uuid.shortId(issue.id),
+            issue.state,
+            if (issue.deleted) " (deleted)" else "",
+            rule_heavy,
+        },
     ) catch {};
     w.print("Title:   {s}\n", .{issue.title}) catch {};
     w.print("Author:  {s} <{s}>\n", .{ issue.author.name, issue.author.email }) catch {};
@@ -76,28 +87,39 @@ pub fn main(comptime B: type, ctx: *context.Context(B), argv: []const []const u8
         if (issue.field(key)) |v| w.print("{s}: {s}\n", .{ key, v }) catch {};
     }
     for (issue.fields) |f| {
-        if (isHeaderField(f.key)) continue;
+        if (isHeaderField(f.key) or isExtensionField(f.key)) continue;
         w.print("{s}: {s}\n", .{ f.key, f.value }) catch {};
     }
+    printExtensions(B, repo, arena, w, issue);
     for (issue.conflicts) |c| {
         w.print(
             "Conflict: {s} was edited concurrently; kept '{s}', not '{s}'\n",
             .{ c.field, c.value, c.lost },
         ) catch {};
     }
+    printProblems(B, ctx, repo, issue);
     if (issue.description.len > 0) w.print("\n{s}\n", .{issue.description}) catch {};
 
-    if (issue.comments.len > 0) {
+    var shown: usize = 0;
+    for (issue.comments) |c| {
+        if (!c.deleted) shown += 1;
+    }
+    if (shown > 0) {
         w.print(
             "\n{s}\nUpdates ({d}):\n{s}\n",
-            .{ rule_light, issue.comments.len, rule_light },
+            .{ rule_light, shown, rule_light },
         ) catch {};
         for (issue.comments) |c| {
+            if (c.deleted) continue;
+            const hex = c.oid.hex();
             w.print(
-                "\n  {s} ({f}):\n",
+                "\n  {s} ({f}){s}{s}{s}:\n",
                 .{
                     c.author.name,
                     common.IsoDate{ .time = c.author.time, .tz = c.author.tz_offset_minutes },
+                    if (c.edited) " (edited)" else "",
+                    if (ids) " " else "",
+                    if (ids) hex.short() else "",
                 },
             ) catch {};
             if (c.state_change) |s| w.print("  [State changed to: {s}]\n", .{s}) catch {};
@@ -109,6 +131,79 @@ pub fn main(comptime B: type, ctx: *context.Context(B), argv: []const []const u8
         }
     }
     return common.exit_ok;
+}
+
+/// Shown by `printExtensions` instead of verbatim.
+const extension_fields = [_][]const u8{
+    "X-Parent",           "X-Start-Date",     "X-Due-Date",
+    "X-Estimate-Minutes", "X-Workflow-State",
+};
+
+fn isExtensionField(key: []const u8) bool {
+    for (extension_fields) |e| if (std.mem.eql(u8, e, key)) return true;
+    return false;
+}
+
+fn printExtensions(
+    comptime B: type,
+    repo: issuez.engine.Repo(B),
+    arena: std.mem.Allocator,
+    w: *std.Io.Writer,
+    issue: issuez.engine.Issue,
+) void {
+    const x = issue.ext;
+    if (x.parent) |p| w.print("Parent:  {s}\n", .{reference(B, repo, arena, p)}) catch {};
+    for (x.blocked_by, 0..) |b, i| w.print("{s}{s}\n", .{
+        if (i == 0) "Blocked by: " else "            ",
+        reference(B, repo, arena, b),
+    }) catch {};
+    if (x.start_date) |d| w.print("Start:   {f}\n", .{d}) catch {};
+    if (x.due_date) |d| w.print("Due:     {f}\n", .{d}) catch {};
+    if (x.estimate_minutes) |m| {
+        w.print("Estimate: {d} min", .{m}) catch {};
+        if (m >= 60) w.print(" ({d}h{s})", .{
+            m / 60,
+            if (m % 60 == 0) "" else std.fmt.allocPrint(arena, "{d}m", .{m % 60}) catch "",
+        }) catch {};
+        w.writeAll("\n") catch {};
+    }
+    if (x.workflow) |s| w.print("Workflow: {s}\n", .{s}) catch {};
+}
+
+fn reference(
+    comptime B: type,
+    repo: issuez.engine.Repo(B),
+    arena: std.mem.Allocator,
+    id: []const u8,
+) []const u8 {
+    const short = uuid.shortId(id);
+    const res = repo.resolve(arena, id) catch return short;
+    const ref = switch (res) {
+        .one => |r| r,
+        else => return std.fmt.allocPrint(arena, "{s} (not found locally)", .{short}) catch short,
+    };
+    const target = repo.load(arena, ref) catch return short;
+    return std.fmt.allocPrint(arena, "{s} {s}", .{ short, target.title }) catch short;
+}
+
+/// Only builds the projection when the issue has references or invalid
+/// values: any problem with the issue involves one of those, so plain
+/// issues stay a single read.
+fn printProblems(
+    comptime B: type,
+    ctx: *context.Context(B),
+    repo: issuez.engine.Repo(B),
+    issue: issuez.engine.Issue,
+) void {
+    const x = issue.ext;
+    if (x.parent == null and x.blocked_by.len == 0 and x.invalid.len == 0) return;
+    const proj = ext_flags.project(B, ctx, repo) orelse return;
+    const i = proj.find(issue.id) orelse return;
+    const problems = proj.problemsOf(ctx.arena, i) catch return;
+    for (problems) |p| ctx.out.print(
+        "Problem: {s}\n",
+        .{ext_flags.describeProblem(ctx.arena, p)},
+    ) catch {};
 }
 
 fn isHeaderField(key: []const u8) bool {

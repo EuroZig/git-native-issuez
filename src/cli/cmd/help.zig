@@ -22,6 +22,11 @@ pub const text =
     \\git-native-issuez commands:
     \\   push        Push issues to a remote
     \\   sync        Merge from and push to a remote
+    \\   close       Close an issue (state --close)
+    \\   reopen      Reopen an issue (state --open)
+    \\   delete      Delete an issue (restore brings it back)
+    \\   restore     Restore a deleted issue
+    \\   tree        Show the parent/child tree with progress and blockers
     \\   status      Show unpushed, quarantined and conflicted issues
     \\   quarantine  Resolve a quarantined issue
     \\

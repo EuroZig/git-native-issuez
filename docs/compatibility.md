@@ -52,6 +52,14 @@ are installed.
 
 - A body whose last paragraph would be read as trailers is refused.
   Upstream lets it add trailers to the root commit.
+- Extra options for planning: `--parent`, `--blocked-by`, `--start`,
+  `--due`, `--estimate` and `--workflow` (also on `edit`). Each writes an
+  `X-` trailer ([format.md](format.md) §3) that upstream keeps and shows as
+  a plain trailer line.
+- `-a` also takes `<uuid> <email>`, which names a person independently of
+  their address.
+- Writes that would break the hierarchy are refused: a parent or blocker
+  loop, a missing or deleted parent, an open issue under a closed one.
 
 ## ls
 
@@ -61,17 +69,28 @@ are installed.
   [format.md](format.md) §4), so after merges they can differ from
   upstream's "last trailer found".
 - `--conflicts` lists issues with concurrent writes, and which value won.
+- `--problems` lists issues with problems (a parent or blocker that is
+  missing or loops back, an invalid value, ...), each with the problem.
+- Deleted issues are left out. `--deleted` lists only them. Upstream doesn't
+  know about deletion and lists them.
 
 ## show
 
 - Unknown options after the ID are rejected. Upstream ignores them.
-- `Fixed-By`, `Release`, `Reason`, other fields and conflicts are shown.
+- `Fixed-By`, `Release`, `Reason`, the planning fields (parent, blockers,
+  dates, estimate, workflow state), other fields and conflicts are shown.
+- Edited comments show their current text, deleted ones are left out, and
+  the event commits themselves are not listed as updates. Upstream shows
+  every commit as it was written. `--ids` adds each comment's ID.
 
 ## comment
 
 - Whitespace-only text (`-m " "`) is refused.
 - Only the last paragraph is checked for text that would read as trailers.
   git never reads a single paragraph as trailers.
+- `--edit <comment-id> -m <text>`, `--delete <comment-id>` and
+  `--restore <comment-id>` change a comment by adding an event commit
+  ([format.md](format.md) §5). Nothing is rewritten.
 
 ## edit
 
@@ -80,16 +99,27 @@ are installed.
   Upstream silently does nothing.
 - `-l` together with `--add-label`/`--remove-label` applies the `-l` set
   first. Upstream silently drops `-l`.
+- `--description <text>` replaces the description with an event commit.
+- The planning options of `create`, plus `--unblock` and `--no-<field>` to
+  clear a field (`--no-parent`, `--no-blockers`, `--no-assignee`, ...).
+
+## state
+
+- Closing an issue with open sub-issues, or opening one under a closed
+  ancestor, is refused. Upstream has no hierarchy.
 
 ## search
 
 - `-i` folds ASCII only, so results don't depend on the locale.
 - The subject is searched once. Upstream searches and counts it twice.
 - Long results end with `... N more matching lines`.
+- Deleted issues are left out.
 
 ## fsck
 
 - `-q` is accepted as `--quiet`, and unreadable histories are reported.
+- Invalid extension values and hierarchy or blocker problems are noted on
+  stderr, not counted as errors: other tools can write them.
 
 ## init
 
@@ -130,6 +160,11 @@ are installed.
   first and retries. When the remote refuses a ref (a hook, permissions),
   it stops with the remote's message.
 - `sync <remote>`: `merge`, then `push`.
+- `close` and `reopen <id>`: `state --close` and `state --open`.
+- `delete` and `restore <id>`: hide an issue from `ls`, `tree` and
+  `search`, and bring it back. Nothing is removed from history.
+- `tree [<id>]`: the parent and child tree, with progress over each
+  parent's leaves, blockers and problems.
 - `status [<remote>]`: issues not pushed yet, quarantined issues and how to
   resolve them, and issues with conflicts. Local state only.
 - `quarantine <remote> --accept-remote|--keep-local <id>`: resolves a

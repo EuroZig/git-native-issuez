@@ -90,6 +90,8 @@ test "fixture worlds through the oracle" {
                 "       git remote add <name> <url-or-path>\n",
         },
         .{ .cmd = .{ .read = &.{"status"} }, .exit = 0 },
+        .{ .cmd = .{ .read = &.{ "tree", "--all" } }, .exit = 0 },
+        .{ .cmd = .{ .read = &.{ "ls", "--problems", "-a" } }, .exit = 0 },
         .{
             .cmd = .{ .quarantine = .{ .remote = "origin", .id = "ffff", .accept = false } },
             .exit = 1,

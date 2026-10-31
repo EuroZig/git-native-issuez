@@ -6,6 +6,7 @@ const common = @import("../common.zig");
 const core = @import("issuez").format.core;
 const issuez = @import("issuez");
 const query = issuez.query;
+const ext_flags = @import("../ext_flags.zig");
 const labels_fmt = issuez.format.labels;
 const uuid = issuez.format.uuid;
 
@@ -23,8 +24,12 @@ pub const help =
     \\   -f, --format <format>   short (default), full or oneline
     \\   --sort <field>          created (default), updated, priority or state
     \\   --reverse               Reverse the sort order
+    \\   --problems              Only issues with problems (a parent or blocker that
+    \\                           is missing or loops back, invalid values, ...), each
+    \\                           with the problem
     \\   --conflicts             Only issues with fields edited concurrently, each
     \\                           with the conflict
+    \\   --deleted               Only deleted issues (see git issue restore)
     \\   -h, --help              Show this help
     \\
     \\Formats:
@@ -45,7 +50,9 @@ pub fn main(comptime B: type, ctx: *context.Context(B), argv: []const []const u8
     var format: Format = .short;
     var sort: query.SortKey = .created;
     var reverse = false;
+    var only_problems = false;
     var only_conflicts = false;
+    var only_deleted = false;
 
     var args: common.Args = .{ .list = argv };
     while (args.next()) |arg| {
@@ -81,8 +88,12 @@ pub fn main(comptime B: type, ctx: *context.Context(B), argv: []const []const u8
             );
         } else if (std.mem.eql(u8, arg, "--reverse")) {
             reverse = true;
+        } else if (std.mem.eql(u8, arg, "--problems")) {
+            only_problems = true;
         } else if (std.mem.eql(u8, arg, "--conflicts")) {
             only_conflicts = true;
+        } else if (std.mem.eql(u8, arg, "--deleted")) {
+            only_deleted = true;
         } else {
             return common.unknownOption(ctx.err, "ls", arg);
         }
@@ -96,12 +107,23 @@ pub fn main(comptime B: type, ctx: *context.Context(B), argv: []const []const u8
         .label = label_filter,
         .assignee = assignee_filter,
         .priority = priority_filter,
+        .deleted = only_deleted,
     };
     const sorted = query.list(arena, all, filter, .{ .key = sort, .reverse = reverse }) catch
         return common.exit_error;
+    const proj = if (only_problems)
+        ext_flags.project(B, ctx, repo) orelse return common.exit_error
+    else
+        null;
     var kept: std.ArrayList(issuez.engine.Issue) = .empty;
     for (sorted) |issue| {
         if (only_conflicts and issue.conflicts.len == 0) continue;
+        if (only_problems) {
+            const p = proj.?;
+            const problems = p.problemsOf(arena, p.find(issue.id).?) catch
+                return common.oom(ctx.err);
+            if (problems.len == 0) continue;
+        }
         kept.append(arena, issue) catch return common.oom(ctx.err);
     }
     const listed = kept.items;
@@ -143,6 +165,13 @@ pub fn main(comptime B: type, ctx: *context.Context(B), argv: []const []const u8
             },
         }
         if (format == .oneline) continue;
+        if (proj) |p| {
+            const problems = p.problemsOf(arena, p.find(issue.id).?) catch &.{};
+            for (problems) |pr| ctx.out.print(
+                "       problem: {s}\n",
+                .{ext_flags.describeProblem(arena, pr)},
+            ) catch {};
+        }
         if (only_conflicts) for (issue.conflicts) |c| ctx.out.print(
             "       conflict: {s} kept '{s}', not '{s}'\n",
             .{ c.field, c.value, c.lost },

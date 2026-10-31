@@ -355,6 +355,76 @@ fn atLeast(git_version_output: []const u8, major: u32, minor: u32) bool {
     return ma > major or (ma == major and mi >= minor);
 }
 
+test "tree and problems" {
+    var sb = try Sandbox.init(.{});
+    defer sb.deinit();
+    const idOf = struct {
+        fn f(out: Sandbox.Output) []const u8 {
+            return std.mem.trimEnd(u8, out.stdout["Created issue ".len..], "\n");
+        }
+    }.f;
+    // Distinct creation times: siblings are ordered by them.
+    const at = struct {
+        fn set(s: *Sandbox, t: []const u8) !void {
+            try s.env.put("GIT_AUTHOR_DATE", t);
+            try s.env.put("GIT_COMMITTER_DATE", t);
+        }
+    }.set;
+    try at(&sb, "1700000001 +0000");
+    const epic = idOf(try gitIssue(&sb, &.{ "create", "Epic" }));
+    try at(&sb, "1700000002 +0000");
+    const blocker = idOf(try gitIssue(&sb, &.{ "create", "Blocker" }));
+    try at(&sb, "1700000003 +0000");
+    const a = idOf(try gitIssue(
+        &sb,
+        &.{ "create", "Task A", "--parent", epic, "--blocked-by", blocker },
+    ));
+    try at(&sb, "1700000004 +0000");
+    const b = idOf(try gitIssue(&sb, &.{ "create", "Task B", "--parent", epic }));
+    try expectSuccess(try gitIssue(&sb, &.{ "state", b, "--close" }));
+
+    // Closed issues without open descendants show with --all only. Progress
+    // counts them either way.
+    const tree = try gitIssue(&sb, &.{"tree"});
+    try expectSuccess(tree);
+    const want = try std.fmt.allocPrint(sb.arena(),
+        \\{s} [open] Epic  (1/2 done)
+        \\└── {s} [open] Task A  [blocked by {s}]
+        \\{s} [open] Blocker
+        \\
+    , .{ epic, a, blocker, blocker });
+    try testing.expectEqualStrings(want, tree.stdout);
+    const full = try gitIssue(&sb, &.{ "tree", "--all" });
+    const want_all = try std.fmt.allocPrint(sb.arena(),
+        \\{s} [open] Epic  (1/2 done)
+        \\├── {s} [open] Task A  [blocked by {s}]
+        \\└── {s} [closed] Task B
+        \\{s} [open] Blocker
+        \\
+    , .{ epic, a, blocker, b, blocker });
+    try testing.expectEqualStrings(want_all, full.stdout);
+
+    // Another writer adds an issue whose parent isn't here.
+    const tip = try sb.run(&.{
+        "sh", "-c",
+        "printf 'Orphan\\n\\nState: open\\nX-Parent: 0f0f0f0f-0f0f-4f0f-8f0f-0f0f0f0f0f0f\\n" ++
+            "Format-Version: 1\\n' | git commit-tree $(git hash-object -t tree /dev/null)",
+    });
+    try expectSuccess(tip);
+    const orphan_ref = "refs/issues/1e1e1e1e-1e1e-4e1e-8e1e-1e1e1e1e1e1e";
+    try sb.git(&.{ "update-ref", orphan_ref, std.mem.trimEnd(u8, tip.stdout, "\n") });
+
+    const problems = try gitIssue(&sb, &.{ "ls", "--problems" });
+    try expectSuccess(problems);
+    try testing.expectEqualStrings(
+        "1e1e1e1 [open] Orphan\n       problem: parent not found (0f0f0f0)\n",
+        problems.stdout,
+    );
+    const fsck = try gitIssue(&sb, &.{"fsck"});
+    try expectSuccess(fsck); // noted, not an error
+    try testing.expect(std.mem.find(u8, fsck.stderr, "note: 1e1e1e1: parent not found") != null);
+}
+
 test "ls --conflicts" {
     var sb = try Sandbox.init(.{});
     defer sb.deinit();
@@ -390,4 +460,51 @@ test "ls --conflicts" {
     try testing.expect(std.mem.find(u8, listed.stdout, line) != null);
     const none = try gitIssue(&sb, &.{ "ls", "--conflicts", "-s", "closed" });
     try testing.expectEqualStrings("", none.stdout);
+}
+
+test "lifecycle commands" {
+    var sb = try Sandbox.init(.{});
+    defer sb.deinit();
+    const idOf = struct {
+        fn f(out: Sandbox.Output) []const u8 {
+            return std.mem.trimEnd(u8, out.stdout["Created issue ".len..], "\n");
+        }
+    }.f;
+    const top = idOf(try gitIssue(&sb, &.{ "create", "Top" }));
+    const mid = idOf(try gitIssue(&sb, &.{ "create", "Mid", "--parent", top }));
+    const leaf = idOf(try gitIssue(&sb, &.{ "create", "Leaf", "--parent", mid }));
+
+    try expectSuccess(try gitIssue(&sb, &.{ "close", leaf, "--reason", "completed" }));
+    try expectSuccess(try gitIssue(&sb, &.{ "reopen", leaf }));
+    try expectSuccess(try gitIssue(&sb, &.{ "comment", leaf, "-m", "Tpyo" }));
+    // The comment is the leaf's tip right now. --ids shows its ID.
+    const pattern = try std.fmt.allocPrint(sb.arena(), "refs/issues/{s}*", .{leaf});
+    const tip = try sb.run(&.{ "git", "for-each-ref", "--format=%(objectname)", pattern });
+    const cid = tip.stdout[0..7];
+    const ids = try gitIssue(&sb, &.{ "show", leaf, "--ids" });
+    try testing.expect(std.mem.find(u8, ids.stdout, cid) != null);
+    try expectSuccess(try gitIssue(&sb, &.{ "comment", leaf, "--edit", cid, "-m", "Typo fixed" }));
+    var shown = try gitIssue(&sb, &.{ "show", leaf });
+    try testing.expect(std.mem.find(u8, shown.stdout, "(edited):\n  Typo fixed") != null);
+    try expectSuccess(try gitIssue(&sb, &.{ "comment", leaf, "--delete", cid }));
+    shown = try gitIssue(&sb, &.{ "show", leaf });
+    try testing.expect(std.mem.find(u8, shown.stdout, "Typo fixed") == null);
+
+    const refused = try gitIssue(&sb, &.{ "delete", mid });
+    try testing.expectEqual(@as(u8, 1), refused.code);
+    const why = "sub-issues that aren't deleted";
+    try testing.expect(std.mem.find(u8, refused.stderr, why) != null);
+    try expectSuccess(try gitIssue(&sb, &.{ "delete", leaf }));
+    try expectSuccess(try gitIssue(&sb, &.{ "delete", mid }));
+    const listed = try gitIssue(&sb, &.{ "ls", "-f", "oneline" });
+    try testing.expectEqual(@as(usize, 1), std.mem.count(u8, listed.stdout, "\n"));
+    const gone = try gitIssue(&sb, &.{ "ls", "--deleted", "-f", "oneline" });
+    try testing.expectEqual(@as(usize, 2), std.mem.count(u8, gone.stdout, "\n"));
+    // Restoring the leaf under its deleted parent is allowed and reported.
+    try expectSuccess(try gitIssue(&sb, &.{ "restore", leaf }));
+    const tree = try gitIssue(&sb, &.{"tree"});
+    try testing.expect(std.mem.find(u8, tree.stdout, "Leaf") != null); // lifted to Top
+    try testing.expect(std.mem.find(u8, tree.stdout, "Mid") == null);
+    const problems = try gitIssue(&sb, &.{ "ls", "--problems" });
+    try testing.expect(std.mem.find(u8, problems.stdout, "parent is deleted") != null);
 }

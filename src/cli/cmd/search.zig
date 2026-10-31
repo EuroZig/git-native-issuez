@@ -57,6 +57,7 @@ pub fn main(comptime B: type, ctx: *context.Context(B), argv: []const []const u8
     }
 
     for (issues) |issue| {
+        if (issue.deleted) continue;
         if (!std.mem.eql(u8, state_filter, "all") and !std.mem.eql(
             u8,
             issue.state,

@@ -11,7 +11,10 @@ tree. There is no server, no database and nothing in the working tree.
 **Status:** early. This version covers format 1: creating, listing,
 showing, commenting on, editing, closing and searching issues, `fsck` and
 `init`, and sharing issues between clones through any git remote (`merge`,
-`push`, `sync`).
+`push`, `sync`). On top of format 1 it adds planning fields (parent issues,
+blockers, dates, estimates, workflow states) and lifecycle events (editing
+and deleting comments, deleting and restoring issues), as extra trailers
+that upstream keeps and shows.
 
 > [!WARNING]
 > Generative AI was used to edit and/or produce large portions of this code.
@@ -25,7 +28,10 @@ git issue create "Login page crashes" -l bug -p high
 git issue ls
 git issue comment a7f3 -m "Happens on Safari only."
 git issue edit a7f3 -a ada@example.com
-git issue state a7f3 --close --fixed-by 1a2b3c4
+git issue create "Release 1.0" --due 2026-12-01
+git issue edit a7f3 --parent 5e21 --estimate 2h
+git issue tree                   # parents, sub-issues, progress, blockers
+git issue close a7f3 --fixed-by 1a2b3c4
 git issue show a7f3
 git issue search -i safari
 git issue fsck
@@ -33,6 +39,12 @@ git issue sync origin            # merge the remote's issues, push ours
 ```
 
 Issue IDs can be shortened to any unique prefix.
+
+Edits never rewrite history: `git issue comment <id> --edit <comment-id>`,
+`--delete` and `--restore`, `git issue edit <id> --description` and
+`git issue delete`/`restore` each add a commit. `git issue show --ids`
+shows comment IDs, `git issue ls --problems` lists issues whose parent or
+blocker is missing or loops back.
 
 `git issue sync <remote>` fetches the remote's issues, merges them, and
 pushes the local ones. Concurrent edits get a merge commit; which value

@@ -26,6 +26,18 @@ pub const merge_identity_name = "git-issue";
 pub const merge_identity_email = "git-issue@invalid";
 pub const merge_subject = "Merge issue";
 
+/// Restated by merge commits after the core fields, as written (invalid
+/// values too), so upstream, which reads the newest trailer, shows the
+/// merged value. `X-Blocked-By` follows them.
+pub const restated_extensions = [_][]const u8{
+    "X-Parent",
+    "X-Start-Date",
+    "X-Due-Date",
+    "X-Estimate-Minutes",
+    "X-Workflow-State",
+    "X-Deleted",
+};
+
 /// Refs per atomic push.
 pub const push_chunk = 128;
 /// Push attempts, with a merge in between when the remote moved.
@@ -421,6 +433,13 @@ pub fn Sync(comptime B: type) type {
             for ([_][]const u8{ "Assignee", "Priority", "Milestone" }) |key| {
                 if (resolved.field(key)) |v| try list.append(arena, .{ .key = key, .value = v });
             }
+            for (restated_extensions) |key| {
+                if (resolved.field(key)) |v| try list.append(arena, .{ .key = key, .value = v });
+            }
+            if (resolved.ext.blocked_by_written.len > 0) try list.append(arena, .{
+                .key = "X-Blocked-By",
+                .value = try labels_fmt.join(arena, resolved.ext.blocked_by_written),
+            });
             const message = try trailers.build(arena, merge_subject, "", list.items);
             return self.repo.writeCommit(
                 arena,
@@ -923,6 +942,57 @@ test "push and merge converge" {
     try testing.expectEqual(@as(usize, 0), p3.pushed);
     try testing.expectEqual(@as(usize, 0), (try bob.sim.listRefs(arena, "refs/remotes/")).len);
     try bob.sim.commit();
+}
+
+test "merge commits restate extension fields" {
+    var arena_state: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var world = testWorld();
+
+    var a = try onClone(arena, &world, 0);
+    const epic = try a.sync.repo.create(arena, .{ .title = "Epic" });
+    const created = try a.sync.repo.create(arena, .{ .title = "Shared" });
+    const ref_name = try std.fmt.allocPrint(arena, "refs/issues/{s}", .{created.id.slice()});
+    _ = try a.sync.push(arena, "origin");
+    try a.sim.commit();
+    var bob = try onClone(arena, &world, 1);
+    _ = try bob.sync.merge(arena, "origin", .{});
+    try bob.sim.commit();
+
+    a = try onClone(arena, &world, 0);
+    _ = try a.sync.repo.edit(arena, ref_name, .{
+        .parent = epic.id.slice(),
+        .due_date = "2026-12-01",
+    });
+    try a.sim.commit();
+    bob = try onClone(arena, &world, 1);
+    _ = try bob.sync.repo.edit(arena, ref_name, .{
+        .add_blocked_by = &.{epic.id.slice()},
+        .estimate_minutes = .{ .set = 90 },
+        .workflow = "ready",
+    });
+    _ = try bob.sync.push(arena, "origin");
+    try bob.sim.commit();
+
+    a = try onClone(arena, &world, 0);
+    const p = try a.sync.push(arena, "origin");
+    try testing.expectEqual(@as(usize, 1), p.merges[0].count(.merged));
+    const tip = (try a.sim.resolveRef(ref_name)).?;
+    const commit = try object.Commit.parse(arena, .sha1, (try a.sim.readObject(arena, tip)).?.data);
+    try a.sim.commit();
+    const want = try std.fmt.allocPrint(arena,
+        \\Merge issue
+        \\
+        \\State: open
+        \\X-Parent: {s}
+        \\X-Due-Date: 2026-12-01
+        \\X-Estimate-Minutes: 90
+        \\X-Workflow-State: ready
+        \\X-Blocked-By: {s}
+        \\
+    , .{ epic.id.slice(), epic.id.slice() });
+    try testing.expectEqualStrings(want, commit.message);
 }
 
 test "deterministic merge commits" {

@@ -3,8 +3,9 @@
 //! Each case first drives random backend operations against a separate
 //! model, then runs random commands on a few clones sharing a hub remote.
 //! Every command is checked by the oracle and the engine's reading of each
-//! issue is compared with the oracle's. Now and then someone force-pushes
-//! to the hub, so clones quarantine and resolve. Finally all clones sync,
+//! issue is compared with the oracle's. Now and then another tool writes
+//! extension fields (invalid ones too), or someone force-pushes to the
+//! hub, so clones quarantine and resolve. Finally all clones sync,
 //! accepting the hub's version of anything quarantined, until they hold
 //! exactly the hub's refs. A failing case prints its seed:
 //!
@@ -93,12 +94,17 @@ pub fn main(init: std.process.Init) u8 {
                 .{ case_seed, err, case_seed },
             );
             stats.deinit(init.gpa);
+            skips.deinit(init.gpa);
             return 1;
         };
     }
     for (stats.keys(), stats.values()) |cmd, v| {
         std.debug.print("  {s:<10} {d:>7} ok {d:>7} rejected\n", .{ cmd, v[0], v[1] });
     }
+    for (skips.keys(), skips.values()) |reason, n| {
+        std.debug.print("  oracle skipped {d:>5}x: {s}\n", .{ n, reason });
+    }
+    skips.deinit(init.gpa);
     std.debug.print("git-issue-fuzz: {d} cases passed\n", .{iterations});
     stats.deinit(init.gpa);
     return 0;
@@ -167,6 +173,17 @@ fn countOutcome(cmd: []const u8, ok: bool) void {
     gop.value_ptr[if (ok) 0 else 1] += 1;
 }
 
+/// Checks the oracle had no rule for, by reason. A growing count points at
+/// a gap in its coverage.
+var skips: std.array_hash_map.String(u64) = .empty;
+
+fn countSkip(reason: []const u8) void {
+    const gpa = stats_gpa orelse return;
+    const gop = skips.getOrPut(gpa, reason) catch return;
+    if (!gop.found_existing) gop.value_ptr.* = 0;
+    gop.value_ptr.* += 1;
+}
+
 const words = [_][]const u8{
     "Crash",
     "on",
@@ -233,6 +250,87 @@ fn pickAlloc(rand: std.Random, pool: []const []const u8) Allocator.Error![]const
     return pick(rand, pool);
 }
 
+const date_pool = [_][]const u8{ "2026-11-01", "2026-12-31", "2028-02-29", "2026-02-30", "26-1-1" };
+const estimate_pool = [_][]const u8{ "90", "0", "2h", "1h30m", "45m", "007", "2x", "" };
+const workflow_pool = [_][]const u8{ "backlog", "ready", "review", "doing", "done", "In-Progress" };
+const clear_pool = [_][]const u8{
+    "parent",   "blockers", "start",    "due",       "estimate",
+    "workflow", "assignee", "priority", "milestone", "labels",
+};
+
+/// Returns true when it set anything, since a create with planning fields
+/// can't be predicted to succeed.
+fn genExt(
+    arena: Allocator,
+    rand: std.Random,
+    ids: []const []const u8,
+    ext: *spec.Ext,
+    edit: bool,
+) Allocator.Error!bool {
+    if (rand.uintLessThan(u8, 4) == 0) ext.parent = try genPrefix(arena, rand, ids);
+    const blockers = if (rand.uintLessThan(u8, 3) == 0) @as(usize, 2) else 0;
+    ext.blocked_by = try some(arena, rand, blockers, genPrefix, .{ arena, rand, ids });
+    if (edit and rand.uintLessThan(u8, 5) == 0) {
+        ext.unblock = try arena.dupe([]const u8, &.{try genPrefix(arena, rand, ids)});
+    }
+    const single = [_]struct { *?[]const u8, []const []const u8 }{
+        .{ &ext.start, &date_pool },
+        .{ &ext.due, &date_pool },
+        .{ &ext.estimate, &estimate_pool },
+        .{ &ext.workflow, &workflow_pool },
+    };
+    for (single) |x| if (rand.uintLessThan(u8, 5) == 0) {
+        x[0].* = pick(rand, x[1]);
+    };
+    if (edit) {
+        const clears = if (rand.uintLessThan(u8, 4) == 0) @as(usize, 2) else 0;
+        ext.clear = try some(arena, rand, clears, pickAlloc, .{ rand, &clear_pool });
+    }
+    return !ext.isEmpty();
+}
+
+fn generateLifecycle(
+    arena: Allocator,
+    rand: std.Random,
+    ids: []const []const u8,
+    commits: []const []const u8,
+) Allocator.Error!Generated {
+    const id = try genPrefix(arena, rand, ids);
+    const cmd: Command = switch (rand.uintLessThan(u8, 4)) {
+        0 => if (rand.boolean()) .{ .delete = .{ .id = id } } else .{ .restore = .{ .id = id } },
+        1 => blk: {
+            const x: spec.Lifecycle = .{
+                .id = id,
+                .message = if (rand.boolean()) "Done" else null,
+            };
+            break :blk if (rand.boolean()) .{ .close = x } else .{ .reopen = x };
+        },
+        2 => blk: {
+            const target = if (commits.len > 0 and rand.uintLessThan(u8, 4) != 0) inner: {
+                const hex = commits[rand.uintLessThan(usize, commits.len)];
+                break :inner hex[0..rand.intRangeAtMost(usize, 4, 10)];
+            } else pick(rand, &.{ "abcd", "00", "ffffffff" });
+            const kind: @FieldType(spec.CommentEvent, "kind") = switch (rand.uintLessThan(u8, 3)) {
+                0 => .edit,
+                1 => .delete,
+                else => .restore,
+            };
+            break :blk .{ .comment_event = .{
+                .id = id,
+                .kind = kind,
+                .target = target,
+                .text = if (kind == .edit) pick(rand, &message_pool) else null,
+            } };
+        },
+        else => .{ .edit = .{
+            .id = id,
+            .priority = if (rand.boolean()) "high" else null,
+            .description = try arena.dupe([]const u8, &.{pick(rand, &message_pool)}),
+        } },
+    };
+    return .{ .cmd = cmd };
+}
+
 fn generate(arena: Allocator, rand: std.Random, ids: []const []const u8) Allocator.Error!Generated {
     switch (rand.uintLessThan(u8, 15)) {
         0...2 => { // create
@@ -270,6 +368,7 @@ fn generate(arena: Allocator, rand: std.Random, ids: []const []const u8) Allocat
             if (rand.uintLessThan(u8, 4) == 0) x.milestone = pick(rand, &milestone_pool);
             const bodies = [_][]const u8{ "First paragraph.", "Two\nlines", "Fixes: 12" };
             if (rand.boolean()) x.body = pick(rand, &bodies);
+            if (try genExt(arena, rand, ids, &x.ext, false)) valid = false;
             return .{ .cmd = .{ .create = x }, .must_succeed = valid };
         },
         3...4 => return .{ .cmd = .{ .comment = .{
@@ -297,6 +396,7 @@ fn generate(arena: Allocator, rand: std.Random, ids: []const []const u8) Allocat
             if (rand.uintLessThan(u8, 3) == 0) x.assignee = pick(rand, &email_pool);
             if (rand.uintLessThan(u8, 3) == 0) x.priority = pick(rand, &priority_pool);
             if (rand.uintLessThan(u8, 4) == 0) x.milestone = pick(rand, &milestone_pool);
+            _ = try genExt(arena, rand, ids, &x.ext, true);
             return .{ .cmd = .{ .edit = x } };
         },
         9 => return .{ .cmd = .{ .read = try arena.dupe([]const u8, &.{
@@ -353,10 +453,14 @@ fn fuzzCommands(
     // Work clones c0..cN share "hub" as origin.
     const work_count = rand.intRangeAtMost(usize, 1, 3);
     const clones = try arena.alloc(World.Clone, work_count + 1);
+    const custom_workflow = rand.boolean();
     for (clones[0..work_count], 0..) |*c, idx| {
         c.* = .{
             .name = try std.fmt.allocPrint(arena, "c{d}", .{idx}),
-            .config = &.{.{ .key = "remote.origin.url", .value = "sim:hub" }},
+            .config = if (custom_workflow) &.{
+                .{ .key = "remote.origin.url", .value = "sim:hub" },
+                .{ .key = "issue.workflowStates", .value = "backlog, doing, done" },
+            } else &.{.{ .key = "remote.origin.url", .value = "sim:hub" }},
         };
     }
     clones[work_count] = .{ .name = "hub" };
@@ -385,6 +489,11 @@ fn fuzzCommands(
             try upstreamStep(arena, &world, clone_index);
             continue;
         }
+        if (ids.items.len > 0 and rand.uintLessThan(u8, 10) == 0) {
+            // Another tool writes extension fields, valid or not.
+            try foreignStep(arena, rand, &world, clone_index, ids.items);
+            continue;
+        }
         if (rand.uintLessThan(u8, 10) == 0) {
             // Someone force-pushes to the hub.
             try rewriteHub(arena, rand, &world, work_count);
@@ -401,7 +510,16 @@ fn fuzzCommands(
             _ = try step(io, gpa, arena, environ_map, &world, clone_index, cmd, true);
             continue;
         }
-        const gen = try generate(arena, rand, ids.items);
+        // So comment events sometimes target a real comment.
+        var commits: std.ArrayList([]const u8) = .empty;
+        for (world.clones[clone_index].objects) |o| if (o.kind == .commit) {
+            const oid = object.hashObject(world.format, .commit, o.data);
+            try commits.append(arena, try arena.dupe(u8, oid.hex().slice()));
+        };
+        const gen = if (rand.uintLessThan(u8, 6) == 0)
+            try generateLifecycle(arena, rand, ids.items, commits.items)
+        else
+            try generate(arena, rand, ids.items);
         _ = try step(io, gpa, arena, environ_map, &world, clone_index, gen.cmd, gen.must_succeed);
     }
 
@@ -526,6 +644,71 @@ fn upstreamStep(arena: Allocator, world: *World, clone_index: usize) CaseError!v
     try crossCheckModel(arena, world, clone_index);
 }
 
+/// Values another tool may write, `""` (a clear) and invalid ones included.
+const foreign_pools = [_]struct { []const u8, []const []const u8 }{
+    .{ "X-Parent", &.{ "", "not-a-uuid", "0b6c4f63-6f5a-4a3e-9c2b-1d2e3f4a5b6c" } },
+    .{ "X-Blocked-By", &.{ "", "nope", "0b6c4f63-6f5a-4a3e-9c2b-1d2e3f4a5b6c, x" } },
+    .{ "X-Start-Date", &date_pool },
+    .{ "X-Due-Date", &(date_pool ++ [_][]const u8{""}) },
+    .{ "X-Estimate-Minutes", &estimate_pool },
+    .{ "X-Workflow-State", &(workflow_pool ++ [_][]const u8{""}) },
+    .{ "X-Deleted", &.{ "true", "false", "maybe", "" } },
+};
+
+/// A commit on top of one issue with extension trailers, as a tool that
+/// doesn't check them would write. Merges must restate such values as they
+/// are, and readers must take them without failing.
+fn foreignStep(
+    arena: Allocator,
+    rand: std.Random,
+    world: *World,
+    clone_index: usize,
+    ids: []const []const u8,
+) CaseError!void {
+    const before = world.*;
+    var sim = try GitSim.init(arena, world, clone_index);
+    const name = try std.fmt.allocPrint(arena, "refs/issues/{s}", .{pick(rand, ids)});
+    const tip = (try sim.resolveRef(name)) orelse return;
+    var list: std.ArrayList(issuez.format.trailers.Trailer) = .empty;
+    for (foreign_pools) |f| if (rand.uintLessThan(u8, 3) == 0) {
+        var value = pick(rand, f[1]);
+        // A reference to an issue of this clone.
+        if (rand.uintLessThan(u8, 3) == 0 and (std.mem.eql(u8, f[0], "X-Parent") or
+            std.mem.eql(u8, f[0], "X-Blocked-By"))) value = pick(rand, ids);
+        try list.append(arena, .{ .key = f[0], .value = value });
+    };
+    if (list.items.len == 0) try list.append(arena, .{ .key = "X-Deleted", .value = "false" });
+    const message = issuez.format.trailers.build(arena, "Edit fields", "", list.items) catch |err|
+        switch (err) {
+            error.OutOfMemory => |e| return e,
+            else => unreachable, // no body, and every value is one line
+        };
+    const who = sim.identity(arena) catch |err| switch (err) {
+        error.OutOfMemory => |e| return e,
+        error.IdentityUnknown => return,
+    };
+    const commit: object.Commit = .{
+        .tree = object.emptyTree(world.format),
+        .parents = &.{tip},
+        .author = who.author,
+        .committer = who.committer,
+        .message = message,
+    };
+    const oid = try sim.writeObject(.commit, try commit.serializeAlloc(arena));
+    sim.updateRefs(&.{.{ .name = name, .op = .{ .update = .{ .new = oid, .old = tip } } }}) catch
+        return;
+    try sim.commit();
+    countOutcome("(foreign fields)", true);
+
+    var report: oracle.Report = .{ .arena = arena };
+    try oracle.checkInvariants(arena, before, world.*, &report);
+    if (!report.ok()) {
+        std.debug.print("  foreign fields on {s}\n", .{world.clones[clone_index].name});
+        return reject(report);
+    }
+    try crossCheckModel(arena, world, clone_index);
+}
+
 /// A force-push to the hub: one issue goes back to an older commit of its
 /// history, maybe with a new commit on top, or is replaced by an unrelated
 /// one. Clones that merged the lost commits push them back after a plain
@@ -613,6 +796,8 @@ fn step(
     must_succeed: bool,
 ) CaseError!u8 {
     const before = world.*;
+    const writes = cmd.writes();
+    const violations_before = if (writes) try guardViolations(arena, world, clone_index) else &.{};
     const argv = try cmd.argv(arena);
     var discard_buf: [256]u8 = undefined;
     var discarding: std.Io.Writer.Discarding = .init(&discard_buf);
@@ -647,12 +832,50 @@ fn step(
                 return error.OracleNoRule;
             },
         };
+    for (report.skipped.items) |reason| countSkip(reason);
     if (!report.ok()) {
         std.debug.print("  command: {s} on {s} (exit {d})\n", .{ shown, clone, code });
         return reject(report);
     }
     try crossCheckModel(arena, world, clone_index);
+    if (writes and code == 0) {
+        // Our writes never break a guard, so no new violation may appear.
+        for (try guardViolations(arena, world, clone_index)) |v| {
+            if (issuez.format.labels.contains(violations_before, v)) continue;
+            std.debug.print(
+                "  {s} on {s} introduced a guard violation: {s}\n",
+                .{ shown, clone, v },
+            );
+            return error.ModelMismatch;
+        }
+    }
     return code;
+}
+
+/// Projection problems a guard would have prevented, as `<id> <kind>`.
+fn guardViolations(
+    arena: Allocator,
+    world: *World,
+    clone_index: usize,
+) CaseError![]const []const u8 {
+    var sim = try GitSim.init(arena, world, clone_index);
+    const repo = issuez.Repo(GitSim).init(&sim);
+    const issues = repo.loadAll(arena) catch return error.ModelMismatch;
+    const proj = try issuez.projection.build(arena, issues, .{});
+    var out: std.ArrayList([]const u8) = .empty;
+    for (proj.problems) |p| switch (p.kind) {
+        // Not guard rules: values from elsewhere, size limits, a parent
+        // deleted later (restoring under it is allowed).
+        .invalid_value,
+        .too_many_leaves,
+        .parent_deleted,
+        .invalid_event,
+        .pending_event,
+        .event_in_other_issue,
+        => {},
+        else => try out.append(arena, try std.fmt.allocPrint(arena, "{s} {t}", .{ p.id, p.kind })),
+    };
+    return out.items;
 }
 
 fn issueRefsDigest(arena: Allocator, world: World) Allocator.Error![]const u8 {
@@ -710,7 +933,14 @@ fn crossCheckModel(arena: Allocator, world: *World, clone_index: usize) CaseErro
             oracle.commands.sameSet(issue.labels, n.labels) and
             std.mem.eql(u8, issue.field("Assignee") orelse "", n.assignee) and
             std.mem.eql(u8, issue.field("Priority") orelse "", n.priority) and
-            std.mem.eql(u8, issue.field("Milestone") orelse "", n.milestone);
+            std.mem.eql(u8, issue.field("Milestone") orelse "", n.milestone) and
+            std.mem.eql(u8, issue.field("X-Parent") orelse "", n.parent) and
+            std.mem.eql(u8, issue.field("X-Start-Date") orelse "", n.start) and
+            std.mem.eql(u8, issue.field("X-Due-Date") orelse "", n.due) and
+            std.mem.eql(u8, issue.field("X-Estimate-Minutes") orelse "", n.estimate) and
+            std.mem.eql(u8, issue.field("X-Workflow-State") orelse "", n.workflow) and
+            sameBlockers(issue.ext, n.blocked_by) and
+            issue.deleted == std.mem.eql(u8, n.deleted, "true");
         if (!ok) {
             std.debug.print(
                 "  model mismatch on {s}:\n" ++
@@ -729,6 +959,17 @@ fn crossCheckModel(arena: Allocator, world: *World, clone_index: usize) CaseErro
             return error.ModelMismatch;
         }
     }
+}
+
+/// The engine's valid blockers plus its invalid ones are the oracle's set.
+fn sameBlockers(ext: issuez.model.issue.Extensions, naive: []const []const u8) bool {
+    var n: usize = ext.blocked_by.len;
+    for (ext.invalid) |f| if (std.mem.eql(u8, f.key, "X-Blocked-By")) {
+        n += 1;
+    };
+    if (n != naive.len) return false;
+    for (ext.blocked_by) |b| if (!issuez.format.labels.contains(naive, b)) return false;
+    return true;
 }
 
 fn driveBackend(arena: Allocator, rand: std.Random, sim: *GitSim) CaseError!void {

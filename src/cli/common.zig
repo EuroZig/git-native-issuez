@@ -186,6 +186,26 @@ pub fn reportEngineError(err: *std.Io.Writer, e: anyerror) void {
         error.InvalidText => "error: values must not contain newlines\n",
         error.TooLong => "error: text is too long\n",
         error.TooManyLabels => "error: too many labels\n",
+        error.TooManyBlockers => "error: too many blockers\n",
+        error.InvalidValue => "error: invalid value\n",
+        error.ReferenceNotFound => "error: the referenced issue doesn't exist here\n",
+        error.ParentIsSelf => "error: an issue can't be its own parent\n",
+        error.ParentCycle => "error: that parent is the issue itself or one of its " ++
+            "descendants (the hierarchy would loop)\n",
+        error.TooDeep => "error: the hierarchy would be nested deeper than 8 levels\n",
+        error.BlocksItself => "error: an issue can't block itself\n",
+        error.BlockerCycle => "error: that issue is (transitively) blocked by this one; " ++
+            "blocking it back would be a cycle\n",
+        error.OpenDescendants => "error: the issue has open sub-issues; close them first " ++
+            "(see 'git issue tree <id>')\n",
+        error.ClosedAncestor => "error: a parent (or one above it) is closed; " ++
+            "reopen it first\n",
+        error.GuardScanTooLarge => "error: checking the hierarchy would read more issues " ++
+            "than allowed\n",
+        error.ActiveChildren => "error: the issue has sub-issues that aren't deleted; " ++
+            "delete or move them first (see 'git issue tree <id>')\n",
+        error.CommentNotFound => "error: that isn't a comment of this issue\n",
+        error.ParentDeleted => "error: that parent is deleted; restore it first\n",
         error.NothingToEdit => "error: at least one edit option is required\n",
         error.InvalidIssueRef => "error: not an issue ref\n",
         error.VersionMismatch => "error: the issue changed since it was read\n",
@@ -255,8 +275,17 @@ pub fn engineExitCode(e: anyerror) u8 {
     };
 }
 
+/// An email, or `<uuid> <email>`.
 pub fn validateAssignee(err: *std.Io.Writer, value: []const u8) bool {
-    return validateEmail(err, "assignee", value);
+    const space = std.mem.findScalar(u8, value, ' ') orelse
+        return validateEmail(err, "assignee", value);
+    if (!issuez.format.uuid.isCanonical(value[0..space]))
+        return validateEmail(err, "assignee", value);
+    const a = issuez.format.fields.Assignee.parse(value) orelse {
+        err.writeAll("error: assignee must be an email or '<uuid> <email>'\n") catch {};
+        return false;
+    };
+    return validateEmail(err, "assignee", a.email);
 }
 
 /// Upstream's `validate_email` messages. Empty is allowed and clears the
