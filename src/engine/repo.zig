@@ -88,7 +88,7 @@ pub const CreateSpec = struct {
     labels: []const []const u8 = &.{},
     /// `email` or `<uuid> <email>`.
     assignee: ?[]const u8 = null,
-    priority: ?[]const u8 = null,
+    priority: ?core_fmt.Priority = null,
     milestone: ?[]const u8 = null,
     // References are full UUIDs. Callers resolve short IDs first.
     parent: ?[]const u8 = null,
@@ -112,7 +112,8 @@ pub const CommentSpec = struct {
 };
 
 pub const StateSpec = struct {
-    state: []const u8,
+    /// `.other` takes letters, digits, `-` and `_`, like upstream.
+    state: core_fmt.State,
     /// Defaults to "Close issue", "Reopen issue", ...
     message: ?[]const u8 = null,
     fixed_by: ?[]const u8 = null,
@@ -130,7 +131,7 @@ pub const EditSpec = struct {
     remove_labels: []const []const u8 = &.{},
     /// Empty clears it.
     assignee: ?[]const u8 = null,
-    priority: ?[]const u8 = null,
+    priority: ?PriorityEdit = null,
     milestone: ?[]const u8 = null,
     // null leaves a field alone, "" or `.clear` clears it.
     parent: ?[]const u8 = null,
@@ -146,6 +147,7 @@ pub const EditSpec = struct {
     expect: ?Oid = null,
 
     pub const EstimateEdit = union(enum) { set: u32, clear };
+    pub const PriorityEdit = union(enum) { set: core_fmt.Priority, clear };
 
     pub fn isEmpty(spec: EditSpec) bool {
         return spec.title == null and spec.set_labels == null and spec.add_labels.len == 0 and
@@ -400,7 +402,6 @@ pub fn Repo(comptime B: type) type {
             try self.checkText(spec.title, self.limits.max_title_bytes);
             if (spec.body.len > self.limits.max_body_bytes) return error.TooLong;
             const normalized = try self.normalizeLabels(arena, spec.labels);
-            if (spec.priority) |v| if (!core_fmt.isPriority(v)) return error.InvalidValue;
 
             var list: std.ArrayList(trailers.Trailer) = .empty;
             try list.append(arena, .{ .key = "State", .value = "open" });
@@ -412,7 +413,7 @@ pub fn Repo(comptime B: type) type {
                 arena,
                 .{ .key = "Assignee", .value = v },
             );
-            if (spec.priority) |v| try list.append(arena, .{ .key = "Priority", .value = v });
+            if (spec.priority) |v| try list.append(arena, .{ .key = "Priority", .value = v.text() });
             if (spec.milestone) |v| if (v.len > 0) try list.append(
                 arena,
                 .{ .key = "Milestone", .value = v },
@@ -506,26 +507,27 @@ pub fn Repo(comptime B: type) type {
             spec: StateSpec,
         ) Error!Oid {
             try self.checkLimits();
-            try self.checkText(spec.state, 64);
-            if (!core_fmt.isState(spec.state)) return error.InvalidValue;
+            // `.{ .other = "closed" }` is `.closed`.
+            const state = core_fmt.State.parse(spec.state.text());
+            try self.checkText(state.text(), 64);
+            if (!core_fmt.isState(state.text())) return error.InvalidValue;
             var list: std.ArrayList(trailers.Trailer) = .empty;
-            try list.append(arena, .{ .key = "State", .value = spec.state });
+            try list.append(arena, .{ .key = "State", .value = state.text() });
             if (spec.fixed_by) |v| try list.append(arena, .{ .key = "Fixed-By", .value = v });
             if (spec.release) |v| try list.append(arena, .{ .key = "Release", .value = v });
             if (spec.reason) |v| try list.append(arena, .{ .key = "Reason", .value = v });
             for (list.items) |t| try self.checkText(t.value, self.limits.max_trailer_value_bytes);
-            const default_subject = if (std.mem.eql(u8, spec.state, "open"))
-                "Reopen issue"
-            else if (std.mem.eql(u8, spec.state, "closed"))
-                "Close issue"
-            else
-                try std.fmt.allocPrint(arena, "Change state to {s}", .{spec.state});
+            const default_subject = switch (state) {
+                .open => "Reopen issue",
+                .closed => "Close issue",
+                .other => |s| try std.fmt.allocPrint(arena, "Change state to {s}", .{s}),
+            };
             const split = splitMessage(spec.message orelse default_subject);
             const message = try trailers.build(arena, split.subject, split.body, list.items);
             return self.appendCommit(arena, ref_name, spec.author, spec.expect, StateBuilder{
                 .repo = self,
                 .text = message,
-                .closed = std.mem.eql(u8, spec.state, "closed"),
+                .closed = !state.isOpen(),
             });
         }
 
@@ -720,12 +722,8 @@ pub fn Repo(comptime B: type) type {
             try self.checkLimits();
             if (spec.isEmpty()) return error.NothingToEdit;
             if (spec.title) |t| try self.checkText(t, self.limits.max_title_bytes);
-            for ([_]?[]const u8{ spec.assignee, spec.priority, spec.milestone }) |v| {
+            for ([_]?[]const u8{ spec.assignee, spec.milestone }) |v| {
                 if (v) |value| try self.checkText(value, self.limits.max_trailer_value_bytes);
-            }
-            // An empty priority clears it.
-            if (spec.priority) |v| {
-                if (v.len > 0 and !core_fmt.isPriority(v)) return error.InvalidValue;
             }
             var changes: std.ArrayList(Change) = .empty;
             if (spec.title != null) try changes.append(arena, .title);
@@ -862,7 +860,13 @@ pub fn Repo(comptime B: type) type {
                     );
                 }
                 if (spec.assignee) |v| try list.append(arena, .{ .key = "Assignee", .value = v });
-                if (spec.priority) |v| try list.append(arena, .{ .key = "Priority", .value = v });
+                if (spec.priority) |v| try list.append(arena, .{
+                    .key = "Priority",
+                    .value = switch (v) {
+                        .set => |p| p.text(),
+                        .clear => "",
+                    },
+                });
                 if (spec.milestone) |v| try list.append(arena, .{ .key = "Milestone", .value = v });
                 if (spec.parent) |v| try list.append(arena, .{ .key = "X-Parent", .value = v });
                 if (spec.set_blocked_by != null or spec.add_blocked_by.len > 0 or
@@ -1171,8 +1175,9 @@ fn refNameOf(arena: Allocator, id: []const u8) Allocator.Error![]const u8 {
     return std.fmt.allocPrint(arena, "{s}{s}", .{ issue_ref_prefix, id });
 }
 
+/// Anything but `open` counts as done (`wontfix`, ...).
 fn isClosed(issue: Issue) bool {
-    return std.mem.eql(u8, issue.state, "closed");
+    return !issue.state.isOpen();
 }
 
 fn checkReference(r: []const u8) error{InvalidValue}!void {
@@ -1249,14 +1254,14 @@ test "create, comment, state, edit and read back" {
         .body = "First paragraph.\n\nSecond.",
         .labels = &.{ "bug", " auth ", "bug" },
         .assignee = "bob@e.x",
-        .priority = "high",
+        .priority = .high,
     });
     const ref_name = try std.fmt.allocPrint(arena, "refs/issues/{s}", .{created.id.slice()});
     _ = try repo.comment(arena, ref_name, .{ .text = "Repro on Firefox\n\nDetail line" });
     _ = try repo.setState(
         arena,
         ref_name,
-        .{ .state = "closed", .message = "Fixed in abc", .fixed_by = "abc123" },
+        .{ .state = .closed, .message = "Fixed in abc", .fixed_by = "abc123" },
     );
     const edited = try repo.edit(
         arena,
@@ -1269,7 +1274,7 @@ test "create, comment, state, edit and read back" {
     const issue = try repo.load(arena, res.one);
     try testing.expectEqualStrings("Crash on login", issue.title);
     try testing.expectEqualStrings("First paragraph.\n\nSecond.", issue.description);
-    try testing.expectEqualStrings("closed", issue.state);
+    try testing.expectEqualStrings("closed", issue.state.text());
     try testing.expectEqual(@as(usize, 2), issue.labels.len);
     try testing.expectEqualStrings("bug", issue.labels[0]);
     try testing.expectEqualStrings("regression", issue.labels[1]);
@@ -1361,25 +1366,23 @@ test "caller mistakes are errors, not panics" {
         try testing.expectError(error.InvalidIssueRef, repo.comment(arena, bad, .{ .text = "hi" }));
         try testing.expectError(
             error.InvalidIssueRef,
-            repo.setState(arena, bad, .{ .state = "closed" }),
+            repo.setState(arena, bad, .{ .state = .closed }),
         );
         try testing.expectError(error.InvalidIssueRef, repo.edit(arena, bad, .{ .title = "t" }));
     }
 
-    // Upstream's write rules hold for library callers too.
+    // Upstream's write rules hold for library callers too. Priorities
+    // can't be wrong: they're an enum.
     for ([_]CreateSpec{
-        .{ .title = "x", .priority = "urgent" },
-        .{ .title = "x", .priority = "" },
         .{ .title = "x", .assignee = "ada" },
         .{ .title = "x", .assignee = "ada@example." },
     }) |bad| try testing.expectError(error.InvalidValue, repo.create(arena, bad));
-    try testing.expectError(error.InvalidValue, repo.edit(arena, ref_name, .{ .priority = "p1" }));
     try testing.expectError(error.InvalidValue, repo.edit(arena, ref_name, .{ .assignee = "ada" }));
     try testing.expectError(
         error.InvalidValue,
-        repo.setState(arena, ref_name, .{ .state = "in progress" }),
+        repo.setState(arena, ref_name, .{ .state = .{ .other = "in progress" } }),
     );
-    _ = try repo.edit(arena, ref_name, .{ .priority = "", .assignee = "" });
+    _ = try repo.edit(arena, ref_name, .{ .priority = .clear, .assignee = "" });
 }
 
 test "expect" {
@@ -1402,7 +1405,7 @@ test "expect" {
     );
     try testing.expectError(
         error.VersionMismatch,
-        repo.setState(arena, ref_name, .{ .state = "closed", .expect = seen }),
+        repo.setState(arena, ref_name, .{ .state = .closed, .expect = seen }),
     );
     try testing.expectError(
         error.VersionMismatch,
@@ -1480,7 +1483,7 @@ test "comments that would read as trailers are refused" {
     _ = try repo.comment(arena, ref_name, .{ .text = "State: closed" });
     try testing.expectEqualStrings(
         "open",
-        (try repo.load(arena, (try repo.resolve(arena, created.id.short())).one)).state,
+        (try repo.load(arena, (try repo.resolve(arena, created.id.short())).one)).state.text(),
     );
     try testing.expectError(error.InvalidText, repo.create(arena, .{ .title = "two\nlines" }));
 }
@@ -1517,7 +1520,7 @@ const RacingSim = struct {
             const other = Repo(GitSim).init(r.sim);
             const a = r.sim.arena;
             if (race.close) {
-                _ = other.setState(a, race.ref, .{ .state = "closed" }) catch unreachable;
+                _ = other.setState(a, race.ref, .{ .state = .closed }) catch unreachable;
             } else {
                 _ = other.comment(a, race.ref, .{ .text = race.message }) catch unreachable;
             }
@@ -1623,24 +1626,27 @@ test "guards" {
 
     try testing.expectError(
         error.OpenDescendants,
-        repo.setState(arena, try refOf(arena, task), .{ .state = "closed" }),
+        repo.setState(arena, try refOf(arena, task), .{ .state = .closed }),
     );
     const leaf = try repo.create(arena, .{ .title = "Leaf", .parent = side.id.slice() });
-    _ = try repo.setState(arena, try refOf(arena, leaf), .{ .state = "closed" });
-    _ = try repo.setState(arena, try refOf(arena, side), .{ .state = "closed" });
+    // Any state but open is done: a `wontfix` leaf doesn't hold its parent
+    // open, and counts as closing.
+    _ = try repo.setState(arena, try refOf(arena, leaf), .{ .state = .{ .other = "wontfix" } });
+    _ = try repo.setState(arena, try refOf(arena, leaf), .{ .state = .closed });
+    _ = try repo.setState(arena, try refOf(arena, side), .{ .state = .closed });
     try testing.expectError(error.ClosedAncestor, repo.create(arena, .{
         .title = "Under closed",
         .parent = side.id.slice(),
     }));
     try testing.expectError(
         error.ClosedAncestor,
-        repo.setState(arena, try refOf(arena, leaf), .{ .state = "open" }),
+        repo.setState(arena, try refOf(arena, leaf), .{ .state = .open }),
     );
     try testing.expectError(error.ClosedAncestor, repo.edit(arena, try refOf(arena, b1), .{
         .parent = side.id.slice(),
     }));
-    _ = try repo.setState(arena, try refOf(arena, side), .{ .state = "open" });
-    _ = try repo.setState(arena, try refOf(arena, leaf), .{ .state = "open" });
+    _ = try repo.setState(arena, try refOf(arena, side), .{ .state = .open });
+    _ = try repo.setState(arena, try refOf(arena, leaf), .{ .state = .open });
 
     // Whatever the guards let through leaves no violation.
     const issues = try repo.loadAll(arena);
@@ -1674,9 +1680,9 @@ test "guards on foreign cycles" {
 
     // Reopening A walks up through B back to A. That must neither put A's
     // ref in the transaction twice nor fail because A was closed.
-    _ = try repo.setState(arena, a_ref, .{ .state = "open" });
+    _ = try repo.setState(arena, a_ref, .{ .state = .open });
     const now = try repo.load(arena, .{ .name = a_ref, .tip = (try sim.resolveRef(a_ref)).? });
-    try testing.expectEqualStrings("open", now.state);
+    try testing.expectEqualStrings("open", now.state.text());
 }
 
 test "lifecycle" {

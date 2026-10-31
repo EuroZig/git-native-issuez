@@ -143,8 +143,10 @@ pub const Projection = struct {
     }
 };
 
+/// Anything but `open` counts as done (`wontfix`, `duplicate`, ...), like
+/// `ls` hides it.
 pub fn isClosed(issue: Issue) bool {
-    return std.mem.eql(u8, issue.state, "closed");
+    return !issue.state.isOpen();
 }
 
 /// What blocks, and what the open/closed rules look at.
@@ -436,7 +438,7 @@ fn fakeIssue(id: []const u8, created: i64, state: []const u8, ext: issue_model.E
         .title = id,
         .title_override = null,
         .description = "",
-        .state = state,
+        .state = .parse(state),
         .labels = &.{},
         .ext = ext,
         .fields = &.{},
@@ -475,6 +477,16 @@ test "hierarchy, blocking, progress and workflow" {
     try testing.expectEqualStrings("review", p.workflow(p.find("d-blocker").?).?);
     try testing.expect(p.workflow(p.find("b-task").?) == null);
     try testing.expectEqual(@as(u32, 2), p.depth[p.find("e-sub").?]);
+
+    // Any state but open is done: a `wontfix` blocker no longer blocks, and
+    // a `wontfix` leaf counts as closed.
+    var more = issues;
+    more[3].state = .{ .other = "wontfix" };
+    more[1].state = .{ .other = "duplicate" };
+    const q = try build(arena, &more, .{});
+    try testing.expect(!q.activelyBlocked(q.find("c-task").?));
+    try testing.expectEqual(Progress{ .closed = 2, .total = 2 }, (try q.progress(arena, epic)).?);
+    try testing.expect(q.workflow(q.find("d-blocker").?) != null); // as written
 }
 
 test "broken graphs" {
@@ -587,7 +599,7 @@ test "deleted issues" {
     try testing.expect(p.workflow(1) == null);
 
     // Reopening c under the deleted b is allowed, and reported.
-    issues[2].state = "open";
+    issues[2].state = .open;
     const q = try build(arena, &issues, .{});
     var kinds: std.ArrayList(Problem.Kind) = .empty;
     for (q.problems) |pr| try kinds.append(arena, pr.kind);

@@ -43,10 +43,10 @@ const Format = enum { short, full, oneline };
 
 pub fn main(comptime B: type, ctx: *context.Context(B), argv: []const []const u8) u8 {
     const arena = ctx.arena;
-    var state_filter: []const u8 = "open";
+    var state_filter: ?core.State = .open;
     var label_filter: ?[]const u8 = null;
     var assignee_filter: ?[]const u8 = null;
-    var priority_filter: ?[]const u8 = null;
+    var priority_filter: ?core.Priority = null;
     var format: Format = .short;
     var sort: query.SortKey = .created;
     var reverse = false;
@@ -60,20 +60,20 @@ pub fn main(comptime B: type, ctx: *context.Context(B), argv: []const []const u8
             ctx.out.writeAll(help) catch {};
             return common.exit_ok;
         } else if (std.mem.eql(u8, arg, "-s") or std.mem.eql(u8, arg, "--state")) {
-            state_filter = args.value(ctx.err, "-s") orelse return common.exit_error;
+            state_filter = common.stateFilter(args.value(ctx.err, "-s") orelse return common.exit_error);
         } else if (std.mem.eql(u8, arg, "-l") or std.mem.eql(u8, arg, "--label")) {
             label_filter = args.value(ctx.err, "-l") orelse return common.exit_error;
         } else if (std.mem.eql(u8, arg, "--assignee")) {
             assignee_filter = args.value(ctx.err, "--assignee") orelse return common.exit_error;
         } else if (std.mem.eql(u8, arg, "--priority")) {
             const v = args.value(ctx.err, "--priority") orelse return common.exit_error;
-            if (!core.isPriority(v)) return common.fail(
+            const p = core.Priority.parse(v) orelse return common.fail(
                 ctx.err,
                 "error: priority must be low, medium, high, or critical\n",
             );
-            priority_filter = v;
+            priority_filter = p;
         } else if (std.mem.eql(u8, arg, "-a") or std.mem.eql(u8, arg, "--all")) {
-            state_filter = "all";
+            state_filter = null;
         } else if (std.mem.eql(u8, arg, "-f") or std.mem.eql(u8, arg, "--format")) {
             const v = args.value(ctx.err, "-f") orelse return common.exit_error;
             format = std.meta.stringToEnum(Format, v) orelse return common.fail(
@@ -103,7 +103,7 @@ pub fn main(comptime B: type, ctx: *context.Context(B), argv: []const []const u8
     const all = repo.loadAll(arena) catch |e| return common.repoFailed(B, ctx, e);
 
     const filter: query.Filter = .{
-        .state = if (std.mem.eql(u8, state_filter, "all")) null else state_filter,
+        .state = state_filter,
         .label = label_filter,
         .assignee = assignee_filter,
         .priority = priority_filter,
@@ -133,14 +133,14 @@ pub fn main(comptime B: type, ctx: *context.Context(B), argv: []const []const u8
         switch (format) {
             .oneline => ctx.out.print(
                 "{s} {s} {s}\n",
-                .{ short, issue.state, issue.title },
+                .{ short, issue.state.text(), issue.title },
             ) catch {},
             .short => ctx.out.print(
                 "{s} [{s}] {s}\n",
-                .{ short, issue.state, issue.title },
+                .{ short, issue.state.text(), issue.title },
             ) catch {},
             .full => {
-                ctx.out.print("{s} [{s}] {s}\n", .{ short, issue.state, issue.title }) catch {};
+                ctx.out.print("{s} [{s}] {s}\n", .{ short, issue.state.text(), issue.title }) catch {};
                 var detail: std.Io.Writer.Allocating = .init(arena);
                 if (issue.labels.len > 0) detail.writer.print(
                     " labels:{s}",
@@ -173,8 +173,8 @@ pub fn main(comptime B: type, ctx: *context.Context(B), argv: []const []const u8
             ) catch {};
         }
         if (only_conflicts) for (issue.conflicts) |c| ctx.out.print(
-            "       conflict: {s} kept '{s}', not '{s}'\n",
-            .{ c.field, c.value, c.lost },
+            "       conflict: {f} kept '{s}', not '{s}'\n",
+            .{ c.target, c.value, c.lost },
         ) catch {};
     }
     return common.exit_ok;

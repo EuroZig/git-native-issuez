@@ -68,7 +68,7 @@ pub fn main(comptime B: type, ctx: *context.Context(B), argv: []const []const u8
         "Issue {s} [{s}]{s}\n{s}\n",
         .{
             uuid.shortId(issue.id),
-            issue.state,
+            issue.state.text(),
             if (issue.deleted) " (deleted)" else "",
             rule_heavy,
         },
@@ -93,8 +93,8 @@ pub fn main(comptime B: type, ctx: *context.Context(B), argv: []const []const u8
     printExtensions(B, repo, arena, w, issue);
     for (issue.conflicts) |c| {
         w.print(
-            "Conflict: {s} was edited concurrently; kept '{s}', not '{s}'\n",
-            .{ c.field, c.value, c.lost },
+            "Conflict: {f} was edited concurrently; kept '{s}', not '{s}'\n",
+            .{ c.target, c.value, c.lost },
         ) catch {};
     }
     printProblems(B, ctx, repo, issue);
@@ -122,7 +122,7 @@ pub fn main(comptime B: type, ctx: *context.Context(B), argv: []const []const u8
                     if (ids) hex.short() else "",
                 },
             ) catch {};
-            if (c.state_change) |s| w.print("  [State changed to: {s}]\n", .{s}) catch {};
+            if (c.state_change) |s| w.print("  [State changed to: {s}]\n", .{s.text()}) catch {};
             w.print("  {s}\n", .{c.subject}) catch {};
             for (c.text) |line| {
                 if (std.mem.trim(u8, line, " \t\r").len == 0) continue;

@@ -303,7 +303,7 @@ test "we read upstream's issues" {
 
     try testing.expectEqualStrings("Upstream made this", issue.title);
     try testing.expectEqualStrings("Body", issue.description);
-    try testing.expectEqualStrings("open", issue.state);
+    try testing.expectEqualStrings("open", issue.state.text());
     try testing.expectEqual(@as(usize, 1), issue.labels.len);
     try testing.expectEqualStrings("bug", issue.labels[0]);
     try testing.expectEqualStrings("high", issue.field("Priority").?);
@@ -328,12 +328,12 @@ test "upstream reads our issues" {
         .title = "Written by git-native-issuez",
         .body = "Created through the library.",
         .labels = &.{ "interop", "p0" },
-        .priority = "medium",
+        .priority = .medium,
     });
     const id = created.id.short();
     const ref = try findIssue(issues, arena, id);
     _ = try issues.comment(arena, ref.name, .{ .text = "Reproduced on main." });
-    _ = try issues.setState(arena, ref.name, .{ .state = "closed", .fixed_by = "abc1234" });
+    _ = try issues.setState(arena, ref.name, .{ .state = .closed, .fixed_by = "abc1234" });
 
     // Upstream lists, shows and checks it.
     try expectContains(try repo.read(.upstream, "ls -s closed", .{}), id);
@@ -347,7 +347,7 @@ test "upstream reads our issues" {
     // Upstream adds to it, and the library sees that on top.
     try repo.upstream("comment {s} -m 'Upstream replies'", .{id});
     const issue = try issues.load(arena, try findIssue(issues, arena, id));
-    try testing.expectEqualStrings("closed", issue.state);
+    try testing.expectEqualStrings("closed", issue.state.text());
     try testing.expectEqual(@as(usize, 3), issue.comments.len);
     try testing.expectEqualStrings("Upstream replies", issue.comments[2].subject);
 }

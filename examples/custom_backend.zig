@@ -162,7 +162,7 @@ pub fn main(init: std.process.Init) !void {
 
     // ...client B's change is based on a version that no longer exists.
     try out.writeAll("client B closes (same, now stale ETag):\n");
-    if (repo.setState(arena, ref_name, .{ .state = "closed", .expect = etag })) |_| {
+    if (repo.setState(arena, ref_name, .{ .state = .closed, .expect = etag })) |_| {
         try out.writeAll("  unexpectedly applied\n");
     } else |err| switch (err) {
         error.VersionMismatch => try out.writeAll("  refused: VersionMismatch (reload, retry)\n"),
@@ -170,9 +170,9 @@ pub fn main(init: std.process.Init) !void {
     }
 
     try out.writeAll("client B retries with the fresh ETag:\n");
-    _ = try repo.setState(arena, ref_name, .{ .state = "closed", .expect = after_a });
+    _ = try repo.setState(arena, ref_name, .{ .state = .closed, .expect = after_a });
 
     const tip = (try sim.resolveRef(ref_name)).?;
     const issue = try repo.load(arena, .{ .name = ref_name, .tip = tip });
-    try out.print("\n{s}: {s}, {d} update(s)\n", .{ issue.title, issue.state, issue.comments.len });
+    try out.print("\n{s}: {s}, {d} update(s)\n", .{ issue.title, issue.state.text(), issue.comments.len });
 }

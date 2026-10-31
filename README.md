@@ -85,8 +85,8 @@ var git = try issuez.backend.GitProcess.open(io, gpa, .{ .path = ".", .environ_m
 defer git.close();
 const repo = Repo.init(&git);
 const created = try repo.create(arena, .{ .title = "Login page crashes", .labels = &.{"bug"} });
-const open = try issuez.query.list(arena, try repo.loadAll(arena), .{ .state = "open" }, .{});
-for (open) |issue| std.debug.print("{s} {s}\n", .{ issue.state, issue.title });
+const open = try issuez.query.list(arena, try repo.loadAll(arena), .{ .state = .open }, .{});
+for (open) |issue| std.debug.print("{s} {s}\n", .{ issue.state.text(), issue.title });
 ```
 
 `Repo` is generic over its backend. `GitProcess` drives the `git` binary,

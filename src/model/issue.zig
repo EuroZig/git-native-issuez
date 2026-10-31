@@ -20,6 +20,7 @@ const trailers = @import("../format/trailers.zig");
 const labels_fmt = @import("../format/labels.zig");
 const fields_fmt = @import("../format/fields.zig");
 const uuid_fmt = @import("../format/uuid.zig");
+const core_fmt = @import("../format/core.zig");
 const Oid = object.Oid;
 const Signature = object.Signature;
 
@@ -38,9 +39,29 @@ pub const Field = struct {
 };
 
 pub const Conflict = struct {
-    field: []const u8,
+    target: Target,
     value: []const u8,
     lost: []const u8,
+
+    pub const Target = union(enum) {
+        /// A trailer key, as canonicalized.
+        field: []const u8,
+        description,
+        /// The comment's commit.
+        comment: Oid,
+
+        /// `Priority`, `Description`, `Comment 3f9a1c2`.
+        pub fn format(t: Target, w: *std.Io.Writer) std.Io.Writer.Error!void {
+            switch (t) {
+                .field => |k| try w.writeAll(k),
+                .description => try w.writeAll("Description"),
+                .comment => |oid| {
+                    const h = oid.hex();
+                    try w.print("Comment {s}", .{h.short()});
+                },
+            }
+        }
+    };
 };
 
 pub const Comment = struct {
@@ -53,7 +74,8 @@ pub const Comment = struct {
     /// Without the trailer block, the way git reads trailers. Use this one
     /// to display a comment.
     body: []const []const u8 = &.{},
-    state_change: ?[]const u8,
+    /// The `State` this commit wrote, if any.
+    state_change: ?core_fmt.State,
     is_merge: bool,
     /// Set by events. `text` and `body` already hold the edited text.
     edited: bool = false,
@@ -99,7 +121,8 @@ pub const Issue = struct {
     title: []const u8,
     title_override: ?[]const u8,
     description: []const u8,
-    state: []const u8,
+    /// `open` when never set.
+    state: core_fmt.State,
     labels: []const []const u8,
     ext: Extensions = .{},
     deleted: bool = false,
@@ -116,6 +139,12 @@ pub const Issue = struct {
     commit_count: usize,
     /// Raw messages in `git log` order, for `search`.
     log: []const []const u8,
+
+    /// Null when unset or not one of the four levels (another tool may
+    /// write `urgent`); `field("Priority")` has the text.
+    pub fn priority(issue: Issue) ?core_fmt.Priority {
+        return core_fmt.Priority.parse(issue.field("Priority") orelse return null);
+    }
 
     pub fn field(issue: Issue, key: []const u8) ?[]const u8 {
         for (issue.fields) |f| if (std.mem.eql(u8, f.key, key)) return f.value;
@@ -237,10 +266,11 @@ pub fn materialize(
     std.mem.sort([]const u8, keys, {}, lessThan);
     for (keys) |k| {
         const c = final.scalars.get(k).?;
-        if (c.lost) |lost| try conflicts.append(
-            arena,
-            .{ .field = try conflictName(arena, k), .value = c.value, .lost = lost },
-        );
+        if (c.lost) |lost| try conflicts.append(arena, .{
+            .target = conflictTarget(k, root_node.input.oid.object_format),
+            .value = c.value,
+            .lost = lost,
+        });
         if (isInternalKey(k)) continue;
         if (std.mem.eql(u8, k, "State") or std.mem.eql(u8, k, "Title") or std.mem.eql(
             u8,
@@ -254,7 +284,7 @@ pub fn materialize(
     const labels = try setMembers(arena, final, "Labels");
     const blocked_by = try setMembers(arena, final, "X-Blocked-By");
 
-    const state_value = nonEmpty(final.scalars.get("State")) orelse "open";
+    const state_value = core_fmt.State.parse(nonEmpty(final.scalars.get("State")) orelse "open");
 
     return .{
         .id = id,
@@ -414,14 +444,14 @@ fn isInternalKey(k: []const u8) bool {
     return std.mem.eql(u8, k, description_key) or std.mem.findScalar(u8, k, ' ') != null;
 }
 
-/// "Description", "Comment 3f9a1c2"
-fn conflictName(arena: Allocator, k: []const u8) Allocator.Error![]const u8 {
-    if (std.mem.eql(u8, k, description_key)) return "Description";
+/// Event keys name what they change: the description or a comment.
+fn conflictTarget(k: []const u8, format: object.ObjectFormat) Conflict.Target {
+    if (std.mem.eql(u8, k, description_key)) return .description;
     if (std.mem.findScalar(u8, k, ' ')) |sp| {
-        const target = k[sp + 1 ..];
-        return std.fmt.allocPrint(arena, "Comment {s}", .{target[0..@min(7, target.len)]});
+        // Event targets were checked when the event was read.
+        return .{ .comment = Oid.parseHex(format, k[sp + 1 ..]) catch unreachable };
     }
-    return k;
+    return .{ .field = k };
 }
 
 fn isEventKey(key: []const u8) bool {
@@ -746,7 +776,7 @@ fn comments(
             .subject = try trailers.subject(arena, node.input.message),
             .text = try trailers.textLines(arena, body, true),
             .body = try trailers.textLines(arena, body, false),
-            .state_change = trailers.lastValue(node.block, "State"),
+            .state_change = if (trailers.lastValue(node.block, "State")) |v| core_fmt.State.parse(v) else null,
             .is_merge = node.parents.len > 1,
             .deleted = visible != null and std.mem.eql(u8, visible.?.value, "0"),
         };
@@ -859,14 +889,14 @@ test "linear history" {
     const i = try d.issue(c3);
     try testing.expectEqualStrings("Crash", i.title);
     try testing.expectEqualStrings("Body text.", i.description);
-    try testing.expectEqualStrings("closed", i.state);
+    try testing.expectEqualStrings("closed", i.state.text());
     try testing.expectEqual(@as(usize, 2), i.labels.len);
     try testing.expectEqualStrings("regression", i.labels[1]);
     try testing.expect(i.field("Assignee") == null); // explicitly cleared
     try testing.expectEqualStrings("high", i.field("Priority").?); // never cleared by omission
     try testing.expectEqual(@as(usize, 3), i.comments.len);
     try testing.expectEqualStrings("A comment", i.comments[0].subject);
-    try testing.expectEqualStrings("closed", i.comments[1].state_change.?);
+    try testing.expectEqualStrings("closed", i.comments[1].state_change.?.text());
     try testing.expectEqualStrings("1", i.format_version.?);
     try testing.expectEqual(@as(i64, 100), i.created);
     try testing.expectEqual(@as(i64, 400), i.updated);
@@ -897,13 +927,13 @@ test "concurrent edits" {
     const merge = try d.add(&.{ left, right }, 400, "Merge issue from origin\n");
     const i = try d.issue(merge);
     try testing.expectEqualStrings("medium", i.field("Priority").?); // later author time
-    try testing.expectEqualStrings("closed", i.state); // only right changed it
+    try testing.expectEqualStrings("closed", i.state.text()); // only right changed it
     // Right removed "bug" while left left it alone, so it's gone. Left
     // added "ui", so it stays.
     try testing.expectEqual(@as(usize, 1), i.labels.len);
     try testing.expectEqualStrings("ui", i.labels[0]);
     try testing.expectEqual(@as(usize, 1), i.conflicts.len);
-    try testing.expectEqualStrings("Priority", i.conflicts[0].field);
+    try testing.expectEqualStrings("Priority", i.conflicts[0].target.field);
     try testing.expectEqualStrings("high", i.conflicts[0].lost);
 }
 
@@ -984,7 +1014,7 @@ test "upstream merges keep X- fields" {
     const m = try d.add(&.{ l, r }, 400, "Merge issue from origin\n\nState: closed\n");
     const i = try d.issue(m);
     try testing.expectEqualStrings("ready", i.field("X-Workflow-State").?);
-    try testing.expectEqualStrings("closed", i.state);
+    try testing.expectEqualStrings("closed", i.state.text());
 }
 
 test "description and comment text" {
@@ -1005,7 +1035,7 @@ test "description and comment text" {
     );
     try testing.expectEqual(@as(usize, 1), i.comments[0].text.len);
     try testing.expectEqualStrings("State: closed", i.comments[0].text[0]);
-    try testing.expectEqualStrings("closed", i.comments[0].state_change.?);
+    try testing.expectEqualStrings("closed", i.comments[0].state_change.?.text());
 }
 
 test "per-commit trailers" {
@@ -1166,7 +1196,7 @@ test "concurrent and bad events" {
     var i = try d.issue(merge);
     try testing.expectEqualStrings("Right text", i.comments[0].subject);
     try testing.expectEqual(@as(usize, 1), i.conflicts.len);
-    try testing.expect(std.mem.startsWith(u8, i.conflicts[0].field, "Comment "));
+    try testing.expect(i.conflicts[0].target == .comment);
 
     // Dangling target, the root, an event, and two events in one commit.
     const missing = "0f" ** 20;

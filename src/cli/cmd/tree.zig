@@ -103,7 +103,7 @@ const Printer = struct {
         try w.print("{s}{s} [{s}] {s}{s}", .{
             lead,
             short,
-            issue.state,
+            issue.state.text(),
             issue.title,
             if (issue.deleted) " (deleted)" else "",
         });

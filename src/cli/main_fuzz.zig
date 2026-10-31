@@ -929,7 +929,7 @@ fn crossCheckModel(arena: Allocator, world: *World, clone_index: usize) CaseErro
             error.NoRule => return error.OracleNoRule,
         };
         const ok = std.mem.eql(u8, issue.title, n.title) and
-            std.mem.eql(u8, issue.state, n.state) and
+            std.mem.eql(u8, issue.state.text(), n.state) and
             oracle.commands.sameSet(issue.labels, n.labels) and
             std.mem.eql(u8, issue.field("Assignee") orelse "", n.assignee) and
             std.mem.eql(u8, issue.field("Priority") orelse "", n.priority) and
@@ -948,7 +948,7 @@ fn crossCheckModel(arena: Allocator, world: *World, clone_index: usize) CaseErro
                     "    naive:  '{s}' [{s}] labels={d} a='{s}' p='{s}' m='{s}'\n",
                 .{
                     r.id(),                             issue.title,
-                    issue.state,                        issue.labels.len,
+                    issue.state.text(),                 issue.labels.len,
                     issue.field("Assignee") orelse "",  issue.field("Priority") orelse "",
                     issue.field("Milestone") orelse "", n.title,
                     n.state,                            n.labels.len,

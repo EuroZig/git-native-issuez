@@ -106,7 +106,8 @@ are installed.
 ## state
 
 - Closing an issue with open sub-issues, or opening one under a closed
-  ancestor, is refused. Upstream has no hierarchy.
+  ancestor, is refused. Upstream has no hierarchy. Any state but `open`
+  (`wontfix`, ...) counts as closed here.
 
 ## search
 

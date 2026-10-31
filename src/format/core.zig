@@ -3,12 +3,60 @@
 
 const std = @import("std");
 
-pub const priorities = [_][]const u8{ "low", "medium", "high", "critical" };
+/// Upstream's four levels, lowest first.
+pub const Priority = enum {
+    low,
+    medium,
+    high,
+    critical,
 
-pub fn isPriority(s: []const u8) bool {
-    for (priorities) |p| if (std.mem.eql(u8, p, s)) return true;
-    return false;
-}
+    /// Exactly one of the four names. Readers keep other values as text.
+    pub fn parse(s: []const u8) ?Priority {
+        return std.meta.stringToEnum(Priority, s);
+    }
+
+    pub fn text(p: Priority) []const u8 {
+        return @tagName(p);
+    }
+
+    /// 1 (low) to 4 (critical).
+    pub fn rank(p: Priority) u8 {
+        return @as(u8, @intFromEnum(p)) + 1;
+    }
+};
+
+/// An issue's state. Format 1 knows `open` and `closed` and allows others
+/// (`wontfix`, `in-review`, ...). Anything but `open` counts as done: `ls`
+/// hides it, and parents, blockers and progress treat it as closed.
+pub const State = union(enum) {
+    open,
+    closed,
+    other: []const u8,
+
+    /// Any text, as read. `open` and `closed` get their own tags.
+    pub fn parse(s: []const u8) State {
+        if (std.mem.eql(u8, s, "open")) return .open;
+        if (std.mem.eql(u8, s, "closed")) return .closed;
+        return .{ .other = s };
+    }
+
+    pub fn text(s: State) []const u8 {
+        return switch (s) {
+            .open => "open",
+            .closed => "closed",
+            .other => |t| t,
+        };
+    }
+
+    pub fn isOpen(s: State) bool {
+        return s == .open;
+    }
+
+    /// Same text. `.{ .other = "open" }` equals `.open`.
+    pub fn eql(a: State, b: State) bool {
+        return std.mem.eql(u8, a.text(), b.text());
+    }
+};
 
 /// Letters, digits, `-` and `_`, like upstream's `state --state`.
 pub fn isState(s: []const u8) bool {
@@ -40,6 +88,24 @@ test checkEmail {
     try t.expectEqual(EmailProblem.missing_local_part, checkEmail("@example.com"));
     try t.expectEqual(EmailProblem.missing_domain, checkEmail("ada@.com"));
     try t.expectEqual(EmailProblem.missing_tld, checkEmail("ada@example."));
+}
+
+test Priority {
+    try std.testing.expectEqual(Priority.high, Priority.parse("high").?);
+    try std.testing.expect(Priority.parse("urgent") == null);
+    try std.testing.expect(Priority.parse("High") == null);
+    try std.testing.expectEqual(@as(u8, 4), Priority.critical.rank());
+    try std.testing.expectEqual(@as(u8, 1), Priority.low.rank());
+}
+
+test State {
+    try std.testing.expectEqual(State.open, State.parse("open"));
+    try std.testing.expectEqual(State.closed, State.parse("closed"));
+    const wontfix = State.parse("wontfix");
+    try std.testing.expectEqualStrings("wontfix", wontfix.text());
+    try std.testing.expect(!wontfix.isOpen());
+    try std.testing.expect(State.eql(.{ .other = "open" }, .open));
+    try std.testing.expect(!State.eql(wontfix, .closed));
 }
 
 test isState {

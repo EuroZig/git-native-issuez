@@ -6,28 +6,29 @@ const issue_model = @import("../model/issue.zig");
 const labels_fmt = @import("../format/labels.zig");
 
 const Issue = issue_model.Issue;
+const core_fmt = @import("../format/core.zig");
+const State = core_fmt.State;
+const Priority = core_fmt.Priority;
 
 /// All set criteria must match, exactly, like upstream compares.
 pub const Filter = struct {
-    /// Null for any state.
-    state: ?[]const u8 = "open",
+    /// Null for any state. Compared as text, so `wontfix` finds `wontfix`.
+    state: ?State = .open,
     label: ?[]const u8 = null,
     /// "" matches unassigned issues.
     assignee: ?[]const u8 = null,
-    priority: ?[]const u8 = null,
+    priority: ?Priority = null,
     /// false hides deleted issues, true shows only those, null both.
     deleted: ?bool = false,
 
     pub fn matches(f: Filter, issue: Issue) bool {
         if (f.deleted) |d| if (issue.deleted != d) return false;
-        if (f.state) |s| if (!std.mem.eql(u8, issue.state, s)) return false;
+        if (f.state) |s| if (!issue.state.eql(s)) return false;
         if (f.label) |l| if (!labels_fmt.contains(issue.labels, l)) return false;
         if (f.assignee) |a| if (!std.mem.eql(u8, issue.field("Assignee") orelse "", a)) {
             return false;
         };
-        if (f.priority) |p| if (!std.mem.eql(u8, issue.field("Priority") orelse "", p)) {
-            return false;
-        };
+        if (f.priority) |p| if (issue.priority() != p) return false;
         return true;
     }
 };
@@ -64,19 +65,10 @@ fn sortKey(issue: Issue, key: SortKey) i64 {
     return switch (key) {
         .created => issue.created,
         .updated => issue.updated,
-        .priority => priorityRank(issue.field("Priority")),
-        .state => if (std.mem.eql(u8, issue.state, "open")) 1 else 0,
+        // Values outside the four levels sort below `low`, like upstream.
+        .priority => if (issue.priority()) |p| p.rank() else 0,
+        .state => if (issue.state.isOpen()) 1 else 0,
     };
-}
-
-/// critical 4, high 3, medium 2, low 1, anything else 0.
-pub fn priorityRank(priority: ?[]const u8) u8 {
-    const p = priority orelse return 0;
-    const ranks = [_]struct { []const u8, u8 }{
-        .{ "critical", 4 }, .{ "high", 3 }, .{ "medium", 2 }, .{ "low", 1 },
-    };
-    for (ranks) |r| if (std.mem.eql(u8, r[0], p)) return r[1];
-    return 0;
 }
 
 pub const SearchOptions = struct {
@@ -128,7 +120,7 @@ fn testIssue(
         .title = id,
         .title_override = null,
         .description = "",
-        .state = state,
+        .state = State.parse(state),
         .labels = &.{},
         .fields = fields,
         .conflicts = &.{},
@@ -168,7 +160,7 @@ test "filter and sort like git issue ls" {
     const reversed = try list(arena, &issues, .{ .state = null }, .{ .reverse = true });
     try testing.expectEqualStrings("a", reversed[0].id);
 
-    const critical = try list(arena, &issues, .{ .state = null, .priority = "critical" }, .{});
+    const critical = try list(arena, &issues, .{ .state = null, .priority = .critical }, .{});
     try testing.expectEqual(@as(usize, 2), critical.len);
     const unassigned = try list(arena, &issues, .{ .assignee = "" }, .{});
     try testing.expectEqual(@as(usize, 3), unassigned.len);

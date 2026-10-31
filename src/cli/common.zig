@@ -48,6 +48,12 @@ pub const Args = struct {
     }
 };
 
+/// `-s/--state` of `ls` and `search`: a state, or `all` (null).
+pub fn stateFilter(value: []const u8) ?issuez.format.core.State {
+    if (std.mem.eql(u8, value, "all")) return null;
+    return issuez.format.core.State.parse(value);
+}
+
 pub fn isHelp(arg: []const u8) bool {
     return std.mem.eql(u8, arg, "-h") or std.mem.eql(u8, arg, "--help");
 }

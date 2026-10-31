@@ -29,7 +29,7 @@ pub fn main(comptime B: type, ctx: *context.Context(B), argv: []const []const u8
     var body: std.ArrayList([]const u8) = .empty;
     var labels: std.ArrayList([]const u8) = .empty;
     var assignee: ?[]const u8 = null;
-    var priority: ?[]const u8 = null;
+    var priority: ?core.Priority = null;
     var milestone: ?[]const u8 = null;
     var ext: ext_flags.Flags = .{};
 
@@ -68,11 +68,11 @@ pub fn main(comptime B: type, ctx: *context.Context(B), argv: []const []const u8
             assignee = v;
         } else if (std.mem.eql(u8, arg, "-p") or std.mem.eql(u8, arg, "--priority")) {
             const v = args.value(ctx.err, "-p") orelse return common.exit_error;
-            if (!core.isPriority(v)) return common.fail(
+            const p = core.Priority.parse(v) orelse return common.fail(
                 ctx.err,
                 "error: priority must be low, medium, high, or critical\n",
             );
-            priority = v;
+            priority = p;
         } else if (std.mem.eql(u8, arg, "--milestone")) {
             const v = args.value(ctx.err, "--milestone") orelse return common.exit_error;
             if (common.hasNewline(v)) return common.fail(

@@ -107,11 +107,11 @@ pub fn main(comptime B: type, ctx: *context.Context(B), argv: []const []const u8
             spec.assignee = v;
         } else if (std.mem.eql(u8, arg, "-p") or std.mem.eql(u8, arg, "--priority")) {
             const v = args.value(ctx.err, "-p") orelse return common.exit_error;
-            if (!core.isPriority(v)) return common.fail(
+            const p = core.Priority.parse(v) orelse return common.fail(
                 ctx.err,
                 "error: priority must be low, medium, high, or critical\n",
             );
-            spec.priority = v;
+            spec.priority = .{ .set = p };
         } else if (std.mem.eql(u8, arg, "--milestone")) {
             const v = args.value(ctx.err, "--milestone") orelse return common.exit_error;
             if (common.hasNewline(v)) return common.fail(
@@ -140,7 +140,7 @@ pub fn main(comptime B: type, ctx: *context.Context(B), argv: []const []const u8
     spec.remove_labels = remove.items;
     const clears = ext.no;
     if (clears.contains(.assignee)) spec.assignee = "";
-    if (clears.contains(.priority)) spec.priority = "";
+    if (clears.contains(.priority)) spec.priority = .clear;
     if (clears.contains(.milestone)) spec.milestone = "";
     if (clears.contains(.labels)) spec.set_labels = &.{};
     if (spec.isEmpty() and !ext.any() and description.items.len == 0) return common.missing(

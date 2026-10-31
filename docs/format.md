@@ -87,6 +87,9 @@ Format-Version: 1
   exists, cycles and depth are questions across issues, answered when
   reading (the projection, `ls --problems`, `tree`), never by refusing to
   read.
+- Any `State` but `open` counts as done (`wontfix`, `duplicate`, ...).
+  `ls` hides it by default, as upstream does, and parents, blockers,
+  progress and the guards treat it as closed.
 - Workflow states come from `git config issue.workflowStates` (default
   `backlog, ready, in-progress, review`). An open issue without a value
   reads as the first one.

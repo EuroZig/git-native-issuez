@@ -421,7 +421,7 @@ pub fn Sync(comptime B: type) type {
             const resolved = try issue_model.materialize(arena, id, synthetic, all.items);
 
             var list: std.ArrayList(trailers.Trailer) = .empty;
-            try list.append(arena, .{ .key = "State", .value = resolved.state });
+            try list.append(arena, .{ .key = "State", .value = resolved.state.text() });
             if (resolved.title_override) |t| try list.append(
                 arena,
                 .{ .key = "Title", .value = t },
@@ -899,7 +899,7 @@ test "push and merge converge" {
     try bob.sim.commit();
 
     a = try onClone(arena, &world, 0);
-    _ = try a.sync.repo.edit(arena, ref_name, .{ .priority = "high", .add_labels = &.{"ui"} });
+    _ = try a.sync.repo.edit(arena, ref_name, .{ .priority = .{ .set = .high }, .add_labels = &.{"ui"} });
     try a.sim.commit();
     bob = try onClone(arena, &world, 1);
     _ = try bob.sync.repo.edit(
@@ -1009,7 +1009,7 @@ test "deterministic merge commits" {
     } };
 
     var a = try onClone(arena, &world, 0);
-    const created = try a.sync.repo.create(arena, .{ .title = "T", .priority = "low" });
+    const created = try a.sync.repo.create(arena, .{ .title = "T", .priority = .low });
     const ref_name = try std.fmt.allocPrint(arena, "refs/issues/{s}", .{created.id.slice()});
     _ = try a.sync.push(arena, "origin");
     try a.sim.commit();
@@ -1018,7 +1018,7 @@ test "deterministic merge commits" {
     try bob.sim.commit();
 
     a = try onClone(arena, &world, 0);
-    _ = try a.sync.repo.edit(arena, ref_name, .{ .priority = "high" });
+    _ = try a.sync.repo.edit(arena, ref_name, .{ .priority = .{ .set = .high } });
     try a.sim.commit();
     bob = try onClone(arena, &world, 1);
     _ = try bob.sync.repo.comment(arena, ref_name, .{ .text = "from bob" });
@@ -1082,7 +1082,7 @@ test "sync reports conflicts" {
     var world = testWorld();
 
     var a = try onClone(arena, &world, 0);
-    const created = try a.sync.repo.create(arena, .{ .title = "Contested", .priority = "low" });
+    const created = try a.sync.repo.create(arena, .{ .title = "Contested", .priority = .low });
     const ref_name = try std.fmt.allocPrint(arena, "refs/issues/{s}", .{created.id.slice()});
     const first = try a.sync.sync(arena, "origin");
     try testing.expectEqual(@as(usize, 1), first.push.pushed);
@@ -1091,19 +1091,19 @@ test "sync reports conflicts" {
 
     var bob = try onClone(arena, &world, 1);
     _ = try bob.sync.sync(arena, "origin");
-    _ = try bob.sync.repo.edit(arena, ref_name, .{ .priority = "high" });
+    _ = try bob.sync.repo.edit(arena, ref_name, .{ .priority = .{ .set = .high } });
     _ = try bob.sync.sync(arena, "origin");
     try bob.sim.commit();
 
     // Alice changed the same field concurrently. Her sync keeps one value
     // and reports the conflict.
     a = try onClone(arena, &world, 0);
-    _ = try a.sync.repo.edit(arena, ref_name, .{ .priority = "critical" });
+    _ = try a.sync.repo.edit(arena, ref_name, .{ .priority = .{ .set = .critical } });
     const report = try a.sync.sync(arena, "origin");
     const conflicted = try report.conflicted(arena);
     try testing.expectEqual(@as(usize, 1), conflicted.len);
     try testing.expectEqualStrings(created.id.slice(), conflicted[0].id);
-    try testing.expectEqualStrings("Priority", conflicted[0].conflicts[0].field);
+    try testing.expectEqualStrings("Priority", conflicted[0].conflicts[0].target.field);
     try testing.expectEqual(@as(usize, 1), report.push.pushed);
     try testing.expectEqual(@as(usize, 0), report.push.skipped.len);
 }

@@ -97,20 +97,19 @@ pub fn main(comptime B: type, ctx: *context.Context(B), argv: []const []const u8
         ctx.err,
         prefix,
     ) orelse return common.exit_error;
+    const parsed = core.State.parse(state);
     _ = repo.setState(arena, ref.name, .{
-        .state = state,
+        .state = parsed,
         .message = message,
         .fixed_by = fixed_by,
         .release = release,
         .reason = reason,
     }) catch |e| return common.repoFailed(B, ctx, e);
     const short = uuid.shortId(ref.id());
-    if (std.mem.eql(u8, state, "open")) {
-        ctx.out.print("Reopened issue {s}\n", .{short}) catch {};
-    } else if (std.mem.eql(u8, state, "closed")) {
-        ctx.out.print("Closed issue {s}\n", .{short}) catch {};
-    } else {
-        ctx.out.print("Changed state of {s} to {s}\n", .{ short, state }) catch {};
+    switch (parsed) {
+        .open => ctx.out.print("Reopened issue {s}\n", .{short}) catch {},
+        .closed => ctx.out.print("Closed issue {s}\n", .{short}) catch {},
+        .other => |s| ctx.out.print("Changed state of {s} to {s}\n", .{ short, s }) catch {},
     }
     return common.exit_ok;
 }
