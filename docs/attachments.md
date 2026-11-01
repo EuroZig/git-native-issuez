@@ -135,9 +135,11 @@ every attachment with its `availability` (`local`, `missing`, `corrupt`).
 - `att.uploads(arena, attachments, mode)` returns the bytes this clone has,
   and with `.git_lfs` also copies them into git-lfs's store (so
   `git lfs push` finds them); sync uses it before a push.
-- `att.fetch(arena, remote, issues)` brings the derived refs in line, then
-  downloads missing bytes (`git lfs fetch <remote> refs/attachments/<id>`)
-  and stores them. `FetchReport.missing` lists what is still missing, and
+- `att.fetch(arena, remote, issues)` downloads missing bytes
+  (`git lfs fetch <remote> refs/attachments/<id>`) and stores them. When a
+  derived ref is missing or out of date, it hands git-lfs a derived commit
+  for the issue as it is instead, written as objects only: fetching never
+  moves a ref. `FetchReport.missing` lists what is still missing, and
   `transfer_failed` says git-lfs failed for some of it.
 - `att.reconcile(arena, issue, remote_derived_tip)` is what sync runs after
   a merge.

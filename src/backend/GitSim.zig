@@ -460,11 +460,13 @@ pub fn lfsFetch(
     const format = sim.world.format;
     // Like git-lfs: an unknown ref fails the whole call, and an object the
     // server lacks fails it after the others arrived.
-    for (local_refs) |name| if (!sim.refs.contains(name)) return error.LfsTransferFailed;
+    const tips = try arena.alloc(Oid, local_refs.len);
+    for (local_refs, tips) |name, *tip| tip.* = sim.refs.get(name) orelse
+        (Oid.parseHex(format, name) catch return error.LfsTransferFailed);
     var lacking = false;
-    for (local_refs) |name| {
-        const tip = sim.refs.get(name).?;
-        const c = object.Commit.parse(arena, format, sim.objects.get(tip).?.data) catch continue;
+    for (tips) |tip| {
+        const obj = sim.objects.get(tip) orelse return error.LfsTransferFailed;
+        const c = object.Commit.parse(arena, format, obj.data) catch continue;
         const tree = sim.objects.get(c.tree) orelse continue;
         const entries = object.Tree.parse(arena, format, tree.data) catch continue;
         for (entries) |e| {

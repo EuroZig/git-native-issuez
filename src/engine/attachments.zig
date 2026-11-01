@@ -592,8 +592,10 @@ pub fn Attachments(comptime B: type) type {
         };
 
         /// `git lfs fetch <remote> refs/attachments/<id>` for every issue
-        /// with missing bytes, then adopts them. The derived refs are
-        /// brought in line with the issues first, since git-lfs reads them.
+        /// with missing bytes, then adopts them. git-lfs reads the pointers
+        /// from there, so when that ref is missing or out of date it gets
+        /// a derived commit for the issue as it is instead. That commit is
+        /// written as objects only: fetching never moves a ref.
         pub fn fetch(
             self: Self,
             arena: Allocator,
@@ -612,8 +614,16 @@ pub fn Attachments(comptime B: type) type {
                     any = true;
                 };
                 if (!any) continue;
-                _ = try self.reconcile(arena, i, null);
-                try refs.append(arena, try derivedRefName(arena, i.id));
+                const name = try derivedRefName(arena, i.id);
+                if (try self.derivedState(arena, i) == .ok) {
+                    try refs.append(arena, name);
+                    continue;
+                }
+                const old = try self.repo.backend.resolveRef(name);
+                const parents: []const Oid = if (old) |o| &.{o} else &.{};
+                const pointers = try pointersOf(arena, i.attachments);
+                const oid = try self.derivedCommit(arena, i.id, i.tip, pointers, parents);
+                try refs.append(arena, try arena.dupe(u8, oid.hex().slice()));
             }
             if (refs.items.len == 0) return .{ .fetched = 0, .missing = &.{} };
             var failed = false;

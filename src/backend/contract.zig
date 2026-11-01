@@ -31,7 +31,7 @@
 //! fn lfsList(self, arena, LfsStore) Error![]const []const u8
 //! fn lfsAvailable(self, arena) Error!bool                   // git-lfs installed
 //! fn lfsPush(self, arena, remote, sha256_hexes) (Error || LfsTransportError)!void
-//! fn lfsFetch(self, arena, remote, local_refs) (Error || LfsTransportError)!void
+//! fn lfsFetch(self, arena, remote, refs_or_oids) (Error || LfsTransportError)!void
 //! ```
 //!
 //! The last three are optional again. Without them attachments work

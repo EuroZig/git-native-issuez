@@ -272,6 +272,9 @@ pub fn checkTransition(
         else => false,
     };
     if (attaches and !hasGitLfs(b)) try report.fail("{t} succeeded without git-lfs", .{cmd});
+    // Fetching bytes may write a derived commit as loose objects, never refs.
+    if (attaches and cmd == .read)
+        return expectCloneUnchanged(arena, before.format, b, a, report, false);
     if (cmd == .read) return expectCloneUnchanged(arena, before.format, b, a, report, true);
     const cb = try commands.Clone.init(arena, before.format, b);
     const ca = try commands.Clone.init(arena, after.format, a);

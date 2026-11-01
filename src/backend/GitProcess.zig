@@ -552,8 +552,9 @@ pub fn lfsPush(
     }
 }
 
-/// Downloads into git-lfs's store, in batches. Objects that arrived stay
-/// when a later batch, or an object in the same batch, fails.
+/// Downloads into git-lfs's store, in batches, the objects the trees of
+/// these refs or commit OIDs point at. Objects that arrived stay when a
+/// later batch, or an object in the same batch, fails.
 pub fn lfsFetch(
     gp: *GitProcess,
     arena: Allocator,
@@ -569,7 +570,8 @@ pub fn lfsFetch(
         // Every object, whatever lfs.fetchinclude and lfs.fetchexclude say.
         try argv.appendSlice(arena, &.{ "git", "lfs", "fetch", "-I", "*", "-X", "", remote });
         for (local_refs[start..@min(start + 32, local_refs.len)]) |r| {
-            assert(contract.isValidRefName(r));
+            const oid = if (Oid.parseHex(gp.format, r)) |_| true else |_| false;
+            assert(oid or contract.isValidRefName(r));
             try argv.append(arena, r);
         }
         const r = try gp.run(arena, argv.items, null);
