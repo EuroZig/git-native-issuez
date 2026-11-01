@@ -64,15 +64,10 @@ pub fn main(comptime B: type, ctx: *context.Context(B), argv: []const []const u8
         .all = all,
         .shown = Printer.visibility(ctx.arena, proj, all) catch return common.oom(ctx.err),
     };
-    var top: std.ArrayList(u32) = .empty;
-    for (start) |r| {
-        if (!all and proj.issues[r].deleted) {
-            printer.shownChildren(r, &top) catch return common.oom(ctx.err);
-        } else if (printer.shown[r]) top.append(ctx.arena, r) catch return common.oom(ctx.err);
-    }
+    const top = printer.topNodes(start) catch return common.oom(ctx.err);
     if (as_json) {
         var s = json.begin(ctx.out);
-        printer.jsonNodes(&s, top.items) catch |e| return json.failed(ctx.err, e);
+        printer.jsonNodes(&s, top) catch |e| return json.failed(ctx.err, e);
         json.end(&s);
         return common.exit_ok;
     }
@@ -80,7 +75,7 @@ pub fn main(comptime B: type, ctx: *context.Context(B), argv: []const []const u8
         ctx.out.writeAll("No issues found.\n") catch {};
         return common.exit_ok;
     }
-    printer.nodes(top.items) catch return common.exit_error;
+    printer.nodes(top) catch return common.exit_error;
     return common.exit_ok;
 }
 
@@ -118,6 +113,17 @@ const Printer = struct {
             };
         }
         return out;
+    }
+
+    /// The shown ones of `start`, a deleted one replaced like a child.
+    fn topNodes(p: *Printer, start: []const u32) ![]const u32 {
+        var top: std.ArrayList(u32) = .empty;
+        for (start) |r| {
+            if (!p.all and p.proj.issues[r].deleted) {
+                try p.shownChildren(r, &top);
+            } else if (p.shown[r]) try top.append(p.arena, r);
+        }
+        return top.items;
     }
 
     /// Without --all, a deleted child is replaced by its own children.
@@ -229,3 +235,93 @@ const Printer = struct {
         }
     }
 };
+
+const testing = std.testing;
+const GitSim = issuez.backend.GitSim;
+
+test "tree --json nodes" {
+    var arena_state: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var world: GitSim.World = .{ .seed = 11, .clones = &.{.{ .name = "a" }} };
+    var sim = try GitSim.init(arena, &world, 0);
+    const repo = issuez.Repo(GitSim).init(&sim);
+    const root = try repo.create(arena, .{ .title = "Root" });
+    for ([_][]const u8{ "Open", "Done", "Gone" }) |t| {
+        _ = try repo.create(arena, .{ .title = t, .parent = root.id.slice() });
+    }
+    const gone = for (try repo.loadAll(arena)) |i| {
+        if (std.mem.eql(u8, i.title, "Gone")) break i.id;
+    } else unreachable;
+    _ = try repo.create(arena, .{ .title = "Orphan", .parent = gone });
+    _ = try repo.create(arena, .{ .title = "Old" });
+    const issues = try repo.loadAll(arena);
+    for (issues) |*i| {
+        if (std.mem.eql(u8, i.title, "Done") or std.mem.eql(u8, i.title, "Old")) i.state = .closed;
+        if (std.mem.eql(u8, i.title, "Gone")) i.deleted = true;
+    }
+    const proj = try issuez.projection.build(arena, issues, .{});
+
+    const Node = struct { title: []const u8, children: []const @This() };
+    const render = struct {
+        fn f(a: std.mem.Allocator, pr: Projection, all: bool) ![]const Node {
+            var p: Printer = .{
+                .ctx_out = undefined,
+                .arena = a,
+                .proj = pr,
+                .all = all,
+                .shown = try Printer.visibility(a, pr, all),
+            };
+            var out: std.Io.Writer.Allocating = .init(a);
+            var s = json.begin(&out.writer);
+            try p.jsonNodes(&s, try p.topNodes(pr.roots));
+            const v = try std.json.parseFromSliceLeaky(std.json.Value, a, out.written(), .{});
+            return nodes(a, v);
+        }
+        fn nodes(a: std.mem.Allocator, v: std.json.Value) ![]const Node {
+            var list: std.ArrayList(Node) = .empty;
+            for (v.array.items) |n| {
+                const keys = n.object.keys();
+                try testing.expectEqual(@as(usize, 2), keys.len);
+                try testing.expectEqualStrings("issue", keys[0]);
+                try testing.expectEqualStrings("children", keys[1]);
+                const issue = n.object.get("issue").?.object;
+                // Issues carry the projection fields.
+                try testing.expect(issue.get("progress") != null);
+                try list.append(a, .{
+                    .title = issue.get("title").?.string,
+                    .children = try nodes(a, n.object.get("children").?),
+                });
+            }
+            // The projection's order isn't the point here.
+            std.mem.sort(Node, list.items, {}, struct {
+                fn lt(_: void, x: Node, y: Node) bool {
+                    return std.mem.lessThan(u8, x.title, y.title);
+                }
+            }.lt);
+            return list.items;
+        }
+    }.f;
+    const expect = struct {
+        fn f(want: []const u8, got: []const Node) !void {
+            var buf: std.Io.Writer.Allocating = .init(testing.allocator);
+            defer buf.deinit();
+            try show(&buf.writer, got);
+            try testing.expectEqualStrings(want, buf.written());
+        }
+        fn show(w: *std.Io.Writer, got: []const Node) !void {
+            for (got, 0..) |n, k| {
+                if (k > 0) try w.writeAll(" ");
+                try w.writeAll(n.title);
+                if (n.children.len == 0) continue;
+                try w.writeAll("(");
+                try show(w, n.children);
+                try w.writeAll(")");
+            }
+        }
+    }.f;
+    // Done subtrees with nothing open are left out; a deleted issue's
+    // children take its place.
+    try expect("Root(Open Orphan)", try render(arena, proj, false));
+    try expect("Old Root(Done Gone(Orphan) Open)", try render(arena, proj, true));
+}
