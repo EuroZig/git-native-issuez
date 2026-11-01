@@ -337,13 +337,35 @@ pub fn findMilestone(
     return null;
 }
 
+/// Null after printing why. Writes check against these states.
 pub fn workflowStates(
     comptime B: type,
     ctx: *context.Context(B),
     repo: issuez.engine.Repo(B),
 ) ?[]const []const u8 {
+    return readWorkflowStates(B, ctx, repo, "error: ", "\n");
+}
+
+/// For reads: a bad setting is a warning, and the default states stand in,
+/// so listing never fails on it.
+fn readStatesOrDefault(
+    comptime B: type,
+    ctx: *context.Context(B),
+    repo: issuez.engine.Repo(B),
+) []const []const u8 {
+    return readWorkflowStates(B, ctx, repo, "warning: ", "; using the default states\n") orelse
+        &fields.default_workflow;
+}
+
+fn readWorkflowStates(
+    comptime B: type,
+    ctx: *context.Context(B),
+    repo: issuez.engine.Repo(B),
+    comptime prefix: []const u8,
+    comptime suffix: []const u8,
+) ?[]const []const u8 {
     const raw = repo.backend.configGet(ctx.arena, "issue.workflowStates") catch {
-        ctx.err.writeAll("error: could not read git config issue.workflowStates\n") catch {};
+        ctx.err.writeAll(prefix ++ "could not read git config issue.workflowStates" ++ suffix) catch {};
         return null;
     } orelse return &fields.default_workflow;
     var out: std.ArrayList([]const u8) = .empty;
@@ -353,13 +375,16 @@ pub fn workflowStates(
         if (s.len == 0) continue;
         if (!fields.isSlug(s)) {
             ctx.err.print(
-                "error: issue.workflowStates has '{s}'; states are lowercase letters, " ++
-                    "digits and '-'\n",
+                prefix ++ "issue.workflowStates has '{s}'; states are lowercase letters, " ++
+                    "digits and '-'" ++ suffix,
                 .{s},
             ) catch {};
             return null;
         }
-        out.append(ctx.arena, s) catch return null;
+        out.append(ctx.arena, s) catch {
+            _ = common.oom(ctx.err);
+            return null;
+        };
     }
     if (out.items.len == 0) return &fields.default_workflow;
     return out.items;
@@ -376,6 +401,7 @@ fn resolveRef(
     return ref.id();
 }
 
+/// Null after printing why.
 pub fn project(
     comptime B: type,
     ctx: *context.Context(B),
@@ -385,17 +411,29 @@ pub fn project(
         common.reportRepoError(B, ctx, e);
         return null;
     };
-    const states = workflowStates(B, ctx, repo) orelse return null;
+    return projectIssues(B, ctx, repo, issues);
+}
+
+/// `project` over issues the caller already loaded (every issue).
+pub fn projectIssues(
+    comptime B: type,
+    ctx: *context.Context(B),
+    repo: issuez.engine.Repo(B),
+    issues: []const issuez.engine.Issue,
+) ?issuez.projection.Projection {
     const cat = issuez.Catalog(B).of(repo);
     const milestones = cat.infos(ctx.arena) catch |e| {
         common.reportRepoError(B, ctx, e);
         return null;
     };
     return issuez.projection.build(ctx.arena, issues, .{
-        .workflow = states,
+        .workflow = readStatesOrDefault(B, ctx, repo),
         .milestones = milestones,
         .done_states = repo.done_states,
-    }) catch null;
+    }) catch {
+        _ = common.oom(ctx.err);
+        return null;
+    };
 }
 
 pub fn describeProblem(arena: Allocator, p: issuez.projection.Problem) []const u8 {

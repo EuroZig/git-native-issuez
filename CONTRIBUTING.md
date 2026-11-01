@@ -13,6 +13,8 @@ approach before you put in the work.
   `fsck` fails on mawk) and uuid-runtime.
 - For the attachment test in `test/cli_git.zig`: git-lfs. Without it the
   test is skipped.
+- For the completion and man page test: zsh, fish and mandoc. Each check
+  is skipped without its tool.
 
 ```sh
 zig build test                 # the quick check
@@ -49,6 +51,8 @@ line. When the fuzzer fails, it also prints a replay command for that case
   confirm the fuzzer catches it.
 - **No unbounded work.** Every loop and read has a limit (`Limits`), and no
   input can make a computation loop or overflow.
+- **`--json` output only grows.** Add fields, never rename, retype or
+  remove them ([docs/json.md](docs/json.md)).
 
 ## Code
 
@@ -74,4 +78,5 @@ line. When the fuzzer fails, it also prints a replay command for that case
 One topic per commit, subject `(<type>) <summary>`, where `<type>` is `add`,
 `fix` or `chore`, for example
 `(add) search: --state filter`. The body says what changed and why, and
-names the tests that cover it.
+names the tests that cover it. Update [CHANGELOG.md](CHANGELOG.md) under
+"Unreleased" for user-visible changes.

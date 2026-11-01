@@ -378,6 +378,8 @@ pub fn hasBlankLine(s: []const u8) bool {
 pub const IsoDate = struct {
     time: i64,
     tz: i16,
+    /// RFC 3339 instead, for --json.
+    rfc3339: bool = false,
 
     pub fn format(d: IsoDate, w: *std.Io.Writer) std.Io.Writer.Error!void {
         const local = d.time + @as(i64, d.tz) * 60;
@@ -385,11 +387,16 @@ pub const IsoDate = struct {
         const secs: u32 = @intCast(local - days * 86400);
         const civil = civilFromDays(days);
         const abs_tz: u16 = @abs(d.tz);
-        try w.print("{d:0>4}-{d:0>2}-{d:0>2} {d:0>2}:{d:0>2}:{d:0>2} {c}{d:0>2}{d:0>2}", .{
+        const args = .{
             @as(u32, @intCast(civil.year)),      civil.month,      civil.day,
             secs / 3600,                         (secs / 60) % 60, secs % 60,
             @as(u8, if (d.tz < 0) '-' else '+'), abs_tz / 60,      abs_tz % 60,
-        });
+        };
+        if (d.rfc3339) {
+            try w.print("{d:0>4}-{d:0>2}-{d:0>2}T{d:0>2}:{d:0>2}:{d:0>2}{c}{d:0>2}:{d:0>2}", args);
+        } else {
+            try w.print("{d:0>4}-{d:0>2}-{d:0>2} {d:0>2}:{d:0>2}:{d:0>2} {c}{d:0>2}{d:0>2}", args);
+        }
     }
 };
 

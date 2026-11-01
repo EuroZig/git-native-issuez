@@ -4,6 +4,7 @@ const std = @import("std");
 const context = @import("../context.zig");
 const common = @import("../common.zig");
 const issuez = @import("issuez");
+const json = @import("../json.zig");
 const uuid = issuez.format.uuid;
 
 pub const help =
@@ -30,6 +31,7 @@ pub const help =
     \\   -m, --message <text>  Comment text (add) or commit message (rm, rename)
     \\   --name <name>         Display name instead of the file name (add, one file)
     \\   --remote <remote>     Fetch from this remote (default: every remote)
+    \\   --json                JSON array of attachments (ls; docs/json.md)
     \\   -h, --help            Show this help
     \\
 ;
@@ -51,6 +53,7 @@ pub fn main(comptime B: type, ctx: *context.Context(B), argv: []const []const u8
     var paragraphs: std.ArrayList([]const u8) = .empty;
     var name: ?[]const u8 = null;
     var remote: ?[]const u8 = null;
+    var as_json = false;
     var args: common.Args = .{ .list = argv[1..] };
     while (args.next()) |arg| {
         if (!args.isOption(arg)) {
@@ -66,9 +69,12 @@ pub fn main(comptime B: type, ctx: *context.Context(B), argv: []const []const u8
             name = args.value(ctx.err, arg) orelse return common.exit_error;
         } else if (std.mem.eql(u8, arg, "--remote")) {
             remote = args.value(ctx.err, arg) orelse return common.exit_error;
+        } else if (std.mem.eql(u8, arg, "--json")) {
+            as_json = true;
         } else return common.unknownOption(ctx.err, "attach", arg);
     }
     const w = words.items;
+    if (as_json and sub != .ls) return common.missing(ctx.err, "attach", "--json goes with ls");
     if (remote != null and sub != .fetch and sub != .cat)
         return common.missing(ctx.err, "attach", "--remote goes with fetch and cat");
     if (sub == .fetch) {
@@ -121,6 +127,12 @@ pub fn main(comptime B: type, ctx: *context.Context(B), argv: []const []const u8
         .ls => {
             const issue = repo.load(arena, ref) catch |e| return common.repoFailed(B, ctx, e);
             const entries = att.list(arena, issue) catch |e| return common.repoFailed(B, ctx, e);
+            if (as_json) {
+                var s = json.begin(ctx.out);
+                json.attachmentList(&s, entries) catch |e| return json.failed(ctx.err, e);
+                json.end(&s);
+                return common.exit_ok;
+            }
             for (entries) |e| {
                 const a = e.attachment;
                 ctx.out.print("{s}  {s:<10}  {f}  {s}", .{

@@ -333,12 +333,7 @@ pub fn Catalog(comptime B: type) type {
             id: []const u8,
         ) Error!projection_mod.Progress {
             const proj = try self.projection(arena);
-            var closed: u32 = 0;
-            const leaves = try proj.milestoneLeaves(arena, id);
-            for (leaves) |i| {
-                if (proj.isDone(i)) closed += 1;
-            }
-            return .{ .closed = closed, .total = @intCast(leaves.len) };
+            return proj.milestoneProgress(arena, id);
         }
 
         pub fn editDescription(

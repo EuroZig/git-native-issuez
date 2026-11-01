@@ -228,3 +228,22 @@ are installed.
   is dropped: the replaced local tip stays under `refs/issuez-sync/`.
 
 `fsck` notes quarantined issues on stderr without counting them as errors.
+
+## Output and integrations
+
+- `--json` on `ls`, `show`, `tree`, `search`, `status`, `attach ls`,
+  `milestone ls` and `milestone show` ([json.md](json.md)). Upstream has
+  no JSON output. The text output is unchanged.
+- `completion bash|zsh|fish` prints a completion script. Upstream ships
+  bash and zsh scripts; these are written from scratch (upstream is
+  GPL-2.0) and generated from the help texts. They complete `git-issue`,
+  `git issue` and the `git-issue-<command>` entry points: commands,
+  options, option values, issue IDs (with titles in zsh and fish) and
+  remotes.
+- Man pages: `git-issue(1)`, which `git issue --help` opens through git,
+  and `git-issue-<command>(1)` for every command, like upstream's. The
+  pages carry no date, so builds are reproducible.
+- lazygit: the custom commands in upstream's `docs/lazygit.md` work
+  unchanged, and `test/cli_git.zig` runs each one as lazygit expands it.
+  [lazygit.md](lazygit.md) suggests a menu under one key instead, which
+  keeps lazygit's own keys free.

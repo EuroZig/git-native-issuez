@@ -14,7 +14,9 @@ showing, commenting on, editing, closing and searching issues, `fsck` and
 `push`, `sync`). On top of format 1 it adds planning fields (parent issues,
 blockers, dates, estimates, workflow states), milestones, lifecycle
 events (editing and deleting comments, deleting and restoring issues) and
-image attachments, as extra trailers that upstream keeps and shows.
+image attachments, as extra trailers that upstream keeps and shows. Read
+commands print JSON with `--json`, and the install includes shell
+completions and man pages.
 
 > [!WARNING]
 > Generative AI was used to edit and/or produce large portions of this code.
@@ -23,7 +25,7 @@ image attachments, as extra trailers that upstream keeps and shows.
 ## Usage
 
 ```sh
-zig build --prefix ~/.local     # installs git-issue and the git-issue-<sub> links
+zig build --prefix ~/.local     # git-issue, the git-issue-<sub> links, completions, man pages
 git issue create "Login page crashes" -l bug -p high
 git issue ls
 git issue comment a7f3 -m "Happens on Safari only."
@@ -39,6 +41,7 @@ git issue attach cat a7f3 fc7b > login.png
 git issue close a7f3 --fixed-by 1a2b3c4
 git issue show a7f3
 git issue search -i safari
+git issue ls --json              # for scripts, see docs/json.md
 git issue fsck
 git issue sync origin            # merge the remote's issues, push ours
 ```
@@ -73,7 +76,19 @@ remote issue whose history was rewritten is quarantined until you decide
 (`git issue status`, `git issue quarantine`). Clones can sync with
 upstream's `git issue merge` and `git push` too.
 
-`git issue <command> --help` describes each command.
+`git issue <command> --help` describes each command. The same texts are
+installed as man pages (`man git-issue-create`; `git issue --help` opens
+`git-issue(1)` through git). `zig build install` puts them and the bash,
+zsh and fish completions under the prefix's `share/`, for native builds.
+`git issue completion <shell>` prints a completion script by hand.
+
+`--json` on `ls`, `show`, `tree`, `search`, `status`, `attach ls`,
+`milestone ls` and `milestone show` prints JSON for scripts and programs
+that don't link the library. Fields are only ever added
+([docs/json.md](docs/json.md)).
+
+For [lazygit](https://github.com/jesseduffield/lazygit),
+[docs/lazygit.md](docs/lazygit.md) has an issues menu under one key.
 
 Like upstream, the `git-issue-<command>` entry points are installed next to
 `git-issue`, so scripts that call them directly keep working.
@@ -125,16 +140,19 @@ for (open) |issue| std.debug.print("{s} {s}\n", .{ issue.state.text(), issue.tit
 - [docs/format.md](docs/format.md): the format on disk.
 - [docs/attachments.md](docs/attachments.md): attachments in the CLI and
   the library.
+- [docs/json.md](docs/json.md): the `--json` output.
+- [docs/lazygit.md](docs/lazygit.md): an issues menu for lazygit.
 - [docs/design.md](docs/design.md): how the library is put together.
 - [docs/compatibility.md](docs/compatibility.md): where the CLI differs from
   upstream on purpose.
+- [CHANGELOG.md](CHANGELOG.md): what changed.
 
 ## Development
 
 Requires Zig 0.16.0 and git 2.30 or newer.
 
 ```sh
-zig build                      # git-issue and the git-issue-<sub> links
+zig build                      # git-issue, the git-issue-<sub> links, completions, man pages
 zig build test                 # unit, backend, CLI, simulator and fuzz smoke tests, examples
 zig build test-interop         # both tools on shared repositories (fetches upstream)
 zig build test-upstream-suite  # upstream's t/*.sh against our git-issue

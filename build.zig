@@ -38,6 +38,8 @@ pub fn build(b: *std.Build) void {
     const exe = cli.exe("git-issue", "src/cli/main.zig", optimize);
     b.installArtifact(exe);
     installEntryPoints(b, exe);
+    installCompletions(b, exe);
+    installManPages(b, exe);
 
     const run_step = b.step("run", "Run git-issue");
     const run_exe = b.addRunArtifact(exe);
@@ -328,6 +330,66 @@ fn makeEntryPointLinks(step: *std.Build.Step, options: std.Build.Step.MakeOption
         std.Io.Dir.cwd().symLinkAtomic(io, "git-issue", link, .{}) catch |err|
             return step.fail("unable to symlink {s} -> git-issue: {t}", .{ link, err });
     }
+}
+
+/// Skipped for cross builds, where the binary can't run to print them.
+fn installCompletions(b: *std.Build, exe: *std.Build.Step.Compile) void {
+    if (!runsOnHost(b, exe)) return;
+    const Install = struct { shell: []const u8, dir: []const u8, file: []const u8 };
+    // bash-completion and fish look scripts up by command name, so every
+    // entry point gets a copy. zsh's `#compdef` line covers them all.
+    var installs: std.ArrayList(Install) = .empty;
+    const bash_dir = "share/bash-completion/completions";
+    const fish_dir = "share/fish/vendor_completions.d";
+    installs.appendSlice(b.allocator, &.{
+        .{ .shell = "bash", .dir = bash_dir, .file = "git-issue" },
+        .{ .shell = "zsh", .dir = "share/zsh/site-functions", .file = "_git-issue" },
+        .{ .shell = "fish", .dir = fish_dir, .file = "git-issue.fish" },
+    }) catch @panic("OOM");
+    for (entry_points.names) |name| installs.appendSlice(b.allocator, &.{
+        .{ .shell = "bash", .dir = bash_dir, .file = b.fmt("git-issue-{s}", .{name}) },
+        .{ .shell = "fish", .dir = fish_dir, .file = b.fmt("git-issue-{s}.fish", .{name}) },
+    }) catch @panic("OOM");
+
+    var scripts: [3]?std.Build.LazyPath = @splat(null);
+    const shells = [_][]const u8{ "bash", "zsh", "fish" };
+    for (installs.items) |i| {
+        const index = for (shells, 0..) |s, k| {
+            if (std.mem.eql(u8, s, i.shell)) break k;
+        } else unreachable;
+        const script = scripts[index] orelse blk: {
+            const gen = b.addRunArtifact(exe);
+            gen.addArgs(&.{ "completion", i.shell });
+            gen.expectExitCode(0);
+            scripts[index] = gen.captureStdOut(.{});
+            break :blk scripts[index].?;
+        };
+        b.getInstallStep().dependOn(&b.addInstallFileWithDir(
+            script,
+            .prefix,
+            b.fmt("{s}/{s}", .{ i.dir, i.file }),
+        ).step);
+    }
+}
+
+/// Native builds only, like the completions.
+fn installManPages(b: *std.Build, exe: *std.Build.Step.Compile) void {
+    if (!runsOnHost(b, exe)) return;
+    const gen = b.addRunArtifact(exe);
+    gen.addArg("__manpages");
+    const pages = gen.addOutputDirectoryArg("man1");
+    gen.expectExitCode(0);
+    b.getInstallStep().dependOn(&b.addInstallDirectory(.{
+        .source_dir = pages,
+        .install_dir = .prefix,
+        .install_subdir = "share/man/man1",
+    }).step);
+}
+
+fn runsOnHost(b: *std.Build, exe: *std.Build.Step.Compile) bool {
+    const target = exe.rootModuleTarget();
+    const host = b.graph.host.result;
+    return target.os.tag == host.os.tag and target.cpu.arch == host.cpu.arch;
 }
 
 fn hasPath(b: *std.Build, path: []const u8) bool {

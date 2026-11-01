@@ -5,9 +5,11 @@
 //! Every command is checked by the oracle and the engine's reading of each
 //! issue is compared with the oracle's. Now and then another tool writes
 //! extension fields (invalid ones too), or someone force-pushes to the
-//! hub, so clones quarantine and resolve. Finally all clones sync,
-//! accepting the hub's version of anything quarantined, until they hold
-//! exactly the hub's refs. A failing case prints its seed:
+//! hub, so clones quarantine and resolve. Read commands often run with
+//! `--json`, whose output must parse and agree with the oracle's reading
+//! of each issue it lists. Finally all clones sync, accepting the hub's
+//! version of anything quarantined, until they hold exactly the hub's
+//! refs. A failing case prints its seed:
 //!
 //!     git-issue-fuzz --seed <seed> --iterations 1
 
@@ -193,6 +195,9 @@ const words = [_][]const u8{
     "Firefox",
     "\xc3\xbcber",
     "edge\xe2\x9c\x93",
+    // Not UTF-8, and characters JSON escapes.
+    "bad\xff\xfe",
+    "q\"uo\\te",
     "--",
     "-x",
 };
@@ -380,7 +385,7 @@ fn generateMilestoneWork(
     const id = try genPrefix(arena, rand, ids);
     const by_id = milestones.len > 0 and rand.uintLessThan(u8, 3) == 0;
     const named = if (rand.uintLessThan(u8, 4) == 0) "v2" else "v1";
-    var kind = rand.uintLessThan(u8, 8);
+    var kind = rand.uintLessThan(u8, 9);
     if (milestones.len == 0 and rand.boolean()) kind = 0;
     if (kind == 0 and milestones.len > 0 and rand.uintLessThan(u8, 8) != 0) kind = 1;
     const name = if (by_id and kind != 0 and kind != 2)
@@ -417,7 +422,14 @@ fn generateMilestoneWork(
             break :blk .{ .edit = x };
         },
         5, 6 => if (rand.boolean()) .{ .close = .{ .id = id } } else .{ .reopen = .{ .id = id } },
-        else => if (rand.boolean()) .{ .delete = .{ .id = id } } else .{ .restore = .{ .id = id } },
+        7 => if (rand.boolean()) .{ .delete = .{ .id = id } } else .{ .restore = .{ .id = id } },
+        // Its issues and progress, inherited ones included; the catalog.
+        else => .{ .read = if (rand.uintLessThan(u8, 3) != 0)
+            try arena.dupe([]const u8, &.{ "milestone", "show", name })
+        else if (rand.boolean())
+            try arena.dupe([]const u8, &.{ "milestone", "ls", "--all" })
+        else
+            try arena.dupe([]const u8, &.{ "milestone", "ls" }) },
     };
     return .{ .cmd = cmd };
 }
@@ -572,7 +584,7 @@ fn generate(arena: Allocator, rand: std.Random, ids: []const []const u8) Allocat
             try arena.dupe([]const u8, &.{ "fsck", pick(rand, &.{ "--quiet", "--" }) })
         else
             try arena.dupe([]const u8, &.{
-                pick(rand, &.{ "show", "search" }),
+                pick(rand, &.{ "show", "search", "tree" }),
                 try genPrefix(arena, rand, ids),
             }) } },
         11 => {
@@ -717,7 +729,8 @@ fn fuzzCommands(
             try generateLifecycle(arena, rand, ids.items, commits.items)
         else
             try generate(arena, rand, ids.items);
-        _ = try step(io, gpa, arena, environ_map, &world, clone_index, gen.cmd, gen.must_succeed);
+        const cmd = try withJson(arena, rand, gen.cmd);
+        _ = try step(io, gpa, arena, environ_map, &world, clone_index, cmd, gen.must_succeed);
     }
 
     // Everyone syncs and takes the hub's version of whatever got
@@ -848,7 +861,7 @@ const foreign_pools = [_]struct { []const u8, []const []const u8 }{
     .{ "X-Start-Date", &date_pool },
     .{ "X-Due-Date", &(date_pool ++ [_][]const u8{""}) },
     .{ "X-Estimate-Minutes", &estimate_pool },
-    .{ "X-Workflow-State", &(workflow_pool ++ [_][]const u8{""}) },
+    .{ "X-Workflow-State", &(workflow_pool ++ [_][]const u8{ "", "do\xffing" }) },
     .{ "X-Milestone-Mode", &milestone_mode_pool },
     .{ "X-Deleted", &.{ "true", "false", "maybe", "" } },
 };
@@ -1003,6 +1016,8 @@ fn step(
     const argv = try cmd.argv(arena);
     var discard_buf: [256]u8 = undefined;
     var discarding: std.Io.Writer.Discarding = .init(&discard_buf);
+    const json = cmd == .read and issuez.format.labels.contains(argv, "--json");
+    var captured: std.Io.Writer.Allocating = .init(arena);
     const code = try simulate.run(
         io,
         gpa,
@@ -1011,7 +1026,7 @@ fn step(
         world,
         clone_index,
         argv,
-        &discarding.writer,
+        if (json) &captured.writer else &discarding.writer,
         &discarding.writer,
     );
     countOutcome(cmd.verb(), code == 0);
@@ -1040,6 +1055,7 @@ fn step(
         return reject(report);
     }
     try crossCheckModel(arena, world, clone_index);
+    if (json and code == 0) try checkJson(arena, world, clone_index, argv, captured.written());
     if (writes and code == 0) {
         // Our writes never break a guard, so no new violation may appear.
         for (try guardViolations(arena, world, clone_index)) |v| {
@@ -1185,6 +1201,451 @@ fn crossCheckModel(arena: Allocator, world: *World, clone_index: usize) CaseErro
             return error.ModelMismatch;
         }
     }
+}
+
+/// Read commands that take `--json`, as their first words.
+const json_reads = [_][]const []const u8{
+    &.{"ls"},     &.{"show"},           &.{"tree"},              &.{"search"},
+    &.{"status"}, &.{ "attach", "ls" }, &.{ "milestone", "ls" }, &.{ "milestone", "show" },
+};
+
+/// Adds `--json` to half the reads that take it.
+fn withJson(arena: Allocator, rand: std.Random, cmd: Command) Allocator.Error!Command {
+    const read = switch (cmd) {
+        .read => |w| w,
+        else => return cmd,
+    };
+    for (json_reads) |r| {
+        if (read.len < r.len or !std.mem.eql(u8, read[0], r[0])) continue;
+        if (r.len == 2 and !std.mem.eql(u8, read[1], r[1])) continue;
+        if (rand.boolean()) return cmd;
+        // Last, so it never becomes the value of an option.
+        return .{ .read = try std.mem.concat(arena, []const u8, &.{ read, &.{"--json"} }) };
+    }
+    return cmd;
+}
+
+/// `--json` output must parse (the parser also rejects text that isn't
+/// UTF-8), and every issue in it must read as the oracle reads the issue:
+/// text with bytes that aren't UTF-8 replaced, as docs/json.md says.
+fn checkJson(
+    arena: Allocator,
+    world: *World,
+    clone_index: usize,
+    argv: []const []const u8,
+    out: []const u8,
+) CaseError!void {
+    const shown = try std.mem.join(arena, " ", argv);
+    const value = std.json.parseFromSliceLeaky(std.json.Value, arena, out, .{}) catch |err| {
+        std.debug.print("  {s}: invalid JSON ({t}):\n{s}\n", .{ shown, err, out });
+        return error.ModelMismatch;
+    };
+    var issues: std.ArrayList(std.json.ObjectMap) = .empty;
+    const verb = argv[0];
+    const ok = if (std.mem.eql(u8, verb, "ls"))
+        try collect(arena, &issues, value, .list)
+    else if (std.mem.eql(u8, verb, "show"))
+        try collect(arena, &issues, value, .one)
+    else if (std.mem.eql(u8, verb, "search"))
+        try collect(arena, &issues, value, .matches)
+    else if (std.mem.eql(u8, verb, "tree"))
+        try collect(arena, &issues, value, .nodes)
+    else
+        value == .object or value == .array;
+    if (!ok) {
+        std.debug.print("  {s}: unexpected JSON shape:\n{s}\n", .{ shown, out });
+        return error.ModelMismatch;
+    }
+
+    const naive_clone = try oracle.commands.Clone.init(arena, world.format, world.clones[clone_index]);
+    const j: JsonCheck = .{ .arena = arena, .clone = naive_clone, .shown = shown, .out = out };
+    if (std.mem.eql(u8, verb, "status")) return j.status(value);
+    if (std.mem.eql(u8, verb, "attach")) return j.attachments(value, argv[2]);
+    if (std.mem.eql(u8, verb, "milestone")) return if (std.mem.eql(u8, argv[1], "ls"))
+        j.milestoneList(value, issuez.format.labels.contains(argv, "--all"))
+    else
+        j.milestoneShow(value);
+    var seen: std.StringHashMapUnmanaged(void) = .empty;
+    for (issues.items) |o| {
+        const id = jsonText(o, "id") orelse return badJson(shown, "an issue without an id", out);
+        // `tree` may show an issue under each of its places; `ls` once.
+        if ((try seen.fetchPut(arena, id, {})) != null and !std.mem.eql(u8, verb, "tree"))
+            return badJson(shown, "an issue twice", out);
+        const name = try std.fmt.allocPrint(arena, "refs/issues/{s}", .{id});
+        const tip = for (world.clones[clone_index].refs) |r| {
+            if (std.mem.eql(u8, r.name, name)) break r.oid;
+        } else return badJson(shown, "an issue that isn't there", out);
+        const n = naive_clone.naive(tip) catch |err| switch (err) {
+            error.OutOfMemory => |e| return e,
+            error.NoRule => return error.OracleNoRule,
+        };
+        if (!try sameAsNaive(arena, o, n)) {
+            std.debug.print("  {s}: issue {s} differs from the oracle's reading\n", .{ shown, id });
+            return badJson(shown, "a wrong issue", out);
+        }
+    }
+    countOutcome("(--json issues)", true);
+}
+
+/// `status`, `attach ls` and `milestone` output against the refs and the
+/// oracle's reading of them.
+const JsonCheck = struct {
+    arena: Allocator,
+    clone: oracle.commands.Clone,
+    shown: []const u8,
+    out: []const u8,
+
+    const Value = std.json.Value;
+
+    fn bad(j: JsonCheck, what: []const u8) CaseError {
+        return badJson(j.shown, what, j.out);
+    }
+
+    fn done(_: JsonCheck, what: []const u8) void {
+        countOutcome(what, true);
+    }
+
+    fn asArray(v: ?Value) ?[]const Value {
+        const a = v orelse return null;
+        return if (a == .array) a.array.items else null;
+    }
+
+    fn asObject(v: Value) ?std.json.ObjectMap {
+        return if (v == .object) v.object else null;
+    }
+
+    fn isText(j: JsonCheck, o: std.json.ObjectMap, key: []const u8, want: []const u8) !bool {
+        const got = jsonText(o, key) orelse return false;
+        return std.mem.eql(u8, got, try utf8(j.arena, want));
+    }
+
+    /// Refs under `prefix`, by the rest of their name.
+    fn refsUnder(j: JsonCheck, prefix: []const u8) !std.StringHashMapUnmanaged([]const u8) {
+        var out: std.StringHashMapUnmanaged([]const u8) = .empty;
+        for (j.clone.clone.refs) |r| if (std.mem.startsWith(u8, r.name, prefix)) {
+            try out.put(j.arena, r.name[prefix.len..], r.oid);
+        };
+        return out;
+    }
+
+    fn naiveIssue(j: JsonCheck, id: []const u8) CaseError!?oracle.commands.NaiveIssue {
+        const tip = j.clone.ref(try std.fmt.allocPrint(j.arena, "refs/issues/{s}", .{id})) orelse
+            return null;
+        return j.clone.naive(tip) catch |err| switch (err) {
+            error.OutOfMemory => |e| return e,
+            error.NoRule => return error.OracleNoRule,
+        };
+    }
+
+    /// Remotes from the config; per remote the quarantines (from their
+    /// records) and the pending issues: not quarantined, tip not the
+    /// `pushed` record.
+    fn status(j: JsonCheck, v: Value) CaseError!void {
+        const o = asObject(v) orelse return j.bad("a status that isn't an object");
+        var configured: std.ArrayList([]const u8) = .empty;
+        for (j.clone.clone.config) |e| {
+            if (!std.mem.startsWith(u8, e.key, "remote.") or !std.mem.endsWith(u8, e.key, ".url"))
+                continue;
+            try configured.append(j.arena, e.key["remote.".len .. e.key.len - ".url".len]);
+        }
+        const remotes = asArray(o.get("remotes")) orelse return j.bad("no remotes");
+        if (remotes.len != configured.items.len) return j.bad("other remotes than configured");
+        for (remotes) |rv| {
+            const r = asObject(rv) orelse return j.bad("a remote that isn't an object");
+            const name = jsonText(r, "name") orelse return j.bad("a remote without a name");
+            if (!issuez.format.labels.contains(configured.items, name))
+                return j.bad("a remote that isn't configured");
+            const base = try std.fmt.allocPrint(j.arena, "refs/issuez-sync/{s}/", .{name});
+            const issue_marks = try j.refsUnder(try std.fmt.allocPrint(j.arena, "{s}quarantined/issues/", .{base}));
+            const milestone_marks = try j.refsUnder(try std.fmt.allocPrint(j.arena, "{s}quarantined/milestones/", .{base}));
+            const quarantined = asArray(r.get("quarantined")) orelse return j.bad("no quarantined list");
+            if (quarantined.len != issue_marks.count() + milestone_marks.count())
+                return j.bad("other quarantines than recorded");
+            for (quarantined) |qv| {
+                const q = asObject(qv) orelse return j.bad("a quarantine that isn't an object");
+                const id = jsonText(q, "id") orelse return j.bad("a quarantine without an id");
+                const kind = jsonText(q, "kind") orelse return j.bad("a quarantine without a kind");
+                const ns = if (std.mem.eql(u8, kind, "issue"))
+                    "issues"
+                else if (std.mem.eql(u8, kind, "milestone"))
+                    "milestones"
+                else
+                    return j.bad("a quarantine of another kind");
+                const marks = if (ns[0] == 'i') issue_marks else milestone_marks;
+                const tip = marks.get(id) orelse return j.bad("a quarantine that isn't recorded");
+                if (!std.mem.eql(u8, jsonText(q, "remote_tip") orelse "", tip))
+                    return j.bad("a quarantine with another remote tip");
+                const kept = j.clone.ref(try std.fmt.allocPrint(j.arena, "{s}kept/{s}/{s}", .{ base, ns, id }));
+                const kept_local = q.get("kept_local") orelse return j.bad("no kept_local");
+                const want_kept = kept != null and std.mem.eql(u8, kept.?, tip);
+                if (kept_local != .bool or kept_local.bool != want_kept)
+                    return j.bad("a wrong kept_local");
+                if (jsonText(q, "title") == null) return j.bad("a quarantine without a title");
+                const reason = q.get("reason") orelse return j.bad("no reason");
+                if (reason != .null) {
+                    const known = [_][]const u8{ "unrelated_history", "rewound", "invalid_issue" };
+                    if (reason != .string or !issuez.format.labels.contains(&known, reason.string))
+                        return j.bad("an unknown reason");
+                }
+            }
+            const pushed = try j.refsUnder(try std.fmt.allocPrint(j.arena, "{s}pushed/issues/", .{base}));
+            var want: std.ArrayList([]const u8) = .empty;
+            for (j.clone.clone.refs) |ref| {
+                if (!std.mem.startsWith(u8, ref.name, "refs/issues/")) continue;
+                const id = ref.name["refs/issues/".len..];
+                if (issue_marks.contains(id)) continue;
+                if (pushed.get(id)) |p| if (std.mem.eql(u8, p, ref.oid)) continue;
+                try want.append(j.arena, id);
+            }
+            const pending = asArray(r.get("pending")) orelse return j.bad("no pending list");
+            var got: std.ArrayList([]const u8) = .empty;
+            for (pending) |p| {
+                if (p != .string) return j.bad("a pending entry that isn't an ID");
+                try got.append(j.arena, p.string);
+            }
+            if (!oracle.commands.sameSet(got.items, want.items) or got.items.len != want.items.len)
+                return j.bad("other pending issues than the records say");
+        }
+        const conflicts = asArray(o.get("conflicts")) orelse return j.bad("no conflicts list");
+        for (conflicts) |cv| {
+            const c = asObject(cv) orelse return j.bad("a conflict that isn't an object");
+            const id = jsonText(c, "id") orelse return j.bad("a conflict without an id");
+            if (try j.naiveIssue(id) == null) return j.bad("a conflict on an issue that isn't there");
+            for ([_][]const u8{ "field", "kept", "lost" }) |k| {
+                if (jsonText(c, k) == null) return j.bad("a conflict without field, kept or lost");
+            }
+        }
+        j.done("(--json status)");
+    }
+
+    /// Exactly the issue's attachments as the oracle reads them.
+    fn attachments(j: JsonCheck, v: Value, prefix: []const u8) CaseError!void {
+        const listed = asArray(v) orelse return j.bad("attachments that aren't an array");
+        const refs = try j.clone.matching(prefix);
+        if (refs.len != 1) return j.bad("attachments of an ambiguous or unknown issue");
+        const n = (try j.naiveIssue(refs[0]["refs/issues/".len..])).?;
+        if (listed.len != n.attachments.len) return j.bad("other attachments than the oracle's");
+        for (listed) |av| {
+            const a = asObject(av) orelse return j.bad("an attachment that isn't an object");
+            const id = jsonText(a, "id") orelse return j.bad("an attachment without an id");
+            const want = for (n.attachments) |na| {
+                if (std.mem.eql(u8, na.id, id)) break na;
+            } else return j.bad("an attachment the oracle doesn't know");
+            const size = a.get("size") orelse return j.bad("an attachment without a size");
+            const want_size = std.fmt.parseInt(i64, want.size, 10) catch
+                return j.bad("an attachment with a size the oracle can't read");
+            if (!try j.isText(a, "name", want.name) or !try j.isText(a, "media_type", want.media) or
+                !try j.isText(a, "sha256", want.sha256) or size != .integer or
+                size.integer != want_size)
+                return j.bad("an attachment that differs from the oracle's");
+            const availability = jsonText(a, "availability") orelse "";
+            if (!issuez.format.labels.contains(&.{ "local", "missing", "corrupt" }, availability))
+                return j.bad("an attachment without a known availability");
+        }
+        j.done("(--json attach ls)");
+    }
+
+    /// The catalog as the oracle reads it: open milestones, or all.
+    fn milestoneList(j: JsonCheck, v: Value, all: bool) CaseError!void {
+        const listed = asArray(v) orelse return j.bad("milestones that aren't an array");
+        const naive = j.clone.milestones() catch |err| switch (err) {
+            error.OutOfMemory => |e| return e,
+            error.NoRule => return error.OracleNoRule,
+        };
+        var want: usize = 0;
+        for (naive) |m| {
+            if (!all and !std.mem.eql(u8, m.status, "open")) continue;
+            want += 1;
+        }
+        if (listed.len != want) return j.bad("other milestones than the oracle's");
+        for (listed) |mv| _ = try j.milestone(mv, naive, all);
+        j.done("(--json milestone ls)");
+    }
+
+    fn milestone(
+        j: JsonCheck,
+        mv: Value,
+        naive: []const oracle.commands.NaiveMilestone,
+        all: bool,
+    ) CaseError!oracle.commands.NaiveMilestone {
+        const m = asObject(mv) orelse return j.bad("a milestone that isn't an object");
+        const id = jsonText(m, "id") orelse return j.bad("a milestone without an id");
+        const want = for (naive) |n| {
+            if (std.mem.eql(u8, n.id, id)) break n;
+        } else return j.bad("a milestone the oracle doesn't know");
+        if (!all and !std.mem.eql(u8, want.status, "open")) return j.bad("a milestone that isn't open");
+        if (!try j.isText(m, "name", want.name) or !try j.isText(m, "status", want.status) or
+            !std.mem.eql(u8, jsonText(m, "short_id") orelse "", id[0..7]))
+            return j.bad("a milestone that differs from the oracle's");
+        return want;
+    }
+
+    /// Without restating inheritance: every listed issue is there, not
+    /// deleted and linked to the milestone itself or through its parents;
+    /// every issue linked directly (mode `explicit`, or unset with an ID)
+    /// is listed, unless the milestone is retired.
+    fn milestoneShow(j: JsonCheck, v: Value) CaseError!void {
+        const naive = j.clone.milestones() catch |err| switch (err) {
+            error.OutOfMemory => |e| return e,
+            error.NoRule => return error.OracleNoRule,
+        };
+        const m = try j.milestone(v, naive, true);
+        const progress = asObject(v.object.get("progress") orelse return j.bad("no progress")) orelse
+            return j.bad("a progress that isn't an object");
+        const closed = progress.get("closed") orelse return j.bad("no closed count");
+        const total = progress.get("total") orelse return j.bad("no total count");
+        if (closed != .integer or total != .integer or closed.integer < 0 or
+            closed.integer > total.integer) return j.bad("a progress that doesn't add up");
+        const members = asArray(v.object.get("issues")) orelse return j.bad("no issues list");
+        var listed: std.ArrayList([]const u8) = .empty;
+        for (members) |iv| {
+            if (iv != .string) return j.bad("an issue entry that isn't an ID");
+            try listed.append(j.arena, iv.string);
+            var cur = (try j.naiveIssue(iv.string)) orelse return j.bad("an issue that isn't there");
+            if (std.mem.eql(u8, cur.deleted, "true")) return j.bad("a deleted issue");
+            // The nearest link up the chain; loops end at the step limit.
+            var linked = false;
+            for (0..64) |_| {
+                if (std.mem.eql(u8, cur.milestone_id, m.id)) linked = true;
+                if (linked or cur.parent.len == 0) break;
+                cur = (try j.naiveIssue(cur.parent)) orelse break;
+            }
+            if (!linked) return j.bad("an issue not linked to the milestone");
+        }
+        if (total.integer > members.len) return j.bad("more leaves than issues");
+        if (std.mem.eql(u8, m.status, "retired")) return j.done("(--json milestone show)");
+        for (j.clone.clone.refs) |r| {
+            if (!std.mem.startsWith(u8, r.name, "refs/issues/")) continue;
+            const id = r.name["refs/issues/".len..];
+            const n = (try j.naiveIssue(id)).?;
+            if (!std.mem.eql(u8, n.milestone_id, m.id) or std.mem.eql(u8, n.deleted, "true")) continue;
+            const mode = n.milestone_mode;
+            if (std.mem.eql(u8, mode, "none") or std.mem.eql(u8, mode, "inherit")) continue;
+            if (!issuez.format.labels.contains(listed.items, id))
+                return j.bad("a directly linked issue that isn't listed");
+        }
+        j.done("(--json milestone show)");
+    }
+};
+
+fn badJson(shown: []const u8, what: []const u8, out: []const u8) CaseError {
+    std.debug.print("  {s}: JSON with {s}:\n{s}\n", .{ shown, what, out });
+    return error.ModelMismatch;
+}
+
+const Shape = enum { list, one, matches, nodes };
+
+/// The issue objects of a command's output. False when the shape is wrong.
+fn collect(
+    arena: Allocator,
+    issues: *std.ArrayList(std.json.ObjectMap),
+    v: std.json.Value,
+    shape: Shape,
+) Allocator.Error!bool {
+    switch (shape) {
+        .one => {
+            if (v != .object) return false;
+            try issues.append(arena, v.object);
+        },
+        .list, .matches, .nodes => {
+            if (v != .array) return false;
+            for (v.array.items) |item| {
+                if (item != .object) return false;
+                if (shape == .list) {
+                    try issues.append(arena, item.object);
+                    continue;
+                }
+                const inner = item.object.get("issue") orelse return false;
+                if (inner != .object) return false;
+                try issues.append(arena, inner.object);
+                if (shape == .nodes) {
+                    const children = item.object.get("children") orelse return false;
+                    if (!try collect(arena, issues, children, .nodes)) return false;
+                }
+            }
+        },
+    }
+    return true;
+}
+
+fn jsonText(o: std.json.ObjectMap, key: []const u8) ?[]const u8 {
+    const v = o.get(key) orelse return null;
+    return if (v == .string) v.string else null;
+}
+
+/// How `--json` writes text: bytes that aren't UTF-8 become U+FFFD.
+fn utf8(arena: Allocator, v: []const u8) Allocator.Error![]const u8 {
+    return std.fmt.allocPrint(arena, "{f}", .{std.unicode.fmtUtf8(v)});
+}
+
+/// The core fields as the oracle reads them, `null` for "". Extension
+/// fields only when set, since `--json` leaves out values it can't parse.
+fn sameAsNaive(
+    arena: Allocator,
+    o: std.json.ObjectMap,
+    n: oracle.commands.NaiveIssue,
+) Allocator.Error!bool {
+    const Same = struct {
+        fn text(a: Allocator, obj: std.json.ObjectMap, key: []const u8, want: []const u8) !bool {
+            const v = obj.get(key) orelse return false;
+            if (want.len == 0) return v == .null;
+            return v == .string and std.mem.eql(u8, v.string, try utf8(a, want));
+        }
+        fn ifSet(a: Allocator, obj: std.json.ObjectMap, key: []const u8, raw: []const u8) !bool {
+            const v = obj.get(key) orelse return false;
+            if (v == .null) return true;
+            return v == .string and std.mem.eql(u8, v.string, try utf8(a, raw));
+        }
+    };
+    if (!try Same.text(arena, o, "title", n.title)) return false;
+    if (!try Same.text(arena, o, "state", n.state)) return false;
+    if (!try Same.text(arena, o, "priority", n.priority)) return false;
+    if (!try Same.text(arena, o, "milestone", n.milestone)) return false;
+    // The email, also for the `<uuid> <email>` form.
+    const assignee = o.get("assignee") orelse return false;
+    if (n.assignee.len == 0) {
+        if (assignee != .null) return false;
+    } else {
+        if (assignee != .string) return false;
+        const raw = try utf8(arena, n.assignee);
+        if (!std.mem.eql(u8, assignee.string, raw) and
+            !std.mem.endsWith(u8, raw, try std.fmt.allocPrint(arena, " {s}", .{assignee.string})))
+            return false;
+    }
+    for ([_]struct { []const u8, []const u8 }{
+        .{ "parent", n.parent },             .{ "start", n.start },
+        .{ "due", n.due },                   .{ "workflow", n.workflow },
+        .{ "milestone_id", n.milestone_id },
+    }) |f| if (!try Same.ifSet(arena, o, f[0], f[1])) return false;
+
+    const deleted = o.get("deleted") orelse return false;
+    if (deleted != .bool or deleted.bool != std.mem.eql(u8, n.deleted, "true")) return false;
+
+    const labels = o.get("labels") orelse return false;
+    if (labels != .array or labels.array.items.len != n.labels.len) return false;
+    for (labels.array.items) |l| {
+        if (l != .string) return false;
+        const found = for (n.labels) |want| {
+            if (std.mem.eql(u8, l.string, try utf8(arena, want))) break true;
+        } else false;
+        if (!found) return false;
+    }
+    const blocked_by = o.get("blocked_by") orelse return false;
+    if (blocked_by != .array) return false;
+    for (blocked_by.array.items) |b| {
+        if (b != .string or !issuez.format.labels.contains(n.blocked_by, b.string)) return false;
+    }
+    const attachments = o.get("attachments") orelse return false;
+    if (attachments != .array or attachments.array.items.len != n.attachments.len) return false;
+    for (attachments.array.items) |a| {
+        if (a != .object) return false;
+        const id = jsonText(a.object, "id") orelse return false;
+        const found = for (n.attachments) |na| {
+            if (std.mem.eql(u8, na.id, id)) break true;
+        } else false;
+        if (!found) return false;
+    }
+    return true;
 }
 
 fn sameAttachments(
