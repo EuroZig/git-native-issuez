@@ -193,7 +193,7 @@ fn checkAttachments(
         const entries: []const A.Entry = if (!check_bytes)
             &.{}
         else
-            att.list(ctx.arena, issue) catch |e| {
+            att.list(ctx.arena, issue, .{ .verify = true }) catch |e| {
                 common.reportRepoError(B, ctx, e);
                 errors += 1;
                 continue;

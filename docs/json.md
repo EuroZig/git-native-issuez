@@ -132,8 +132,9 @@ place.
 ```
 
 `availability` (`attach ls` only) is `local`, `missing` (the bytes aren't in
-this clone yet: `git issue attach fetch`) or `corrupt`. The bytes themselves
-come from `git issue attach cat`.
+this clone yet: `git issue attach fetch`) or `corrupt` (stored at the wrong
+size; `attach ls` doesn't read the bytes, `git issue fsck` hashes them). The
+bytes themselves come from `git issue attach cat`.
 
 ## Status
 

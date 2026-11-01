@@ -54,8 +54,12 @@ pub const World = struct {
         lfs: []const LfsObject = &.{},
     };
 
+    /// Like GitProcess: `issuez` is the store, `git_lfs` git-lfs's copy
+    /// for transfers.
+    pub const LfsStore = enum { issuez, git_lfs };
+
     pub const LfsObject = struct {
-        store: contract.LfsStore,
+        store: LfsStore,
         sha256: []const u8,
         data: []const u8,
     };
@@ -387,57 +391,66 @@ pub fn randomBytes(sim: *GitSim, buf: []u8) void {
     sim.prng.random().bytes(buf);
 }
 
-pub fn lfsRead(
-    sim: *GitSim,
-    arena: Allocator,
-    store: contract.LfsStore,
-    sha256: []const u8,
-) Error!?[]const u8 {
+/// Ours when it hashes right, else git-lfs's put into ours when it does,
+/// else whatever there is. Like GitProcess.
+pub fn lfsRead(sim: *GitSim, arena: Allocator, sha256: []const u8) Error!?[]const u8 {
     _ = arena;
     checkSha(sha256);
-    for (sim.lfs.items) |o| if (o.store == store and std.mem.eql(u8, o.sha256, sha256)) {
+    const ours = sim.stored(.issuez, sha256);
+    if (ours) |data| if (hashes(data, sha256)) return data;
+    const theirs = sim.stored(.git_lfs, sha256) orelse return ours;
+    if (!hashes(theirs, sha256)) return ours orelse theirs;
+    try sim.store(.issuez, sha256, theirs);
+    return theirs;
+}
+
+pub fn lfsSize(sim: *GitSim, sha256: []const u8) Error!?u64 {
+    checkSha(sha256);
+    return if (sim.stored(.issuez, sha256)) |d| d.len else null;
+}
+
+pub fn lfsWrite(sim: *GitSim, sha256: []const u8, data: []const u8) Error!void {
+    checkSha(sha256);
+    if (!hashes(data, sha256)) protocolViolation("LFS object stored under a wrong hash", .{});
+    try sim.store(.issuez, sha256, data);
+}
+
+pub fn lfsList(sim: *GitSim, arena: Allocator) Error![]const []const u8 {
+    var out: std.ArrayList([]const u8) = .empty;
+    for (sim.lfs.items) |o| if (o.store == .issuez) try out.append(arena, o.sha256);
+    std.mem.sort([]const u8, out.items, {}, stringLessThan);
+    return out.items;
+}
+
+fn stored(sim: *GitSim, s: World.LfsStore, sha256: []const u8) ?[]const u8 {
+    for (sim.lfs.items) |o| if (o.store == s and std.mem.eql(u8, o.sha256, sha256)) {
         return o.data;
     };
     return null;
 }
 
-pub fn lfsWrite(
-    sim: *GitSim,
-    store: contract.LfsStore,
-    sha256: []const u8,
-    data: []const u8,
-) Error!void {
-    checkSha(sha256);
-    var digest: [32]u8 = undefined;
-    std.crypto.hash.sha2.Sha256.hash(data, &digest, .{});
-    const hex = std.fmt.bytesToHex(digest, .lower);
-    if (!std.mem.eql(u8, &hex, sha256))
-        protocolViolation("LFS object stored under a wrong hash", .{});
-    // Replaces a damaged copy.
-    for (sim.lfs.items) |*o| if (o.store == store and std.mem.eql(u8, o.sha256, sha256)) {
+/// Replaces a damaged copy.
+fn store(sim: *GitSim, s: World.LfsStore, sha256: []const u8, data: []const u8) Error!void {
+    for (sim.lfs.items) |*o| if (o.store == s and std.mem.eql(u8, o.sha256, sha256)) {
         o.data = try sim.arena.dupe(u8, data);
         return;
     };
     try sim.lfs.append(sim.arena, .{
-        .store = store,
+        .store = s,
         .sha256 = try sim.arena.dupe(u8, sha256),
         .data = try sim.arena.dupe(u8, data),
     });
 }
 
-pub fn lfsList(
-    sim: *GitSim,
-    arena: Allocator,
-    store: contract.LfsStore,
-) Error![]const []const u8 {
-    var out: std.ArrayList([]const u8) = .empty;
-    for (sim.lfs.items) |o| if (o.store == store) try out.append(arena, o.sha256);
-    std.mem.sort([]const u8, out.items, {}, stringLessThan);
-    return out.items;
+fn hashes(data: []const u8, sha256: []const u8) bool {
+    var digest: [32]u8 = undefined;
+    std.crypto.hash.sha2.Sha256.hash(data, &digest, .{});
+    const hex = std.fmt.bytesToHex(digest, .lower);
+    return std.mem.eql(u8, &hex, sha256);
 }
 
-/// Moves objects between the clones' git-lfs stores. A clone with
-/// `sim.lfs = false` has no git-lfs.
+/// Copies our objects into git-lfs's store, like GitProcess, then into the
+/// remote clone's. A clone with `sim.lfs = false` has no git-lfs.
 pub fn lfsPush(
     sim: *GitSim,
     arena: Allocator,
@@ -450,7 +463,11 @@ pub fn lfsPush(
     try target.appendSlice(arena, sim.world.clones[idx].lfs);
     for (shas) |sha| {
         checkSha(sha);
-        const data = (try sim.lfsRead(arena, .git_lfs, sha)) orelse return error.LfsTransferFailed;
+        if (sim.stored(.git_lfs, sha) == null) {
+            const ours = sim.stored(.issuez, sha) orelse return error.LfsTransferFailed;
+            try sim.store(.git_lfs, sha, ours);
+        }
+        const data = sim.stored(.git_lfs, sha).?;
         const have = for (target.items) |o| {
             if (o.store == .git_lfs and std.mem.eql(u8, o.sha256, sha)) break true;
         } else false;
@@ -494,7 +511,7 @@ pub fn lfsFetch(
             const found = for (sim.world.clones[idx].lfs) |o| {
                 if (o.store == .git_lfs and std.mem.eql(u8, o.sha256, sha)) break o;
             } else null;
-            if (found) |o| try sim.lfsWrite(.git_lfs, sha, o.data) else lacking = true;
+            if (found) |o| try sim.store(.git_lfs, sha, o.data) else lacking = true;
         }
     }
     if (lacking) return error.LfsTransferFailed;

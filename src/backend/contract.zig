@@ -22,21 +22,40 @@
 //! fn push(self, arena, remote, refspecs, atomic) (Error || error{PushFailed})!PushResult
 //! ```
 //!
-//! Attachments also need the LFS stores. Without them every other
-//! operation still works and attachments fail with AttachmentsUnsupported:
+//! Attachments also need an LFS store. Without it every other operation
+//! still works and attachments fail with AttachmentsUnsupported:
 //!
 //! ```
-//! fn lfsRead(self, arena, LfsStore, sha256_hex) Error!?[]const u8
-//! fn lfsWrite(self, LfsStore, sha256_hex, data) Error!void  // atomic, replaces
-//! fn lfsList(self, arena, LfsStore) Error![]const []const u8
-//! fn lfsAvailable(self, arena) Error!bool                   // git-lfs installed
+//! fn lfsRead(self, arena, sha256_hex) Error!?[]const u8
+//! fn lfsWrite(self, sha256_hex, data) Error!void  // atomic, replaces
+//! fn lfsList(self, arena) Error![]const []const u8
+//! ```
+//!
+//! `lfsRead` returns the stored bytes, damaged or not; the engine checks
+//! them. A backend that keeps a second copy elsewhere, like GitProcess
+//! with git-lfs's store, returns a copy that hashes right when it has one
+//! and puts it back into the store.
+//!
+//! Optional: `lfsSize` lets `Attachments.list` check an object without
+//! reading it. Without it `list` reads every object.
+//!
+//! ```
+//! fn lfsSize(self, sha256_hex) Error!?u64
+//! ```
+//!
+//! Optional too, the transfers. Without them attachments work locally, and
+//! a push that has bytes to upload fails with LfsUnavailable unless the
+//! caller uploads them itself (`Sync.PushOptions.before_push`):
+//!
+//! ```
+//! fn lfsAvailable(self, arena) Error!bool         // git-lfs installed
 //! fn lfsPush(self, arena, remote, sha256_hexes) (Error || LfsTransportError)!void
 //! fn lfsFetch(self, arena, remote, refs_or_oids) (Error || LfsTransportError)!void
 //! ```
 //!
-//! The last three are optional again. Without them attachments work
-//! locally, and a push that has bytes to upload fails with LfsUnavailable
-//! unless the caller uploads them itself (`Sync.PushOptions.before_push`).
+//! `lfsPush` uploads objects from the store. `lfsFetch` downloads the
+//! objects the trees of those refs or commits point at, so that
+//! `lfsRead` finds them afterwards.
 
 const std = @import("std");
 const object = @import("object.zig");
@@ -52,17 +71,12 @@ pub const Identity = struct {
     committer: Signature,
 };
 
-pub const LfsStore = enum {
-    /// `$GIT_DIR/issuez/lfs/objects/`, the one that counts. `git lfs prune`
-    /// doesn't look there.
-    issuez,
-    /// git-lfs's store (`$GIT_DIR/lfs/objects/` or `lfs.storage`), only a
-    /// copy for transfers.
-    git_lfs,
-};
-
 pub fn hasLfs(comptime B: type) bool {
     return @hasDecl(B, "lfsRead") and @hasDecl(B, "lfsWrite") and @hasDecl(B, "lfsList");
+}
+
+pub fn hasLfsSize(comptime B: type) bool {
+    return hasLfs(B) and @hasDecl(B, "lfsSize");
 }
 
 pub fn hasLfsTransport(comptime B: type) bool {

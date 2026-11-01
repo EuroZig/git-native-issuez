@@ -47,6 +47,12 @@ The first release; everything below is new.
   guards, blocking and progress treat the rest as open work.
 - Shell completions (bash, zsh, fish) and man pages, generated from the help
   texts and installed by `zig build install`.
+- Built for large trackers: git runs as a few long-lived processes per
+  command, merge reads each remote history once and writes all refs in one
+  transaction, and `show` and the write guards read only the issues around
+  the one at hand (sub-issues through a local cache,
+  `refs/issuez-cache/parents`). A merge of 2,000 issues where nothing
+  changed takes under half a second.
 - Provider import, export and sync (GitHub, GitLab, …) stay upstream's by
   design: the commands refuse and point to upstream's `git-issue-import` and
   `git-issue-export`.

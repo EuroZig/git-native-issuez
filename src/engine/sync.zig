@@ -1222,11 +1222,7 @@ pub fn Sync(comptime B: type) type {
                 }
             };
             if (wanted.items.len == 0) return;
-            const mode: attachments_mod.UploadMode = if (options.before_push != null)
-                .caller
-            else
-                .git_lfs;
-            const ups = try att.uploads(arena, wanted.items, mode);
+            const ups = try att.uploads(arena, wanted.items);
             if (ups.len == 0) return;
             if (options.before_push) |hook| {
                 hook.run(hook.context, remote, ups) catch return error.BeforePushFailed;

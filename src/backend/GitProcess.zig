@@ -503,8 +503,13 @@ pub fn randomBytes(gp: *GitProcess, buf: []u8) void {
     gp.io.random(buf);
 }
 
+/// `issuez` is `$GIT_DIR/issuez/lfs/objects/`, the store; `git lfs prune`
+/// doesn't look there. `git_lfs` is git-lfs's (`$GIT_DIR/lfs/objects/` or
+/// `lfs.storage`), only a copy for transfers.
+const Store = enum { issuez, git_lfs };
+
 /// The directory holding `ab/cd/<sha256>`.
-fn lfsObjectsDir(gp: *GitProcess, arena: Allocator, store: contract.LfsStore) Error![]const u8 {
+fn lfsObjectsDir(gp: *GitProcess, arena: Allocator, store: Store) Error![]const u8 {
     const common = gp.common_dir.?;
     switch (store) {
         .issuez => return std.fs.path.join(arena, &.{ common, "issuez", "lfs", "objects" }),
@@ -532,12 +537,42 @@ fn isSha256Hex(s: []const u8) bool {
     return s.len == 64 and hex_fmt.isLower(s);
 }
 
-pub fn lfsRead(
-    gp: *GitProcess,
-    arena: Allocator,
-    store: contract.LfsStore,
-    sha256: []const u8,
-) Error!?[]const u8 {
+/// Our copy when it hashes right. Otherwise git-lfs's, e.g. after a
+/// `git lfs fetch`, put into our store when it hashes right; else whatever
+/// we have.
+pub fn lfsRead(gp: *GitProcess, arena: Allocator, sha256: []const u8) Error!?[]const u8 {
+    const ours = try gp.readStore(arena, .issuez, sha256);
+    if (ours) |data| if (hashes(data, sha256)) return data;
+    const theirs = (try gp.readStore(arena, .git_lfs, sha256)) orelse return ours;
+    if (!hashes(theirs, sha256)) return ours orelse theirs;
+    try gp.writeStore(.issuez, sha256, theirs);
+    return theirs;
+}
+
+/// The size of our copy, without reading it.
+pub fn lfsSize(gp: *GitProcess, sha256: []const u8) Error!?u64 {
+    var arena_state: std.heap.ArenaAllocator = .init(gp.gpa);
+    defer arena_state.deinit();
+    return gp.storeSize(arena_state.allocator(), .issuez, sha256);
+}
+
+fn storeSize(gp: *GitProcess, arena: Allocator, store: Store, sha256: []const u8) Error!?u64 {
+    const path = try lfsPath(arena, try gp.lfsObjectsDir(arena, store), sha256);
+    const st = Io.Dir.cwd().statFile(gp.io, path, .{}) catch |e| switch (e) {
+        error.FileNotFound, error.NotDir => return null,
+        else => return storeError(e),
+    };
+    return if (st.kind == .file) st.size else null;
+}
+
+fn hashes(data: []const u8, sha256: []const u8) bool {
+    var digest: [32]u8 = undefined;
+    std.crypto.hash.sha2.Sha256.hash(data, &digest, .{});
+    const hex = std.fmt.bytesToHex(digest, .lower);
+    return std.mem.eql(u8, &hex, sha256);
+}
+
+fn readStore(gp: *GitProcess, arena: Allocator, store: Store, sha256: []const u8) Error!?[]const u8 {
     const path = try lfsPath(arena, try gp.lfsObjectsDir(arena, store), sha256);
     // The limit fails once reached, and a maximal object is valid.
     const limit: Io.Limit = .limited(attachment_fmt.max_object_bytes + 1);
@@ -550,14 +585,13 @@ pub fn lfsRead(
         };
 }
 
+pub fn lfsWrite(gp: *GitProcess, sha256: []const u8, data: []const u8) Error!void {
+    return gp.writeStore(.issuez, sha256, data);
+}
+
 /// Temp file, fsync, rename, so a crash leaves nothing or the whole
 /// object. Replaces an existing copy, which may be damaged.
-pub fn lfsWrite(
-    gp: *GitProcess,
-    store: contract.LfsStore,
-    sha256: []const u8,
-    data: []const u8,
-) Error!void {
+fn writeStore(gp: *GitProcess, store: Store, sha256: []const u8, data: []const u8) Error!void {
     var arena_state: std.heap.ArenaAllocator = .init(gp.gpa);
     defer arena_state.deinit();
     const arena = arena_state.allocator();
@@ -587,7 +621,8 @@ pub fn lfsWrite(
     };
 }
 
-/// Only uploads what the server doesn't have yet.
+/// Copies each object into git-lfs's store first, where `git lfs push`
+/// looks. Only uploads what the server doesn't have yet.
 pub fn lfsPush(
     gp: *GitProcess,
     arena: Allocator,
@@ -596,6 +631,12 @@ pub fn lfsPush(
 ) (Error || contract.LfsTransportError)!void {
     assert(contract.isValidRemoteName(remote));
     try gp.requireGitLfs(arena);
+    for (shas) |s| {
+        assert(isSha256Hex(s));
+        if (try gp.storeSize(arena, .git_lfs, s) != null) continue;
+        const data = (try gp.readStore(arena, .issuez, s)) orelse return error.LfsTransferFailed;
+        try gp.writeStore(.git_lfs, s, data);
+    }
     var start: usize = 0;
     while (start < shas.len) : (start += 64) {
         var argv: std.ArrayList([]const u8) = .empty;
@@ -612,7 +653,7 @@ pub fn lfsPush(
     }
 }
 
-/// Downloads into git-lfs's store, in batches, the objects the trees of
+/// Downloads into git-lfs's store, where `lfsRead` finds them, in batches, the objects the trees of
 /// these refs or commit OIDs point at. Objects that arrived stay when a
 /// later batch, or an object in the same batch, fails.
 pub fn lfsFetch(
@@ -668,12 +709,9 @@ fn storeError(e: anyerror) Error {
     };
 }
 
-pub fn lfsList(
-    gp: *GitProcess,
-    arena: Allocator,
-    store: contract.LfsStore,
-) Error![]const []const u8 {
-    const objects = try gp.lfsObjectsDir(arena, store);
+/// Our store only.
+pub fn lfsList(gp: *GitProcess, arena: Allocator) Error![]const []const u8 {
+    const objects = try gp.lfsObjectsDir(arena, .issuez);
     var out: std.ArrayList([]const u8) = .empty;
     var root = Io.Dir.cwd().openDir(gp.io, objects, .{ .iterate = true }) catch |e| switch (e) {
         error.FileNotFound, error.NotDir => return &.{},

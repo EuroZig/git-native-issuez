@@ -66,8 +66,10 @@ set of plumbing operations:
 - transport: fetch with explicit refspecs (optionally pruning), and push
   (optionally atomic) with a result per ref;
 - random bytes, for UUIDs;
-- optionally, the LFS stores for attachment bytes (read, atomic write,
-  list) and LFS transfer (push and fetch objects). A backend without them
+- optionally, an LFS store for attachment bytes (read, atomic write, list,
+  and optionally the size without reading) and LFS transfer (push and
+  fetch objects). Where transfers keep copies is the backend's business:
+  the git backend goes through git-lfs's store. A backend without a store
   works for everything but attachments.
 
 | Backend      | Use                                                                                                                                                                                                                                                                                                                   |

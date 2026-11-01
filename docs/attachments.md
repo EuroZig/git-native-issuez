@@ -118,8 +118,12 @@ switch (try att.read(arena, a)) {
 ```
 
 `read` looks in this tool's store first, then in git-lfs's store, and
-copies a good copy it finds there into its own, also over a damaged one. `att.list(arena, issue)` gives
-every attachment with its `availability` (`local`, `missing`, `corrupt`).
+copies a good copy it finds there into its own, also over a damaged one.
+`att.list(arena, issue, .{})` gives every attachment with its
+`availability` (`local`, `missing`, `corrupt`). It checks the size of each
+stored object without reading it, so an object damaged at the right size
+counts as `local`; `.{ .verify = true }` reads and hashes every object, as
+`fsck` does.
 `Attachments.find(arena, issue, prefix)` resolves an ID prefix of at least
 4 characters.
 
@@ -132,9 +136,8 @@ every attachment with its `availability` (`local`, `missing`, `corrupt`).
   it moved. It never touches the issue ref.
 - `att.orphans(arena, issues)` lists stored objects that no issue
   references. A write that failed after storing the bytes leaves one.
-- `att.uploads(arena, attachments, mode)` returns the bytes this clone has,
-  and with `.git_lfs` also copies them into git-lfs's store (so
-  `git lfs push` finds them); sync uses it before a push.
+- `att.uploads(arena, attachments)` returns the bytes this clone has; sync
+  hands them to a `before_push` hook.
 - `att.fetch(arena, remote, issues)` downloads missing bytes
   (`git lfs fetch <remote> refs/attachments/<id>`) and stores them. When a
   derived ref is missing or out of date, it hands git-lfs a derived commit
@@ -166,19 +169,27 @@ shown, or for a whole list up front.
 ### Custom backends
 
 The LFS operations are optional in the backend contract
-(`contract.hasLfs`):
+(`contract.hasLfs`). There is one store:
 
 ```zig
-fn lfsRead(self, arena, LfsStore, sha256_hex) Error!?[]const u8
-fn lfsWrite(self, LfsStore, sha256_hex, data) Error!void   // atomic, replaces
-fn lfsList(self, arena, LfsStore) Error![]const []const u8
+fn lfsRead(self, arena, sha256_hex) Error!?[]const u8
+fn lfsWrite(self, sha256_hex, data) Error!void              // atomic, replaces
+fn lfsList(self, arena) Error![]const []const u8
+// optional, so `att.list` needn't read every object (contract.hasLfsSize):
+fn lfsSize(self, sha256_hex) Error!?u64
 // and, to move objects to and from remotes (contract.hasLfsTransport):
 fn lfsAvailable(self, arena) Error!bool                    // git-lfs installed
 fn lfsPush(self, arena, remote, sha256_hexes) (Error || LfsTransportError)!void
 fn lfsFetch(self, arena, remote, local_refs) (Error || LfsTransportError)!void
 ```
 
+`lfsRead` returns the stored bytes, damaged or not; the library checks
+them. `lfsPush` uploads from the store, and after `lfsFetch` the objects
+are readable with `lfsRead`. Where the bytes travel through on the way is
+the backend's business: the git backend copies them through git-lfs's
+store, and heals a damaged copy in its own store from there.
+
 A backend without them still works for everything else, and attachments
-fail with `AttachmentsUnsupported`. A backend with the stores but without
+fail with `AttachmentsUnsupported`. A backend with the store but without
 transport works locally, and a push with objects to upload fails with
 `LfsUnavailable` unless a `before_push` hook uploads them.
