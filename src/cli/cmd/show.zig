@@ -72,8 +72,8 @@ pub fn main(comptime B: type, ctx: *context.Context(B), argv: []const []const u8
     if (as_json) {
         const proj = ext_flags.project(B, ctx, repo) orelse return common.exit_error;
         var s = json.begin(ctx.out);
-        json.issue(&s, arena, issue, .{ .full = true, .projection = proj }) catch
-            return common.exit_error;
+        json.issue(&s, arena, issue, .{ .full = true, .projection = proj }) catch |e|
+            return json.failed(ctx.err, e);
         json.end(&s);
         return common.exit_ok;
     }

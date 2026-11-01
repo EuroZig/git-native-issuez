@@ -18,7 +18,9 @@ ignored. Text output is unchanged (and upstream-compatible where it was).
 
 Conventions:
 - IDs are full UUIDs (`short_id` is the 7-character display form).
-- Times are RFC 3339 with the author's offset (`2026-10-20T20:55:58+05:30`).
+- Times are RFC 3339 with the offset of the commit's author
+  (`2026-10-20T20:55:58+05:30`): `created` the issue author's, `updated`
+  the last writer's.
 - Dates are `YYYY-MM-DD`.
 - A field without a value is `null`. Empty lists are `[]`.
 - Text is always a JSON string. git allows any bytes, so bytes that

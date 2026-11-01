@@ -184,6 +184,31 @@ pub const Projection = struct {
         return out.items;
     }
 
+    /// Done leaves out of `milestoneLeaves`.
+    pub fn milestoneProgress(p: Projection, arena: Allocator, id: []const u8) Allocator.Error!Progress {
+        const leaves = try p.milestoneLeaves(arena, id);
+        var closed: u32 = 0;
+        for (leaves) |i| {
+            if (p.isDone(i)) closed += 1;
+        }
+        return .{ .closed = closed, .total = @intCast(leaves.len) };
+    }
+
+    /// Non-deleted issues in milestone `id`, inherited ones included.
+    pub fn milestoneIssues(
+        p: Projection,
+        arena: Allocator,
+        id: []const u8,
+    ) Allocator.Error![]const u32 {
+        var out: std.ArrayList(u32) = .empty;
+        for (p.issues, p.milestone, 0..) |issue, in, i| {
+            if (issue.deleted) continue;
+            if (!std.mem.eql(u8, in orelse continue, id)) continue;
+            try out.append(arena, @intCast(i));
+        }
+        return out.items;
+    }
+
     pub fn problemsOf(p: Projection, i: u32) []const Problem {
         return p.problems_of[i];
     }
@@ -774,6 +799,13 @@ test "effective milestones" {
     try testing.expect(eff(p, "lost") == null);
     // m1's leaves: kid and grandkid. root has live children, gone is deleted.
     try testing.expectEqual(@as(usize, 2), (try p.milestoneLeaves(arena, "m1")).len);
+    const progress = try p.milestoneProgress(arena, "m1");
+    try testing.expectEqual(@as(u32, 1), progress.closed); // grandkid
+    try testing.expectEqual(@as(u32, 2), progress.total);
+    // root, kid and grandkid; gone is deleted, out has none.
+    const members = try p.milestoneIssues(arena, "m1");
+    try testing.expectEqual(@as(usize, 3), members.len);
+    for (members) |i| try testing.expect(!p.issues[i].deleted);
     var kinds: std.ArrayList(Problem.Kind) = .empty;
     for (p.problems) |pr| try kinds.append(arena, pr.kind);
     try testing.expectEqualSlices(

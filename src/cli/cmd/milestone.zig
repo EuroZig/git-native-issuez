@@ -123,11 +123,7 @@ pub fn main(comptime B: type, ctx: *context.Context(B), argv: []const []const u8
             const list = cat.list(arena) catch |e| return common.repoFailed(B, ctx, e);
             if (as_json) {
                 var s = json.begin(w);
-                s.beginArray() catch return common.exit_error;
-                for (list) |m| if (all or m.status == .open) {
-                    json.milestone(&s, m) catch return common.exit_error;
-                };
-                s.endArray() catch return common.exit_error;
+                json.milestones(&s, list, all) catch |e| return json.failed(ctx.err, e);
                 json.end(&s);
                 return common.exit_ok;
             }
@@ -149,7 +145,7 @@ pub fn main(comptime B: type, ctx: *context.Context(B), argv: []const []const u8
                 .show => if (as_json) {
                     const proj = ext_flags.project(B, ctx, repo) orelse return common.exit_error;
                     var s = json.begin(w);
-                    json.milestoneDetail(&s, arena, m, proj) catch return common.exit_error;
+                    json.milestoneDetail(&s, arena, m, proj) catch |e| return json.failed(ctx.err, e);
                     json.end(&s);
                 } else {
                     w.print("Milestone {s} [{t}]\n", .{ short, m.status }) catch {};
@@ -162,26 +158,19 @@ pub fn main(comptime B: type, ctx: *context.Context(B), argv: []const []const u8
                     ) catch {};
                     if (m.description.len > 0) w.print("\n{s}\n", .{m.description}) catch {};
                     const proj = ext_flags.project(B, ctx, repo) orelse return common.exit_error;
-                    const leaves = proj.milestoneLeaves(arena, m.id) catch
+                    const progress = proj.milestoneProgress(arena, m.id) catch
                         return common.oom(ctx.err);
-                    var done: usize = 0;
-                    for (leaves) |i| {
-                        if (proj.isDone(i)) done += 1;
+                    const members = proj.milestoneIssues(arena, m.id) catch
+                        return common.oom(ctx.err);
+                    w.print("\nProgress: {d}/{d} done\n", .{ progress.closed, progress.total }) catch {};
+                    if (members.len > 0) w.print("\nIssues ({d}):\n", .{members.len}) catch {};
+                    for (members) |i| {
+                        const issue = proj.issues[i];
+                        w.print(
+                            "  {s} [{s}] {s}\n",
+                            .{ uuid.shortId(issue.id), issue.state.text(), issue.title },
+                        ) catch {};
                     }
-                    var members: std.ArrayList(issuez.engine.Issue) = .empty;
-                    for (proj.issues, proj.milestone) |issue, in| {
-                        if (issue.deleted) continue;
-                        if (!std.mem.eql(u8, in orelse continue, m.id)) continue;
-                        members.append(arena, issue) catch return common.oom(ctx.err);
-                    }
-                    w.print("\nProgress: {d}/{d} done\n", .{ done, leaves.len }) catch {};
-                    if (members.items.len > 0) {
-                        w.print("\nIssues ({d}):\n", .{members.items.len}) catch {};
-                    }
-                    for (members.items) |issue| w.print(
-                        "  {s} [{s}] {s}\n",
-                        .{ uuid.shortId(issue.id), issue.state.text(), issue.title },
-                    ) catch {};
                 },
                 .edit => {
                     if (name == null and due == null and description == null) {

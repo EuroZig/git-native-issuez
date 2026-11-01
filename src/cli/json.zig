@@ -22,14 +22,39 @@ pub fn end(s: *Stringify) void {
 
 pub const Error = Stringify.Error || Allocator.Error;
 
-/// `"field"` of a conflict: the key, `Description` or `Comment 3f9a1c2`.
-pub fn conflictField(s: *Stringify, t: issuez.model.issue.Conflict.Target) Error!void {
+/// The exit code when writing fails: out of memory is reported, like on
+/// the text paths, and a closed stdout isn't.
+pub fn failed(err: *std.Io.Writer, e: Error) u8 {
+    return switch (e) {
+        error.OutOfMemory => common.oom(err),
+        error.WriteFailed => common.exit_error,
+    };
+}
+
+const Conflict = issuez.model.issue.Conflict;
+
+/// `"conflicts": [...]`.
+fn conflicts(s: *Stringify, list: []const Conflict) Error!void {
+    try s.objectField("conflicts");
+    try s.beginArray();
+    for (list) |c| try conflict(s, c, null);
+    try s.endArray();
+}
+
+/// One conflict. `status` adds the issue's `id` first.
+pub fn conflict(s: *Stringify, c: Conflict, id: ?[]const u8) Error!void {
+    try s.beginObject();
+    if (id) |v| try field(s, "id", v);
+    // The key, `Description` or `Comment 3f9a1c2`.
     var buf: [32]u8 = undefined;
     try s.objectField("field");
-    switch (t) {
-        .field => |k| try s.write(k),
-        else => try s.write(std.fmt.bufPrint(&buf, "{f}", .{t}) catch unreachable),
+    switch (c.target) {
+        .field => |k| try string(s, k),
+        else => try s.write(std.fmt.bufPrint(&buf, "{f}", .{c.target}) catch unreachable),
     }
+    try field(s, "kept", c.value);
+    try field(s, "lost", c.lost);
+    try s.endObject();
 }
 
 /// A JSON string. Bytes that aren't UTF-8 become U+FFFD (maximal subparts,
@@ -141,21 +166,12 @@ pub fn issue(s: *Stringify, arena: Allocator, i: Issue, options: IssueOptions) E
     try optional(s, "workflow", i.ext.workflow);
     try person(s, "author", i.author);
     try time(s, "created", i.created, i.author.tz_offset_minutes);
-    try time(s, "updated", i.updated, i.author.tz_offset_minutes);
+    try time(s, "updated", i.updated, i.updated_tz_offset_minutes);
     try s.objectField("fields");
     try s.beginObject();
     for (i.fields) |f| try field(s, f.key, f.value);
     try s.endObject();
-    try s.objectField("conflicts");
-    try s.beginArray();
-    for (i.conflicts) |c| {
-        try s.beginObject();
-        try conflictField(s, c.target);
-        try field(s, "kept", c.value);
-        try field(s, "lost", c.lost);
-        try s.endObject();
-    }
-    try s.endArray();
+    try conflicts(s, i.conflicts);
     try s.objectField("attachments");
     try s.beginArray();
     for (i.attachments) |a| try attachment(s, a, null);
@@ -200,6 +216,13 @@ pub fn issue(s: *Stringify, arena: Allocator, i: Issue, options: IssueOptions) E
     try s.endObject();
 }
 
+/// `attach ls`: with each one's availability.
+pub fn attachmentList(s: *Stringify, entries: anytype) Error!void {
+    try s.beginArray();
+    for (entries) |e| try attachment(s, e.attachment, @tagName(e.availability));
+    try s.endArray();
+}
+
 pub fn attachment(
     s: *Stringify,
     a: issuez.model.issue.Attachment,
@@ -218,6 +241,13 @@ pub fn attachment(
     try s.endObject();
 }
 
+/// Open ones, or `all`.
+pub fn milestones(s: *Stringify, list: []const issuez.milestone.Milestone, all: bool) Error!void {
+    try s.beginArray();
+    for (list) |m| if (all or m.status == .open) try milestone(s, m);
+    try s.endArray();
+}
+
 pub fn milestone(s: *Stringify, m: issuez.milestone.Milestone) Error!void {
     try s.beginObject();
     try milestoneFields(s, m);
@@ -231,16 +261,7 @@ fn milestoneFields(s: *Stringify, m: issuez.milestone.Milestone) Error!void {
     try field(s, "status", @tagName(m.status));
     try date(s, "due", m.due);
     try field(s, "description", m.description);
-    try s.objectField("conflicts");
-    try s.beginArray();
-    for (m.conflicts) |c| {
-        try s.beginObject();
-        try conflictField(s, c.target);
-        try field(s, "kept", c.value);
-        try field(s, "lost", c.lost);
-        try s.endObject();
-    }
-    try s.endArray();
+    try conflicts(s, m.conflicts);
 }
 
 pub fn milestoneDetail(
@@ -251,23 +272,15 @@ pub fn milestoneDetail(
 ) Error!void {
     try s.beginObject();
     try milestoneFields(s, m);
-    const leaves = try p.milestoneLeaves(arena, m.id);
-    var closed: u32 = 0;
-    for (leaves) |i| {
-        if (p.isDone(i)) closed += 1;
-    }
+    const progress = try p.milestoneProgress(arena, m.id);
     try s.objectField("progress");
     try s.beginObject();
-    try field(s, "closed", closed);
-    try field(s, "total", leaves.len);
+    try field(s, "closed", progress.closed);
+    try field(s, "total", progress.total);
     try s.endObject();
     try s.objectField("issues");
     try s.beginArray();
-    for (p.issues, p.milestone) |i, in| {
-        if (i.deleted) continue;
-        if (!std.mem.eql(u8, in orelse continue, m.id)) continue;
-        try s.write(i.id);
-    }
+    for (try p.milestoneIssues(arena, m.id)) |i| try s.write(p.issues[i].id);
     try s.endArray();
     try s.endObject();
 }
@@ -437,6 +450,20 @@ test "values: nulls, dates, times with the author's offset" {
     try testing.expectEqualStrings("2025-10-21T04:05:58+05:30", created[0]);
     try testing.expectEqualStrings("2025-10-20T21:05:58-01:30", created[1]);
     try testing.expectEqualStrings("2025-10-20T22:35:58+00:00", created[2]);
+
+    // `updated` has the offset of whoever wrote last.
+    const bare = for (try repo.loadAll(arena)) |i| {
+        if (std.mem.eql(u8, i.title, "Bare")) break i;
+    } else unreachable;
+    var later = ada;
+    later.time += 3600;
+    later.tz_offset_minutes = -300;
+    const ref = try std.fmt.allocPrint(arena, "refs/issues/{s}", .{bare.id});
+    _ = try repo.comment(arena, ref, .{ .text = "Later", .author = later });
+    const commented = try repo.load(arena, (try repo.resolve(arena, bare.id)).one);
+    const o = (try roundTrip(arena, issue, .{ arena, commented, IssueOptions{} })).object;
+    try testing.expectEqualStrings("2025-10-21T04:05:58+05:30", o.get("created").?.string);
+    try testing.expectEqualStrings("2025-10-20T18:35:58-05:00", o.get("updated").?.string);
 }
 
 test "text that isn't UTF-8 is still a string" {

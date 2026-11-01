@@ -174,7 +174,10 @@ pub const Issue = struct {
     conflicts: []const Conflict,
     author: Signature,
     created: i64,
+    /// The tip's author time.
     updated: i64,
+    /// The tip author's offset, since that may not be `author`'s.
+    updated_tz_offset_minutes: i16 = 0,
     comments: []const Comment,
     format_version: ?[]const u8,
     commit_count: usize,
@@ -375,6 +378,7 @@ pub fn materialize(
         .author = root_node.input.author,
         .created = root_node.input.author.time,
         .updated = nodes[tip_index].input.author.time,
+        .updated_tz_offset_minutes = nodes[tip_index].input.author.tz_offset_minutes,
         .comments = try comments(arena, nodes, tip_index, r, events, final),
         .log = try logMessages(arena, nodes, tip_index),
         .format_version = trailers.lastValue(root_node.block, "Format-Version"),

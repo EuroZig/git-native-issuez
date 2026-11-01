@@ -129,7 +129,7 @@ pub fn main(comptime B: type, ctx: *context.Context(B), argv: []const []const u8
         .done_states = repo.done_states,
     }) catch return common.exit_error;
     const proj = if (only_problems or as_json)
-        ext_flags.project(B, ctx, repo) orelse return common.exit_error
+        ext_flags.projectIssues(B, ctx, repo, all) orelse return common.exit_error
     else
         null;
     var kept: std.ArrayList(issuez.engine.Issue) = .empty;
@@ -144,7 +144,7 @@ pub fn main(comptime B: type, ctx: *context.Context(B), argv: []const []const u8
     const listed = kept.items;
     if (as_json) {
         var s = json.begin(ctx.out);
-        writeJson(&s, arena, listed, proj.?) catch return common.exit_error;
+        writeJson(&s, arena, listed, proj.?) catch |e| return json.failed(ctx.err, e);
         json.end(&s);
         return common.exit_ok;
     }

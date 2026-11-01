@@ -504,6 +504,10 @@ test "completions and man pages" {
             \\t git-issue cr
             \\t git-issue create -p ""
             \\t git-issue show ""
+            \\t git-issue attach ""
+            \\t git-issue attach -m text ls ""
+            \\t git-issue attach cat abcd ""
+            \\t git-issue show abcd ""
             \\
         , .{dir});
         const out = try sb.run(&.{ "bash", "-c", harness });
@@ -512,18 +516,35 @@ test "completions and man pages" {
         try testing.expectEqualStrings("create", lines.next().?);
         try testing.expectEqualStrings("low medium high critical", lines.next().?);
         try testing.expectEqualStrings(id, lines.next().?);
+        try testing.expectEqualStrings("add ls cat rename rm fetch", lines.next().?);
+        // After the subcommand: its arguments, and -m's value doesn't count.
+        try testing.expectEqualStrings(id, lines.next().?);
+        try testing.expectEqualStrings("", lines.next().?); // an attachment
+        try testing.expectEqualStrings("", lines.next().?); // show takes one
     }
     if (have(&sb, "fish")) {
         const cmd = try std.fmt.allocPrint(
             arena,
             "source '{s}/completion.fish'; " ++
-                "complete -C 'git-issue show '; complete -C 'git-issue cr'",
+                "complete -C 'git-issue show '; complete -C 'git-issue cr'; echo ==; " ++
+                "complete -C 'git-issue attach '; echo ==; " ++
+                "complete -C 'git-issue attach -m text ls '; echo ==; " ++
+                "complete -C 'git-issue show abcd '",
             .{dir},
         );
         const out = try sb.run(&.{ "fish", "--no-config", "-c", cmd });
         try expectSuccess(out);
-        try testing.expect(std.mem.find(u8, out.stdout, id) != null);
-        try testing.expect(std.mem.find(u8, out.stdout, "create\t") != null);
+        // Not on stderr either: an unknown option fails only there.
+        try testing.expectEqualStrings("", out.stderr);
+        var parts = std.mem.splitSequence(u8, out.stdout, "==\n");
+        const first = parts.next().?;
+        try testing.expect(std.mem.find(u8, first, id) != null);
+        try testing.expect(std.mem.find(u8, first, "create\t") != null);
+        const subs = parts.next().?;
+        try testing.expect(std.mem.startsWith(u8, subs, "add\t"));
+        try testing.expect(std.mem.find(u8, subs, id) == null);
+        try testing.expect(std.mem.startsWith(u8, parts.next().?, id));
+        try testing.expectEqualStrings("", parts.next().?);
     }
 
     const man = try std.fmt.allocPrint(arena, "{s}/man1", .{dir});
@@ -985,4 +1006,14 @@ test "json output" {
     const ms = try parse(arena, try gitIssue(&sb, &.{ "milestone", "show", "v1", "--json" }));
     try testing.expectEqual(@as(usize, 2), ms.object.get("issues").?.array.items.len);
     try testing.expectEqual(@as(i64, 1), ms.object.get("progress").?.object.get("total").?.integer);
+
+    // A bad workflow setting doesn't stop reads, only writes that need it.
+    try sb.git(&.{ "config", "issue.workflowStates", "Not A Slug" });
+    const listed = try gitIssue(&sb, &.{ "ls", "--json" });
+    const again = try parse(arena, listed);
+    try testing.expectEqual(@as(usize, 2), again.array.items.len);
+    try testing.expect(std.mem.startsWith(u8, listed.stderr, "warning: issue.workflowStates"));
+    const refused = try gitIssue(&sb, &.{ "edit", id, "--workflow", "doing" });
+    try testing.expectEqual(@as(u8, 1), refused.code);
+    try testing.expect(std.mem.startsWith(u8, refused.stderr, "error: issue.workflowStates"));
 }

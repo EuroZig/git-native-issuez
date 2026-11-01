@@ -53,9 +53,15 @@ pub fn main(comptime B: type, ctx: *context.Context(B), argv: []const []const u8
         return common.exit_error;
     } else configured;
     if (as_json) {
+        // All read first, so a failure leaves no partial JSON.
+        const statuses = arena.alloc(issuez.sync.Status, remotes.len) catch
+            return common.oom(ctx.err);
+        for (remotes, statuses) |remote, *st| {
+            st.* = s.status(arena, remote) catch |e| return common.repoFailed(B, ctx, e);
+        }
+        const issues = repo.loadAll(arena) catch |e| return common.repoFailed(B, ctx, e);
         var js = json.begin(w);
-        writeJson(B, &js, arena, repo, s, remotes) catch |e|
-            return common.repoFailed(B, ctx, e);
+        writeJson(&js, remotes, statuses, issues) catch |e| return json.failed(ctx.err, e);
         json.end(&js);
         return common.exit_ok;
     }
@@ -113,18 +119,15 @@ pub fn main(comptime B: type, ctx: *context.Context(B), argv: []const []const u8
 }
 
 fn writeJson(
-    comptime B: type,
     js: *json.Stringify,
-    arena: std.mem.Allocator,
-    repo: issuez.engine.Repo(B),
-    s: issuez.Sync(B),
     remotes: []const []const u8,
-) !void {
+    statuses: []const issuez.sync.Status,
+    issues: []const issuez.engine.Issue,
+) json.Error!void {
     try js.beginObject();
     try js.objectField("remotes");
     try js.beginArray();
-    for (remotes) |remote| {
-        const st = try s.status(arena, remote);
+    for (remotes, statuses) |remote, st| {
         try js.beginObject();
         try json.field(js, "name", remote);
         try js.objectField("pending");
@@ -135,18 +138,13 @@ fn writeJson(
         try js.beginArray();
         for (st.quarantined) |q| {
             try js.beginObject();
-            try js.objectField("id");
-            try js.write(q.id);
-            try js.objectField("kind");
-            try js.write(if (q.namespace == .milestones) "milestone" else "issue");
+            try json.field(js, "id", q.id);
+            try json.field(js, "kind", if (q.namespace == .milestones) "milestone" else "issue");
             try json.field(js, "title", q.title);
-            try js.objectField("remote_tip");
             const hex = q.remote_tip.hex();
-            try js.write(hex.slice());
-            try js.objectField("reason");
-            if (q.reason) |r| try js.write(@tagName(r)) else try js.write(null);
-            try js.objectField("kept_local");
-            try js.write(q.kept_local);
+            try json.field(js, "remote_tip", hex.slice());
+            try json.optional(js, "reason", if (q.reason) |r| @tagName(r) else null);
+            try json.field(js, "kept_local", q.kept_local);
             try js.endObject();
         }
         try js.endArray();
@@ -155,15 +153,7 @@ fn writeJson(
     try js.endArray();
     try js.objectField("conflicts");
     try js.beginArray();
-    for (try repo.loadAll(arena)) |issue| for (issue.conflicts) |c| {
-        try js.beginObject();
-        try js.objectField("id");
-        try js.write(issue.id);
-        try json.conflictField(js, c.target);
-        try json.field(js, "kept", c.value);
-        try json.field(js, "lost", c.lost);
-        try js.endObject();
-    };
+    for (issues) |issue| for (issue.conflicts) |c| try json.conflict(js, c, issue.id);
     try js.endArray();
     try js.endObject();
 }

@@ -129,10 +129,7 @@ pub fn main(comptime B: type, ctx: *context.Context(B), argv: []const []const u8
             const entries = att.list(arena, issue) catch |e| return common.repoFailed(B, ctx, e);
             if (as_json) {
                 var s = json.begin(ctx.out);
-                s.beginArray() catch return common.exit_error;
-                for (entries) |e| json.attachment(&s, e.attachment, @tagName(e.availability)) catch
-                    return common.exit_error;
-                s.endArray() catch return common.exit_error;
+                json.attachmentList(&s, entries) catch |e| return json.failed(ctx.err, e);
                 json.end(&s);
                 return common.exit_ok;
             }

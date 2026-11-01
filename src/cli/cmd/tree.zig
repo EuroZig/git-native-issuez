@@ -72,7 +72,7 @@ pub fn main(comptime B: type, ctx: *context.Context(B), argv: []const []const u8
     }
     if (as_json) {
         var s = json.begin(ctx.out);
-        printer.jsonNodes(&s, top.items) catch return common.exit_error;
+        printer.jsonNodes(&s, top.items) catch |e| return json.failed(ctx.err, e);
         json.end(&s);
         return common.exit_ok;
     }
@@ -133,58 +133,74 @@ const Printer = struct {
         }
     }
 
-    fn jsonNodes(p: *Printer, s: *json.Stringify, top: []const u32) !void {
-        const Frame = struct { nodes: []const u32, next: usize = 0 };
+    /// Depth first over the shown nodes, children in order: `v.enter`
+    /// before a node's children gets the state its parent's `enter`
+    /// returned (null at the top), `v.leave` after them.
+    fn walk(p: *Printer, top: []const u32, v: anytype) !void {
+        const State = @TypeOf(v.*).State;
+        const Frame = struct { nodes: []const u32, next: usize = 0, state: ?State };
         var stack: std.ArrayList(Frame) = .empty;
-        try s.beginArray();
-        try stack.append(p.arena, .{ .nodes = top });
+        try stack.append(p.arena, .{ .nodes = top, .state = null });
         while (stack.items.len > 0) {
             const f = &stack.items[stack.items.len - 1];
             if (f.next == f.nodes.len) {
-                try s.endArray();
                 _ = stack.pop();
                 // The node that owned these children.
-                if (stack.items.len > 0) try s.endObject();
+                if (stack.items.len > 0) try v.leave();
                 continue;
             }
             const i = f.nodes[f.next];
             f.next += 1;
-            try s.beginObject();
-            try s.objectField("issue");
-            try json.issue(s, p.arena, p.proj.issues[i], .{ .projection = p.proj });
-            try s.objectField("children");
-            try s.beginArray();
+            const state = try v.enter(i, f.next == f.nodes.len, f.state);
             var shown: std.ArrayList(u32) = .empty;
             try p.shownChildren(i, &shown);
-            try stack.append(p.arena, .{ .nodes = shown.items });
+            try stack.append(p.arena, .{ .nodes = shown.items, .state = state });
         }
     }
 
+    fn jsonNodes(p: *Printer, s: *json.Stringify, top: []const u32) !void {
+        const Nodes = struct {
+            p: *Printer,
+            s: *json.Stringify,
+            const State = void;
+            fn enter(n: *@This(), i: u32, _: bool, _: ?void) !void {
+                try n.s.beginObject();
+                try n.s.objectField("issue");
+                try json.issue(n.s, n.p.arena, n.p.proj.issues[i], .{ .projection = n.p.proj });
+                try n.s.objectField("children");
+                try n.s.beginArray();
+            }
+            fn leave(n: *@This()) !void {
+                try n.s.endArray();
+                try n.s.endObject();
+            }
+        };
+        var v: Nodes = .{ .p = p, .s = s };
+        try s.beginArray();
+        try p.walk(top, &v);
+        try s.endArray();
+    }
+
     fn nodes(p: *Printer, top: []const u32) !void {
-        const Frame = struct { nodes: []const u32, next: usize = 0, lead: ?[]const u8 };
-        var stack: std.ArrayList(Frame) = .empty;
-        try stack.append(p.arena, .{ .nodes = top, .lead = null });
-        while (stack.items.len > 0) {
-            const f = &stack.items[stack.items.len - 1];
-            if (f.next == f.nodes.len) {
-                _ = stack.pop();
-                continue;
+        const Lines = struct {
+            p: *Printer,
+            /// The lead of the children's lines. Top-level nodes have no branch.
+            const State = []const u8;
+            fn enter(l: *@This(), i: u32, last: bool, base: ?[]const u8) ![]const u8 {
+                const arena = l.p.arena;
+                var lead: []const u8 = "";
+                var child_lead: []const u8 = "";
+                if (base) |b| {
+                    lead = try std.mem.concat(arena, u8, &.{ b, if (last) last_branch else branch });
+                    child_lead = try std.mem.concat(arena, u8, &.{ b, if (last) gap else pipe });
+                }
+                try l.p.line(i, lead, child_lead);
+                return child_lead;
             }
-            const i = f.nodes[f.next];
-            f.next += 1;
-            // Top-level nodes have no branch.
-            var lead: []const u8 = "";
-            var child_lead: []const u8 = "";
-            if (f.lead) |base| {
-                const last = f.next == f.nodes.len;
-                lead = try std.mem.concat(p.arena, u8, &.{ base, if (last) last_branch else branch });
-                child_lead = try std.mem.concat(p.arena, u8, &.{ base, if (last) gap else pipe });
-            }
-            try p.line(i, lead, child_lead);
-            var shown: std.ArrayList(u32) = .empty;
-            try p.shownChildren(i, &shown);
-            try stack.append(p.arena, .{ .nodes = shown.items, .lead = child_lead });
-        }
+            fn leave(_: *@This()) !void {}
+        };
+        var v: Lines = .{ .p = p };
+        try p.walk(top, &v);
     }
 
     fn line(p: *Printer, i: u32, lead: []const u8, child_lead: []const u8) !void {

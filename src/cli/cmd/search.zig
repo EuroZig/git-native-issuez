@@ -62,7 +62,7 @@ pub fn main(comptime B: type, ctx: *context.Context(B), argv: []const []const u8
         return common.exit_ok;
     }
     var s = json.begin(ctx.out);
-    if (as_json) s.beginArray() catch return common.exit_error;
+    if (as_json) s.beginArray() catch |e| return json.failed(ctx.err, e);
 
     const filter: issuez.query.Filter = .{ .state = state_filter, .done = null };
     for (issues) |issue| {
@@ -72,7 +72,7 @@ pub fn main(comptime B: type, ctx: *context.Context(B), argv: []const []const u8
         }) catch return common.oom(ctx.err);
         if (lines.len == 0) continue;
         if (as_json) {
-            writeMatch(&s, arena, issue, lines) catch return common.exit_error;
+            writeMatch(&s, arena, issue, lines) catch |e| return json.failed(ctx.err, e);
             continue;
         }
         ctx.out.print(
@@ -89,7 +89,7 @@ pub fn main(comptime B: type, ctx: *context.Context(B), argv: []const []const u8
         ) catch {};
     }
     if (as_json) {
-        s.endArray() catch return common.exit_error;
+        s.endArray() catch |e| return json.failed(ctx.err, e);
         json.end(&s);
     }
     return common.exit_ok;
