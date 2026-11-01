@@ -294,6 +294,79 @@ fn genExt(
     return !ext.isEmpty();
 }
 
+const samples = issuez.format.attachment.samples;
+
+const fuzz_files = [_]World.File{
+    .{ .path = "shot.png", .data = samples.png },
+    .{ .path = "dir/photo.jpg", .data = samples.jpeg },
+    .{ .path = "pic.webp", .data = samples.webp },
+    .{ .path = "anim.png", .data = samples.apng },
+    .{ .path = "anim.webp", .data = samples.animated_webp },
+    .{ .path = "notes.txt", .data = samples.text },
+    .{ .path = "empty.png", .data = "" },
+};
+const file_pool = [_][]const u8{ "shot.png", "dir/photo.jpg", "pic.webp" };
+const bad_file_pool = [_][]const u8{
+    "anim.png", "anim.webp", "notes.txt", "empty.png", "missing.png",
+};
+
+fn pickFile(rand: std.Random) Allocator.Error![]const u8 {
+    if (rand.uintLessThan(u8, 8) == 0) return pick(rand, &bad_file_pool);
+    return pick(rand, &file_pool);
+}
+
+fn generateAttach(
+    arena: Allocator,
+    rand: std.Random,
+    ids: []const []const u8,
+    attachment_ids: []const []const u8,
+) Allocator.Error!Generated {
+    if (ids.len == 0) return .{ .cmd = .{ .create = .{ .title = "Needs a screenshot" } } };
+    const id = try genPrefix(arena, rand, ids);
+    const att = if (attachment_ids.len > 0 and rand.uintLessThan(u8, 5) != 0) blk: {
+        const full = attachment_ids[rand.uintLessThan(usize, attachment_ids.len)];
+        break :blk full[0..rand.intRangeAtMost(usize, 3, 36)];
+    } else pick(rand, &.{ "abcd", "0000", "" });
+    const cmd: Command = switch (rand.uintLessThan(u8, 8)) {
+        0, 1 => .{ .attach = .{
+            .sub = .add,
+            .id = id,
+            .words = try some(arena, rand, 2, pickFile, .{rand}),
+            .text = if (rand.uintLessThan(u8, 3) == 0) pick(rand, &message_pool) else null,
+            .name = if (rand.uintLessThan(u8, 5) == 0)
+                pick(rand, &.{ "x.png", " \tspaced ", "" })
+            else
+                null,
+        } },
+        2 => .{ .attach = .{
+            .sub = .comment,
+            .id = id,
+            .words = try arena.dupe([]const u8, &.{try pickFile(rand)}),
+            .text = if (rand.uintLessThan(u8, 4) != 0) pick(rand, &message_pool) else null,
+        } },
+        3 => .{ .read = if (rand.boolean())
+            try arena.dupe([]const u8, &.{ "attach", "ls", id })
+        else
+            try arena.dupe([]const u8, &.{ "attach", "cat", id, att }) },
+        4 => .{ .attach = .{
+            .sub = .rename,
+            .id = id,
+            .words = try arena.dupe([]const u8, &.{
+                att,
+                pick(rand, &.{ "new.png", "a/b.png", "" }),
+            }),
+        } },
+        5, 6 => .{ .attach = .{
+            .sub = .rm,
+            .id = id,
+            .words = try arena.dupe([]const u8, &.{att}),
+            .text = if (rand.boolean()) "Drop it" else null,
+        } },
+        else => if (rand.boolean()) .repair else .{ .read = &.{ "fsck", "-q" } },
+    };
+    return .{ .cmd = cmd };
+}
+
 /// Milestone guards need long sequences (link, close, complete, reopen,
 /// move, restore) that random commands rarely produce.
 fn generateMilestoneWork(
@@ -547,6 +620,11 @@ fn fuzzCommands(
     const custom_workflow = rand.boolean();
     // `in-review` done, `wontfix` and `duplicate` open work.
     const custom_done = rand.uintLessThan(u8, 3) == 0;
+    // Attachment commands must refuse there, and its syncs still work.
+    const without_lfs: ?usize = if (rand.uintLessThan(u8, 4) == 0)
+        rand.uintLessThan(usize, work_count)
+    else
+        null;
     for (clones[0..work_count], 0..) |*c, idx| {
         var config: std.ArrayList(World.ConfigEntry) = .empty;
         try config.append(arena, .{ .key = "remote.origin.url", .value = "sim:hub" });
@@ -555,6 +633,7 @@ fn fuzzCommands(
             .{ .key = "issue.workflowStates", .value = "backlog, doing, done" },
         );
         if (custom_done) try config.append(arena, .{ .key = "issue.doneStates", .value = "in-review" });
+        if (without_lfs == idx) try config.append(arena, .{ .key = "sim.lfs", .value = "false" });
         c.* = .{
             .name = try std.fmt.allocPrint(arena, "c{d}", .{idx}),
             .config = config.items,
@@ -569,6 +648,7 @@ fn fuzzCommands(
             .tz_offset_minutes = rand.intRangeAtMost(i16, -720, 840),
         },
         .clones = clones,
+        .files = &fuzz_files,
     };
 
     const milestone_focus = rand.uintLessThan(u8, 3) == 0;
@@ -621,7 +701,17 @@ fn fuzzCommands(
             const oid = object.hashObject(world.format, .commit, o.data);
             try commits.append(arena, try arena.dupe(u8, oid.hex().slice()));
         };
-        const gen = if (milestone_focus and rand.uintLessThan(u8, 2) == 0)
+        var attachment_ids: std.ArrayList([]const u8) = .empty;
+        for (world.clones[clone_index].objects) |o| if (o.kind == .commit) {
+            var it = std.mem.splitSequence(u8, o.data, "X-Attachment: ");
+            _ = it.next();
+            while (it.next()) |rest| if (rest.len >= 36) {
+                try attachment_ids.append(arena, rest[0..36]);
+            };
+        };
+        const gen = if (rand.uintLessThan(u8, 8) == 0)
+            try generateAttach(arena, rand, ids.items, attachment_ids.items)
+        else if (milestone_focus and rand.uintLessThan(u8, 2) == 0)
             try generateMilestoneWork(arena, rand, ids.items, milestone_ids.items)
         else if (rand.uintLessThan(u8, 6) == 0)
             try generateLifecycle(arena, rand, ids.items, commits.items)
@@ -1023,7 +1113,8 @@ fn issueRefsDigest(arena: Allocator, world: World) Allocator.Error![]const u8 {
 /// What sync has to converge.
 fn isSynced(name: []const u8) bool {
     return std.mem.startsWith(u8, name, "refs/issues/") or
-        std.mem.startsWith(u8, name, "refs/milestones/");
+        std.mem.startsWith(u8, name, "refs/milestones/") or
+        std.mem.startsWith(u8, name, "refs/attachments/");
 }
 
 fn sameIssueRefs(a: World.Clone, b: World.Clone) bool {
@@ -1074,6 +1165,7 @@ fn crossCheckModel(arena: Allocator, world: *World, clone_index: usize) CaseErro
             std.mem.eql(u8, issue.field("X-Milestone-Id") orelse "", n.milestone_id) and
             std.mem.eql(u8, issue.field("X-Milestone-Mode") orelse "", n.milestone_mode) and
             sameBlockers(issue.ext, n.blocked_by) and
+            sameAttachments(issue.attachments, n.attachments) and
             issue.deleted == std.mem.eql(u8, n.deleted, "true");
         if (!ok) {
             std.debug.print(
@@ -1093,6 +1185,21 @@ fn crossCheckModel(arena: Allocator, world: *World, clone_index: usize) CaseErro
             return error.ModelMismatch;
         }
     }
+}
+
+fn sameAttachments(
+    engine: []const issuez.model.issue.Attachment,
+    naive: []const oracle.commands.NaiveAttachment,
+) bool {
+    if (engine.len != naive.len) return false;
+    for (engine) |e| {
+        const n = for (naive) |n| {
+            if (std.mem.eql(u8, n.id, e.id)) break n;
+        } else return false;
+        if (!std.mem.eql(u8, n.name, e.name) or !std.mem.eql(u8, n.sha256, e.sha256.slice()) or
+            !std.mem.eql(u8, n.media, e.media.mediaType())) return false;
+    }
+    return true;
 }
 
 /// The engine's valid blockers plus its invalid ones are the oracle's set.

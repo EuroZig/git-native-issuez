@@ -43,9 +43,9 @@ cli ──► engine ──► model ──► format
 
 | Layer     | Files                 | Does                                                                                                      |
 | --------- | --------------------- | --------------------------------------------------------------------------------------------------------- |
-| `format`  | `src/format/`         | trailers exactly as git parses them, labels, UUIDs, hex, upstream's value rules, extension field grammars |
-| `model`   | `src/model/issue.zig` | one issue from its commit DAG: fields, comments, events, conflicts                                        |
-| `engine`  | `src/engine/`         | `Repo` (read, create, comment, edit, state, delete, check, guards), `Catalog`, `Sync`, `query`, `projection` |
+| `format`  | `src/format/`         | trailers exactly as git parses them, labels, UUIDs, hex, upstream's value rules, extension field grammars, attachment trailers and image types |
+| `model`   | `src/model/issue.zig` | one issue from its commit DAG: fields, comments, events, attachments, conflicts                           |
+| `engine`  | `src/engine/`         | `Repo` (read, create, comment, edit, state, delete, check, guards), `Catalog`, `Attachments`, `Sync`, `query`, `projection` |
 | `backend` | `src/backend/`        | the contract, `GitProcess`, `GitSim`, git objects                                                         |
 | `cli`     | `src/cli/`            | argument parsing, output, exit codes                                                                      |
 
@@ -65,12 +65,15 @@ set of plumbing operations:
 - config, remotes, the default identity;
 - transport: fetch with explicit refspecs, and push (optionally atomic)
   with a result per ref;
-- random bytes, for UUIDs.
+- random bytes, for UUIDs;
+- optionally, the LFS stores for attachment bytes (read, atomic write,
+  list) and LFS transfer (push and fetch objects). A backend without them
+  works for everything but attachments.
 
 | Backend      | Use                                                                                                                                                                                                                                                                                                                   |
 | ------------ | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `GitProcess` | Runs `git` from PATH with a fixed environment and `--` separators. Reads objects through one long-lived `cat-file --batch`. Output is bounded.                                                                                                                                                                        |
-| `GitSim`     | An in-memory world of clones, serialised as ZON. Objects hash exactly like git, so OIDs are real. A remote is another clone of the world (`remote.<name>.url = sim:<clone>`). Clock and randomness come from the world. Breaking a protocol rule (a commit pointing at a missing object, an invalid ref name) panics. |
+| `GitProcess` | Runs `git` from PATH with a fixed environment and `--` separators. Reads objects through one long-lived `cat-file --batch`. Output is bounded. LFS objects are files under the git dir; transfers run `git lfs push` and `git lfs fetch` when git-lfs is installed.                                                    |
+| `GitSim`     | An in-memory world of clones, serialised as ZON. Objects hash exactly like git, so OIDs are real. A remote is another clone of the world (`remote.<name>.url = sim:<clone>`). Clock and randomness come from the world. Each clone has both LFS stores, LFS transfers copy objects between clones, and like git-lfs a fetch fails on an unknown ref or an object the remote lacks. `sim.lfs = false` makes a clone without git-lfs. Breaking a protocol rule (a commit pointing at a missing object, an invalid ref name) panics. |
 | your own     | Wrap or replace either one. `examples/custom_backend.zig` logs every ref change and push, and refuses writes outside the issue and bookkeeping refs.                                                                                                                                                                  |
 
 ## Reading an issue
@@ -113,6 +116,23 @@ reference a milestone by UUID; which milestone an issue is in, through its
 parents, is a question for the projection. Completing a milestone reads
 every issue in it and pins each one with a `verify` line, the same way the
 issue guards do.
+
+## Attachments
+
+`Attachments(B)` (`src/engine/attachments.zig`) writes images onto issues
+([attachments.md](attachments.md)). The trailers in the issue history are
+the source of truth and the model reads them like any other field. The
+bytes are LFS objects in a store of this tool's own, and copied into
+git-lfs's store only for transfers, because `git lfs prune` would delete
+them there. `refs/attachments/<uuid>` is derived: a tree of LFS pointers,
+so git-lfs and LFS servers see the objects. A write stores the bytes
+first, then moves the issue ref and the derived ref in one transaction.
+Sync fetches the derived refs but never merges them; it rebuilds them from
+the merged issues, so they converge like everything else. Bytes travel
+only on push (`git lfs push`, or a hook for an embedder's own LFS client),
+uploaded before any ref so a failed upload pushes nothing, and on demand
+(`att.fetch`). On a backend that can run git-lfs, every attachment call
+checks first that it is installed and fails with `LfsUnavailable` if not.
 
 ## Writing an issue (compare and swap)
 
@@ -174,7 +194,7 @@ changed, like an HTTP ETag.
 The bookkeeping refs are a cache: they make rewound remotes detectable and
 `status` cheap, and losing them only costs a slower next sync. Nothing is
 force-pushed or deleted. Quarantine keeps the local issue, and resolving it
-keeps the version it replaces ([format.md](format.md) §7).
+keeps the version it replaces ([format.md](format.md) §8).
 
 Merge commits are deterministic, so every clone that merges the same pair
 writes the same commit. After all clones have exchanged everything, they
@@ -225,7 +245,8 @@ way, to go unnoticed.
   - per command: what `create`, `comment` (and its edit, delete and
     restore events), `edit` (with the extension fields and the
     description and the milestone fields), `state`, `close`, `reopen`,
-    `delete`, `restore`, `milestone` and `init` may write, and that
+    `delete`, `restore`, `milestone`, `attach`, `comment --attach`,
+    `fsck --repair` and `init` may write, and that
     read-only commands change nothing. Messages are checked where the
     format depends on them (the root message, trailers, text the user
     wrote). Subjects the CLI picks itself are not;
@@ -233,8 +254,12 @@ way, to go unnoticed.
     deleted or rewound on either side, a merge commit has the deterministic
     shape and restates the oracle's own resolution of its parents (and
     reads exactly as its parents do), every
-    remote issue arrives unless a real reason quarantines it, and after a
-    push the remote has every local tip that isn't quarantined.
+    remote issue arrives unless a real reason quarantines it, after a
+    push the remote has every local tip that isn't quarantined, and every
+    derived attachment ref matches its issue and was never rewound;
+  - for attachments: the bytes are in the store, LFS objects are never
+    deleted, a derived ref holds one pointer per present attachment, and
+    no attachment command succeeds on a clone without git-lfs.
 
   It may not import the model or the engine, only git objects, the world
   format and the trailer parser (which is itself checked against git).
@@ -244,7 +269,9 @@ way, to go unnoticed.
   `test/interop.zig` compares it with real upstream merges.
 - **Fuzzer** (`git-issue-fuzz`, built with `-Dfuzz`): each case first runs
   random backend operations against a separate model of the contract, then
-  random commands, valid and invalid, on a few clones that share a hub
+  random commands, valid and invalid (attachments include animated, empty
+  and non-image files), on a few clones that share a hub, sometimes one
+  of them without git-lfs
   remote, with some upstream merges mixed in, and commits from another
   tool that writes extension fields without checking them (invalid
   values, clears). Now and then someone
@@ -258,7 +285,8 @@ way, to go unnoticed.
   oracle has no rule for is counted as skipped, so gaps show up in the
   statistics. At the end every clone syncs, taking
   the hub's version of anything quarantined, until nothing changes, and
-  each must then hold exactly the hub's issues (convergence). The seed is
+  each must then hold exactly the hub's issues, milestones and derived
+  attachment refs (convergence). The seed is
   printed, and `--seed <seed> --iterations 1` replays a failure.
 
 `zig build test` runs the fixture worlds in `src/cli/worlds/` through the

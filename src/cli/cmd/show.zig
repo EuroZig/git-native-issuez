@@ -10,6 +10,7 @@ const common = @import("../common.zig");
 const issuez = @import("issuez");
 const labels_fmt = issuez.format.labels;
 const uuid = issuez.format.uuid;
+const attach = @import("attach.zig");
 const ext_flags = @import("../ext_flags.zig");
 
 pub const help =
@@ -98,6 +99,15 @@ pub fn main(comptime B: type, ctx: *context.Context(B), argv: []const []const u8
         ) catch {};
     }
     printProblems(B, ctx, repo, issue);
+    if (issue.attachments.len > 0) {
+        w.print("Attachments ({d}):\n", .{issue.attachments.len}) catch {};
+        for (issue.attachments) |a| w.print("  {s}  {s:<10}  {f}  {s}\n", .{
+            uuid.shortId(a.id),
+            a.media.mediaType(),
+            attach.Size{ .bytes = a.size },
+            a.name,
+        }) catch {};
+    }
     if (issue.description.len > 0) w.print("\n{s}\n", .{issue.description}) catch {};
 
     var shown: usize = 0;
@@ -127,6 +137,12 @@ pub fn main(comptime B: type, ctx: *context.Context(B), argv: []const []const u8
             for (c.text) |line| {
                 if (std.mem.trim(u8, line, " \t\r").len == 0) continue;
                 w.print("  {s}\n", .{line}) catch {};
+            }
+            for (c.attachments) |id| {
+                const a = for (issue.attachments) |x| {
+                    if (std.mem.eql(u8, x.id, id)) break x;
+                } else continue;
+                w.print("  [attached {s} {s}]\n", .{ uuid.shortId(a.id), a.name }) catch {};
             }
         }
     }

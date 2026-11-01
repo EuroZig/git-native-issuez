@@ -28,6 +28,7 @@ pub const text =
     \\   restore     Restore a deleted issue
     \\   tree        Show the parent/child tree with progress and blockers
     \\   milestone   Create, list and manage milestones
+    \\   attach      Attach images to an issue (add, ls, cat, rename, rm)
     \\   status      Show unpushed, quarantined and conflicted issues
     \\   quarantine  Resolve a quarantined issue
     \\

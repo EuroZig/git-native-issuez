@@ -355,6 +355,15 @@ fn atLeast(git_version_output: []const u8, major: u32, minor: u32) bool {
     return ma > major or (ma == major and mi >= minor);
 }
 
+fn have(sb: *Sandbox, tool: []const u8) bool {
+    const out = sb.run(&.{ "sh", "-c", std.fmt.allocPrint(
+        sb.arena(),
+        "command -v {s}",
+        .{tool},
+    ) catch return false }) catch return false;
+    return out.code == 0;
+}
+
 test "tree and problems" {
     var sb = try Sandbox.init(.{});
     defer sb.deinit();
@@ -604,4 +613,136 @@ test "issues in milestones" {
             "(see 'git issue milestone ls')\n",
         free.stderr,
     );
+}
+
+test "attachments" {
+    var sb = try Sandbox.init(.{});
+    defer sb.deinit();
+    const arena = sb.arena();
+    // A 1x1 PNG (format/attachment.zig `samples.png`).
+    const png = "\x89PNG\r\n\x1a\n\x00\x00\x00\x0dIHDR\x00\x00\x00\x01\x00\x00\x00\x01" ++
+        "\x08\x06\x00\x00\x00\x1f\x15\xc4\x89\x00\x00\x00\x00IEND\xaeB`\x82";
+    const path = try std.fmt.allocPrint(arena, "{s}/shot.png", .{sb.repo});
+    try std.Io.Dir.cwd().writeFile(testing.io, .{ .sub_path = path, .data = png });
+    const created = try gitIssue(&sb, &.{ "create", "Shots" });
+    try expectSuccess(created);
+    const id = std.mem.trimEnd(u8, created.stdout["Created issue ".len..], "\n");
+
+    try expectSuccess(try gitIssue(&sb, &.{ "comment", id, "-m", "Look", "--attach", path }));
+    try expectFailure(
+        try gitIssue(&sb, &.{ "attach", "add", id, "build.zig.zon" }),
+        1,
+        "error: cannot read 'build.zig.zon': no such file\n",
+    );
+    const ls = try gitIssue(&sb, &.{ "attach", "ls", id });
+    try expectSuccess(ls);
+    try testing.expect(std.mem.find(u8, ls.stdout, "image/png   45 B  shot.png") != null);
+    const att = ls.stdout[0..7];
+    const cat = try gitIssue(&sb, &.{ "attach", "cat", id, att });
+    try expectSuccess(cat);
+    try testing.expectEqualSlices(u8, png, cat.stdout);
+    const show = try gitIssue(&sb, &.{ "show", id });
+    try testing.expect(std.mem.find(u8, show.stdout, "Attachments (1):\n") != null);
+    try testing.expect(std.mem.find(u8, show.stdout, "  [attached ") != null);
+
+    // The bytes are in the library's store, not git-lfs's.
+    const sha = "6422564120b76bbc05819b296f96f7e82593e60bb33f3ecf2abaad1cdbf85339";
+    const stored = try std.fmt.allocPrint(
+        arena,
+        "{s}/.git/issuez/lfs/objects/64/22/{s}",
+        .{ sb.repo, sha },
+    );
+    try std.Io.Dir.cwd().access(testing.io, stored, .{});
+
+    // Losing the derived ref: fsck notes it, --repair brings it back.
+    const refs = try sb.run(&.{
+        "git", "for-each-ref", "--format=%(refname)", "refs/attachments/",
+    });
+    const derived = std.mem.trimEnd(u8, refs.stdout, "\n");
+    try sb.git(&.{ "update-ref", "-d", derived });
+    const fsck = try gitIssue(&sb, &.{ "fsck", "-q" });
+    try expectSuccess(fsck);
+    const note = "is missing (run 'git issue fsck --repair')";
+    try testing.expect(std.mem.find(u8, fsck.stderr, note) != null);
+    try expectSuccess(try gitIssue(&sb, &.{ "fsck", "--repair", "-q" }));
+    const tree = try std.fmt.allocPrint(arena, "{s}^{{tree}}", .{derived});
+    const back = try sb.run(&.{ "git", "cat-file", "-p", tree });
+    try testing.expect(std.mem.find(u8, back.stdout, ".png") != null);
+}
+
+test "attachments over git-lfs" {
+    var sb = try Sandbox.init(.{});
+    defer sb.deinit();
+    if (!have(&sb, "git-lfs")) return error.SkipZigTest;
+    const arena = sb.arena();
+    const hub = try std.fmt.allocPrint(arena, "{s}-hub.git", .{sb.repo});
+    const other = try std.fmt.allocPrint(arena, "{s}-other", .{sb.repo});
+    const url = try std.fmt.allocPrint(arena, "file://{s}", .{hub});
+    try sb.git(&.{ "init", "-q", "--bare", hub });
+    try sb.git(&.{ "init", "-q", other });
+    try sb.git(&.{ "remote", "add", "origin", url });
+    try expectSuccess(try sb.runIn(other, &.{ "git", "remote", "add", "origin", url }));
+    const inOther = struct {
+        fn run(s: *Sandbox, dir: []const u8, args: []const []const u8) !Sandbox.Output {
+            var argv: std.ArrayList([]const u8) = .empty;
+            try argv.append(s.arena(), try s.exe(paths.git_issue_exe));
+            try argv.appendSlice(s.arena(), args);
+            return s.runIn(dir, argv.items);
+        }
+    }.run;
+    const png = "\x89PNG\r\n\x1a\n\x00\x00\x00\x0dIHDR\x00\x00\x00\x01\x00\x00\x00\x01" ++
+        "\x08\x06\x00\x00\x00\x1f\x15\xc4\x89\x00\x00\x00\x00IEND\xaeB`\x82";
+    const path = try std.fmt.allocPrint(arena, "{s}/shot.png", .{sb.repo});
+    try std.Io.Dir.cwd().writeFile(testing.io, .{ .sub_path = path, .data = png });
+
+    // With git-lfs's pre-push hook, which would refuse the derived ref of
+    // an attachment removed before its first push.
+    try expectSuccess(try sb.runIn(sb.repo, &.{ "git", "lfs", "install", "--local" }));
+    try expectSuccess(try gitIssue(&sb, &.{ "init", "origin" }));
+    const created = try gitIssue(&sb, &.{ "create", "Shots" });
+    try expectSuccess(created);
+    const id = std.mem.trimEnd(u8, created.stdout["Created issue ".len..], "\n");
+    // Other bytes, so its object is in no store but the derived history.
+    const other_path = try std.fmt.allocPrint(arena, "{s}/old.png", .{sb.repo});
+    try std.Io.Dir.cwd().writeFile(testing.io, .{ .sub_path = other_path, .data = png ++ "x" });
+    const first = try gitIssue(&sb, &.{ "attach", "add", id, other_path });
+    try expectSuccess(first);
+    const first_id = first.stdout["Attached ".len..][0..7];
+    try expectSuccess(try gitIssue(&sb, &.{ "attach", "rm", id, first_id }));
+    try expectSuccess(try gitIssue(&sb, &.{ "attach", "add", id, path }));
+    const synced = try gitIssue(&sb, &.{ "sync", "origin" });
+    try expectSuccess(synced);
+    const uploaded = "Uploaded 1 attachment object(s) to origin's LFS server.";
+    try testing.expect(std.mem.find(u8, synced.stdout, uploaded) != null);
+
+    try expectSuccess(try inOther(&sb, other, &.{ "init", "origin" }));
+    try expectSuccess(try inOther(&sb, other, &.{ "sync", "origin" }));
+    const ls = try inOther(&sb, other, &.{ "attach", "ls", id });
+    try testing.expect(std.mem.find(u8, ls.stdout, "(bytes not here)") != null);
+    const att = ls.stdout[0..7];
+    // git-lfs reads the derived ref, so fetch rebuilds a missing one first.
+    const derived = try sb.runIn(other, &.{
+        "git", "for-each-ref", "--format=%(refname)", "refs/attachments/",
+    });
+    try expectSuccess(derived);
+    const name = std.mem.trimEnd(u8, derived.stdout, "\n");
+    try expectSuccess(try sb.runIn(other, &.{ "git", "update-ref", "-d", name }));
+    const fetched = try inOther(&sb, other, &.{ "attach", "fetch", id });
+    try expectSuccess(fetched);
+    try testing.expectEqualStrings("Fetched 1 attachment(s).\n", fetched.stdout);
+    const cat = try inOther(&sb, other, &.{ "attach", "cat", id, att });
+    try expectSuccess(cat);
+    try testing.expectEqualSlices(u8, png, cat.stdout);
+
+    // `git lfs prune` empties git-lfs's store, since it ignores custom refs.
+    // Our own store keeps the bytes.
+    try expectSuccess(try sb.runIn(other, &.{ "git", "commit", "-q", "--allow-empty", "-m", "x" }));
+    try expectSuccess(try sb.runIn(other, &.{
+        "git",                   "-c",                           "lfs.fetchrecentrefsdays=0",
+        "-c",                    "lfs.fetchrecentcommitsdays=0", "-c",
+        "lfs.pruneoffsetdays=0", "lfs",                          "prune",
+    }));
+    const after = try inOther(&sb, other, &.{ "attach", "cat", id, att });
+    try expectSuccess(after);
+    try testing.expectEqualSlices(u8, png, after.stdout);
 }

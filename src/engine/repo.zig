@@ -13,6 +13,7 @@ const trailers = @import("../format/trailers.zig");
 const labels_fmt = @import("../format/labels.zig");
 const uuid_fmt = @import("../format/uuid.zig");
 const core_fmt = @import("../format/core.zig");
+const attachment_fmt = @import("../format/attachment.zig");
 const fields_fmt = @import("../format/fields.zig");
 const issue_model = @import("../model/issue.zig");
 
@@ -23,6 +24,8 @@ pub const Signature = object.Signature;
 pub const issue_ref_prefix = "refs/issues/";
 /// Milestones use the same engine.
 pub const milestone_ref_prefix = "refs/milestones/";
+/// Derived refs: LFS pointer trees, never the source of truth.
+pub const attachment_ref_prefix = "refs/attachments/";
 /// Local only, never pushed. A guard can pin what it read but not that
 /// something is absent, like a child of the issue being closed. So writes
 /// that add work under an issue or to a milestone move that ID's guard ref,
@@ -75,6 +78,8 @@ pub const Limits = struct {
     /// For our writes. A root has depth 0.
     max_depth: u8 = 8,
     max_guard_scan: u32 = 100_000,
+    max_attachments: u16 = attachment_fmt.max_per_issue,
+    max_attachment_bytes: u32 = attachment_fmt.max_bytes,
 
     /// So no limit can be raised to the point of meaning nothing.
     pub const maximum: Limits = .{
@@ -89,6 +94,8 @@ pub const Limits = struct {
         .max_blockers = 4096,
         .max_depth = 64,
         .max_guard_scan = 10_000_000,
+        .max_attachments = 1000,
+        .max_attachment_bytes = attachment_fmt.max_object_bytes,
     };
 
     pub fn valid(l: Limits) bool {
@@ -305,6 +312,21 @@ pub fn Repo(comptime B: type) type {
             /// Use `loadPage`.
             TooManyIssues,
             InvalidLimits,
+            /// The backend has no LFS store.
+            AttachmentsUnsupported,
+            /// git-lfs isn't installed.
+            LfsUnavailable,
+            /// Not a PNG, JPEG or WebP.
+            UnsupportedType,
+            AnimatedImage,
+            /// The given media type doesn't match the bytes.
+            MediaMismatch,
+            /// Over `Limits.max_attachment_bytes`.
+            AttachmentTooLarge,
+            EmptyAttachment,
+            TooManyAttachments,
+            AttachmentNotFound,
+            NoAttachments,
         } || issue_model.Error;
 
         pub fn init(backend: *B) Self {
@@ -947,6 +969,10 @@ pub fn Repo(comptime B: type) type {
                     .op = .{ .update = .{ .new = oid, .old = tip } },
                 });
                 try ops.appendSlice(arena, try guarded.ops(arena, oid));
+                // More refs in the same transaction, like the derived
+                // attachment ref.
+                if (@hasDecl(@TypeOf(builder), "after"))
+                    try ops.appendSlice(arena, try builder.after(arena, current, oid));
                 self.backend.updateRefs(ops.items) catch |err| switch (err) {
                     // Our ref moved, or an issue a guard read changed. With
                     // `expect` only the first is the caller's problem.
@@ -975,6 +1001,19 @@ pub fn Repo(comptime B: type) type {
             const tip = (try self.backend.resolveRef(name)) orelse return null;
             const header = milestoneHeader(try self.load(arena, .{ .name = name, .tip = tip }));
             return .{ .name = header.name, .status = header.status, .tip = tip };
+        }
+
+        /// For builders from other modules, like the attachment store.
+        pub fn appendWith(
+            self: Self,
+            arena: Allocator,
+            ref_name: []const u8,
+            author: ?Signature,
+            expect: ?Oid,
+            builder: anytype,
+        ) Error!Oid {
+            try self.checkLimits();
+            return self.appendCommit(arena, ref_name, author, expect, builder);
         }
 
         /// For the milestone catalog: `appendWith` for `refs/milestones/`.

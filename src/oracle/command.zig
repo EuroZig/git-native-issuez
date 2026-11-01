@@ -24,12 +24,17 @@ pub const Command = union(enum) {
     restore: Lifecycle,
     comment_event: CommentEvent,
     milestone: Milestone,
+    attach: Attach,
+    /// `fsck --repair`.
+    repair,
 
     /// The CLI's name for it, for messages and statistics.
     pub fn verb(c: Command) []const u8 {
         return switch (c) {
             .read => |words| if (words.len > 0) words[0] else "help",
             .comment_event => "comment",
+            .attach => |a| if (a.sub == .comment) "comment" else "attach",
+            .repair => "fsck",
             else => @tagName(c),
         };
     }
@@ -37,7 +42,7 @@ pub const Command = union(enum) {
     /// Writes to issues, milestones or attachments when it succeeds.
     pub fn writes(c: Command) bool {
         return switch (c) {
-            .read, .init, .merge, .push, .sync, .quarantine => false,
+            .read, .init, .merge, .push, .sync, .quarantine, .repair => false,
             else => true,
         };
     }
@@ -59,6 +64,8 @@ pub const Command = union(enum) {
             .close, .reopen, .delete, .restore => |x| try x.render(&out, @tagName(c)),
             .comment_event => |x| try x.render(&out),
             .milestone => |x| try x.render(&out),
+            .attach => |x| try x.render(&out),
+            .repair => try out.words(&.{ "fsck", "--repair" }),
         }
         return out.list.items;
     }
@@ -301,6 +308,34 @@ pub const Milestone = struct {
         try out.opt("--due", x.due);
         try out.opt("-m", x.message);
         try out.opt("--name", x.new_name);
+    }
+};
+
+/// `attach add|rm|rename`, and `comment --attach`. `ls` and `cat` are
+/// reads.
+pub const Attach = struct {
+    sub: enum { add, comment, rm, rename },
+    id: []const u8,
+    /// Files for add and comment, attachment IDs for rm, the ID and the new
+    /// name for rename.
+    words: []const []const u8,
+    text: ?[]const u8 = null,
+    /// add only.
+    name: ?[]const u8 = null,
+
+    fn render(x: Attach, out: *Argv) Allocator.Error!void {
+        switch (x.sub) {
+            .comment => {
+                try out.words(&.{ "comment", x.id });
+                try out.each("--attach", x.words);
+            },
+            else => {
+                try out.words(&.{ "attach", @tagName(x.sub), x.id });
+                try out.words(x.words);
+            },
+        }
+        try out.opt("-m", x.text);
+        try out.opt("--name", x.name);
     }
 };
 

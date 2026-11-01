@@ -12,6 +12,7 @@ const assert = std.debug.assert;
 const Allocator = std.mem.Allocator;
 const contract = @import("contract.zig");
 const object = @import("object.zig");
+const hex_fmt = @import("../format/hex.zig");
 const Oid = object.Oid;
 const ObjectFormat = object.ObjectFormat;
 const ObjectKind = object.ObjectKind;
@@ -26,6 +27,10 @@ pub const World = struct {
     clock: Clock = .{},
     identity: Identity = .{},
     clones: []const Clone,
+    /// The files commands can read, e.g. for `attach add`.
+    files: []const File = &.{},
+
+    pub const File = struct { path: []const u8, data: []const u8 };
 
     pub const Clock = struct {
         /// Returned by the next `identity()` call.
@@ -46,6 +51,13 @@ pub const World = struct {
         config: []const ConfigEntry = &.{},
         refs: []const Ref = &.{},
         objects: []const StoredObject = &.{},
+        lfs: []const LfsObject = &.{},
+    };
+
+    pub const LfsObject = struct {
+        store: contract.LfsStore,
+        sha256: []const u8,
+        data: []const u8,
     };
 
     pub const ConfigEntry = struct { key: []const u8, value: []const u8 };
@@ -95,6 +107,7 @@ clone_index: usize,
 objects: ObjectMap,
 refs: std.array_hash_map.String(Oid),
 config: std.ArrayList(World.ConfigEntry),
+lfs: std.ArrayList(World.LfsObject),
 prng: std.Random.DefaultPrng,
 
 pub const Error = error{OutOfMemory};
@@ -110,9 +123,11 @@ pub fn init(arena: Allocator, world: *World, clone_index: usize) Error!GitSim {
         .objects = .empty,
         .refs = .empty,
         .config = .empty,
+        .lfs = .empty,
         .prng = .init(world.seed),
     };
     try sim.config.appendSlice(arena, clone.config);
+    try sim.lfs.appendSlice(arena, clone.lfs);
     for (clone.objects) |o| {
         const oid = object.hashObject(world.format, o.kind, o.data);
         try sim.objects.put(arena, oid, o);
@@ -157,6 +172,8 @@ pub fn commit(sim: *GitSim) Error!void {
     clones[sim.clone_index].objects = objs;
     clones[sim.clone_index].refs = refs;
     clones[sim.clone_index].config = sim.config.items;
+    std.mem.sort(World.LfsObject, sim.lfs.items, {}, lfsLessThan);
+    clones[sim.clone_index].lfs = sim.lfs.items;
     sim.world.clones = clones;
     sim.world.seed = sim.prng.next();
     _ = format;
@@ -353,6 +370,140 @@ pub fn randomBytes(sim: *GitSim, buf: []u8) void {
     sim.prng.random().bytes(buf);
 }
 
+pub fn lfsRead(
+    sim: *GitSim,
+    arena: Allocator,
+    store: contract.LfsStore,
+    sha256: []const u8,
+) Error!?[]const u8 {
+    _ = arena;
+    checkSha(sha256);
+    for (sim.lfs.items) |o| if (o.store == store and std.mem.eql(u8, o.sha256, sha256)) {
+        return o.data;
+    };
+    return null;
+}
+
+pub fn lfsWrite(
+    sim: *GitSim,
+    store: contract.LfsStore,
+    sha256: []const u8,
+    data: []const u8,
+) Error!void {
+    checkSha(sha256);
+    var digest: [32]u8 = undefined;
+    std.crypto.hash.sha2.Sha256.hash(data, &digest, .{});
+    const hex = std.fmt.bytesToHex(digest, .lower);
+    if (!std.mem.eql(u8, &hex, sha256))
+        protocolViolation("LFS object stored under a wrong hash", .{});
+    // Replaces a damaged copy.
+    for (sim.lfs.items) |*o| if (o.store == store and std.mem.eql(u8, o.sha256, sha256)) {
+        o.data = try sim.arena.dupe(u8, data);
+        return;
+    };
+    try sim.lfs.append(sim.arena, .{
+        .store = store,
+        .sha256 = try sim.arena.dupe(u8, sha256),
+        .data = try sim.arena.dupe(u8, data),
+    });
+}
+
+pub fn lfsList(
+    sim: *GitSim,
+    arena: Allocator,
+    store: contract.LfsStore,
+) Error![]const []const u8 {
+    var out: std.ArrayList([]const u8) = .empty;
+    for (sim.lfs.items) |o| if (o.store == store) try out.append(arena, o.sha256);
+    std.mem.sort([]const u8, out.items, {}, stringLessThan);
+    return out.items;
+}
+
+/// Moves objects between the clones' git-lfs stores. A clone with
+/// `sim.lfs = false` has no git-lfs.
+pub fn lfsPush(
+    sim: *GitSim,
+    arena: Allocator,
+    remote: []const u8,
+    shas: []const []const u8,
+) (Error || contract.LfsTransportError)!void {
+    if (!try sim.lfsAvailable(arena)) return error.LfsUnavailable;
+    const idx = (try sim.remoteClone(arena, remote)) orelse return error.LfsTransferFailed;
+    var target: std.ArrayList(World.LfsObject) = .empty;
+    try target.appendSlice(arena, sim.world.clones[idx].lfs);
+    for (shas) |sha| {
+        checkSha(sha);
+        const data = (try sim.lfsRead(arena, .git_lfs, sha)) orelse return error.LfsTransferFailed;
+        const have = for (target.items) |o| {
+            if (o.store == .git_lfs and std.mem.eql(u8, o.sha256, sha)) break true;
+        } else false;
+        if (!have) try target.append(arena, .{
+            .store = .git_lfs,
+            .sha256 = try arena.dupe(u8, sha),
+            .data = data,
+        });
+    }
+    std.mem.sort(World.LfsObject, target.items, {}, lfsLessThan);
+    const clones = try arena.dupe(World.Clone, sim.world.clones);
+    clones[idx].lfs = target.items;
+    sim.world.clones = clones;
+}
+
+pub fn lfsFetch(
+    sim: *GitSim,
+    arena: Allocator,
+    remote: []const u8,
+    local_refs: []const []const u8,
+) (Error || contract.LfsTransportError)!void {
+    if (!try sim.lfsAvailable(arena)) return error.LfsUnavailable;
+    const idx = (try sim.remoteClone(arena, remote)) orelse return error.LfsTransferFailed;
+    const format = sim.world.format;
+    // Like git-lfs: an unknown ref fails the whole call, and an object the
+    // server lacks fails it after the others arrived.
+    const tips = try arena.alloc(Oid, local_refs.len);
+    for (local_refs, tips) |name, *tip| tip.* = sim.refs.get(name) orelse
+        (Oid.parseHex(format, name) catch return error.LfsTransferFailed);
+    var lacking = false;
+    for (tips) |tip| {
+        const obj = sim.objects.get(tip) orelse return error.LfsTransferFailed;
+        const c = object.Commit.parse(arena, format, obj.data) catch continue;
+        const tree = sim.objects.get(c.tree) orelse continue;
+        const entries = object.Tree.parse(arena, format, tree.data) catch continue;
+        for (entries) |e| {
+            const blob = sim.objects.get(e.oid) orelse continue;
+            const at = std.mem.find(u8, blob.data, "oid sha256:") orelse continue;
+            if (at + 11 + 64 > blob.data.len) continue;
+            const sha = blob.data[at + 11 ..][0..64];
+            const found = for (sim.world.clones[idx].lfs) |o| {
+                if (o.store == .git_lfs and std.mem.eql(u8, o.sha256, sha)) break o;
+            } else null;
+            if (found) |o| try sim.lfsWrite(.git_lfs, sha, o.data) else lacking = true;
+        }
+    }
+    if (lacking) return error.LfsTransferFailed;
+}
+
+/// False with `sim.lfs = false`.
+pub fn lfsAvailable(sim: *GitSim, arena: Allocator) Error!bool {
+    const v = (try sim.configGet(arena, "sim.lfs")) orelse return true;
+    return !std.mem.eql(u8, v, "false");
+}
+
+pub fn readFile(sim: *GitSim, path: []const u8) ?[]const u8 {
+    for (sim.world.files) |f| if (std.mem.eql(u8, f.path, path)) return f.data;
+    return null;
+}
+
+fn checkSha(sha256: []const u8) void {
+    if (sha256.len != 64 or !hex_fmt.isLower(sha256))
+        protocolViolation("LFS id '{s}' is not a sha256", .{sha256});
+}
+
+fn lfsLessThan(_: void, a: World.LfsObject, b: World.LfsObject) bool {
+    if (a.store != b.store) return @intFromEnum(a.store) < @intFromEnum(b.store);
+    return std.mem.lessThan(u8, a.sha256, b.sha256);
+}
+
 /// Remotes are other clones: `remote.<name>.url = sim:<clone>`.
 fn remoteClone(sim: *GitSim, arena: Allocator, remote: []const u8) Error!?usize {
     const key = try std.fmt.allocPrint(arena, "remote.{s}.url", .{remote});
@@ -393,6 +544,12 @@ fn copyReachable(
                 protocolViolation("remote commit {f} does not decode", .{oid});
             try stack.append(arena, c.tree);
             for (c.parents) |p| try stack.append(arena, p);
+        } else if (o.kind == .tree) {
+            const entries = object.Tree.parse(arena, format, o.data) catch |e| switch (e) {
+                error.OutOfMemory => return error.OutOfMemory,
+                error.InvalidTree => protocolViolation("remote tree {f} does not decode", .{oid}),
+            };
+            for (entries) |e| try stack.append(arena, e.oid);
         }
     }
 }

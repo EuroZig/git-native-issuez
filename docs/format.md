@@ -13,16 +13,19 @@ The key words MUST, MUST NOT, SHOULD and MAY are used as in RFC 2119.
 | --- | --- |
 | `refs/issues/<uuid>` | an issue |
 | `refs/milestones/<uuid>` | a milestone (§6) |
-| `refs/remotes/<remote>/{issues,milestones}/<uuid>` | fetched issues and milestones, waiting to be merged |
-| `refs/issuez-sync/<remote>/<kind>/{issues,milestones}/<uuid>` | sync bookkeeping, local only (§7) |
+| `refs/attachments/<uuid>` | LFS pointers for the attachments of issue `<uuid>`, derived (§7) |
+| `refs/remotes/<remote>/{issues,milestones,attachments}/<uuid>` | fetched refs, waiting to be merged |
+| `refs/issuez-sync/<remote>/<kind>/{issues,milestones,attachments}/<uuid>` | sync bookkeeping, local only (§8) |
 | `refs/issuez-guard/<uuid>` | write serialization, local only (§3, Guards) |
 
 UUIDs are lowercase, hyphenated, version 4. Readers MUST NOT read data from
 any ref other than `refs/issues/*` and `refs/milestones/*`.
+`refs/attachments/*` holds no data of its own and can always be rebuilt.
 
 `git issue merge`, `sync` and `git fetch` after `git issue init` fetch into
-`refs/remotes/<remote>/issues/` and `refs/remotes/<remote>/milestones/`,
-never straight into `refs/issues/` or `refs/milestones/`.
+`refs/remotes/<remote>/issues/`, `.../milestones/` and `.../attachments/`,
+never straight into `refs/issues/`, `refs/milestones/` or
+`refs/attachments/`.
 
 ## 2. Issue commits
 
@@ -80,6 +83,8 @@ Format-Version: 1
 | `X-Estimate-Minutes` | scalar | decimal minutes, `0` allowed, no leading zeros, at most 10 × 366 days |
 | `X-Workflow-State` | scalar | slug: lowercase letter, then lowercase letters, digits, `-` (at most 64 bytes) |
 | `X-Deleted` | scalar | `true` or `false` |
+| `X-Attachment` | keyed set | an attachment (§7) |
+| `X-Attachment-Removed` | keyed set | an attachment's UUID (§7) |
 | `X-Event`, `X-Comment` | event | §5 |
 
 - Keys match case-insensitively, as in git.
@@ -149,8 +154,9 @@ parents first:
 
 Sets (`Labels`, `X-Blocked-By`): each member's presence has its own setter.
 A set trailer lists the whole set, adding and removing relative to the
-parent state. A concurrent add and remove resolves to add. Events follow the
-same rule per target comment (§5).
+parent state. A concurrent add and remove resolves to add. Keyed sets
+(attachments, §7) follow the same rule per key, and events per target
+comment (§5).
 
 No merge base is needed, and criss-cross histories are well defined.
 
@@ -167,8 +173,8 @@ pair write the identical commit:
   `State`, `Title` (only when it overrides the root subject), `Labels`,
   `Assignee`, `Priority`, `Milestone`, then `X-Parent`, `X-Start-Date`,
   `X-Due-Date`, `X-Estimate-Minutes`, `X-Workflow-State`, `X-Milestone-Id`,
-  `X-Milestone-Mode`, `X-Deleted`, `X-Blocked-By`. Other fields and events
-  follow from the parents.
+  `X-Milestone-Mode`, `X-Deleted`, `X-Blocked-By`. Other fields,
+  attachments and events follow from the parents.
 
 Restating the values lets upstream, which reads the newest trailer it
 finds, show the merged state, extension fields included. For this tool
@@ -252,7 +258,68 @@ retired. Retiring one is for milestones that won't be finished: their
 issues keep their trailers, but no longer count as in the milestone, and
 new issues can't be added.
 
-## 7. Sync
+## 7. Attachments
+
+Images (PNG, JPEG or WebP, not animated) attached to an issue:
+
+```
+X-Attachment: <uuid> <media-type> <size> sha256:<hex> <name>
+X-Attachment-Removed: <uuid>
+```
+
+- `<uuid>`: the attachment's v4 UUID. `<media-type>`: `image/png`,
+  `image/jpeg` or `image/webp`. `<size>`: decimal bytes, 1 to 64 MiB
+  (writers default to at most 5 MiB). `<hex>`: 64 lowercase hex digits of
+  the content's sha256. `<name>`: the rest of the line, 1 to 255 bytes of
+  UTF-8, no control characters, no leading or trailing space.
+- Both trailers are repeatable. A commit may add several attachments, and
+  may carry a comment too: the images belong to that comment.
+- Per UUID, §4 applies over its adds and removals; a concurrent add and
+  remove resolves to add. A later `X-Attachment` with the same object
+  (hash, size, media type) is a rename. One with a different object is
+  invalid and ignored, because attachments are immutable. A removed UUID
+  may be added again with the same object.
+- Links in text use `attachment:<uuid>`.
+
+A comment with an image:
+
+```
+Here's what it looks like on a small screen.
+
+X-Attachment: 5b0c4e0e-2b8a-4f5e-9d39-6c1c1f0f2a77 image/png 45 sha256:<hex> login.png
+```
+
+**Bytes.** The trailer is the source of truth. The bytes are LFS objects,
+named by their sha256:
+- in this tool's store, `$GIT_DIR/issuez/lfs/objects/ab/cd/<sha256>` (the
+  git common dir). `git lfs prune` doesn't touch it;
+- copied to git-lfs's store (`$GIT_DIR/lfs/objects`, or `lfs.storage`)
+  for transfers. Any copy whose hash matches is valid.
+
+**Derived ref.** `refs/attachments/<issue-uuid>` makes the objects visible
+to git-lfs and LFS servers. It holds no data of its own and can always be
+rebuilt:
+- each commit's tree has one entry per present attachment,
+  `<attachment-uuid>.<png|jpg|webp>` (mode 100644), whose blob is the LFS
+  pointer
+
+  ```
+  version https://git-lfs.github.com/spec/v1
+  oid sha256:<hex>
+  size <size>
+  ```
+- message `Regenerate attachments`, then `X-Issue: <issue-uuid>` and
+  `X-Issue-Tip: <issue tip it was derived from>`;
+- author and committer `git-issue <git-issue@invalid>`, dated with that
+  issue tip's committer time, offset `+0000`; parents sorted by OID;
+- it only moves forward: a new commit has the previous tip (and, after a
+  sync, the remote's) as parents.
+
+It is *stale* when its tree differs from what the present attachments
+derive. A newer issue tip alone is not stale. Writes that change the
+attachments move it in the same transaction as the issue ref.
+
+## 8. Sync
 
 `git issue merge <remote>` fetches the remote's issues into
 `refs/remotes/<remote>/issues/` and compares each one with the local issue.
@@ -280,11 +347,22 @@ tries again, a bounded number of times. A ref the remote refuses (a hook,
 permissions) fails the push with the remote's message. `git issue sync` is
 merge, then push.
 
+Derived attachment refs (§7) are fetched into
+`refs/remotes/<remote>/attachments/` but never merged. After the merge,
+each issue's derived ref is rebuilt from the merged issue: it
+fast-forwards to the remote's when that one is right, and otherwise gets a
+new commit on top of both. A remote derived ref that isn't a commit is
+ignored. A push first uploads the LFS objects the remote's derived refs
+don't list yet (with `git lfs push`), then sends each derived ref in the
+same atomic batch as its issue. If the upload fails, nothing is pushed.
+The derived refs of quarantined issues are not pushed. Bytes are never
+downloaded during a sync.
+
 ### Bookkeeping refs
 
 These refs are local and never pushed. Losing them only costs extra work on
 the next sync. Milestones have the same refs, with `milestones` in place of
-`issues`:
+`issues`. Derived attachment refs only have `pushed` and `seen`:
 - `refs/issuez-sync/<remote>/merged/issues/<uuid>`: the remote tip last
   merged, used to detect rewritten history;
 - `.../pushed/issues/<uuid>`: the tip the remote has;
@@ -296,7 +374,7 @@ the next sync. Milestones have the same refs, with `milestones` in place of
 - `.../seen/issues/<uuid>`: where `push` fetches the remote's refs, deleted
   right after.
 
-## 8. Compatibility
+## 9. Compatibility
 
 - Upstream reads every issue written here as format 1: `ls`, `show` and
   `fsck` work, and the extension trailers show as plain trailer lines.
@@ -311,6 +389,11 @@ the next sync. Milestones have the same refs, with `milestones` in place of
   their `X-Milestone-Id`, which stays unresolved (and is reported) until
   the milestone itself arrives through this tool's sync. Upstream shows the
   `Milestone` name written next to it.
+- Upstream doesn't know attachments. It shows the `X-Attachment` trailers
+  as plain lines and keeps them through its writes and merges, but it
+  doesn't sync `refs/attachments/*` or the bytes. Issues that travel
+  through upstream keep their attachments: this tool rebuilds the derived
+  ref, and the bytes come from any clone that pushed them with git-lfs.
 - Clones can sync through either tool. Upstream's `merge` and this tool's
   read each other's merge commits, and the `refs/issuez-sync/` refs are
   invisible to upstream.

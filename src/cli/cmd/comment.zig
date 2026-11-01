@@ -6,6 +6,7 @@ const std = @import("std");
 const context = @import("../context.zig");
 const common = @import("../common.zig");
 const issuez = @import("issuez");
+const attach = @import("attach.zig");
 const uuid = issuez.format.uuid;
 
 pub const help =
@@ -21,6 +22,7 @@ pub const help =
     \\   --edit <comment-id>        Replace a comment's text with -m
     \\   --delete <comment-id>      Hide a comment
     \\   --restore <comment-id>     Show a deleted comment again
+    \\   --attach <file>            Attach an image with the comment (repeatable)
     \\   -h, --help                 Show this help
     \\
 ;
@@ -33,6 +35,7 @@ pub fn main(comptime B: type, ctx: *context.Context(B), argv: []const []const u8
     var paragraphs: std.ArrayList([]const u8) = .empty;
     var action: Action = .add;
     var target: ?[]const u8 = null;
+    var files: std.ArrayList([]const u8) = .empty;
 
     var args: common.Args = .{ .list = argv };
     while (args.next()) |arg| {
@@ -45,6 +48,9 @@ pub fn main(comptime B: type, ctx: *context.Context(B), argv: []const []const u8
         } else if (std.mem.eql(u8, arg, "-m") or std.mem.eql(u8, arg, "--message")) {
             const v = args.value(ctx.err, "-m") orelse return common.exit_error;
             paragraphs.append(arena, v) catch return common.oom(ctx.err);
+        } else if (std.mem.eql(u8, arg, "--attach")) {
+            const v = args.value(ctx.err, arg) orelse return common.exit_error;
+            files.append(arena, v) catch return common.oom(ctx.err);
         } else if (std.meta.stringToEnum(Action, if (arg.len > 2) arg[2..] else "")) |a| {
             if (a == .add or !std.mem.startsWith(u8, arg, "--")) {
                 return common.unknownOption(ctx.err, "comment", arg);
@@ -64,6 +70,11 @@ pub fn main(comptime B: type, ctx: *context.Context(B), argv: []const []const u8
         ctx.err,
         "comment",
         "issue ID is required",
+    );
+    if (files.items.len > 0 and action != .add) return common.missing(
+        ctx.err,
+        "comment",
+        "--attach goes with a new comment",
     );
     const needs_text = action == .add or action == .edit;
     if (needs_text and paragraphs.items.len == 0) return common.missing(
@@ -92,6 +103,16 @@ pub fn main(comptime B: type, ctx: *context.Context(B), argv: []const []const u8
         prefix,
     ) orelse return common.exit_error;
     const short = uuid.shortId(ref.id());
+    if (action == .add and files.items.len > 0) {
+        const att = issuez.Attachments(B).fromRepo(repo);
+        att.ready(arena) catch |e| return common.repoFailed(B, ctx, e);
+        const inputs = attach.readInputs(B, ctx, att, files.items, null) orelse
+            return common.exit_error;
+        _ = att.add(arena, ref.name, .{ .files = inputs, .comment = text }) catch |e|
+            return common.repoFailed(B, ctx, e);
+        ctx.out.print("Added comment to {s}\n", .{short}) catch {};
+        return common.exit_ok;
+    }
     if (action == .add) {
         _ = repo.comment(arena, ref.name, .{ .text = text }) catch |e|
             return common.repoFailed(B, ctx, e);

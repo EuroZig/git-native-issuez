@@ -127,6 +127,20 @@ fn syncError(comptime B: type, ctx: *context.Context(B), e: anyerror, remote: []
             "error: '{s}' kept changing while pushing; try again\n",
             .{remote},
         ) catch {},
+        error.LfsUnavailable => {
+            ctx.err.print(
+                "error: this clone has attachment bytes '{s}' doesn't have yet, and\n" ++
+                    "       git-lfs isn't installed to upload them; nothing was pushed.\n" ++
+                    "       Install git-lfs (https://git-lfs.com) and push again.\n",
+                .{remote},
+            ) catch {};
+            return common.exit_error;
+        },
+        error.LfsUploadFailed => ctx.err.print(
+            "error: git-lfs couldn't upload the attachment objects to '{s}', so\n" ++
+                "       nothing was pushed (does it have an LFS server? see 'git lfs env')\n",
+            .{remote},
+        ) catch {},
         else => return common.repoFailed(B, ctx, e),
     }
     if (@hasDecl(B, "lastStderr")) {

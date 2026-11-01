@@ -1,4 +1,4 @@
-//! Object IDs, commits and git's object hashing. We encode objects
+//! Object IDs, commits, trees and git's object hashing. We encode objects
 //! ourselves instead of calling `git commit-tree`, so `GitProcess` and
 //! `GitSim` produce the same OIDs.
 
@@ -275,7 +275,72 @@ pub const Commit = struct {
     }
 };
 
+/// Flat trees of regular files, which is all we write.
+pub const Tree = struct {
+    pub const Entry = struct {
+        /// No `/` and no NUL.
+        name: []const u8,
+        oid: Oid,
+    };
+
+    pub const ParseError = error{InvalidTree} || Allocator.Error;
+
+    /// Mode 100644, sorted by name (git's order for plain files).
+    pub fn serializeAlloc(arena: Allocator, entries: []const Entry) Allocator.Error![]u8 {
+        const sorted = try arena.dupe(Entry, entries);
+        std.mem.sort(Entry, sorted, {}, struct {
+            fn lt(_: void, a: Entry, b: Entry) bool {
+                return std.mem.lessThan(u8, a.name, b.name);
+            }
+        }.lt);
+        var out: std.ArrayList(u8) = .empty;
+        for (sorted) |e| {
+            assert(e.name.len > 0 and std.mem.findAny(u8, e.name, "/\x00") == null);
+            try out.appendSlice(arena, "100644 ");
+            try out.appendSlice(arena, e.name);
+            try out.append(arena, 0);
+            try out.appendSlice(arena, e.oid.slice());
+        }
+        return out.items;
+    }
+
+    /// Any mode, so the simulator can copy whatever a tree references.
+    pub fn parse(arena: Allocator, format: ObjectFormat, data: []const u8) ParseError![]Entry {
+        var out: std.ArrayList(Entry) = .empty;
+        var rest = data;
+        const n = format.byteLen();
+        while (rest.len > 0) {
+            const space = std.mem.findScalar(u8, rest, ' ') orelse return error.InvalidTree;
+            const nul = std.mem.findScalarPos(u8, rest, space, 0) orelse
+                return error.InvalidTree;
+            if (nul + 1 + n > rest.len) return error.InvalidTree;
+            var oid: Oid = .{ .object_format = format, .bytes = @splat(0) };
+            @memcpy(oid.bytes[0..n], rest[nul + 1 ..][0..n]);
+            try out.append(arena, .{ .name = rest[space + 1 .. nul], .oid = oid });
+            rest = rest[nul + 1 + n ..];
+        }
+        return out.items;
+    }
+};
+
 const testing = std.testing;
+
+test "tree serialization matches git mktree" {
+    var arena_state: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const entries = [_]Tree.Entry{
+        .{ .name = "b.png", .oid = hashObject(.sha1, .blob, "x") },
+        .{ .name = "a.txt", .oid = hashObject(.sha1, .blob, "hello\n") },
+    };
+    const data = try Tree.serializeAlloc(arena, &entries);
+    const oid = hashObject(.sha1, .tree, data).hex();
+    try testing.expectEqualStrings("33012a818981664607f900af8ea22cfc0a66a89f", oid.slice());
+    const back = try Tree.parse(arena, .sha1, data);
+    try testing.expectEqual(@as(usize, 2), back.len);
+    try testing.expectEqualStrings("a.txt", back[0].name);
+    try testing.expectError(error.InvalidTree, Tree.parse(arena, .sha1, "100644 x\x00ab"));
+}
 
 test "empty tree matches git" {
     const sha1 = emptyTree(.sha1).hex();

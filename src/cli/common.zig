@@ -247,6 +247,22 @@ pub fn reportEngineError(err: *std.Io.Writer, e: anyerror) void {
         error.MilestoneCompleted => "error: the milestone is completed; reopen it first " ++
             "('git issue milestone reopen')\n",
         error.MilestoneRetired => "error: the milestone is retired; pick another one\n",
+        error.AttachmentsUnsupported => "error: this backend has no attachment store\n",
+        error.UnsupportedType => "not a PNG, JPEG or WebP image\n",
+        error.AnimatedImage => "animated images aren't supported\n",
+        error.MediaMismatch => "the file's type doesn't match its contents\n",
+        error.AttachmentTooLarge => "larger than the attachment limit (5 MiB)\n",
+        error.EmptyAttachment => "the file is empty\n",
+        error.TooManyAttachments => "error: an issue can have at most 30 attachments\n",
+        error.AttachmentNotFound => "error: no such attachment on this issue\n",
+        error.NoAttachments => "error: no attachments given\n",
+        error.StoreFailed => "error: could not read or write the LFS store\n",
+        error.LfsUploadFailed => "error: git-lfs couldn't upload the attachments' objects, so " ++
+            "nothing was pushed\n" ++
+            "       (does the remote have an LFS server? see 'git lfs env')\n",
+        error.LfsUnavailable => "error: attachments need git-lfs, which isn't installed " ++
+            "(https://git-lfs.com)\n",
+        error.LfsTransferFailed => "error: git-lfs couldn't transfer the attachment objects\n",
         error.OpenWorkInMilestone => "error: the milestone still has open issues; close or " ++
             "move them first (see 'git issue milestone show')\n",
         error.NothingToEdit => "error: at least one edit option is required\n",
@@ -272,7 +288,9 @@ pub fn reportEngineError(err: *std.Io.Writer, e: anyerror) void {
 pub fn reportRepoError(comptime B: type, ctx: *context.Context(B), e: anyerror) void {
     if (e == error.IdentityUnknown) if (reportMissingIdentity(B, ctx)) return;
     reportEngineError(ctx.err, e);
-    if (e != error.GitFailed) return;
+    const has_detail = e == error.GitFailed or e == error.LfsTransferFailed or
+        e == error.LfsUploadFailed;
+    if (!has_detail) return;
     if (!@hasDecl(B, "lastStderr")) return;
     const backend = ctx.backend catch return;
     const detail = std.mem.trim(u8, backend.lastStderr(), " \t\r\n");
