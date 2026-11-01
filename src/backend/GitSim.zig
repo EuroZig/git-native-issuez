@@ -602,6 +602,7 @@ pub fn fetch(
     arena: Allocator,
     remote: []const u8,
     refspecs: []const []const u8,
+    prune: bool,
 ) (Error || error{FetchFailed})!void {
     const idx = (try sim.remoteClone(arena, remote)) orelse return error.FetchFailed;
     const remote_clone = sim.world.clones[idx];
@@ -609,6 +610,24 @@ pub fn fetch(
     const remote_objects = try objectsOf(arena, format, remote_clone);
     for (refspecs) |raw| {
         const spec = parseRefspec(raw);
+        // Like `git fetch --prune`: what the remote no longer has goes,
+        // for glob refspecs.
+        if (prune and std.mem.endsWith(u8, spec.dst, "*")) {
+            const dst_prefix = spec.dst[0 .. spec.dst.len - 1];
+            const src_prefix = spec.src[0 .. spec.src.len - 1];
+            var gone: std.ArrayList([]const u8) = .empty;
+            var it = sim.refs.iterator();
+            while (it.next()) |e| {
+                const name = e.key_ptr.*;
+                if (!std.mem.startsWith(u8, name, dst_prefix)) continue;
+                const src = try std.mem.concat(arena, u8, &.{ src_prefix, name[dst_prefix.len..] });
+                const there = for (remote_clone.refs) |r| {
+                    if (std.mem.eql(u8, r.name, src)) break true;
+                } else false;
+                if (!there) try gone.append(arena, name);
+            }
+            for (gone.items) |name| _ = sim.refs.orderedRemove(name);
+        }
         for (remote_clone.refs) |r| {
             const dst = (try mapRef(arena, r.name, spec)) orelse continue;
             if (!contract.isValidRefName(dst)) protocolViolation(

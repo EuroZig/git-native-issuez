@@ -327,22 +327,20 @@ pub fn remoteNames(gp: *GitProcess, arena: Allocator) Error![]const []const u8 {
 /// Only the given refspecs write refs: `--refmap=` stops git from also
 /// updating refs through `remote.<name>.fetch`, which with upstream's
 /// `+refs/issues/*:refs/issues/*` would reset unpushed local issues. Tags
-/// and FETCH_HEAD are left alone.
+/// and FETCH_HEAD are left alone. `prune` deletes the refs under the
+/// refspecs' destinations that the remote no longer has.
 pub fn fetch(
     gp: *GitProcess,
     arena: Allocator,
     remote: []const u8,
     refspecs: []const []const u8,
+    prune: bool,
 ) (Error || error{FetchFailed})!void {
     assert(contract.isValidRemoteName(remote));
     var argv: std.ArrayList([]const u8) = .empty;
-    try argv.appendSlice(
-        arena,
-        &.{
-            "git",     "fetch", "--no-tags", "--no-write-fetch-head", "--refmap=",
-            "--quiet", "--",    remote,
-        },
-    );
+    try argv.appendSlice(arena, &.{ "git", "fetch", "--no-tags", "--no-write-fetch-head" });
+    if (prune) try argv.append(arena, "--prune");
+    try argv.appendSlice(arena, &.{ "--refmap=", "--quiet", "--", remote });
     try argv.appendSlice(arena, refspecs);
     const result = try gp.run(arena, argv.items, null);
     if (!result.ok()) {

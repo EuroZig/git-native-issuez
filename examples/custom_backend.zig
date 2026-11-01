@@ -37,7 +37,8 @@ fn Audited(comptime Inner: type) type {
                     std.mem.startsWith(u8, u.name, "refs/milestones/") or
                     std.mem.startsWith(u8, u.name, "refs/attachments/") or
                     std.mem.startsWith(u8, u.name, "refs/issuez-sync/") or
-                    std.mem.startsWith(u8, u.name, "refs/issuez-guard/");
+                    std.mem.startsWith(u8, u.name, "refs/issuez-guard/") or
+                    std.mem.startsWith(u8, u.name, "refs/issuez-cache/");
                 if (!allowed) @panic("write outside the issue namespaces");
                 self.log.print("  ref {t} {s}\n", .{ u.op, u.name }) catch {};
             }
@@ -130,8 +131,9 @@ fn Audited(comptime Inner: type) type {
             arena: Allocator,
             remote: []const u8,
             refspecs: []const []const u8,
+            prune: bool,
         ) (Error || error{FetchFailed})!void {
-            return self.inner.fetch(arena, remote, refspecs);
+            return self.inner.fetch(arena, remote, refspecs, prune);
         }
 
         comptime {

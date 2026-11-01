@@ -361,7 +361,7 @@ test "push and fetch" {
     );
 
     // b fetches into staging, builds on it, pushes.
-    try gb.fetch(arena, "origin", &.{"+refs/issues/*:refs/remotes/origin/issues/*"});
+    try gb.fetch(arena, "origin", &.{"+refs/issues/*:refs/remotes/origin/issues/*"}, false);
     const staged_name = "refs/remotes/origin/issues/a7f3b2c1-4e5d-4a8b-9c1e-2f3a4b5c6d7e";
     const staged = (try gb.resolveRef(staged_name)).?;
     try testing.expect(staged.eql(root));
@@ -383,14 +383,14 @@ test "push and fetch" {
     try ga.updateRefs(&.{.{ .name = other, .op = .{ .create = root } }});
     const rejected = try ga.push(arena, "origin", &.{ spec, other ++ ":" ++ other }, true);
     try testing.expect(rejected.rejected());
-    try gb.fetch(arena, "origin", &.{"+refs/issues/*:refs/remotes/origin/issues/*"});
+    try gb.fetch(arena, "origin", &.{"+refs/issues/*:refs/remotes/origin/issues/*"}, false);
     const other_staged = "refs/remotes/origin/issues/b8e4c3d2-5f6e-4b9c-8d2f-3a4b5c6d7e8f";
     try testing.expect(try gb.resolveRef(other_staged) == null);
 
     // An unknown remote is a fetch failure with git's explanation kept.
     try testing.expectError(
         error.FetchFailed,
-        ga.fetch(arena, "nosuchremote", &.{"+refs/issues/*:refs/remotes/x/issues/*"}),
+        ga.fetch(arena, "nosuchremote", &.{"+refs/issues/*:refs/remotes/x/issues/*"}, false),
     );
     try testing.expect(ga.lastStderr().len > 0);
 }

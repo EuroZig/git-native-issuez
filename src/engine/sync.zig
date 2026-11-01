@@ -1,7 +1,9 @@
 //! Merge, push and sync with a git remote.
 //!
-//! Fetches land in `refs/remotes/<remote>/<ns>/` and get merged from there.
-//! What we merged, what the remote has and what we refused is recorded in
+//! Fetches land in `refs/issuez-sync/<remote>/seen/<ns>/`, kept between
+//! syncs, and get merged from there (`--no-fetch` merges the user's own
+//! fetch in `refs/remotes/<remote>/<ns>/`). What we merged, what the
+//! remote has and what we refused is recorded in
 //! `refs/issuez-sync/<remote>/<record>/<ns>/<uuid>` (`Record`). Those refs
 //! are never pushed, and losing them only costs extra work.
 //!
@@ -98,7 +100,8 @@ pub const Record = enum {
     quarantined,
     /// A quarantine resolved with `keep_local`, for that remote tip.
     kept,
-    /// Where push fetches the remote's refs, deleted right after.
+    /// The remote's refs as of the last fetch by merge or push. Kept
+    /// between syncs, so a fetch only writes what changed.
     seen,
     /// Local tips that `accept_remote` replaced, one ref per tip.
     replaced,
@@ -258,18 +261,12 @@ pub fn Sync(comptime B: type) type {
             if (!contract.isValidRemoteName(remote)) return error.InvalidRemoteName;
             if (options.fetch) {
                 try self.ensureRemote(arena, remote);
-                var specs: [fetched_namespaces.len][]const u8 = undefined;
-                for (fetched_namespaces, &specs) |ns, *spec| spec.* = try std.fmt.allocPrint(
-                    arena,
-                    "+{s}*:{s}*",
-                    .{ ns.refPrefix(), try stagingPrefix(arena, remote, ns) },
-                );
-                try self.b().fetch(arena, remote, &specs);
+                try self.fetchSeen(arena, remote);
             }
             var entries: std.ArrayList(Entry) = .empty;
             var batch: Batch = .{};
             for (namespaces) |ns| {
-                const staging_prefix = try stagingPrefix(arena, remote, ns);
+                const staging_prefix = try sourcePrefix(arena, remote, ns, options.fetch);
                 const staged = try self.b().listRefs(arena, staging_prefix);
                 const k = try self.readKnown(arena, remote, ns);
                 for (staged) |s| {
@@ -298,8 +295,7 @@ pub fn Sync(comptime B: type) type {
         ) Error!usize {
             const A = attachments_mod.Attachments(B);
             const att = A.fromRepo(self.repo);
-            const staging_prefix = try stagingPrefix(arena, remote, .attachments);
-            const staged = try self.b().listRefs(arena, staging_prefix);
+            const staging_prefix = try sourcePrefix(arena, remote, .attachments, options.fetch);
             const remote_tips = try self.refsUnder(arena, staging_prefix);
             const local_tips = try self.refsUnder(arena, attachments_mod.ref_prefix);
             const pushed = try self.refsUnder(
@@ -329,10 +325,6 @@ pub fn Sync(comptime B: type) type {
                     remote_derived,
                 );
             }
-            if (options.fetch) for (staged) |s| {
-                if (uuid_fmt.isCanonical(s.name[staging_prefix.len..]))
-                    try batch.delete(arena, s.name, s.oid);
-            };
             try self.apply(arena, &batch);
             return moved;
         }
@@ -365,7 +357,6 @@ pub fn Sync(comptime B: type) type {
                 .id = id,
                 .k = k,
                 .staged = staged,
-                .fetched = options.fetch,
             };
 
             // Merged before and nothing changed since: vetted then, so only
@@ -481,7 +472,7 @@ pub fn Sync(comptime B: type) type {
             };
         }
 
-        /// The records a merged issue leaves, and the staging cleanup.
+        /// The records a merged issue leaves.
         const RecordWrites = struct {
             sync: Self,
             arena: Allocator,
@@ -490,7 +481,6 @@ pub fn Sync(comptime B: type) type {
             id: []const u8,
             k: *const Known,
             staged: contract.RefEntry,
-            fetched: bool,
 
             fn add(w: RecordWrites, batch: *Batch) Error!void {
                 const a = w.arena;
@@ -503,9 +493,6 @@ pub fn Sync(comptime B: type) type {
                 try batch.set(a, pushed, w.k.pushed.get(w.id), tip);
                 const marker = try recordRef(a, w.remote, .quarantined, w.ns, w.id);
                 try batch.delete(a, marker, w.k.quarantined.get(w.id));
-                // Like upstream, only clean up what this merge fetched. With
-                // `--no-fetch` the staging refs came from the user's own fetch.
-                if (w.fetched) try batch.delete(a, w.staged.name, tip);
             }
         };
 
@@ -917,9 +904,7 @@ pub fn Sync(comptime B: type) type {
         }
 
         pub fn sync(self: Self, arena: Allocator, remote: []const u8) Error!SyncReport {
-            const merged = try self.merge(arena, remote, .{});
-            const pushed = try self.push(arena, remote);
-            return .{ .merge = merged, .push = pushed };
+            return self.syncWith(arena, remote, .{});
         }
 
         pub fn push(self: Self, arena: Allocator, remote: []const u8) Error!PushReport {
@@ -933,7 +918,8 @@ pub fn Sync(comptime B: type) type {
             options: PushOptions,
         ) Error!SyncReport {
             const merged = try self.merge(arena, remote, .{});
-            const pushed = try self.pushWith(arena, remote, options);
+            // The merge just fetched what the remote has.
+            const pushed = try self.pushIn(arena, remote, options, false);
             return .{ .merge = merged, .push = pushed };
         }
 
@@ -943,9 +929,19 @@ pub fn Sync(comptime B: type) type {
             remote: []const u8,
             options: PushOptions,
         ) Error!PushReport {
+            return self.pushIn(arena, remote, options, true);
+        }
+
+        fn pushIn(
+            self: Self,
+            arena: Allocator,
+            remote: []const u8,
+            options: PushOptions,
+            fetch: bool,
+        ) Error!PushReport {
             if (!contract.isValidRemoteName(remote)) return error.InvalidRemoteName;
             try self.ensureRemote(arena, remote);
-            try self.refreshPushed(arena, remote);
+            try self.refreshPushed(arena, remote, fetch);
             // Pushed issues should carry their pointers. Issues that came in
             // through upstream have no derived ref yet.
             const att = attachments_mod.Attachments(B).fromRepo(self.repo);
@@ -1028,26 +1024,9 @@ pub fn Sync(comptime B: type) type {
         /// Sets the `pushed` records to what the remote has now. They go
         /// stale when someone else force-pushes or deletes a ref, and push
         /// only sends what differs from them.
-        fn refreshPushed(self: Self, arena: Allocator, remote: []const u8) Error!void {
-            // Left over from an interrupted push, they would read as what
-            // the remote has.
-            var stale: std.ArrayList(contract.RefUpdate) = .empty;
-            for (fetched_namespaces) |ns| {
-                for (try self.b().listRefs(arena, try recordRef(arena, remote, .seen, ns, ""))) |e| {
-                    try stale.append(arena, .{ .name = e.name, .op = .{ .delete = e.oid } });
-                }
-            }
-            if (stale.items.len > 0) self.b().updateRefs(stale.items) catch |err| switch (err) {
-                error.RefConflict => return error.ConcurrentModification,
-                else => |e| return e,
-            };
-            var specs: [fetched_namespaces.len][]const u8 = undefined;
-            for (fetched_namespaces, &specs) |ns, *spec| spec.* = try std.fmt.allocPrint(
-                arena,
-                "+{s}*:{s}*",
-                .{ ns.refPrefix(), try recordRef(arena, remote, .seen, ns, "") },
-            );
-            try self.b().fetch(arena, remote, &specs);
+        /// `fetch` false: `seen/` is current, a merge just fetched it.
+        fn refreshPushed(self: Self, arena: Allocator, remote: []const u8, fetch: bool) Error!void {
+            if (fetch) try self.fetchSeen(arena, remote);
             // One transaction for all records, not a git call per issue.
             var ops: std.ArrayList(contract.RefUpdate) = .empty;
             for (fetched_namespaces) |ns| {
@@ -1067,17 +1046,24 @@ pub fn Sync(comptime B: type) type {
                     else if (old) |o| .{ .delete = o } else null;
                     if (op) |o| try ops.append(arena, .{ .name = name, .op = o });
                 }
-                var it = remote_tips.iterator();
-                while (it.next()) |e| try ops.append(arena, .{
-                    .name = try std.mem.concat(arena, u8, &.{ seen_prefix, e.key_ptr.* }),
-                    .op = .{ .delete = e.value_ptr.* },
-                });
             }
             if (ops.items.len == 0) return;
             self.b().updateRefs(ops.items) catch |err| switch (err) {
                 error.RefConflict => return error.ConcurrentModification,
                 else => |e| return e,
             };
+        }
+
+        /// Brings `seen/` in line with the remote: refs it no longer has
+        /// go, and only changed refs are written.
+        fn fetchSeen(self: Self, arena: Allocator, remote: []const u8) Error!void {
+            var specs: [fetched_namespaces.len][]const u8 = undefined;
+            for (fetched_namespaces, &specs) |ns, *spec| spec.* = try std.fmt.allocPrint(
+                arena,
+                "+{s}*:{s}*",
+                .{ ns.refPrefix(), try recordRef(arena, remote, .seen, ns, "") },
+            );
+            try self.b().fetch(arena, remote, &specs, true);
         }
 
         /// The refs under `prefix`, by the rest of their name.
@@ -1283,7 +1269,16 @@ fn findPending(list: anytype, name: []const u8) ?@TypeOf(list[0]) {
     return null;
 }
 
-fn stagingPrefix(arena: Allocator, remote: []const u8, ns: Namespace) Allocator.Error![]const u8 {
+/// Where merge reads the remote's refs: `seen/` after its own fetch,
+/// otherwise the staging refs of the user's fetch,
+/// `refs/remotes/<remote>/<ns>/`.
+fn sourcePrefix(
+    arena: Allocator,
+    remote: []const u8,
+    ns: Namespace,
+    fetched: bool,
+) Allocator.Error![]const u8 {
+    if (fetched) return recordRef(arena, remote, .seen, ns, "");
     return std.fmt.allocPrint(arena, "refs/remotes/{s}/{t}/", .{ remote, ns });
 }
 
@@ -1559,7 +1554,7 @@ test "merge without fetch" {
 
     // Bob fetches by hand, then merges twice without fetching.
     var bob = try onClone(arena, &world, 1);
-    try bob.sim.fetch(arena, "origin", &.{"+refs/issues/*:refs/remotes/origin/issues/*"});
+    try bob.sim.fetch(arena, "origin", &.{"+refs/issues/*:refs/remotes/origin/issues/*"}, false);
     const staged = try std.fmt.allocPrint(
         arena,
         "refs/remotes/origin/issues/{s}",
@@ -1572,9 +1567,43 @@ test "merge without fetch" {
     try testing.expectEqual(@as(usize, 1), again.count(.up_to_date));
     try testing.expect(try bob.sim.resolveRef(staged) != null);
 
+    // Its own fetch goes to `seen/`; the user's staging refs stay.
     const fetched = try bob.sync.merge(arena, "origin", .{});
     try testing.expectEqual(@as(usize, 1), fetched.count(.up_to_date));
-    try testing.expect(try bob.sim.resolveRef(staged) == null);
+    try testing.expect(try bob.sim.resolveRef(staged) != null);
+    const seen = try recordRef(arena, "origin", .seen, .issues, created.id.slice());
+    try testing.expect(try bob.sim.resolveRef(seen) != null);
+}
+
+test "seen refs follow the remote, deleted refs are pushed again" {
+    var arena_state: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var world = testWorld();
+
+    var a = try onClone(arena, &world, 0);
+    const created = try a.sync.repo.create(arena, .{ .title = "Kept" });
+    const ref_name = try std.fmt.allocPrint(arena, "refs/issues/{s}", .{created.id.slice()});
+    _ = try a.sync.sync(arena, "origin");
+    // Fetches write `seen/`, pushes don't.
+    const seen = try recordRef(arena, "origin", .seen, .issues, created.id.slice());
+    try testing.expect(try a.sim.resolveRef(seen) == null);
+    _ = try a.sync.merge(arena, "origin", .{});
+    try testing.expect((try a.sim.resolveRef(seen)).?.eql(created.tip));
+    try a.sim.commit();
+
+    // Someone deletes it on the hub: the next fetch drops it from `seen/`,
+    // so push no longer counts it as there and sends it again.
+    var hub = try GitSim.init(arena, &world, 2);
+    try hub.updateRefs(&.{.{ .name = ref_name, .op = .{ .delete = created.tip } }});
+    try hub.commit();
+    a = try onClone(arena, &world, 0);
+    const s = try a.sync.sync(arena, "origin");
+    try testing.expectEqual(@as(usize, 1), s.push.pushed);
+    try testing.expect(try a.sim.resolveRef(seen) == null);
+    try a.sim.commit();
+    hub = try GitSim.init(arena, &world, 2);
+    try testing.expect((try hub.resolveRef(ref_name)).?.eql(created.tip));
 }
 
 test "sync reports conflicts" {
@@ -1823,7 +1852,6 @@ test "remote reset to an older tip gets the local tip again" {
     a = try onClone(arena, &world, 0);
     const p = try a.sync.push(arena, "origin");
     try testing.expectEqual(@as(usize, 1), p.pushed);
-    try testing.expectEqual(@as(usize, 0), (try a.sim.listRefs(arena, "refs/issuez-sync/origin/seen/")).len);
     try a.sim.commit();
     hub = try GitSim.init(arena, &world, 2);
     try testing.expect((try hub.resolveRef(ref_name)).?.eql(local_tip));

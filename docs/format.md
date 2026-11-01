@@ -14,18 +14,20 @@ The key words MUST, MUST NOT, SHOULD and MAY are used as in RFC 2119.
 | `refs/issues/<uuid>` | an issue |
 | `refs/milestones/<uuid>` | a milestone (§6) |
 | `refs/attachments/<uuid>` | LFS pointers for the attachments of issue `<uuid>`, derived (§7) |
-| `refs/remotes/<remote>/{issues,milestones,attachments}/<uuid>` | fetched refs, waiting to be merged |
+| `refs/remotes/<remote>/{issues,milestones,attachments}/<uuid>` | refs a plain `git fetch` brought, read by `merge --no-fetch` |
 | `refs/issuez-sync/<remote>/<kind>/{issues,milestones,attachments}/<uuid>` | sync bookkeeping, local only (§8) |
 | `refs/issuez-guard/<uuid>` | write serialization, local only (§3, Guards) |
+| `refs/issuez-cache/parents` | every issue's parent, a local cache (§3, Guards) |
 
 UUIDs are lowercase, hyphenated, version 4. Readers MUST NOT read data from
 any ref other than `refs/issues/*` and `refs/milestones/*`.
 `refs/attachments/*` holds no data of its own and can always be rebuilt.
 
-`git issue merge`, `sync` and `git fetch` after `git issue init` fetch into
-`refs/remotes/<remote>/issues/`, `.../milestones/` and `.../attachments/`,
-never straight into `refs/issues/`, `refs/milestones/` or
-`refs/attachments/`.
+`git issue merge`, `push` and `sync` fetch into
+`refs/issuez-sync/<remote>/seen/` (§8), and `git fetch` after
+`git issue init` into `refs/remotes/<remote>/issues/`, `.../milestones/`
+and `.../attachments/`. Neither writes `refs/issues/`, `refs/milestones/`
+or `refs/attachments/` directly.
 
 ## 2. Issue commits
 
@@ -131,6 +133,13 @@ the children: two such writes in one clone conflict, and the retry sees the
 child. Milestones work the same way: changing what is in a milestone and
 completing it both move the milestone's guard ref. The guard refs carry no
 data, are never pushed, and can be deleted at any time.
+
+To find an issue's sub-issues without reading every issue, guards use
+`refs/issuez-cache/parents`: a blob with one line per issue,
+`<uuid> <tip> -` (no parent) or `<uuid> <tip> =<parent>`. A line counts
+only while `<tip>` is still the issue's tip; other issues are read. A write
+that read it rewrites it after succeeding, once enough lines are stale. It
+is local, never pushed, and can be deleted at any time.
 
 Other tools and concurrent clones can still produce violations; readers
 report them and never fail on them.
@@ -322,10 +331,13 @@ attachments move it in the same transaction as the issue ref.
 ## 8. Sync
 
 `git issue merge <remote>` fetches the remote's issues into
-`refs/remotes/<remote>/issues/` and compares each one with the local issue.
-Only refs named by a UUID there are issues: a remote branch `issues/...`,
-which git's default refspec also tracks there, is left alone. Milestones
-sync the same way, through `refs/remotes/<remote>/milestones/`, with the
+`refs/issuez-sync/<remote>/seen/issues/` and compares each one with the
+local issue (`--no-fetch` takes them from `refs/remotes/<remote>/issues/`
+instead). Only refs named by a UUID there are issues: a remote branch
+`issues/...`, which git's default refspec also tracks there, is left alone.
+An issue whose remote tip is the local tip and the one merged last is
+already up to date and isn't checked again. Milestones sync the same way,
+through `.../seen/milestones/`, with the
 same outcomes: `status` lists a quarantined milestone and `quarantine`
 resolves it like an issue.
 
@@ -341,14 +353,14 @@ resolves it like an issue.
   resolves it.
 
 `git issue push <remote>` first fetches the remote's issue refs to see
-what it has, then pushes the local issues and milestones that differ, in
+what it has (`sync` reuses the merge's fetch), then pushes the local issues and milestones that differ, in
 atomic batches and never with force. When the remote moved, it merges and
 tries again, a bounded number of times. A ref the remote refuses (a hook,
 permissions) fails the push with the remote's message. `git issue sync` is
 merge, then push.
 
-Derived attachment refs (§7) are fetched into
-`refs/remotes/<remote>/attachments/` but never merged. After the merge,
+Derived attachment refs (§7) are fetched into `.../seen/attachments/` but
+never merged. After the merge,
 each issue's derived ref is rebuilt from the merged issue: it
 fast-forwards to the remote's when that one is right, and otherwise gets a
 new commit on top of both. A remote derived ref that isn't a commit is
@@ -371,8 +383,9 @@ the next sync. Milestones have the same refs, with `milestones` in place of
   (`quarantine --keep-local`);
 - `.../replaced/issues/<uuid>/<tip>`: each local tip replaced by
   `quarantine --accept-remote`, so no version is ever dropped;
-- `.../seen/issues/<uuid>`: where `push` fetches the remote's refs, deleted
-  right after.
+- `.../seen/issues/<uuid>`: the remote's ref as of the last fetch by
+  `merge`, `push` or `sync`. It stays between syncs, so a fetch only writes
+  the refs that changed, and refs the remote no longer has are pruned.
 
 ## 9. Compatibility
 

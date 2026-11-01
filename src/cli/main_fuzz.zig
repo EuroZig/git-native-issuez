@@ -793,7 +793,7 @@ fn upstreamStep(arena: Allocator, world: *World, clone_index: usize) CaseError!v
     const before = world.*;
     var sim = try GitSim.init(arena, world, clone_index);
     const staging = "refs/remotes/origin/issues/";
-    sim.fetch(arena, "origin", &.{"+refs/issues/*:" ++ staging ++ "*"}) catch {
+    sim.fetch(arena, "origin", &.{"+refs/issues/*:" ++ staging ++ "*"}, false) catch {
         countOutcome("(upstream merge)", false);
         return;
     };

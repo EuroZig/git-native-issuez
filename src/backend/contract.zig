@@ -18,7 +18,7 @@
 //! fn remoteNames(self, arena) Error![]const []const u8
 //! fn identity(self, arena) Error!Identity
 //! fn randomBytes(self, buf: []u8) void
-//! fn fetch(self, arena, remote, refspecs) (Error || error{FetchFailed})!void
+//! fn fetch(self, arena, remote, refspecs, prune) (Error || error{FetchFailed})!void
 //! fn push(self, arena, remote, refspecs, atomic) (Error || error{PushFailed})!PushResult
 //! ```
 //!

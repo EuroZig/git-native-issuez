@@ -192,8 +192,10 @@ are installed.
   ([format.md](format.md) §8). Upstream ignores them.
 - The remote must be a configured remote name. URLs and paths are refused
   with a `git remote add` hint; upstream fails on them too, at the fetch.
-- `--no-fetch` keeps the staging refs, like upstream. A fetching merge
-  removes the ones it merged.
+- `--no-fetch` merges the refs a plain `git fetch` brought to
+  `refs/remotes/<remote>/`, and keeps them, like upstream. A fetching merge
+  fetches into its own `refs/issuez-sync/<remote>/seen/` instead, which
+  stays between syncs, so an unchanged remote costs no ref writes.
 
 ## Commands upstream doesn't have
 

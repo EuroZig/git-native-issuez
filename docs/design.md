@@ -63,8 +63,8 @@ set of plumbing operations:
   every update states the value it expects;
 - graph: is-ancestor and merge bases;
 - config, remotes, the default identity;
-- transport: fetch with explicit refspecs, and push (optionally atomic)
-  with a result per ref;
+- transport: fetch with explicit refspecs (optionally pruning), and push
+  (optionally atomic) with a result per ref;
 - random bytes, for UUIDs;
 - optionally, the LFS stores for attachment bytes (read, atomic write,
   list) and LFS transfer (push and fetch objects). A backend without them
@@ -156,7 +156,9 @@ Writes that touch the hierarchy also run guards
 a closed one, no deleting an issue with live sub-issues. A guard reads other
 issues, and every issue it reads gets a `verify` line in the same ref
 transaction as the write. When one of them moves concurrently, the
-transaction fails and the write starts again from step 1. A `verify` can't
+transaction fails and the write starts again from step 1. Sub-issues are
+found through `refs/issuez-cache/parents`, a blob of every issue's tip and
+parent: only issues whose tip changed since are read. A `verify` can't
 pin an absence, like no child under the issue being closed, so those
 writes also move a local guard ref (`refs/issuez-guard/<uuid>`) of the
 issue whose children matter, and two of them conflict. Milestones are
@@ -175,9 +177,10 @@ changed, like an HTTP ETag.
 
 `Sync(B)` (`src/engine/sync.zig`) sits on top of `Repo(B)`:
 
-1. Fetch into `refs/remotes/<remote>/issues/` and
-   `refs/remotes/<remote>/milestones/`. A fetch never writes `refs/issues/`
-   or `refs/milestones/` directly. Milestones go through the same steps as
+1. Fetch into `refs/issuez-sync/<remote>/seen/` with `--prune`. It stays
+   between syncs, so an unchanged remote costs no ref writes, and the push
+   of a `sync` reuses it. A fetch never writes `refs/issues/` or
+   `refs/milestones/` directly. Milestones go through the same steps as
    issues.
 2. Classify each fetched issue against the local one: new, fast-forward, up
    to date, local ahead, diverged, or to be quarantined (unrelated history,
