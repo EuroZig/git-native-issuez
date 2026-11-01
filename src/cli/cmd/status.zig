@@ -126,8 +126,7 @@ fn writeJson(
     for (remotes) |remote| {
         const st = try s.status(arena, remote);
         try js.beginObject();
-        try js.objectField("name");
-        try js.write(remote);
+        try json.field(js, "name", remote);
         try js.objectField("pending");
         try js.beginArray();
         for (st.pending) |ref| try js.write(ref.id());
@@ -140,8 +139,7 @@ fn writeJson(
             try js.write(q.id);
             try js.objectField("kind");
             try js.write(if (q.namespace == .milestones) "milestone" else "issue");
-            try js.objectField("title");
-            try js.write(q.title);
+            try json.field(js, "title", q.title);
             try js.objectField("remote_tip");
             const hex = q.remote_tip.hex();
             try js.write(hex.slice());
@@ -162,10 +160,8 @@ fn writeJson(
         try js.objectField("id");
         try js.write(issue.id);
         try json.conflictField(js, c.target);
-        try js.objectField("kept");
-        try js.write(c.value);
-        try js.objectField("lost");
-        try js.write(c.lost);
+        try json.field(js, "kept", c.value);
+        try json.field(js, "lost", c.lost);
         try js.endObject();
     };
     try js.endArray();

@@ -21,6 +21,8 @@ Conventions:
 - Times are RFC 3339 with the author's offset (`2026-10-20T20:55:58+05:30`).
 - Dates are `YYYY-MM-DD`.
 - A field without a value is `null`. Empty lists are `[]`.
+- Text is always a JSON string. git allows any bytes, so bytes that
+  aren't valid UTF-8 are replaced by U+FFFD.
 
 ## Issue
 

@@ -48,5 +48,6 @@ test {
     _ = dispatch;
     _ = @import("simulate.zig");
     _ = @import("completion.zig");
+    _ = @import("json.zig");
     _ = @import("manpage.zig");
 }

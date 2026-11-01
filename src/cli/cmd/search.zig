@@ -104,7 +104,6 @@ fn writeMatch(
     try s.beginObject();
     try s.objectField("issue");
     try json.issue(s, arena, issue, .{});
-    try s.objectField("matches");
-    try s.write(lines);
+    try json.field(s, "matches", lines);
     try s.endObject();
 }
