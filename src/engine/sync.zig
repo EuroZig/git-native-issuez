@@ -297,13 +297,18 @@ pub fn Sync(comptime B: type) type {
             const att = A.fromRepo(self.repo);
             const staging_prefix = try stagingPrefix(arena, remote, .attachments);
             const staged = try self.b().listRefs(arena, staging_prefix);
+            const remote_tips = try self.refsUnder(arena, staging_prefix);
+            const local_tips = try self.refsUnder(arena, attachments_mod.ref_prefix);
             var moved: usize = 0;
             for (try self.repo.refs(arena)) |r| {
                 const id = r.id();
-                const staged_name = try std.mem.concat(arena, u8, &.{ staging_prefix, id });
-                const remote_tip = try self.b().resolveRef(staged_name);
+                const remote_tip = remote_tips.get(id);
                 const issue = self.repo.load(arena, r) catch continue;
+                // Issues that never had attachments cost no git process.
+                if (remote_tip == null and !local_tips.contains(id) and
+                    issue.attachments.len == 0 and issue.removed_attachments.len == 0) continue;
                 if (try att.reconcile(arena, issue, remote_tip)) moved += 1;
+                if (remote_tip == null) continue;
                 const local = try self.b().resolveRef(try A.derivedRefName(arena, id));
                 const same = remote_tip != null and local != null and local.?.eql(remote_tip.?);
                 if (same) try self.setRef(
@@ -829,8 +834,11 @@ pub fn Sync(comptime B: type) type {
             // Pushed issues should carry their pointers. Issues that came in
             // through upstream have no derived ref yet.
             const att = attachments_mod.Attachments(B).fromRepo(self.repo);
+            const local_tips = try self.refsUnder(arena, attachments_mod.ref_prefix);
             for (try self.repo.refs(arena)) |r| {
                 const issue = self.repo.load(arena, r) catch continue;
+                if (!local_tips.contains(r.id()) and issue.attachments.len == 0 and
+                    issue.removed_attachments.len == 0) continue;
                 _ = try att.reconcile(arena, issue, null);
             }
             var report: PushReport = .{
@@ -1053,27 +1061,26 @@ pub fn Sync(comptime B: type) type {
             // Derived refs right after their issue, or on their own if the
             // issue is already pushed.
             const ns: Namespace = .attachments;
-            var with_derived: std.ArrayList(Pending) = .empty;
-            var derived: std.ArrayList(Pending) = .empty;
+            const markers = try self.refsUnder(
+                arena,
+                try recordRef(arena, remote, .quarantined, .issues, ""),
+            );
+            const records = try self.refsUnder(arena, try recordRef(arena, remote, .pushed, ns, ""));
+            var derived: std.StringArrayHashMapUnmanaged(Pending) = .empty;
             for (try self.b().listRefs(arena, ns.refPrefix())) |r| {
                 const id = r.name[ns.refPrefix().len..];
-                const marker = try recordRef(arena, remote, .quarantined, .issues, id);
-                if (try self.b().resolveRef(marker) != null) continue;
-                const pushed_ref = try recordRef(arena, remote, .pushed, ns, id);
-                const pushed = try self.b().resolveRef(pushed_ref);
+                if (markers.contains(id)) continue;
+                const pushed = records.get(id);
                 if (pushed != null and pushed.?.eql(r.oid)) continue;
-                try derived.append(arena, .{ .name = r.name, .tip = r.oid, .ns = ns, .id = id });
+                try derived.put(arena, id, .{ .name = r.name, .tip = r.oid, .ns = ns, .id = id });
             }
+            var with_derived: std.ArrayList(Pending) = .empty;
             for (out.items) |p| {
                 try with_derived.append(arena, p);
                 if (p.ns != .issues) continue;
-                for (derived.items, 0..) |d, i| if (std.mem.eql(u8, d.id, p.id)) {
-                    try with_derived.append(arena, d);
-                    _ = derived.orderedRemove(i);
-                    break;
-                };
+                if (derived.fetchSwapRemove(p.id)) |d| try with_derived.append(arena, d.value);
             }
-            try with_derived.appendSlice(arena, derived.items);
+            try with_derived.appendSlice(arena, derived.values());
             return with_derived.items;
         }
 
