@@ -484,15 +484,28 @@ pub fn Repo(comptime B: type) type {
             ref: IssueRef,
             root_keys: []const []const u8,
         ) Allocator.Error![]const Problem {
-            var problems: std.ArrayList(Problem) = .empty;
-            if (!uuid_fmt.isCanonical(ref.id())) try problems.append(arena, .invalid_uuid);
             const commits = self.loadCommits(arena, ref.tip) catch |e| switch (e) {
                 error.OutOfMemory => return error.OutOfMemory,
                 else => {
+                    var problems: std.ArrayList(Problem) = .empty;
+                    if (!uuid_fmt.isCanonical(ref.id())) try problems.append(arena, .invalid_uuid);
                     try problems.append(arena, .{ .unreadable = e });
                     return problems.items;
                 },
             };
+            return self.checkCommits(arena, ref, commits, root_keys);
+        }
+
+        /// `checkWith` on commits already loaded with `loadCommits`.
+        pub fn checkCommits(
+            self: Self,
+            arena: Allocator,
+            ref: IssueRef,
+            commits: []const issue_model.CommitInput,
+            root_keys: []const []const u8,
+        ) Allocator.Error![]const Problem {
+            var problems: std.ArrayList(Problem) = .empty;
+            if (!uuid_fmt.isCanonical(ref.id())) try problems.append(arena, .invalid_uuid);
             const empty = object.emptyTree(self.backend.objectFormat());
             var roots: usize = 0;
             var root_message: ?[]const u8 = null;

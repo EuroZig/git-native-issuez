@@ -72,7 +72,7 @@ set of plumbing operations:
 
 | Backend      | Use                                                                                                                                                                                                                                                                                                                   |
 | ------------ | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `GitProcess` | Runs `git` from PATH with a fixed environment and `--` separators. Reads objects through one long-lived `cat-file --batch`. Output is bounded. LFS objects are files under the git dir; transfers run `git lfs push` and `git lfs fetch` when git-lfs is installed.                                                    |
+| `GitProcess` | Runs `git` from PATH with a fixed environment and `--` separators. Reads objects, and resolves single refs, through one long-lived `cat-file --batch`. Output is bounded. LFS objects are files under the git dir; transfers run `git lfs push` and `git lfs fetch` when git-lfs is installed.                                                    |
 | `GitSim`     | An in-memory world of clones, serialised as ZON. Objects hash exactly like git, so OIDs are real. A remote is another clone of the world (`remote.<name>.url = sim:<clone>`). Clock and randomness come from the world. Each clone has both LFS stores, LFS transfers copy objects between clones, and like git-lfs a fetch fails on an unknown ref or an object the remote lacks. `sim.lfs = false` makes a clone without git-lfs. Breaking a protocol rule (a commit pointing at a missing object, an invalid ref name) panics. |
 | your own     | Wrap or replace either one. `examples/custom_backend.zig` logs every ref change and push, and refuses writes outside the issue and bookkeeping refs.                                                                                                                                                                  |
 
@@ -181,15 +181,18 @@ changed, like an HTTP ETag.
    issues.
 2. Classify each fetched issue against the local one: new, fast-forward, up
    to date, local ahead, diverged, or to be quarantined (unrelated history,
-   rewritten since the last merge, fails `fsck`).
+   rewritten since the last merge, fails `fsck`). Local refs and records are
+   read once per namespace, and an issue already merged at the same tip
+   isn't checked again.
 3. Fast-forward, or write a deterministic merge commit, with the same
    compare and swap as every other write.
 4. Fetch again to learn what the remote has (someone may have
    force-pushed), then push what differs, atomically in batches. A
    rejection means the remote moved: merge again and retry, up to a fixed
    number of rounds.
-5. Record what was merged and pushed in `refs/issuez-sync/`, and report
-   every issue's outcome.
+5. Record what was merged and pushed in `refs/issuez-sync/`, in one ref
+   transaction per merge and per pushed batch, and report every issue's
+   outcome.
 
 The bookkeeping refs are a cache: they make rewound remotes detectable and
 `status` cheap, and losing them only costs a slower next sync. Nothing is

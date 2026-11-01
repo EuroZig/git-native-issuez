@@ -328,6 +328,23 @@ pub fn configUnsetValue(sim: *GitSim, key: []const u8, value: []const u8) Error!
     }
 }
 
+/// Like `GitProcess.configList`: section and name lowercase, the
+/// subsection as written.
+pub fn configList(sim: *GitSim, arena: Allocator) Error![]const World.ConfigEntry {
+    const out = try arena.alloc(World.ConfigEntry, sim.config.items.len);
+    for (sim.config.items, out) |e, *o| {
+        const key = try arena.dupe(u8, e.key);
+        const first = std.mem.findScalar(u8, key, '.') orelse key.len;
+        const last = std.mem.findScalarLast(u8, key, '.') orelse key.len;
+        for (key[0..first]) |*c| c.* = std.ascii.toLower(c.*);
+        if (last < key.len) for (key[last..]) |*c| {
+            c.* = std.ascii.toLower(c.*);
+        };
+        o.* = .{ .key = key, .value = e.value };
+    }
+    return out;
+}
+
 /// In first-seen order.
 pub fn remoteNames(sim: *GitSim, arena: Allocator) Error![]const []const u8 {
     var out: std.ArrayList([]const u8) = .empty;

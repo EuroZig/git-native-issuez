@@ -144,21 +144,16 @@ pub fn writeObject(gp: *GitProcess, kind: ObjectKind, data: []const u8) Error!Oi
     return oid;
 }
 
+/// Through the `cat-file` session rather than a `rev-parse` per ref. It
+/// reads the ref each time, so it sees changes made since.
 pub fn resolveRef(gp: *GitProcess, name: []const u8) Error!?Oid {
     assert(contract.isValidRefName(name));
-    var arena_state: std.heap.ArenaAllocator = .init(gp.gpa);
-    defer arena_state.deinit();
-    const result = try gp.run(
-        arena_state.allocator(),
-        &.{ "git", "rev-parse", "--verify", "--quiet", "--end-of-options", name },
-        null,
-    );
-    if (!result.ok()) {
-        if (result.exitCode() == 1) return null;
-        gp.keepStderr(result.stderr);
-        return error.GitFailed;
-    }
-    return Oid.parseHex(gp.format, std.mem.trimEnd(u8, result.stdout, "\n")) catch error.GitFailed;
+    const cf = try gp.catFile();
+    return cf.resolve(name) catch |err| {
+        cf.deinit(gp.io, gp.gpa);
+        gp.cat_file = null;
+        return err;
+    };
 }
 
 pub fn listRefs(gp: *GitProcess, arena: Allocator, prefix: []const u8) Error![]contract.RefEntry {
@@ -303,6 +298,26 @@ pub fn configUnsetValue(gp: *GitProcess, key: []const u8, value: []const u8) Err
         gp.keepStderr(result.stderr);
         return error.GitFailed;
     }
+}
+
+pub const ConfigEntry = struct { key: []const u8, value: []const u8 };
+
+/// Every config entry in git's order, keys as `git config --list` prints
+/// them (section and name lowercase). Not part of the contract: the CLI
+/// reads its settings with it in one git call.
+pub fn configList(gp: *GitProcess, arena: Allocator) Error![]const ConfigEntry {
+    const out = try gp.runOk(arena, &.{ "git", "config", "--list", "-z" }, null);
+    var entries: std.ArrayList(ConfigEntry) = .empty;
+    var it = std.mem.tokenizeScalar(u8, out, 0);
+    while (it.next()) |item| {
+        // A key without `=` in the file has no value, and no newline here.
+        const nl = std.mem.findScalar(u8, item, '\n');
+        try entries.append(arena, .{
+            .key = if (nl) |n| item[0..n] else item,
+            .value = if (nl) |n| item[n + 1 ..] else "",
+        });
+    }
+    return entries.items;
 }
 
 pub fn remoteNames(gp: *GitProcess, arena: Allocator) Error![]const []const u8 {
@@ -819,6 +834,32 @@ const CatFile = struct {
         const nl = r.takeByte() catch return error.GitFailed;
         if (nl != '\n') return error.GitFailed;
         return .{ .kind = kind, .data = data };
+    }
+
+    /// What `name` points at, null when there is no such ref. The object
+    /// comes along and is skipped.
+    fn resolve(cf: *CatFile, name: []const u8) Error!?Oid {
+        const w = &cf.writer.interface;
+        w.print("{s}\n", .{name}) catch return error.GitFailed;
+        w.flush() catch return error.GitFailed;
+
+        const r = &cf.reader.interface;
+        const line_raw = r.takeDelimiterInclusive('\n') catch return error.GitFailed;
+        const line = line_raw[0 .. line_raw.len - 1];
+
+        // "<name> missing", or "<oid> <type> <size>" and the object.
+        if (std.mem.endsWith(u8, line, " missing") and
+            std.mem.eql(u8, line[0 .. line.len - " missing".len], name)) return null;
+        var it = std.mem.splitScalar(u8, line, ' ');
+        const oid = Oid.parseHex(cf.format, it.next() orelse return error.GitFailed) catch
+            return error.GitFailed;
+        _ = ObjectKind.parse(it.next() orelse return error.GitFailed) orelse
+            return error.GitFailed;
+        const size = std.fmt.parseInt(usize, it.next() orelse return error.GitFailed, 10) catch
+            return error.GitFailed;
+        if (it.next() != null) return error.GitFailed;
+        r.discardAll(size + 1) catch return error.GitFailed;
+        return oid;
     }
 };
 
