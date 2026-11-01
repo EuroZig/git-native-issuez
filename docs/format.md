@@ -138,8 +138,9 @@ To find an issue's sub-issues without reading every issue, guards use
 `refs/issuez-cache/parents`: a blob with one line per issue,
 `<uuid> <tip> -` (no parent) or `<uuid> <tip> =<parent>`. A line counts
 only while `<tip>` is still the issue's tip; other issues are read. A write
-that read it rewrites it after succeeding, once enough lines are stale. It
-is local, never pushed, and can be deleted at any time.
+that read it rewrites it after succeeding, once enough lines are stale, and
+`show` rewrites it when it is missing or stale. It is local, never pushed,
+and can be deleted at any time.
 
 Other tools and concurrent clones can still produce violations; readers
 report them and never fail on them.
@@ -161,9 +162,11 @@ parents first:
   the merge resolved to keeps a conflict visible; a different value resolves
   it.
 
-Sets (`Labels`, `X-Blocked-By`): each member's presence has its own setter.
+Sets (`Labels`, `X-Blocked-By`): each member's presence has its own
+setters, the latest commits that changed it (none an ancestor of another).
 A set trailer lists the whole set, adding and removing relative to the
-parent state. A concurrent add and remove resolves to add. Keyed sets
+parent state. A concurrent add and remove resolves to add, also when the
+add was made on two branches and only one of them saw the removal. Keyed sets
 (attachments, §7) follow the same rule per key, and events per target
 comment (§5).
 

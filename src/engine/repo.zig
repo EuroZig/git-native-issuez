@@ -405,6 +405,95 @@ pub fn Repo(comptime B: type) type {
             return out.items;
         }
 
+        /// What `projection.build` needs to project one issue as it would
+        /// among all of them: the issue, its ancestors, its descendants and
+        /// every issue its blockers lead to. Sub-issues come from
+        /// `parent_cache_ref`, which this refreshes when stale (best effort).
+        /// An event whose comment is missing may target another issue's
+        /// comment, and then it is every issue. Other issues that can't be
+        /// loaded are left out, as in the guards.
+        pub fn loadAround(self: Self, arena: Allocator, ref: IssueRef) Error![]Issue {
+            try self.checkLimits();
+            const center = try self.load(arena, ref);
+            for (center.event_problems) |ep| if (ep.kind == .dangling) return self.loadAll(arena);
+
+            var out: std.ArrayList(Issue) = .empty;
+            var have: std.StringHashMapUnmanaged(void) = .empty;
+            try out.append(arena, center);
+            try have.put(arena, center.id, {});
+            const Add = struct {
+                fn f(o: *std.ArrayList(Issue), h: *std.StringHashMapUnmanaged(void), a: Allocator, issue: Issue) !void {
+                    if ((try h.getOrPut(a, issue.id)).found_existing) return;
+                    try o.append(a, issue);
+                }
+            }.f;
+
+            // Up. Each walk has its own `seen`: in a parent cycle the
+            // ancestors are descendants too.
+            var seen: std.StringHashMapUnmanaged(void) = .empty;
+            try seen.put(arena, center.id, {});
+            var up = center.ext.parent;
+            while (up) |id| {
+                if ((try seen.getOrPut(arena, id)).found_existing) break;
+                const issue = (try self.loadById(arena, id)) orelse break;
+                try Add(&out, &have, arena, issue);
+                up = issue.ext.parent;
+            }
+
+            // Down.
+            const index = try self.childIndex(arena);
+            if (index.refreshed) |c| self.writeParentCache(c);
+            seen.clearRetainingCapacity();
+            try seen.put(arena, center.id, {});
+            var stack: std.ArrayList([]const u8) = .empty;
+            try stack.append(arena, center.id);
+            while (stack.pop()) |id| {
+                const kids = index.children.get(id) orelse continue;
+                for (kids.items) |r| {
+                    if ((try seen.getOrPut(arena, r.id())).found_existing) continue;
+                    const issue = index.loaded.get(r.id()) orelse
+                        self.load(arena, r) catch |err| switch (err) {
+                        error.CorruptIssue,
+                        error.HistoryTooLong,
+                        error.MissingParent,
+                        error.NoRoot,
+                        => continue,
+                        else => |e| return e,
+                    };
+                    try Add(&out, &have, arena, issue);
+                    try stack.append(arena, issue.id);
+                }
+            }
+
+            // Along the blockers, for cycles through this issue.
+            seen.clearRetainingCapacity();
+            try seen.put(arena, center.id, {});
+            var blocked: std.ArrayList(Issue) = .empty;
+            try blocked.append(arena, center);
+            while (blocked.pop()) |x| for (x.ext.blocked_by) |id| {
+                if ((try seen.getOrPut(arena, id)).found_existing) continue;
+                const issue = (try self.loadById(arena, id)) orelse continue;
+                try Add(&out, &have, arena, issue);
+                try blocked.append(arena, issue);
+            };
+            return out.items;
+        }
+
+        /// Null when there's no such issue, or it can't be loaded.
+        fn loadById(self: Self, arena: Allocator, id: []const u8) Error!?Issue {
+            if (!uuid_fmt.isCanonical(id)) return null;
+            const name = try refNameOf(arena, id);
+            const tip = (try self.backend.resolveRef(name)) orelse return null;
+            return self.load(arena, .{ .name = name, .tip = tip }) catch |err| switch (err) {
+                error.CorruptIssue,
+                error.HistoryTooLong,
+                error.MissingParent,
+                error.NoRoot,
+                => null,
+                else => |e| return e,
+            };
+        }
+
         pub const Page = struct {
             issues: []Issue,
             /// Null on the last page.

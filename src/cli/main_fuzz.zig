@@ -1055,6 +1055,7 @@ fn step(
         return reject(report);
     }
     try crossCheckModel(arena, world, clone_index);
+    if (code == 0) try checkAround(arena, world, clone_index);
     if (json and code == 0) try checkJson(arena, world, clone_index, argv, captured.written());
     if (writes and code == 0) {
         // Our writes never break a guard, so no new violation may appear.
@@ -1070,6 +1071,69 @@ fn step(
     return code;
 }
 
+/// Every issue projects the same from `Repo.loadAround` as from all
+/// issues: what `show` prints and `show --json` reports.
+fn checkAround(arena: Allocator, world: *World, clone_index: usize) CaseError!void {
+    var sim = try GitSim.init(arena, world, clone_index);
+    var repo = issuez.Repo(GitSim).init(&sim);
+    repo.done_states = try doneStatesOf(arena, &sim);
+    // Unreadable issues make `loadAll` fail; nothing to compare then.
+    const issues = repo.loadAll(arena) catch return;
+    const cat = issuez.Catalog(GitSim).of(repo);
+    const milestones = cat.infos(arena) catch return error.ModelMismatch;
+    const options: issuez.projection.Options = .{
+        .milestones = milestones,
+        .done_states = repo.done_states,
+    };
+    const full = try issuez.projection.build(arena, issues, options);
+    for (repo.refs(arena) catch return error.ModelMismatch) |r| {
+        const i = full.find(r.id()) orelse continue;
+        const around = repo.loadAround(arena, r) catch return error.ModelMismatch;
+        const part = try issuez.projection.build(arena, around, options);
+        const j = part.find(r.id()).?;
+        const same = sameProblems(full.problemsOf(i), part.problemsOf(j)) and
+            std.meta.eql(full.progress(i), part.progress(j)) and
+            sameText(full.milestone[i], part.milestone[j]) and
+            sameText(full.workflow(i), part.workflow(j)) and
+            full.activelyBlocked(i) == part.activelyBlocked(j);
+        if (!same) {
+            std.debug.print(
+                "  issue {s} projects differently from the {d} issues around it\n",
+                .{ r.id(), around.len },
+            );
+            return error.ModelMismatch;
+        }
+    }
+    countOutcome("(projection around)", true);
+}
+
+fn sameProblems(a: []const issuez.projection.Problem, b: []const issuez.projection.Problem) bool {
+    if (a.len != b.len) return false;
+    for (a, b) |x, y| {
+        if (x.kind != y.kind or !sameText(x.other, y.other) or !sameText(x.key, y.key) or
+            !sameText(x.value, y.value)) return false;
+    }
+    return true;
+}
+
+fn sameText(a: ?[]const u8, b: ?[]const u8) bool {
+    if (a == null or b == null) return a == null and b == null;
+    return std.mem.eql(u8, a.?, b.?);
+}
+
+/// As the CLI reads `issue.doneStates`.
+fn doneStatesOf(arena: Allocator, sim: *GitSim) Allocator.Error![]const []const u8 {
+    const raw = (sim.configGet(arena, "issue.doneStates") catch null) orelse
+        return &issuez.format.core.default_done_states;
+    var states: std.ArrayList([]const u8) = .empty;
+    var it = std.mem.splitScalar(u8, raw, ',');
+    while (it.next()) |part| {
+        const t = std.mem.trim(u8, part, " \t");
+        if (t.len > 0) try states.append(arena, t);
+    }
+    return states.items;
+}
+
 /// Projection problems a guard would have prevented, as `<id> <kind>`.
 fn guardViolations(
     arena: Allocator,
@@ -1078,16 +1142,7 @@ fn guardViolations(
 ) CaseError![]const []const u8 {
     var sim = try GitSim.init(arena, world, clone_index);
     var repo = issuez.Repo(GitSim).init(&sim);
-    // As the CLI reads it.
-    if (sim.configGet(arena, "issue.doneStates") catch null) |raw| {
-        var states: std.ArrayList([]const u8) = .empty;
-        var it = std.mem.splitScalar(u8, raw, ',');
-        while (it.next()) |part| {
-            const t = std.mem.trim(u8, part, " \t");
-            if (t.len > 0) try states.append(arena, t);
-        }
-        repo.done_states = states.items;
-    }
+    repo.done_states = try doneStatesOf(arena, &sim);
     const issues = repo.loadAll(arena) catch return error.ModelMismatch;
     const cat = issuez.Catalog(GitSim).of(repo);
     const milestones = cat.infos(arena) catch return error.ModelMismatch;

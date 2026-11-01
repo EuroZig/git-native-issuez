@@ -414,6 +414,21 @@ pub fn project(
     return projectIssues(B, ctx, repo, issues);
 }
 
+/// `project` for one issue: the same answers for it, from the issues
+/// around it (`Repo.loadAround`).
+pub fn projectAround(
+    comptime B: type,
+    ctx: *context.Context(B),
+    repo: issuez.engine.Repo(B),
+    ref: issuez.engine.IssueRef,
+) ?issuez.projection.Projection {
+    const issues = repo.loadAround(ctx.arena, ref) catch |e| {
+        common.reportRepoError(B, ctx, e);
+        return null;
+    };
+    return projectIssues(B, ctx, repo, issues);
+}
+
 /// `project` over issues the caller already loaded (every issue).
 pub fn projectIssues(
     comptime B: type,

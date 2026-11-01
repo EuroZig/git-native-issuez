@@ -1397,18 +1397,29 @@ fn expectCloneUnchanged(
     report: *Report,
     objects_too: bool,
 ) Allocator.Error!void {
+    // A read may refresh the parent cache: its ref and the blob.
+    const cache_before = findRef(b, issuez.engine.parent_cache_ref);
+    const cache_after = findRef(a, issuez.engine.parent_cache_ref);
+    const cache_moved = cache_after != null and
+        (cache_before == null or !std.mem.eql(u8, cache_before.?, cache_after.?));
     if (objects_too) {
         const bo = try objectSet(arena, format, b);
         const ao = try objectSet(arena, format, a);
-        if (bo.count() != ao.count())
+        const cache_blob: u32 = @intFromBool(cache_moved and !bo.contains(cache_after.?));
+        if (bo.count() + cache_blob != ao.count())
             try report.fail(
                 "clone '{s}': objects changed ({d} -> {d})",
                 .{ a.name, bo.count(), ao.count() },
             );
     }
-    if (b.refs.len != a.refs.len) {
+    var b_refs: usize = 0;
+    var a_refs: usize = 0;
+    for (b.refs) |r| b_refs += @intFromBool(!std.mem.startsWith(u8, r.name, cache_prefix));
+    for (a.refs) |r| a_refs += @intFromBool(!std.mem.startsWith(u8, r.name, cache_prefix));
+    if (b_refs != a_refs) {
         try report.fail("clone '{s}': refs changed", .{a.name});
     } else for (b.refs) |r| {
+        if (std.mem.startsWith(u8, r.name, cache_prefix)) continue;
         const now = findRef(a, r.name);
         if (now == null or !std.mem.eql(u8, now.?, r.oid))
             try report.fail("clone '{s}': ref {s} changed", .{ a.name, r.name });

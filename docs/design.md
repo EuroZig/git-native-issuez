@@ -106,6 +106,13 @@ the issue itself, or part of a cycle is reported and the issue becomes a
 root, so the tree still shows every issue exactly once. `tree`,
 `ls --problems`, `fsck` and `milestone show` read it.
 
+One issue's answers need fewer issues: `Repo.loadAround` loads the issue,
+its ancestors, its descendants (through the parent cache, see "Writing an
+issue") and the issues its blockers lead to, and a projection over those
+gives that issue the same answers as one over every issue. `show` reads
+it that way. Only an event whose comment is missing, which may target
+another issue's comment, needs every issue.
+
 ## Milestones
 
 `Catalog(B)` (`src/engine/milestone.zig`) keeps milestones under
@@ -295,7 +302,9 @@ way, to go unnoticed.
   Every command is checked by the oracle, and the engine's reading of each
   issue is compared with the oracle's. After every write the projection
   must show no new guard violation: a guard can only be broken by other
-  tools or concurrent clones, never by one of our own writes. What the
+  tools or concurrent clones, never by one of our own writes. After every
+  step, each issue must project the same from `loadAround` as from every
+  issue. What the
   oracle has no rule for is counted as skipped, so gaps show up in the
   statistics. At the end every clone syncs, taking
   the hub's version of anything quarantined, until nothing changes, and
