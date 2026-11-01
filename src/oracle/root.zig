@@ -265,6 +265,13 @@ pub fn checkTransition(
         // A failed command may leave unreferenced objects, nothing else.
         return expectCloneUnchanged(arena, before.format, b, a, report, false);
     }
+    // Every attachment command needs git-lfs.
+    const attaches = switch (cmd) {
+        .attach, .repair => true,
+        .read => |argv| argv.len > 0 and std.mem.eql(u8, argv[0], "attach"),
+        else => false,
+    };
+    if (attaches and !hasGitLfs(b)) try report.fail("{t} succeeded without git-lfs", .{cmd});
     if (cmd == .read) return expectCloneUnchanged(arena, before.format, b, a, report, true);
     const cb = try commands.Clone.init(arena, before.format, b);
     const ca = try commands.Clone.init(arena, after.format, a);
@@ -294,7 +301,7 @@ pub fn checkTransition(
         .comment_event => |x| return checkCommentEvent(arena, after, cb, ca, x, report),
         .milestone => |x| return checkMilestone(arena, after, cb, ca, x, report),
         .attach => |x| return checkAttach(arena, after, cb, ca, x, report),
-        .repair => return checkRepair(arena, after, cb, ca, report),
+        .repair => return checkRepair(arena, cb, ca, report),
     }
 }
 
@@ -1456,6 +1463,15 @@ fn sha256Hex(data: []const u8) [64]u8 {
     return std.fmt.bytesToHex(digest, .lower);
 }
 
+/// GitSim's `sim.lfs`, last value wins.
+fn hasGitLfs(clone: World.Clone) bool {
+    var on = true;
+    for (clone.config) |e| if (std.mem.eql(u8, e.key, "sim.lfs")) {
+        on = !std.mem.eql(u8, e.value, "false");
+    };
+    return on;
+}
+
 fn lfsHas(clone: World.Clone, store: anytype, sha: []const u8) bool {
     for (clone.lfs) |o| if (o.store == store and std.mem.eql(u8, o.sha256, sha)) return true;
     return false;
@@ -1492,7 +1508,7 @@ fn checkAttach(
         } else try report.fail("{s} changed {s}", .{ cmd, ch.name });
     }
     if (!issue_moved) return report.fail("{s} didn't write the issue", .{cmd});
-    const chain = (try appendedOne(arena, b, a, name, report, cmd)) orelse return;
+    const chain = (try appendedOne(b, a, name, report, cmd)) orelse return;
     try checkIdentity(world, chain, report);
     const block = try commands.trailersOf(arena, chain.message);
 
@@ -1574,7 +1590,7 @@ fn checkAttach(
     try expectSubject(arena, report, cmd, parsed.text, chain.message);
     if (is_add or parsed.sub == .rm) {
         if (!derived_moved) return report.fail("{s} didn't move {s}", .{ cmd, derived });
-        try checkDerived(arena, world, b, a, id, report);
+        try checkDerived(arena, b, a, id, report);
     }
 }
 
@@ -1582,13 +1598,11 @@ fn checkAttach(
 /// recorded, one LFS pointer per present attachment.
 fn checkDerived(
     arena: Allocator,
-    world: World,
     b: commands.Clone,
     a: commands.Clone,
     id: []const u8,
     report: *Report,
 ) (Allocator.Error || error{NoRule})!void {
-    _ = world;
     const derived = try std.fmt.allocPrint(arena, "refs/attachments/{s}", .{id});
     const issue_ref = try std.fmt.allocPrint(arena, "refs/issues/{s}", .{id});
     const tip = a.ref(derived) orelse return report.fail("{s} missing", .{derived});
@@ -1652,7 +1666,6 @@ fn checkDerived(
 /// `fsck --repair` only touches derived refs, and gets them right.
 fn checkRepair(
     arena: Allocator,
-    world: World,
     b: commands.Clone,
     a: commands.Clone,
     report: *Report,
@@ -1667,7 +1680,7 @@ fn checkRepair(
             try report.fail("fsck --repair wrote {s} for no issue", .{ch.name});
             continue;
         }
-        try checkDerived(arena, world, b, a, id, report);
+        try checkDerived(arena, b, a, id, report);
     }
 }
 
@@ -1724,7 +1737,6 @@ fn checkDerivedAfterSync(
 }
 
 fn appendedOne(
-    arena: Allocator,
     b: commands.Clone,
     a: commands.Clone,
     name: []const u8,
@@ -1736,7 +1748,6 @@ fn appendedOne(
         try report.fail("{s} deleted {s}", .{ cmd, name });
         return null;
     };
-    _ = arena;
     const c = a.commit(new) orelse {
         try report.fail("{s}: {s} is not a commit", .{ cmd, name });
         return null;

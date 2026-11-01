@@ -314,6 +314,8 @@ pub fn Repo(comptime B: type) type {
             InvalidLimits,
             /// The backend has no LFS store.
             AttachmentsUnsupported,
+            /// git-lfs isn't installed.
+            LfsUnavailable,
             /// Not a PNG, JPEG or WebP.
             UnsupportedType,
             AnimatedImage,

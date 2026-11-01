@@ -458,7 +458,6 @@ const Ctx = struct {
             (if (a.present) a else b)
         else if (ctx.lwwWins(b.setter, a.setter)) b else a;
         out.added_in = if (ctx.lwwWins(a.added_in, b.added_in)) b.added_in else a.added_in;
-        if (a.added_in == b.added_in) out.added_in = a.added_in;
         return out;
     }
 

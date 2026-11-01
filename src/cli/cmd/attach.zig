@@ -22,7 +22,8 @@ pub const help =
     \\   rm <issue-id> <attachment>...  Remove attachments
     \\   fetch [<issue-id>]             Download missing bytes (all issues by default)
     \\
-    \\`cat` downloads missing bytes by itself. Downloading needs git-lfs and a
+    \\Attachments need git-lfs (https://git-lfs.com); every subcommand refuses
+    \\without it. `cat` downloads missing bytes by itself. Downloading needs a
     \\remote with an LFS server; `git issue sync` uploads the bytes.
     \\
     \\Options:
@@ -97,39 +98,20 @@ pub fn main(comptime B: type, ctx: *context.Context(B), argv: []const []const u8
         null
     else
         std.mem.join(arena, "\n\n", paragraphs.items) catch return common.oom(ctx.err);
+    if (text) |t| if (std.mem.trim(u8, t, " \t\r\n").len == 0)
+        return common.missing(ctx.err, "attach", "message is empty");
 
     const repo = common.openRepo(B, ctx) orelse return common.exit_fatal;
     const att = issuez.Attachments(B).fromRepo(repo);
+    att.ready(arena) catch |e| return common.repoFailed(B, ctx, e);
     const ref = common.resolveOne(B, repo, arena, ctx.err, w[0]) orelse
         return common.exit_error;
     const short = uuid.shortId(ref.id());
     switch (sub) {
         .add => {
-            var inputs: std.ArrayList(issuez.Attachments(B).Input) = .empty;
-            for (w[1..]) |path| {
-                const limit = repo.limits.max_attachment_bytes;
-                const data = ctx.readFile(path, limit) catch |e| {
-                    ctx.err.print("error: cannot read '{s}': {s}\n", .{ path, switch (e) {
-                        error.FileNotFound => "no such file",
-                        error.FileTooLarge => "larger than the attachment limit",
-                        error.OutOfMemory => "out of memory",
-                        error.ReadFailed => "read failed",
-                    } }) catch {};
-                    return common.exit_error;
-                };
-                const input: issuez.Attachments(B).Input = .{
-                    .name = name orelse path,
-                    .data = data,
-                };
-                _ = att.validate(input) catch |e| {
-                    ctx.err.print("error: '{s}': ", .{path}) catch {};
-                    common.reportRepoError(B, ctx, e);
-                    return common.exit_error;
-                };
-                inputs.append(arena, input) catch return common.oom(ctx.err);
-            }
+            const inputs = readInputs(B, ctx, att, w[1..], name) orelse return common.exit_error;
             const added = att.add(arena, ref.name, .{
-                .files = inputs.items,
+                .files = inputs,
                 .comment = text,
             }) catch |e| return common.repoFailed(B, ctx, e);
             for (added.ids) |id| {
@@ -159,7 +141,7 @@ pub fn main(comptime B: type, ctx: *context.Context(B), argv: []const []const u8
             const issue = repo.load(arena, ref) catch |e| return common.repoFailed(B, ctx, e);
             const a = findOne(B, ctx, issue, w[1]) orelse return common.exit_error;
             var content = att.read(arena, a) catch |e| return common.repoFailed(B, ctx, e);
-            if (content == .missing) {
+            if (content != .bytes) {
                 fetchQuietly(B, ctx, att, issue, remote);
                 content = att.read(arena, a) catch |e| return common.repoFailed(B, ctx, e);
             }
@@ -167,9 +149,8 @@ pub fn main(comptime B: type, ctx: *context.Context(B), argv: []const []const u8
                 .bytes => |b| ctx.out.writeAll(b) catch return common.exit_error,
                 .missing => {
                     ctx.err.print(
-                        "error: the bytes of {s} aren't in this repository, and no remote's\n" ++
-                            "       LFS server had them (needs git-lfs; see " ++
-                            "'git issue attach fetch')\n",
+                        "error: the bytes of {s} aren't in this repository and couldn't be\n" ++
+                            "       fetched (see 'git issue attach fetch' for why)\n",
                         .{uuid.shortId(a.id)},
                     ) catch {};
                     return common.exit_error;
@@ -218,6 +199,7 @@ fn fetchCmd(
     const arena = ctx.arena;
     const repo = common.openRepo(B, ctx) orelse return common.exit_fatal;
     const att = issuez.Attachments(B).fromRepo(repo);
+    att.ready(arena) catch |e| return common.repoFailed(B, ctx, e);
     var issues: std.ArrayList(issuez.engine.Issue) = .empty;
     if (prefix) |p| {
         const ref = common.resolveOne(B, repo, arena, ctx.err, p) orelse
@@ -228,43 +210,79 @@ fn fetchCmd(
         const all = repo.loadAll(arena) catch |e| return common.repoFailed(B, ctx, e);
         issues.appendSlice(arena, all) catch return common.oom(ctx.err);
     }
-    const remotes = remotesFor(B, att, arena, remote) orelse return common.exit_error;
-    if (remotes.len == 0) {
-        ctx.err.writeAll("error: no remote to fetch attachment bytes from\n") catch {};
-        return common.exit_error;
-    }
+    const remotes = remotesFor(B, ctx, att, remote) orelse return common.exit_error;
     var total: usize = 0;
-    var missing: usize = 0;
+    // Unknown until one remote answers.
+    var missing: ?usize = null;
     for (remotes) |r| {
         const report = att.fetch(arena, r, issues.items) catch |e| {
+            ctx.err.print("error: fetching from '{s}': ", .{r}) catch {};
             common.reportRepoError(B, ctx, e);
-            if (e == error.LfsUnavailable) return common.exit_error;
             continue;
         };
+        if (report.transfer_failed) {
+            ctx.err.print("warning: git-lfs failed for some objects from '{s}':\n", .{r}) catch {};
+            printBackendDetail(B, ctx);
+        }
         total += report.fetched;
         missing = report.missing.len;
-        if (missing == 0) break;
+        if (report.missing.len == 0) break;
+        // Only what is still missing goes to the next remote.
     }
     ctx.out.print("Fetched {d} attachment(s).\n", .{total}) catch {};
-    if (missing > 0) {
-        ctx.err.print("warning: {d} attachment(s) are still missing\n", .{missing}) catch {};
+    const left = missing orelse {
+        ctx.err.writeAll("error: no remote could be asked for the bytes\n") catch {};
+        return common.exit_error;
+    };
+    if (left > 0) {
+        ctx.err.print("error: {d} attachment(s) are still missing\n", .{left}) catch {};
         return common.exit_error;
     }
     return common.exit_ok;
 }
 
+/// `--remote`, or every configured remote that sync could use too.
 fn remotesFor(
     comptime B: type,
+    ctx: *context.Context(B),
     att: issuez.Attachments(B),
-    arena: std.mem.Allocator,
     remote: ?[]const u8,
 ) ?[]const []const u8 {
+    const arena = ctx.arena;
+    const valid = issuez.backend.contract.isValidRemoteName;
     if (remote) |r| {
+        if (!valid(r)) {
+            ctx.err.print("error: invalid remote name '{s}'\n", .{r}) catch {};
+            return null;
+        }
         const one = arena.alloc([]const u8, 1) catch return null;
         one[0] = r;
         return one;
     }
-    return att.repo.backend.remoteNames(arena) catch null;
+    const names = att.repo.backend.remoteNames(arena) catch |e| {
+        common.reportRepoError(B, ctx, e);
+        return null;
+    };
+    var out: std.ArrayList([]const u8) = .empty;
+    for (names) |n| {
+        if (valid(n)) {
+            out.append(arena, n) catch return null;
+        } else ctx.err.print("note: skipping remote '{s}' (name not supported)\n", .{n}) catch {};
+    }
+    if (out.items.len == 0) {
+        ctx.err.writeAll("error: no remote to fetch attachment bytes from\n") catch {};
+        return null;
+    }
+    return out.items;
+}
+
+fn printBackendDetail(comptime B: type, ctx: *context.Context(B)) void {
+    if (!@hasDecl(B, "lastStderr")) return;
+    const backend = ctx.backend catch return;
+    const detail = std.mem.trim(u8, backend.lastStderr(), " \t\r\n");
+    var lines = std.mem.splitScalar(u8, detail, '\n');
+    while (lines.next()) |line| if (line.len > 0)
+        ctx.err.print("       git: {s}\n", .{line}) catch {};
 }
 
 /// Errors only matter if the bytes are still missing afterwards.
@@ -275,11 +293,45 @@ fn fetchQuietly(
     issue: issuez.engine.Issue,
     remote: ?[]const u8,
 ) void {
-    const remotes = remotesFor(B, att, ctx.arena, remote) orelse return;
+    const remotes = remotesFor(B, ctx, att, remote) orelse return;
     for (remotes) |r| {
         const report = att.fetch(ctx.arena, r, &.{issue}) catch continue;
         if (report.missing.len == 0) return;
     }
+}
+
+/// Reads and checks the files for `add` and `comment --attach`. Prints
+/// the problem and returns null on the first bad one.
+pub fn readInputs(
+    comptime B: type,
+    ctx: *context.Context(B),
+    att: issuez.Attachments(B),
+    paths: []const []const u8,
+    name: ?[]const u8,
+) ?[]const issuez.Attachments(B).Input {
+    var inputs: std.ArrayList(issuez.Attachments(B).Input) = .empty;
+    for (paths) |path| {
+        const data = ctx.readFile(path, att.repo.limits.max_attachment_bytes) catch |e| {
+            ctx.err.print("error: cannot read '{s}': {s}\n", .{ path, switch (e) {
+                error.FileNotFound => "no such file",
+                error.FileTooLarge => "larger than the attachment limit",
+                error.OutOfMemory => "out of memory",
+                error.ReadFailed => "read failed",
+            } }) catch {};
+            return null;
+        };
+        const input: issuez.Attachments(B).Input = .{ .name = name orelse path, .data = data };
+        _ = att.validate(input) catch |e| {
+            ctx.err.print("error: '{s}': ", .{path}) catch {};
+            common.reportRepoError(B, ctx, e);
+            return null;
+        };
+        inputs.append(ctx.arena, input) catch {
+            _ = common.oom(ctx.err);
+            return null;
+        };
+    }
+    return inputs.items;
 }
 
 pub const Size = struct {

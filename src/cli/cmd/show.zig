@@ -136,8 +136,6 @@ pub fn main(comptime B: type, ctx: *context.Context(B), argv: []const []const u8
             w.print("  {s}\n", .{c.subject}) catch {};
             for (c.text) |line| {
                 if (std.mem.trim(u8, line, " \t\r").len == 0) continue;
-                // Listed below instead.
-                if (std.ascii.startsWithIgnoreCase(line, "X-Attachment")) continue;
                 w.print("  {s}\n", .{line}) catch {};
             }
             for (c.attachments) |id| {

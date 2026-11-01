@@ -7,7 +7,9 @@
 //! It moves in the same transaction as the issue ref and can always be
 //! rebuilt.
 //!
-//! The API takes and returns bytes, never paths.
+//! The API takes and returns bytes, never paths. Everything that reads or
+//! writes attachments needs git-lfs on backends that can run it, and fails
+//! up front with LfsUnavailable without it (see `ready`).
 
 const std = @import("std");
 const Allocator = std.mem.Allocator;
@@ -35,10 +37,17 @@ pub const Upload = struct {
     data: []const u8,
 };
 
+pub const UploadMode = enum {
+    /// Also copied into git-lfs's store, for `git lfs push`.
+    git_lfs,
+    /// Only handed to the caller, e.g. a `before_push` hook.
+    caller,
+};
+
 /// Same identity as merge commits, so two clones deriving the same state
 /// from the same parent write the same commit.
-pub const derived_identity_name = "git-issue";
-pub const derived_identity_email = "git-issue@invalid";
+pub const derived_identity_name = @import("sync.zig").merge_identity_name;
+pub const derived_identity_email = @import("sync.zig").merge_identity_email;
 pub const derived_subject = "Regenerate attachments";
 
 pub fn Attachments(comptime B: type) type {
@@ -71,7 +80,6 @@ pub fn Attachments(comptime B: type) type {
             files: []const Input,
             /// Posted in the same commit as the images. Null gives an "Add
             /// attachment" commit.
-            /// arrive together. Null: an "Add attachment" commit.
             comment: ?[]const u8 = null,
             author: ?Signature = null,
             /// Only apply on top of this issue tip, see `Repo`.
@@ -91,6 +99,16 @@ pub fn Attachments(comptime B: type) type {
             expect: ?Oid = null,
         };
 
+        /// LfsUnavailable when the backend can run git-lfs and it isn't
+        /// installed. Every call below that reads or writes attachments
+        /// checks it first; call it to refuse before reading any file.
+        pub fn ready(self: Self, arena: Allocator) Error!void {
+            if (comptime !contract.hasLfs(B)) return error.AttachmentsUnsupported;
+            if (comptime contract.hasLfsTransport(B)) {
+                if (!try self.repo.backend.lfsAvailable(arena)) return error.LfsUnavailable;
+            }
+        }
+
         /// Checks what `add` would accept without writing anything, e.g.
         /// when a file is dropped. Returns the media type.
         pub fn validate(self: Self, input: Input) Error!Media {
@@ -108,7 +126,7 @@ pub fn Attachments(comptime B: type) type {
         /// Stores the bytes, then writes one commit with an `X-Attachment`
         /// per file, and moves the derived ref with it.
         pub fn add(self: Self, arena: Allocator, ref_name: []const u8, spec: AddSpec) Error!Added {
-            try requireLfs();
+            try self.ready(arena);
             if (spec.files.len == 0) return error.NoAttachments;
             const specs = try arena.alloc(fmt.Spec, spec.files.len);
             const ids = try arena.alloc([]const u8, spec.files.len);
@@ -126,10 +144,6 @@ pub fn Attachments(comptime B: type) type {
                     .name = try fmt.sanitizeName(arena, f.name),
                 };
             }
-            // Bytes first, so a failed commit leaves at most an object
-            // nobody references (see `orphans`).
-            for (spec.files, specs) |f, s| try self.store(s.sha256, f.data);
-
             var tl: std.ArrayList(trailers.Trailer) = .empty;
             for (specs) |s| try tl.append(arena, .{
                 .key = fmt.add_key,
@@ -140,6 +154,9 @@ pub fn Attachments(comptime B: type) type {
             if (text.len > self.repo.limits.max_body_bytes) return error.TooLong;
             const split = repo_mod.splitMessage(text);
             const message = try trailers.build(arena, split.subject, split.body, tl.items);
+            // Bytes before the commit, so a failed commit leaves at most an
+            // object nobody references (see `orphans`).
+            for (spec.files, specs) |f, s| try self.store(s.sha256, f.data);
             const tip = try self.repo.appendWith(arena, ref_name, spec.author, spec.expect, Builder{
                 .self = self,
                 .text = message,
@@ -156,7 +173,7 @@ pub fn Attachments(comptime B: type) type {
             ids: []const []const u8,
             spec: ChangeSpec,
         ) Error!Oid {
-            try requireLfs();
+            try self.ready(arena);
             if (ids.len == 0) return error.NoAttachments;
             var tl: std.ArrayList(trailers.Trailer) = .empty;
             for (ids) |id| {
@@ -182,7 +199,7 @@ pub fn Attachments(comptime B: type) type {
             name: []const u8,
             spec: ChangeSpec,
         ) Error!Oid {
-            try requireLfs();
+            try self.ready(arena);
             const clean = try fmt.sanitizeName(arena, name);
             const split = repo_mod.splitMessage(spec.message orelse "Rename attachment");
             return self.repo.appendWith(arena, ref_name, spec.author, spec.expect, RenameBuilder{
@@ -204,8 +221,11 @@ pub fn Attachments(comptime B: type) type {
                 for (b.removed) |id| {
                     if (findPresent(current, id) == null) return error.AttachmentNotFound;
                 }
+                // Removing must work on an issue over the limit, e.g. after
+                // concurrent adds.
                 const count = current.attachments.len + b.added.len;
-                if (count > b.self.repo.limits.max_attachments) return error.TooManyAttachments;
+                if (b.added.len > 0 and count > b.self.repo.limits.max_attachments)
+                    return error.TooManyAttachments;
                 return b.text;
             }
 
@@ -284,15 +304,18 @@ pub fn Attachments(comptime B: type) type {
         };
 
         /// Tries our store, then git-lfs's (after a `git lfs fetch`), and
-        /// copies what it finds there into ours.
+        /// copies a good copy found there into ours, over a damaged one.
         pub fn read(self: Self, arena: Allocator, a: Attachment) Error!Content {
-            try requireLfs();
+            try self.ready(arena);
+            return self.readStored(arena, a);
+        }
+
+        fn readStored(self: Self, arena: Allocator, a: Attachment) Error!Content {
             const sha = a.sha256.slice();
-            if (try self.lfsRead(arena, .issuez, sha)) |data| {
-                return if (matches(a, data)) .{ .bytes = data } else .corrupt;
-            }
+            const ours = try self.lfsRead(arena, .issuez, sha);
+            if (ours) |data| if (matches(a, data)) return .{ .bytes = data };
             const data = (try self.lfsRead(arena, .git_lfs, sha)) orelse
-                return .missing;
+                return if (ours == null) .missing else .corrupt;
             if (!matches(a, data)) return .corrupt;
             try self.lfsWrite(.issuez, sha, data);
             return .{ .bytes = data };
@@ -307,10 +330,11 @@ pub fn Attachments(comptime B: type) type {
 
         /// Reads each object once to check it.
         pub fn list(self: Self, arena: Allocator, issue: Issue) Error![]const Entry {
+            try self.ready(arena);
             const out = try arena.alloc(Entry, issue.attachments.len);
             for (issue.attachments, out) |a, *e| e.* = .{
                 .attachment = a,
-                .availability = switch (try self.read(arena, a)) {
+                .availability = switch (try self.readStored(arena, a)) {
                     .bytes => .local,
                     .missing => .missing,
                     .corrupt => .corrupt,
@@ -343,26 +367,11 @@ pub fn Attachments(comptime B: type) type {
             return if (c.tree.eql(want)) .ok else .stale;
         }
 
-        /// Returns the new derived tip, or null when nothing was needed.
-        /// Never touches the issue ref.
-        pub fn repair(self: Self, arena: Allocator, issue: Issue) Error!?Oid {
-            try requireLfs();
-            if (try self.derivedState(arena, issue) == .ok) return null;
-            const ops = try self.derivedUpdate(
-                arena,
-                issue.id,
-                issue.tip,
-                try pointersOf(arena, issue.attachments),
-            );
-            self.repo.backend.updateRefs(ops) catch |e| switch (e) {
-                error.RefConflict => return error.ConcurrentModification,
-                else => |x| return x,
-            };
-            return switch (ops[0].op) {
-                .create => |o| o,
-                .update => |u| u.new,
-                else => unreachable,
-            };
+        /// Brings the derived ref in line with the issue. Returns whether
+        /// it moved. Never touches the issue ref.
+        pub fn repair(self: Self, arena: Allocator, issue: Issue) Error!bool {
+            try self.ready(arena);
+            return self.reconcile(arena, issue, null);
         }
 
         /// Stored objects no issue references, left by failed writes.
@@ -371,7 +380,7 @@ pub fn Attachments(comptime B: type) type {
             arena: Allocator,
             issues: []const Issue,
         ) Error![]const []const u8 {
-            try requireLfs();
+            try self.ready(arena);
             var used: std.StringHashMapUnmanaged(void) = .empty;
             for (issues) |i| {
                 for (i.attachments) |a| {
@@ -506,8 +515,14 @@ pub fn Attachments(comptime B: type) type {
             self: Self,
             arena: Allocator,
             issue: Issue,
-            remote_tip: ?Oid,
+            remote_tip_in: ?Oid,
         ) Error!bool {
+            // Anyone can push anything there. What isn't a commit is
+            // ignored, and the next push replaces it.
+            const remote_tip = if (remote_tip_in) |r|
+                (if (try self.readCommit(arena, r) != null) r else null)
+            else
+                null;
             const name = try derivedRefName(arena, issue.id);
             const pointers = try pointersOf(arena, issue.attachments);
             const want = try self.treeFor(arena, pointers, .hash_only);
@@ -568,63 +583,94 @@ pub fn Attachments(comptime B: type) type {
         pub const FetchReport = struct {
             /// Here now and not before.
             fetched: usize,
-            /// The remote's LFS server didn't have them.
+            /// Still not here: the remote's LFS server didn't have them, or
+            /// the transfer failed.
             missing: []const Attachment,
+            /// git-lfs failed for some of them. The backend's last error
+            /// output says why.
+            transfer_failed: bool = false,
         };
 
         /// `git lfs fetch <remote> refs/attachments/<id>` for every issue
-        /// with missing bytes, then adopts them. LfsUnavailable without
-        /// git-lfs.
+        /// with missing bytes, then adopts them. The derived refs are
+        /// brought in line with the issues first, since git-lfs reads them.
         pub fn fetch(
             self: Self,
             arena: Allocator,
             remote: []const u8,
             issues: []const Issue,
-        ) (Error || contract.LfsTransportError)!FetchReport {
-            try requireLfs();
+        ) (Error || contract.LfsTransportError || error{InvalidRemoteName})!FetchReport {
+            try self.ready(arena);
             if (comptime !contract.hasLfsTransport(B)) return error.LfsUnavailable;
+            if (!contract.isValidRemoteName(remote)) return error.InvalidRemoteName;
             var refs: std.ArrayList([]const u8) = .empty;
             var wanted: std.ArrayList(Attachment) = .empty;
             for (issues) |i| {
                 var any = false;
-                for (i.attachments) |a| if (try self.read(arena, a) == .missing) {
+                for (i.attachments) |a| if (try self.readStored(arena, a) != .bytes) {
                     try wanted.append(arena, a);
                     any = true;
                 };
-                if (any) try refs.append(arena, try derivedRefName(arena, i.id));
+                if (!any) continue;
+                _ = try self.reconcile(arena, i, null);
+                try refs.append(arena, try derivedRefName(arena, i.id));
             }
             if (refs.items.len == 0) return .{ .fetched = 0, .missing = &.{} };
-            try self.repo.backend.lfsFetch(arena, remote, refs.items);
+            var failed = false;
+            self.repo.backend.lfsFetch(arena, remote, refs.items) catch |e| switch (e) {
+                error.LfsTransferFailed => failed = true,
+                else => |x| return x,
+            };
             var fetched: usize = 0;
             var missing: std.ArrayList(Attachment) = .empty;
-            for (wanted.items) |a| switch (try self.read(arena, a)) {
+            for (wanted.items) |a| switch (try self.readStored(arena, a)) {
                 .bytes => fetched += 1,
                 else => try missing.append(arena, a),
             };
-            return .{ .fetched = fetched, .missing = missing.items };
+            return .{ .fetched = fetched, .missing = missing.items, .transfer_failed = failed };
         }
 
-        /// Copies the bytes this clone has into git-lfs's store, so
-        /// `git lfs push` finds them. Missing ones are skipped: whoever
-        /// attached them uploaded them.
-        pub fn uploads(self: Self, arena: Allocator, issues: []const Issue) Error![]const Upload {
-            try requireLfs();
+        /// IDs of the attachments a derived commit lists, e.g. what the
+        /// remote's derived ref already has.
+        pub fn derivedIds(self: Self, arena: Allocator, tip: Oid) Error![]const []const u8 {
+            const c = (try self.readCommit(arena, tip)) orelse return &.{};
+            const t = (try self.repo.backend.readObject(arena, c.tree)) orelse return &.{};
+            if (t.kind != .tree) return &.{};
+            const entries = object.Tree.parse(arena, c.tree.object_format, t.data) catch
+                return &.{};
+            var out: std.ArrayList([]const u8) = .empty;
+            for (entries) |e| {
+                const dot = std.mem.findScalar(u8, e.name, '.') orelse continue;
+                try out.append(arena, e.name[0..dot]);
+            }
+            return out.items;
+        }
+
+        /// The bytes this clone has of `list`, deduplicated. Missing ones
+        /// are skipped: whoever attached them uploaded them.
+        pub fn uploads(
+            self: Self,
+            arena: Allocator,
+            list_: []const Attachment,
+            mode: UploadMode,
+        ) Error![]const Upload {
+            try requireStore();
             var out: std.ArrayList(Upload) = .empty;
-            for (issues) |i| next: for (i.attachments) |a| {
+            next: for (list_) |a| {
                 const sha = a.sha256.slice();
                 for (out.items) |u| if (std.mem.eql(u8, u.sha256, sha)) continue :next;
-                const data = switch (try self.read(arena, a)) {
+                const data = switch (try self.readStored(arena, a)) {
                     .bytes => |d| d,
                     else => continue :next,
                 };
-                if (try self.lfsRead(arena, .git_lfs, sha) == null)
+                if (mode == .git_lfs and try self.lfsRead(arena, .git_lfs, sha) == null)
                     try self.lfsWrite(.git_lfs, sha, data);
                 try out.append(arena, .{
                     .sha256 = try arena.dupe(u8, sha),
                     .size = a.size,
                     .data = data,
                 });
-            };
+            }
             return out.items;
         }
 
@@ -638,7 +684,7 @@ pub fn Attachments(comptime B: type) type {
             return self.lfsWrite(.issuez, sha.slice(), data);
         }
 
-        fn requireLfs() Error!void {
+        fn requireStore() Error!void {
             if (comptime !contract.hasLfs(B)) return error.AttachmentsUnsupported;
         }
 
@@ -800,8 +846,8 @@ test "limits, missing bytes, repair, orphans" {
     try sim.updateRefs(&.{.{ .name = dname, .op = .{ .delete = dtip } }});
     const state = try att.derivedState(arena, issue);
     try testing.expectEqual(Attachments(GitSim).DerivedState.absent, state);
-    try testing.expect(try att.repair(arena, issue) != null);
-    try testing.expect(try att.repair(arena, issue) == null);
+    try testing.expect(try att.repair(arena, issue));
+    try testing.expect(!try att.repair(arena, issue));
 
     // An object written by a failed add is an orphan.
     try sim.lfsWrite(.issuez, fmt.Sha256.of(samples.webp).slice(), samples.webp);

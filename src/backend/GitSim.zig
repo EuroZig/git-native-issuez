@@ -396,7 +396,11 @@ pub fn lfsWrite(
     const hex = std.fmt.bytesToHex(digest, .lower);
     if (!std.mem.eql(u8, &hex, sha256))
         protocolViolation("LFS object stored under a wrong hash", .{});
-    for (sim.lfs.items) |o| if (o.store == store and std.mem.eql(u8, o.sha256, sha256)) return;
+    // Replaces a damaged copy.
+    for (sim.lfs.items) |*o| if (o.store == store and std.mem.eql(u8, o.sha256, sha256)) {
+        o.data = try sim.arena.dupe(u8, data);
+        return;
+    };
     try sim.lfs.append(sim.arena, .{
         .store = store,
         .sha256 = try sim.arena.dupe(u8, sha256),
@@ -423,7 +427,7 @@ pub fn lfsPush(
     remote: []const u8,
     shas: []const []const u8,
 ) (Error || contract.LfsTransportError)!void {
-    if (!try sim.hasGitLfs(arena)) return error.LfsUnavailable;
+    if (!try sim.lfsAvailable(arena)) return error.LfsUnavailable;
     const idx = (try sim.remoteClone(arena, remote)) orelse return error.LfsTransferFailed;
     var target: std.ArrayList(World.LfsObject) = .empty;
     try target.appendSlice(arena, sim.world.clones[idx].lfs);
@@ -451,11 +455,15 @@ pub fn lfsFetch(
     remote: []const u8,
     local_refs: []const []const u8,
 ) (Error || contract.LfsTransportError)!void {
-    if (!try sim.hasGitLfs(arena)) return error.LfsUnavailable;
+    if (!try sim.lfsAvailable(arena)) return error.LfsUnavailable;
     const idx = (try sim.remoteClone(arena, remote)) orelse return error.LfsTransferFailed;
     const format = sim.world.format;
+    // Like git-lfs: an unknown ref fails the whole call, and an object the
+    // server lacks fails it after the others arrived.
+    for (local_refs) |name| if (!sim.refs.contains(name)) return error.LfsTransferFailed;
+    var lacking = false;
     for (local_refs) |name| {
-        const tip = sim.refs.get(name) orelse continue;
+        const tip = sim.refs.get(name).?;
         const c = object.Commit.parse(arena, format, sim.objects.get(tip).?.data) catch continue;
         const tree = sim.objects.get(c.tree) orelse continue;
         const entries = object.Tree.parse(arena, format, tree.data) catch continue;
@@ -464,16 +472,17 @@ pub fn lfsFetch(
             const at = std.mem.find(u8, blob.data, "oid sha256:") orelse continue;
             if (at + 11 + 64 > blob.data.len) continue;
             const sha = blob.data[at + 11 ..][0..64];
-            for (sim.world.clones[idx].lfs) |o| {
-                if (o.store == .git_lfs and std.mem.eql(u8, o.sha256, sha)) {
-                    try sim.lfsWrite(.git_lfs, sha, o.data);
-                }
-            }
+            const found = for (sim.world.clones[idx].lfs) |o| {
+                if (o.store == .git_lfs and std.mem.eql(u8, o.sha256, sha)) break o;
+            } else null;
+            if (found) |o| try sim.lfsWrite(.git_lfs, sha, o.data) else lacking = true;
         }
     }
+    if (lacking) return error.LfsTransferFailed;
 }
 
-fn hasGitLfs(sim: *GitSim, arena: Allocator) Error!bool {
+/// False with `sim.lfs = false`.
+pub fn lfsAvailable(sim: *GitSim, arena: Allocator) Error!bool {
     const v = (try sim.configGet(arena, "sim.lfs")) orelse return true;
     return !std.mem.eql(u8, v, "false");
 }

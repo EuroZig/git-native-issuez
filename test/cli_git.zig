@@ -695,10 +695,20 @@ test "attachments over git-lfs" {
     const path = try std.fmt.allocPrint(arena, "{s}/shot.png", .{sb.repo});
     try std.Io.Dir.cwd().writeFile(testing.io, .{ .sub_path = path, .data = png });
 
+    // With git-lfs's pre-push hook, which would refuse the derived ref of
+    // an attachment removed before its first push.
+    try expectSuccess(try sb.runIn(sb.repo, &.{ "git", "lfs", "install", "--local" }));
     try expectSuccess(try gitIssue(&sb, &.{ "init", "origin" }));
     const created = try gitIssue(&sb, &.{ "create", "Shots" });
     try expectSuccess(created);
     const id = std.mem.trimEnd(u8, created.stdout["Created issue ".len..], "\n");
+    // Other bytes, so its object is in no store but the derived history.
+    const other_path = try std.fmt.allocPrint(arena, "{s}/old.png", .{sb.repo});
+    try std.Io.Dir.cwd().writeFile(testing.io, .{ .sub_path = other_path, .data = png ++ "x" });
+    const first = try gitIssue(&sb, &.{ "attach", "add", id, other_path });
+    try expectSuccess(first);
+    const first_id = first.stdout["Attached ".len..][0..7];
+    try expectSuccess(try gitIssue(&sb, &.{ "attach", "rm", id, first_id }));
     try expectSuccess(try gitIssue(&sb, &.{ "attach", "add", id, path }));
     const synced = try gitIssue(&sb, &.{ "sync", "origin" });
     try expectSuccess(synced);
@@ -710,6 +720,16 @@ test "attachments over git-lfs" {
     const ls = try inOther(&sb, other, &.{ "attach", "ls", id });
     try testing.expect(std.mem.find(u8, ls.stdout, "(bytes not here)") != null);
     const att = ls.stdout[0..7];
+    // git-lfs reads the derived ref, so fetch rebuilds a missing one first.
+    const derived = try sb.runIn(other, &.{
+        "git", "for-each-ref", "--format=%(refname)", "refs/attachments/",
+    });
+    try expectSuccess(derived);
+    const name = std.mem.trimEnd(u8, derived.stdout, "\n");
+    try expectSuccess(try sb.runIn(other, &.{ "git", "update-ref", "-d", name }));
+    const fetched = try inOther(&sb, other, &.{ "attach", "fetch", id });
+    try expectSuccess(fetched);
+    try testing.expectEqualStrings("Fetched 1 attachment(s).\n", fetched.stdout);
     const cat = try inOther(&sb, other, &.{ "attach", "cat", id, att });
     try expectSuccess(cat);
     try testing.expectEqualSlices(u8, png, cat.stdout);

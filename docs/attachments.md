@@ -25,11 +25,17 @@ An attachment is named by a unique prefix of its ID (at least 4
 characters). `show` lists the attachments, and each comment names the
 images it added. `cat` downloads missing bytes by itself.
 
-`git issue sync` and `push` upload the bytes with `git lfs push`, so the
-remote needs an LFS server (GitHub, GitLab, Gitea and Forgejo have one).
-Without git-lfs installed, the refs are pushed anyway and `push` warns
-about the objects it couldn't upload. Bytes are never downloaded during a
-sync: `attach cat` and `attach fetch` get them when they are needed.
+Attachments need [git-lfs](https://git-lfs.com). Without it, every
+`attach` subcommand, `comment --attach` and `fsck --repair` refuse before
+doing anything, and `fsck` notes that it didn't check the bytes. `show`
+still lists the attachments, and issues still sync.
+
+`git issue sync` and `push` upload the bytes with `git lfs push`, before
+any ref goes out, so the remote needs an LFS server (GitHub, GitLab, Gitea
+and Forgejo have one). When the upload fails, nothing is pushed. Only
+objects the remote's derived ref doesn't list yet are uploaded. Bytes are
+never downloaded during a sync: `attach cat` and `attach fetch` get them
+when they are needed.
 
 ## Where things live
 
@@ -58,7 +64,10 @@ const Attachments = issuez.Attachments(issuez.backend.GitProcess);
 const att = Attachments.fromRepo(repo); // shares repo.limits
 ```
 
-Everything takes and returns **bytes**, never paths.
+Everything takes and returns **bytes**, never paths. `att.ready(arena)`
+fails with `LfsUnavailable` when git-lfs isn't installed. Every call
+below that reads or writes attachments checks it first; call it yourself
+to refuse before reading any file.
 
 ### Writing
 
@@ -80,7 +89,8 @@ top of that version.
 
 Errors a GUI can tell apart: `UnsupportedType`, `AnimatedImage`,
 `MediaMismatch`, `EmptyAttachment`, `AttachmentTooLarge`,
-`TooManyAttachments`, `AttachmentNotFound`, `NoAttachments`, and
+`TooManyAttachments` (only when adding: removing works on an issue over
+the limit), `AttachmentNotFound`, `NoAttachments`, `LfsUnavailable`, and
 `AttachmentsUnsupported` (a backend without LFS operations).
 
 ### Reading
@@ -108,7 +118,7 @@ switch (try att.read(arena, a)) {
 ```
 
 `read` looks in this tool's store first, then in git-lfs's store, and
-copies what it finds there into its own. `att.list(arena, issue)` gives
+copies a good copy it finds there into its own, also over a damaged one. `att.list(arena, issue)` gives
 every attachment with its `availability` (`local`, `missing`, `corrupt`).
 `Attachments.find(arena, issue, prefix)` resolves an ID prefix of at least
 4 characters.
@@ -118,14 +128,17 @@ every attachment with its `availability` (`local`, `missing`, `corrupt`).
 - `att.derivedState(arena, issue)` returns `.ok`, `.absent` or `.stale`. A
   clone with upstream's refspec has no `refs/attachments/*`, and upstream
   merges don't rebuild it.
-- `att.repair(arena, issue)` rebuilds the derived ref. It never touches the
-  issue ref.
+- `att.repair(arena, issue)` rebuilds the derived ref and returns whether
+  it moved. It never touches the issue ref.
 - `att.orphans(arena, issues)` lists stored objects that no issue
   references. A write that failed after storing the bytes leaves one.
-- `att.uploads(arena, issues)` copies the bytes into git-lfs's store (so
-  `git lfs push` finds them) and returns them; sync uses it before a push.
-- `att.fetch(arena, remote, issues)` downloads missing bytes
-  (`git lfs fetch <remote> refs/attachments/<id>`) and stores them.
+- `att.uploads(arena, attachments, mode)` returns the bytes this clone has,
+  and with `.git_lfs` also copies them into git-lfs's store (so
+  `git lfs push` finds them); sync uses it before a push.
+- `att.fetch(arena, remote, issues)` brings the derived refs in line, then
+  downloads missing bytes (`git lfs fetch <remote> refs/attachments/<id>`)
+  and stores them. `FetchReport.missing` lists what is still missing, and
+  `transfer_failed` says git-lfs failed for some of it.
 - `att.reconcile(arena, issue, remote_derived_tip)` is what sync runs after
   a merge.
 
@@ -139,8 +152,11 @@ every attachment with its `availability` (`local`, `missing`, `corrupt`).
   `Sync.pushWith(arena, remote, .{ .before_push = hook })` (or `syncWith`),
   your hook receives the objects instead, for example to upload them
   through your own LFS client. If the hook fails, nothing is pushed;
-- `PushReport.lfs_uploaded` counts the uploads. `lfs_not_uploaded` lists
-  the objects that couldn't be uploaded because git-lfs isn't installed.
+- without a hook, objects to upload and no git-lfs fail the push with
+  `LfsUnavailable`, and a failed `git lfs push` with `LfsUploadFailed`,
+  both before any ref is pushed. A push with nothing to upload needs no
+  git-lfs;
+- `PushReport.lfs_uploaded` counts the objects handed over.
 
 Bytes are never downloaded during a sync. Call `att.fetch` when an image is
 shown, or for a whole list up front.
@@ -152,13 +168,15 @@ The LFS operations are optional in the backend contract
 
 ```zig
 fn lfsRead(self, arena, LfsStore, sha256_hex) Error!?[]const u8
-fn lfsWrite(self, LfsStore, sha256_hex, data) Error!void   // atomic, idempotent
+fn lfsWrite(self, LfsStore, sha256_hex, data) Error!void   // atomic, replaces
 fn lfsList(self, arena, LfsStore) Error![]const []const u8
 // and, to move objects to and from remotes (contract.hasLfsTransport):
+fn lfsAvailable(self, arena) Error!bool                    // git-lfs installed
 fn lfsPush(self, arena, remote, sha256_hexes) (Error || LfsTransportError)!void
 fn lfsFetch(self, arena, remote, local_refs) (Error || LfsTransportError)!void
 ```
 
 A backend without them still works for everything else, and attachments
 fail with `AttachmentsUnsupported`. A backend with the stores but without
-transport pushes the refs and reports the objects it couldn't upload.
+transport works locally, and a push with objects to upload fails with
+`LfsUnavailable` unless a `before_push` hook uploads them.

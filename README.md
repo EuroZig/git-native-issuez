@@ -61,8 +61,9 @@ Attachments are PNG, JPEG or WebP images. The issue history records each
 one (ID, type, size, sha256, name), and the bytes are git-lfs objects:
 `git issue sync` uploads them with `git lfs push` and `attach cat` or
 `attach fetch` downloads them when needed. They are kept in a store that
-`git lfs prune` doesn't touch. Without git-lfs, attachments work but stay
-in the clone. See [docs/attachments.md](docs/attachments.md).
+`git lfs prune` doesn't touch. Attachments need git-lfs: without it the
+attachment commands refuse, and everything else works. See
+[docs/attachments.md](docs/attachments.md).
 
 `git issue sync <remote>` fetches the remote's issues and milestones,
 merges them, and pushes the local ones. Concurrent edits get a merge commit; which value

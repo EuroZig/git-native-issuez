@@ -34,6 +34,8 @@ fn Audited(comptime Inner: type) type {
                 // The library only writes issue and bookkeeping refs, so
                 // anything else is a bug.
                 const allowed = std.mem.startsWith(u8, u.name, "refs/issues/") or
+                    std.mem.startsWith(u8, u.name, "refs/milestones/") or
+                    std.mem.startsWith(u8, u.name, "refs/attachments/") or
                     std.mem.startsWith(u8, u.name, "refs/issuez-sync/") or
                     std.mem.startsWith(u8, u.name, "refs/issuez-guard/");
                 if (!allowed) @panic("write outside the issue namespaces");
@@ -53,7 +55,9 @@ fn Audited(comptime Inner: type) type {
             return self.inner.push(arena, remote, refspecs, atomic);
         }
 
-        // Plain delegation for the rest of the contract.
+        // Plain delegation for the rest of the contract. The optional LFS
+        // operations are left out, so attachments report
+        // AttachmentsUnsupported through this wrapper.
 
         pub fn objectFormat(self: *const Self) issuez.backend.object.ObjectFormat {
             return self.inner.objectFormat();

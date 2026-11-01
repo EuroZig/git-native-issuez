@@ -13,6 +13,7 @@ const Io = std.Io;
 const contract = @import("contract.zig");
 const object = @import("object.zig");
 const hex_fmt = @import("../format/hex.zig");
+const attachment_fmt = @import("../format/attachment.zig");
 const Oid = object.Oid;
 const ObjectFormat = object.ObjectFormat;
 const ObjectKind = object.ObjectKind;
@@ -26,6 +27,10 @@ format: ObjectFormat,
 cat_file: ?*CatFile,
 /// Resolved on first LFS use.
 common_dir: ?[]u8 = null,
+/// git-lfs's object directory, resolved on first use.
+git_lfs_dir: ?[]u8 = null,
+/// Whether `git lfs version` runs, checked once.
+git_lfs: ?bool = null,
 /// stderr of the last failed command, for error messages.
 last_stderr: [max_stderr_kept]u8,
 last_stderr_len: u16,
@@ -98,6 +103,7 @@ pub fn open(io: Io, gpa: Allocator, options: OpenOptions) Error!GitProcess {
 pub fn close(gp: *GitProcess) void {
     if (gp.cat_file) |cf| cf.deinit(gp.io, gp.gpa);
     if (gp.common_dir) |d| gp.gpa.free(d);
+    if (gp.git_lfs_dir) |d| gp.gpa.free(d);
     gp.env.deinit();
     gp.gpa.free(gp.repo_path);
     gp.* = undefined;
@@ -343,6 +349,11 @@ pub fn push(
     assert(refspecs.len > 0);
     var argv: std.ArrayList([]const u8) = .empty;
     // Hooks run like for any push, so the user's pre-push policies apply.
+    // git-lfs's would refuse derived refs whose history points at objects
+    // nobody has, e.g. one removed before its first push. Sync uploads
+    // what is needed itself, before the refs.
+    try gp.env.put("GIT_LFS_SKIP_PUSH", "1");
+    defer _ = gp.env.swapRemove("GIT_LFS_SKIP_PUSH");
     try argv.appendSlice(arena, &.{ "git", "push", "--porcelain" });
     if (atomic) try argv.append(arena, "--atomic");
     try argv.appendSlice(arena, &.{ "--", remote });
@@ -427,8 +438,6 @@ pub fn randomBytes(gp: *GitProcess, buf: []u8) void {
     gp.io.random(buf);
 }
 
-const max_lfs_object_bytes = 64 * 1024 * 1024;
-
 /// The directory holding `ab/cd/<sha256>`.
 fn lfsObjectsDir(gp: *GitProcess, arena: Allocator, store: contract.LfsStore) Error![]const u8 {
     if (gp.common_dir == null) {
@@ -437,16 +446,21 @@ fn lfsObjectsDir(gp: *GitProcess, arena: Allocator, store: contract.LfsStore) Er
         gp.common_dir = try std.fs.path.resolve(gp.gpa, &.{ gp.repo_path, rel });
     }
     const common = gp.common_dir.?;
-    return switch (store) {
-        .issuez => std.fs.path.join(arena, &.{ common, "issuez", "lfs", "objects" }),
-        .git_lfs => blk: {
-            // Relative to the git dir, like git-lfs does it.
-            if (try gp.configGet(arena, "lfs.storage")) |s| {
-                break :blk std.fs.path.resolve(arena, &.{ common, s, "objects" });
+    switch (store) {
+        .issuez => return std.fs.path.join(arena, &.{ common, "issuez", "lfs", "objects" }),
+        .git_lfs => {
+            if (gp.git_lfs_dir == null) {
+                // Relative to the git dir, like git-lfs does it. Empty
+                // means the default for git-lfs too.
+                const storage = (try gp.configGet(arena, "lfs.storage")) orelse "";
+                gp.git_lfs_dir = try if (storage.len > 0)
+                    std.fs.path.resolve(gp.gpa, &.{ common, storage, "objects" })
+                else
+                    std.fs.path.join(gp.gpa, &.{ common, "lfs", "objects" });
             }
-            break :blk std.fs.path.join(arena, &.{ common, "lfs", "objects" });
+            return gp.git_lfs_dir.?;
         },
-    };
+    }
 }
 
 fn lfsPath(arena: Allocator, objects: []const u8, sha256: []const u8) Error![]const u8 {
@@ -465,7 +479,9 @@ pub fn lfsRead(
     sha256: []const u8,
 ) Error!?[]const u8 {
     const path = try lfsPath(arena, try gp.lfsObjectsDir(arena, store), sha256);
-    return Io.Dir.cwd().readFileAlloc(gp.io, path, arena, .limited(max_lfs_object_bytes)) catch |e|
+    // The limit fails once reached, and a maximal object is valid.
+    const limit: Io.Limit = .limited(attachment_fmt.max_object_bytes + 1);
+    return Io.Dir.cwd().readFileAlloc(gp.io, path, arena, limit) catch |e|
         switch (e) {
             error.FileNotFound, error.NotDir => null,
             error.OutOfMemory => error.OutOfMemory,
@@ -475,7 +491,7 @@ pub fn lfsRead(
 }
 
 /// Temp file, fsync, rename, so a crash leaves nothing or the whole
-/// object. An existing object is kept.
+/// object. Replaces an existing copy, which may be damaged.
 pub fn lfsWrite(
     gp: *GitProcess,
     store: contract.LfsStore,
@@ -487,7 +503,6 @@ pub fn lfsWrite(
     const arena = arena_state.allocator();
     const path = try lfsPath(arena, try gp.lfsObjectsDir(arena, store), sha256);
     const cwd = Io.Dir.cwd();
-    if (cwd.access(gp.io, path, .{})) |_| return else |_| {}
     const dir = std.fs.path.dirname(path).?;
     cwd.createDirPath(gp.io, dir) catch |e| return storeError(e);
     var suffix: [8]u8 = undefined;
@@ -537,7 +552,8 @@ pub fn lfsPush(
     }
 }
 
-/// Downloads into git-lfs's store.
+/// Downloads into git-lfs's store, in batches. Objects that arrived stay
+/// when a later batch, or an object in the same batch, fails.
 pub fn lfsFetch(
     gp: *GitProcess,
     arena: Allocator,
@@ -546,25 +562,40 @@ pub fn lfsFetch(
 ) (Error || contract.LfsTransportError)!void {
     assert(contract.isValidRemoteName(remote));
     try gp.requireGitLfs(arena);
-    var argv: std.ArrayList([]const u8) = .empty;
-    try argv.appendSlice(arena, &.{ "git", "lfs", "fetch", remote });
-    for (local_refs) |r| {
-        assert(contract.isValidRefName(r));
-        try argv.append(arena, r);
+    var failed = false;
+    var start: usize = 0;
+    while (start < local_refs.len) : (start += 32) {
+        var argv: std.ArrayList([]const u8) = .empty;
+        // Every object, whatever lfs.fetchinclude and lfs.fetchexclude say.
+        try argv.appendSlice(arena, &.{ "git", "lfs", "fetch", "-I", "*", "-X", "", remote });
+        for (local_refs[start..@min(start + 32, local_refs.len)]) |r| {
+            assert(contract.isValidRefName(r));
+            try argv.append(arena, r);
+        }
+        const r = try gp.run(arena, argv.items, null);
+        if (!r.ok()) {
+            gp.keepStderr(r.stderr);
+            failed = true;
+        }
     }
-    const r = try gp.run(arena, argv.items, null);
-    if (!r.ok()) {
-        gp.keepStderr(r.stderr);
-        return error.LfsTransferFailed;
-    }
+    if (failed) return error.LfsTransferFailed;
+}
+
+pub fn lfsAvailable(gp: *GitProcess, arena: Allocator) Error!bool {
+    if (gp.git_lfs) |known| return known;
+    const r = gp.run(arena, &.{ "git", "lfs", "version" }, null) catch |e| switch (e) {
+        error.GitSpawnFailed => {
+            gp.git_lfs = false;
+            return false;
+        },
+        else => |x| return x,
+    };
+    gp.git_lfs = r.ok();
+    return gp.git_lfs.?;
 }
 
 fn requireGitLfs(gp: *GitProcess, arena: Allocator) (Error || contract.LfsTransportError)!void {
-    const r = gp.run(arena, &.{ "git", "lfs", "version" }, null) catch |e| switch (e) {
-        error.GitSpawnFailed => return error.LfsUnavailable,
-        else => |x| return x,
-    };
-    if (!r.ok()) return error.LfsUnavailable;
+    if (!try gp.lfsAvailable(arena)) return error.LfsUnavailable;
 }
 
 fn storeError(e: anyerror) Error {

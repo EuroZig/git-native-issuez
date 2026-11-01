@@ -27,14 +27,16 @@
 //!
 //! ```
 //! fn lfsRead(self, arena, LfsStore, sha256_hex) Error!?[]const u8
-//! fn lfsWrite(self, LfsStore, sha256_hex, data) Error!void  // atomic
+//! fn lfsWrite(self, LfsStore, sha256_hex, data) Error!void  // atomic, replaces
 //! fn lfsList(self, arena, LfsStore) Error![]const []const u8
+//! fn lfsAvailable(self, arena) Error!bool                   // git-lfs installed
 //! fn lfsPush(self, arena, remote, sha256_hexes) (Error || LfsTransportError)!void
 //! fn lfsFetch(self, arena, remote, local_refs) (Error || LfsTransportError)!void
 //! ```
 //!
-//! The last two are optional again: without them sync pushes the refs and
-//! reports the objects it couldn't upload.
+//! The last three are optional again. Without them attachments work
+//! locally, and a push that has bytes to upload fails with LfsUnavailable
+//! unless the caller uploads them itself (`Sync.PushOptions.before_push`).
 
 const std = @import("std");
 const object = @import("object.zig");
@@ -64,12 +66,15 @@ pub fn hasLfs(comptime B: type) bool {
 }
 
 pub fn hasLfsTransport(comptime B: type) bool {
-    return hasLfs(B) and @hasDecl(B, "lfsPush") and @hasDecl(B, "lfsFetch");
+    return hasLfs(B) and @hasDecl(B, "lfsAvailable") and
+        @hasDecl(B, "lfsPush") and @hasDecl(B, "lfsFetch");
 }
 
 pub const LfsTransportError = error{
-    /// No git-lfs, or no LFS server for this remote.
+    /// git-lfs isn't installed.
     LfsUnavailable,
+    /// git-lfs failed, e.g. the remote has no LFS server or lacks an
+    /// object.
     LfsTransferFailed,
 };
 

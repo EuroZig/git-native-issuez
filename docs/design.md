@@ -73,7 +73,7 @@ set of plumbing operations:
 | Backend      | Use                                                                                                                                                                                                                                                                                                                   |
 | ------------ | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | `GitProcess` | Runs `git` from PATH with a fixed environment and `--` separators. Reads objects through one long-lived `cat-file --batch`. Output is bounded. LFS objects are files under the git dir; transfers run `git lfs push` and `git lfs fetch` when git-lfs is installed.                                                    |
-| `GitSim`     | An in-memory world of clones, serialised as ZON. Objects hash exactly like git, so OIDs are real. A remote is another clone of the world (`remote.<name>.url = sim:<clone>`). Clock and randomness come from the world. Each clone has both LFS stores, and LFS transfers copy objects between clones. Breaking a protocol rule (a commit pointing at a missing object, an invalid ref name) panics. |
+| `GitSim`     | An in-memory world of clones, serialised as ZON. Objects hash exactly like git, so OIDs are real. A remote is another clone of the world (`remote.<name>.url = sim:<clone>`). Clock and randomness come from the world. Each clone has both LFS stores, LFS transfers copy objects between clones, and like git-lfs a fetch fails on an unknown ref or an object the remote lacks. `sim.lfs = false` makes a clone without git-lfs. Breaking a protocol rule (a commit pointing at a missing object, an invalid ref name) panics. |
 | your own     | Wrap or replace either one. `examples/custom_backend.zig` logs every ref change and push, and refuses writes outside the issue and bookkeeping refs.                                                                                                                                                                  |
 
 ## Reading an issue
@@ -129,8 +129,10 @@ so git-lfs and LFS servers see the objects. A write stores the bytes
 first, then moves the issue ref and the derived ref in one transaction.
 Sync fetches the derived refs but never merges them; it rebuilds them from
 the merged issues, so they converge like everything else. Bytes travel
-only on push (`git lfs push`, or a hook for an embedder's own LFS client)
-and on demand (`att.fetch`).
+only on push (`git lfs push`, or a hook for an embedder's own LFS client),
+uploaded before any ref so a failed upload pushes nothing, and on demand
+(`att.fetch`). On a backend that can run git-lfs, every attachment call
+checks first that it is installed and fails with `LfsUnavailable` if not.
 
 ## Writing an issue (compare and swap)
 
@@ -256,7 +258,8 @@ way, to go unnoticed.
     push the remote has every local tip that isn't quarantined, and every
     derived attachment ref matches its issue and was never rewound;
   - for attachments: the bytes are in the store, LFS objects are never
-    deleted, and a derived ref holds one pointer per present attachment.
+    deleted, a derived ref holds one pointer per present attachment, and
+    no attachment command succeeds on a clone without git-lfs.
 
   It may not import the model or the engine, only git objects, the world
   format and the trailer parser (which is itself checked against git).
@@ -267,7 +270,8 @@ way, to go unnoticed.
 - **Fuzzer** (`git-issue-fuzz`, built with `-Dfuzz`): each case first runs
   random backend operations against a separate model of the contract, then
   random commands, valid and invalid (attachments include animated, empty
-  and non-image files), on a few clones that share a hub
+  and non-image files), on a few clones that share a hub, sometimes one
+  of them without git-lfs
   remote, with some upstream merges mixed in, and commits from another
   tool that writes extension fields without checking them (invalid
   values, clears). Now and then someone

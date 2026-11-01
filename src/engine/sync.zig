@@ -108,9 +108,11 @@ pub const namespaces = [_]Namespace{ .issues, .milestones };
 pub const fetched_namespaces = [_]Namespace{ .issues, .milestones, .attachments };
 
 /// `before_push` gets the LFS objects that the pushed attachment refs
-/// point at, before any ref is pushed, so an embedder can upload them
-/// through its own LFS client. If it fails, nothing is pushed. Without it,
-/// sync uses `git lfs push` when the backend can.
+/// point at and the remote doesn't have yet, before any ref is pushed, so
+/// an embedder can upload them through its own LFS client. If it fails,
+/// nothing is pushed. Without it, sync uses `git lfs push`, and fails with
+/// LfsUnavailable, again before pushing anything, when there are objects
+/// to upload and no git-lfs.
 pub const PushOptions = struct {
     before_push: ?BeforePush = null,
 };
@@ -185,11 +187,9 @@ pub const MergeReport = struct {
 };
 
 pub const PushReport = struct {
-    /// Including objects handed to `before_push`.
+    /// Objects the remote's derived refs didn't list yet, handed to
+    /// `git lfs push` or `before_push`.
     lfs_uploaded: usize = 0,
-    /// sha256 of objects that couldn't be uploaded because git-lfs isn't
-    /// available.
-    lfs_not_uploaded: []const []const u8 = &.{},
     /// Not counted in `pushed`.
     attachment_refs: usize = 0,
     pushed: usize,
@@ -237,7 +237,7 @@ pub fn Sync(comptime B: type) type {
             /// Nothing was pushed.
             BeforePushFailed,
             /// git-lfs is there but the upload failed, so nothing was
-            /// pushed.
+            /// pushed. The backend's last error output says why.
             LfsUploadFailed,
         };
 
@@ -304,11 +304,6 @@ pub fn Sync(comptime B: type) type {
                 const remote_tip = try self.b().resolveRef(staged_name);
                 const issue = self.repo.load(arena, r) catch continue;
                 if (try att.reconcile(arena, issue, remote_tip)) moved += 1;
-                if (remote_tip) |t| try self.setRef(
-                    arena,
-                    try recordRef(arena, remote, .merged, .attachments, id),
-                    t,
-                );
                 const local = try self.b().resolveRef(try A.derivedRefName(arena, id));
                 const same = remote_tip != null and local != null and local.?.eql(remote_tip.?);
                 if (same) try self.setRef(
@@ -846,7 +841,7 @@ pub fn Sync(comptime B: type) type {
             };
             var merges: std.ArrayList(MergeReport) = .empty;
             var skipped: std.ArrayList([]const u8) = .empty;
-            var lfs_missing: std.ArrayList([]const u8) = .empty;
+            var uploaded: std.StringHashMapUnmanaged(void) = .empty;
 
             var round: usize = 0;
             while (round < push_rounds) : (round += 1) {
@@ -856,9 +851,11 @@ pub fn Sync(comptime B: type) type {
                 if (todo.len == 0) {
                     report.merges = merges.items;
                     report.skipped = skipped.items;
-                    report.lfs_not_uploaded = lfs_missing.items;
                     return report;
                 }
+                // All bytes before any ref, so a failed upload pushes
+                // nothing.
+                try self.uploadPending(arena, remote, todo, options, &report, &uploaded);
                 var rejected = false;
                 var start: usize = 0;
                 while (start < todo.len) {
@@ -868,7 +865,6 @@ pub fn Sync(comptime B: type) type {
                         std.mem.eql(u8, todo[end].id, todo[end - 1].id)) end += 1;
                     const chunk = todo[start..end];
                     start = end;
-                    try self.uploadFor(arena, remote, chunk, options, &report, &lfs_missing);
                     var specs: std.ArrayList([]const u8) = .empty;
                     for (chunk) |r| try specs.append(
                         arena,
@@ -895,7 +891,6 @@ pub fn Sync(comptime B: type) type {
                 if (!rejected) {
                     report.merges = merges.items;
                     report.skipped = skipped.items;
-                    report.lfs_not_uploaded = lfs_missing.items;
                     return report;
                 }
                 // The remote has changes we don't. Merge, then retry.
@@ -974,49 +969,57 @@ pub fn Sync(comptime B: type) type {
 
         const Pending = struct { name: []const u8, tip: Oid, ns: Namespace, id: []const u8 };
 
-        /// Uploads the attachments of the issues whose derived refs are in
-        /// `chunk`, before the refs go out.
-        fn uploadFor(
+        /// Uploads the objects the pending derived refs list and the
+        /// remote's derived refs don't, once per push. Objects this clone
+        /// doesn't have are skipped: whoever attached them uploaded them.
+        fn uploadPending(
             self: Self,
             arena: Allocator,
             remote: []const u8,
-            chunk: []const Pending,
+            todo: []const Pending,
             options: PushOptions,
             report: *PushReport,
-            lfs_missing: *std.ArrayList([]const u8),
+            uploaded: *std.StringHashMapUnmanaged(void),
         ) Error!void {
             if (comptime !contract.hasLfs(B)) return;
             const att = attachments_mod.Attachments(B).fromRepo(self.repo);
-            var issues: std.ArrayList(issue_model.Issue) = .empty;
-            for (chunk) |p| if (p.ns == .attachments) {
+            var wanted: std.ArrayList(issue_model.Attachment) = .empty;
+            for (todo) |p| if (p.ns == .attachments) {
                 const name = try localRef(arena, .issues, p.id);
                 const tip = (try self.b().resolveRef(name)) orelse continue;
-                try issues.append(arena, try self.repo.load(arena, .{ .name = name, .tip = tip }));
+                const issue = try self.repo.load(arena, .{ .name = name, .tip = tip });
+                const record = try recordRef(arena, remote, .pushed, .attachments, p.id);
+                const known = if (try self.b().resolveRef(record)) |t|
+                    try att.derivedIds(arena, t)
+                else
+                    &.{};
+                for (issue.attachments) |a| {
+                    if (uploaded.contains(a.sha256.slice())) continue;
+                    if (labels_fmt.contains(known, a.id)) continue;
+                    try wanted.append(arena, a);
+                }
             };
-            if (issues.items.len == 0) return;
-            const ups = try att.uploads(arena, issues.items);
+            if (wanted.items.len == 0) return;
+            const mode: attachments_mod.UploadMode = if (options.before_push != null)
+                .caller
+            else
+                .git_lfs;
+            const ups = try att.uploads(arena, wanted.items, mode);
             if (ups.len == 0) return;
             if (options.before_push) |hook| {
                 hook.run(hook.context, remote, ups) catch return error.BeforePushFailed;
-                report.lfs_uploaded += ups.len;
-                return;
-            }
-            if (comptime contract.hasLfsTransport(B)) {
+            } else {
+                if (comptime !contract.hasLfsTransport(B)) return error.LfsUnavailable;
                 var shas: std.ArrayList([]const u8) = .empty;
                 for (ups) |u| try shas.append(arena, u.sha256);
-                if (self.b().lfsPush(arena, remote, shas.items)) |_| {
-                    report.lfs_uploaded += ups.len;
-                    return;
-                } else |e| switch (e) {
-                    error.LfsUnavailable => {},
+                self.b().lfsPush(arena, remote, shas.items) catch |e| switch (e) {
+                    error.LfsUnavailable => return error.LfsUnavailable,
                     error.LfsTransferFailed => return error.LfsUploadFailed,
                     else => |x| return x,
-                }
+                };
             }
-            next: for (ups) |u| {
-                for (lfs_missing.items) |m| if (std.mem.eql(u8, m, u.sha256)) continue :next;
-                try lfs_missing.append(arena, u.sha256);
-            }
+            for (ups) |u| try uploaded.put(arena, u.sha256, {});
+            report.lfs_uploaded += ups.len;
         }
 
         /// What the remote doesn't have yet, by our records.
@@ -1777,9 +1780,7 @@ test "before_push and no git-lfs" {
     defer arena_state.deinit();
     const arena = arena_state.allocator();
     var world: GitSim.World = .{ .seed = 12, .clones = &.{
-        .{ .name = "alice", .config = remote_config ++ &[_]GitSim.World.ConfigEntry{
-            .{ .key = "sim.lfs", .value = "false" },
-        } },
+        .{ .name = "alice", .config = remote_config },
         .{ .name = "hub" },
     } };
     const samples = @import("../format/attachment.zig").samples;
@@ -1820,13 +1821,35 @@ test "before_push and no git-lfs" {
     });
     try testing.expectEqual(@as(usize, 1), ok.calls);
     try testing.expectEqual(@as(usize, 1), pushed.lfs_uploaded);
-
-    // No hook and no git-lfs: pushed anyway, objects reported.
+    // Only what the remote's derived ref doesn't list yet.
     _ = try A.fromRepo(a.sync.repo).add(arena, ref, .{
         .files = &.{.{ .name = "b.jpg", .data = samples.jpeg }},
     });
+    _ = try a.sync.pushWith(arena, "origin", .{
+        .before_push = .{ .context = &ok, .run = Hook.run },
+    });
+    try testing.expectEqual(@as(usize, 2), ok.calls);
+
+    // Without git-lfs: attachment calls refuse up front, and a push with
+    // bytes to upload fails before any ref moves.
+    _ = try A.fromRepo(a.sync.repo).add(arena, ref, .{
+        .files = &.{.{ .name = "c.webp", .data = samples.webp }},
+    });
+    try a.sim.configAdd("sim.lfs", "false");
+    const att = A.fromRepo(a.sync.repo);
+    try testing.expectError(error.LfsUnavailable, att.add(arena, ref, .{
+        .files = &.{.{ .name = "d.png", .data = samples.png }},
+    }));
+    const hub_before = world.clones[1].refs;
+    try testing.expectError(error.LfsUnavailable, a.sync.push(arena, "origin"));
+    try a.sim.commit();
+    try testing.expectEqualDeep(hub_before, world.clones[1].refs);
+    // With nothing to upload, push needs no git-lfs.
+    a = try onClone(arena, &world, 0);
+    try a.sim.configAdd("sim.lfs", "true");
+    _ = try a.sync.push(arena, "origin");
+    try a.sim.configAdd("sim.lfs", "false");
+    _ = try a.sync.repo.create(arena, .{ .title = "No images" });
     const plain = try a.sync.push(arena, "origin");
-    try testing.expectEqual(@as(usize, 2), plain.lfs_not_uploaded.len);
     try testing.expectEqual(@as(usize, 1), plain.pushed);
-    try testing.expectEqual(@as(usize, 1), plain.attachment_refs);
 }

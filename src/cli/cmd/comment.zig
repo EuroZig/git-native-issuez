@@ -6,6 +6,7 @@ const std = @import("std");
 const context = @import("../context.zig");
 const common = @import("../common.zig");
 const issuez = @import("issuez");
+const attach = @import("attach.zig");
 const uuid = issuez.format.uuid;
 
 pub const help =
@@ -103,26 +104,11 @@ pub fn main(comptime B: type, ctx: *context.Context(B), argv: []const []const u8
     ) orelse return common.exit_error;
     const short = uuid.shortId(ref.id());
     if (action == .add and files.items.len > 0) {
-        const A = issuez.Attachments(B);
-        const att = A.fromRepo(repo);
-        var inputs: std.ArrayList(A.Input) = .empty;
-        for (files.items) |path| {
-            const data = ctx.readFile(path, repo.limits.max_attachment_bytes) catch {
-                ctx.err.print(
-                    "error: cannot read '{s}' (missing, unreadable or too large)\n",
-                    .{path},
-                ) catch {};
-                return common.exit_error;
-            };
-            const input: A.Input = .{ .name = path, .data = data };
-            _ = att.validate(input) catch |e| {
-                ctx.err.print("error: '{s}': ", .{path}) catch {};
-                common.reportRepoError(B, ctx, e);
-                return common.exit_error;
-            };
-            inputs.append(arena, input) catch return common.oom(ctx.err);
-        }
-        _ = att.add(arena, ref.name, .{ .files = inputs.items, .comment = text }) catch |e|
+        const att = issuez.Attachments(B).fromRepo(repo);
+        att.ready(arena) catch |e| return common.repoFailed(B, ctx, e);
+        const inputs = attach.readInputs(B, ctx, att, files.items, null) orelse
+            return common.exit_error;
+        _ = att.add(arena, ref.name, .{ .files = inputs, .comment = text }) catch |e|
             return common.repoFailed(B, ctx, e);
         ctx.out.print("Added comment to {s}\n", .{short}) catch {};
         return common.exit_ok;

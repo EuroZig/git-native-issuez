@@ -51,6 +51,10 @@ pub fn main(comptime B: type, ctx: *context.Context(B), argv: []const []const u8
     }
 
     const repo = common.openRepo(B, ctx) orelse return common.exit_fatal;
+    // --repair writes attachment refs, so it needs git-lfs like every
+    // attachment action.
+    if (repair) issuez.Attachments(B).fromRepo(repo).ready(arena) catch |e|
+        return common.repoFailed(B, ctx, e);
     const refs = repo.refs(arena) catch |e| return common.repoFailed(B, ctx, e);
     const milestones = issuez.Catalog(B).of(repo).refs(arena) catch |e|
         return common.repoFailed(B, ctx, e);
@@ -159,6 +163,15 @@ fn checkAttachments(
     const att = A.fromRepo(repo);
     var errors: usize = 0;
     var issues: std.ArrayList(issuez.engine.Issue) = .empty;
+    const check_bytes = if (att.ready(ctx.arena)) |_| true else |e| switch (e) {
+        error.LfsUnavailable => false,
+        error.AttachmentsUnsupported => return errors,
+        else => {
+            common.reportRepoError(B, ctx, e);
+            return errors + 1;
+        },
+    };
+    var unchecked = false;
     for (refs) |ref| {
         const issue = repo.load(ctx.arena, ref) catch continue;
         issues.append(ctx.arena, issue) catch return errors;
@@ -176,12 +189,15 @@ fn checkAttachments(
             },
         ) catch {};
         if (issue.attachments.len == 0 and issue.removed_attachments.len == 0) continue;
-        const entries = att.list(ctx.arena, issue) catch |e| {
-            if (e == error.AttachmentsUnsupported) return errors;
-            common.reportRepoError(B, ctx, e);
-            errors += 1;
-            continue;
-        };
+        if (!check_bytes) unchecked = true;
+        const entries: []const A.Entry = if (!check_bytes)
+            &.{}
+        else
+            att.list(ctx.arena, issue) catch |e| {
+                common.reportRepoError(B, ctx, e);
+                errors += 1;
+                continue;
+            };
         for (entries) |e| switch (e.availability) {
             .local => {},
             .missing => ctx.err.print(
@@ -191,7 +207,8 @@ fn checkAttachments(
             .corrupt => {
                 errors += 1;
                 ctx.err.print(
-                    "error: {s}: attachment {s} ({s}): stored bytes don't match the hash\n",
+                    "error: {s}: attachment {s} ({s}): stored bytes don't match the hash\n" ++
+                        "       ('git issue attach fetch' gets a good copy)\n",
                     .{ short, uuid.shortId(e.attachment.id), e.attachment.name },
                 ) catch {};
             },
@@ -210,6 +227,11 @@ fn checkAttachments(
             .{ short, issue.id, if (state == .absent) "missing" else "out of date" },
         ) catch {};
     }
+    if (unchecked) ctx.err.writeAll(
+        "note: git-lfs isn't installed, so attachment bytes weren't checked " ++
+            "(https://git-lfs.com)\n",
+    ) catch {};
+    if (!check_bytes) return errors;
     const orphans = att.orphans(ctx.arena, issues.items) catch return errors;
     if (orphans.len > 0) ctx.err.print(
         "note: {d} stored attachment object(s) no issue references (from failed writes)\n",

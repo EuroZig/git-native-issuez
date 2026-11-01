@@ -351,16 +351,18 @@ Derived attachment refs (§7) are fetched into
 `refs/remotes/<remote>/attachments/` but never merged. After the merge,
 each issue's derived ref is rebuilt from the merged issue: it
 fast-forwards to the remote's when that one is right, and otherwise gets a
-new commit on top of both. A push uploads the LFS objects first (with
-`git lfs push`), then sends each derived ref in the same atomic batch as
-its issue. The derived refs of quarantined issues are not pushed. Bytes
-are never downloaded during a sync.
+new commit on top of both. A remote derived ref that isn't a commit is
+ignored. A push first uploads the LFS objects the remote's derived refs
+don't list yet (with `git lfs push`), then sends each derived ref in the
+same atomic batch as its issue. If the upload fails, nothing is pushed.
+The derived refs of quarantined issues are not pushed. Bytes are never
+downloaded during a sync.
 
 ### Bookkeeping refs
 
 These refs are local and never pushed. Losing them only costs extra work on
 the next sync. Milestones have the same refs, with `milestones` in place of
-`issues`. Derived attachment refs only have `merged`, `pushed` and `seen`:
+`issues`. Derived attachment refs only have `pushed` and `seen`:
 - `refs/issuez-sync/<remote>/merged/issues/<uuid>`: the remote tip last
   merged, used to detect rewritten history;
 - `.../pushed/issues/<uuid>`: the tip the remote has;

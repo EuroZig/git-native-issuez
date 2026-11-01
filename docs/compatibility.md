@@ -153,7 +153,8 @@ are installed.
   are errors. Missing bytes, ignored attachment trailers, stored objects
   no issue references, and missing or out-of-date `refs/attachments/*`
   are noted. `--repair` rebuilds those derived refs and never touches an
-  issue.
+  issue. Without git-lfs the bytes aren't checked (noted), and `--repair`
+  refuses.
 
 ## init
 
@@ -200,9 +201,9 @@ are installed.
   issues and milestones that differ, never with force. When the remote
   moved, it merges first and retries. When the remote refuses a ref (a
   hook, permissions), it stops with the remote's message. Attachment
-  bytes are uploaded with `git lfs push` before the refs; without git-lfs
-  the refs are pushed anyway, with a warning naming the objects that
-  weren't uploaded.
+  bytes are uploaded with `git lfs push` before any ref. If that fails,
+  or there are bytes to upload and git-lfs isn't installed, nothing is
+  pushed. git-lfs's own pre-push upload is skipped for these pushes.
 - `sync <remote>`: `merge`, then `push`.
 - `close` and `reopen <id>`: `state --close` and `state --open`.
 - `delete` and `restore <id>`: hide an issue from `ls`, `tree` and
@@ -217,7 +218,9 @@ are installed.
 - `attach add|ls|cat|rename|rm|fetch`: images on issues
   ([attachments.md](attachments.md)). `cat` writes the bytes to stdout and
   downloads them first when they are missing; `fetch` downloads missing
-  bytes for one issue or all of them.
+  bytes for one issue or all of them, and fails while any are still
+  missing. Every subcommand, and `comment --attach`, refuses without
+  git-lfs.
 - `status [<remote>]`: issues not pushed yet, quarantined issues and how to
   resolve them, and issues with conflicts. Local state only.
 - `quarantine <remote> --accept-remote|--keep-local <id>`: resolves a

@@ -134,7 +134,8 @@ pub fn sanitizeName(arena: Allocator, raw: []const u8) Allocator.Error![]const u
     var out: std.ArrayList(u8) = .empty;
     var view = std.unicode.Utf8View.init(base) catch blk: {
         // Not UTF-8: keep printable ASCII.
-        for (base) |c| if (c >= 0x20 and c < 0x7f) try out.append(arena, c);
+        for (base) |c| if (c >= 0x20 and c < 0x7f and out.items.len < max_name_bytes)
+            try out.append(arena, c);
         break :blk null;
     };
     if (view) |*v| {
@@ -276,6 +277,8 @@ test "sanitizeName" {
     try testing.expectEqualStrings("ok", try sanitizeName(arena, "\xffok"));
     const long = try sanitizeName(arena, "é" ** 200);
     try testing.expect(long.len <= max_name_bytes and isCleanName(long));
+    const latin1 = try sanitizeName(arena, "a" ** 300 ++ "\xe9");
+    try testing.expect(latin1.len == max_name_bytes and isCleanName(latin1));
 }
 
 test "lfsPointer" {

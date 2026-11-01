@@ -620,6 +620,11 @@ fn fuzzCommands(
     const custom_workflow = rand.boolean();
     // `in-review` done, `wontfix` and `duplicate` open work.
     const custom_done = rand.uintLessThan(u8, 3) == 0;
+    // Attachment commands must refuse there, and its syncs still work.
+    const without_lfs: ?usize = if (rand.uintLessThan(u8, 4) == 0)
+        rand.uintLessThan(usize, work_count)
+    else
+        null;
     for (clones[0..work_count], 0..) |*c, idx| {
         var config: std.ArrayList(World.ConfigEntry) = .empty;
         try config.append(arena, .{ .key = "remote.origin.url", .value = "sim:hub" });
@@ -628,6 +633,7 @@ fn fuzzCommands(
             .{ .key = "issue.workflowStates", .value = "backlog, doing, done" },
         );
         if (custom_done) try config.append(arena, .{ .key = "issue.doneStates", .value = "in-review" });
+        if (without_lfs == idx) try config.append(arena, .{ .key = "sim.lfs", .value = "false" });
         c.* = .{
             .name = try std.fmt.allocPrint(arena, "c{d}", .{idx}),
             .config = config.items,
