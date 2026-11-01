@@ -221,6 +221,14 @@ hold identical refs: the fuzzer checks exactly that.
   `Context(B)` (`src/cli/context.zig`). `main` opens git before dispatch and
   stores the result or the error; only commands that need a repository
   report the error, so `version` and `help` work anywhere.
+- `--json` is a second renderer over the same library results
+  (`src/cli/json.zig`), next to the text output. Its schema only grows
+  ([json.md](json.md)).
+- The completion scripts (`src/cli/completion.zig`) and the man pages
+  (`src/cli/manpage.zig`) are generated from the commands' `help` texts, so
+  they can't drift from the options. `zig build install` runs the built
+  binary to write them (`git-issue completion <shell>` and the hidden
+  `git-issue __manpages <dir>`), so only native builds install them.
 
 ## Simulator, oracle and fuzzer
 

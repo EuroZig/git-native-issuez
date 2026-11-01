@@ -12,6 +12,7 @@ const labels_fmt = issuez.format.labels;
 const uuid = issuez.format.uuid;
 const attach = @import("attach.zig");
 const ext_flags = @import("../ext_flags.zig");
+const json = @import("../json.zig");
 
 pub const help =
     \\usage: git issue show <issue-id>
@@ -21,6 +22,7 @@ pub const help =
     \\
     \\   <issue-id>    Full UUID or a unique prefix
     \\   --ids         Show each update's comment ID (for comment --edit, ...)
+    \\   --json        The issue as JSON, comments included (docs/json.md)
     \\   -h, --help    Show this help
     \\
 ;
@@ -34,6 +36,7 @@ pub fn main(comptime B: type, ctx: *context.Context(B), argv: []const []const u8
     const arena = ctx.arena;
     var issue_prefix: ?[]const u8 = null;
     var ids = false;
+    var as_json = false;
     var args: common.Args = .{ .list = argv };
     while (args.next()) |arg| {
         if (!args.isOption(arg)) {
@@ -44,6 +47,8 @@ pub fn main(comptime B: type, ctx: *context.Context(B), argv: []const []const u8
             return common.exit_ok;
         } else if (std.mem.eql(u8, arg, "--ids")) {
             ids = true;
+        } else if (std.mem.eql(u8, arg, "--json")) {
+            as_json = true;
         } else {
             return common.unknownOption(ctx.err, "show", arg);
         }
@@ -64,6 +69,14 @@ pub fn main(comptime B: type, ctx: *context.Context(B), argv: []const []const u8
     ) orelse return common.exit_error;
     const issue = repo.load(arena, ref) catch |e| return common.repoFailed(B, ctx, e);
 
+    if (as_json) {
+        const proj = ext_flags.project(B, ctx, repo) orelse return common.exit_error;
+        var s = json.begin(ctx.out);
+        json.issue(&s, arena, issue, .{ .full = true, .projection = proj }) catch
+            return common.exit_error;
+        json.end(&s);
+        return common.exit_ok;
+    }
     const w = ctx.out;
     w.print(
         "Issue {s} [{s}]{s}\n{s}\n",

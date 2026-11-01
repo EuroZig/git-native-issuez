@@ -47,4 +47,6 @@ pub fn main(init: std.process.Init) u8 {
 test {
     _ = dispatch;
     _ = @import("simulate.zig");
+    _ = @import("completion.zig");
+    _ = @import("manpage.zig");
 }

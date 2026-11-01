@@ -75,6 +75,111 @@ test "init remotes" {
     );
 }
 
+/// One line of `ls --format oneline` as lazygit's picker reads it, with the
+/// filter from upstream's docs/lazygit.md: `(?P<value>^\S+)\s+\S+\s+(?P<label>.+)$`.
+fn pickerEntry(line: []const u8) ?struct { value: []const u8, label: []const u8 } {
+    var it = std.mem.tokenizeAny(u8, line, " \t");
+    const value = it.next() orelse return null;
+    _ = it.next() orelse return null; // state
+    const label = std.mem.trim(u8, it.rest(), " \t");
+    if (label.len == 0) return null;
+    return .{ .value = value, .label = label };
+}
+
+test "lazygit commands" {
+    var sb = try Sandbox.init(.{});
+    defer sb.deinit();
+
+    // Shift+C: create, with the priority menu's "-p high" and two labels
+    // ("bug, ui" split on commas and trimmed by the template).
+    const created = try gitIssue(
+        &sb,
+        &.{ "create", "Login page crashes", "-p", "high", "-l", "bug", "-l", "ui" },
+    );
+    try expectSuccess(created);
+    // The "none" priority entry expands to nothing.
+    try expectSuccess(try gitIssue(&sb, &.{ "create", "Write docs" }));
+
+    // The pickers: every line parses, values are the short IDs.
+    const listed = try gitIssue(&sb, &.{ "ls", "--format", "oneline" });
+    try expectSuccess(listed);
+    var ids: [2][]const u8 = undefined;
+    var n: usize = 0;
+    var lines = std.mem.tokenizeScalar(u8, listed.stdout, '\n');
+    while (lines.next()) |line| : (n += 1) {
+        const entry = pickerEntry(line) orelse {
+            std.debug.print("picker can't parse '{s}'\n", .{line});
+            return error.PickerParse;
+        };
+        try testing.expectEqual(@as(usize, 7), entry.value.len);
+        ids[n] = entry.value;
+    }
+    try testing.expectEqual(@as(usize, 2), n);
+
+    // i: show the picked issue. C: comment on it.
+    try expectSuccess(try gitIssue(&sb, &.{ "show", ids[0] }));
+    try expectSuccess(try gitIssue(&sb, &.{ "comment", ids[0], "-m", "Seen on 1.4 too" }));
+
+    // Shift+X: close from the open-issues picker, with and without a reason.
+    const open = try gitIssue(&sb, &.{ "ls", "--format", "oneline", "--state", "open" });
+    try expectSuccess(open);
+    try testing.expect(pickerEntry(std.mem.sliceTo(open.stdout, '\n')) != null);
+    try expectSuccess(try gitIssue(&sb, &.{ "state", ids[0], "--close", "-m", "Fixed in abc123" }));
+    try expectSuccess(try gitIssue(&sb, &.{ "state", ids[1], "--close" }));
+
+    // Shift+I and /: the popups.
+    const full = try gitIssue(&sb, &.{ "ls", "--format", "full" });
+    try expectSuccess(full);
+    const all = try gitIssue(&sb, &.{ "ls", "--format", "full", "--all" });
+    try testing.expect(std.mem.find(u8, all.stdout, "labels:bug, ui priority:high\n") != null);
+    const found = try gitIssue(&sb, &.{ "search", "Login" });
+    try expectSuccess(found);
+    try testing.expect(std.mem.find(u8, found.stdout, "Login page crashes") != null);
+}
+
+test "lazygit: the menu in docs/lazygit.md works" {
+    var sb = try Sandbox.init(.{});
+    defer sb.deinit();
+    const hub = try std.fmt.allocPrint(sb.arena(), "{s}-hub.git", .{sb.repo});
+    try sb.git(&.{ "init", "-q", "--bare", hub });
+    try sb.git(&.{ "remote", "add", "origin", hub });
+
+    // n: with and without the optional priority and label.
+    try expectSuccess(try gitIssue(
+        &sb,
+        &.{ "create", "Login page crashes", "-p", "high", "-l", "bug" },
+    ));
+    try expectSuccess(try gitIssue(&sb, &.{ "create", "Write docs" }));
+
+    // l, a: the list popups. s, c, x: pickers over oneline output.
+    try expectSuccess(try gitIssue(&sb, &.{ "ls", "--format", "full" }));
+    try expectSuccess(try gitIssue(&sb, &.{ "ls", "--all", "--format", "full" }));
+    for ([_][]const []const u8{
+        &.{ "ls", "--all", "--format", "oneline" },
+        &.{ "ls", "--format", "oneline" },
+        &.{ "ls", "--format", "oneline", "--state", "open" },
+    }) |args| {
+        const out = try gitIssue(&sb, args);
+        try expectSuccess(out);
+        var lines = std.mem.tokenizeScalar(u8, out.stdout, '\n');
+        while (lines.next()) |line| try testing.expect(pickerEntry(line) != null);
+    }
+    const picked = pickerEntry(std.mem.sliceTo(
+        (try gitIssue(&sb, &.{ "ls", "--format", "oneline" })).stdout,
+        '\n',
+    )).?.value;
+    try expectSuccess(try gitIssue(&sb, &.{ "show", picked }));
+    try expectSuccess(try gitIssue(&sb, &.{ "comment", picked, "-m", "It's \"really\" broken" }));
+    try expectSuccess(try gitIssue(&sb, &.{ "state", picked, "--close", "--reason", "completed" }));
+
+    // f: search. Y: sync with origin, without `git issue init`.
+    try expectSuccess(try gitIssue(&sb, &.{ "search", "docs" }));
+    const synced = try gitIssue(&sb, &.{ "sync", "origin" });
+    try expectSuccess(synced);
+    const pushed = try sb.run(&.{ "git", "--git-dir", hub, "for-each-ref", "refs/issues/" });
+    try testing.expectEqual(@as(usize, 2), std.mem.count(u8, pushed.stdout, "\n"));
+}
+
 test "quarantine" {
     var sb = try Sandbox.init(.{});
     defer sb.deinit();
@@ -362,6 +467,84 @@ fn have(sb: *Sandbox, tool: []const u8) bool {
         .{tool},
     ) catch return false }) catch return false;
     return out.code == 0;
+}
+
+test "completions and man pages" {
+    var sb = try Sandbox.init(.{});
+    defer sb.deinit();
+    const arena = sb.arena();
+    try expectSuccess(try gitIssue(&sb, &.{ "create", "Completion target" }));
+    const listed = try gitIssue(&sb, &.{ "ls", "-f", "oneline" });
+    const id = listed.stdout[0..7];
+    const dir = std.fs.path.dirname(sb.repo).?;
+
+    for ([_][]const u8{ "bash", "zsh", "fish" }) |shell| {
+        const script = try gitIssue(&sb, &.{ "completion", shell });
+        try expectSuccess(script);
+        const path = try std.fmt.allocPrint(arena, "{s}/completion.{s}", .{ dir, shell });
+        try std.Io.Dir.cwd().writeFile(testing.io, .{ .sub_path = path, .data = script.stdout });
+        if (!have(&sb, shell)) continue;
+        const syntax = try sb.run(&.{ shell, "-n", path });
+        testing.expectEqual(@as(u8, 0), syntax.code) catch |err| {
+            std.debug.print("{s} -n: {s}\n", .{ shell, syntax.stderr });
+            return err;
+        };
+    }
+
+    const bin_dir = std.fs.path.dirname(try sb.exe(paths.git_issue_exe)).?;
+    const old_path = sb.env.get("PATH") orelse "/usr/bin:/bin";
+    const path_env = try std.fmt.allocPrint(arena, "{s}:{s}", .{ bin_dir, old_path });
+    try sb.env.put("PATH", path_env);
+    if (have(&sb, "bash")) {
+        // COMP_WORDS by hand, as bash's completion would set them.
+        const harness = try std.fmt.allocPrint(arena,
+            \\. '{s}/completion.bash'
+            \\t() {{ COMP_WORDS=("$@"); COMP_CWORD=$(( ${{#COMP_WORDS[@]}} - 1 )); COMPREPLY=();
+            \\      _git_issue_command; echo "${{COMPREPLY[*]}}"; }}
+            \\t git-issue cr
+            \\t git-issue create -p ""
+            \\t git-issue show ""
+            \\
+        , .{dir});
+        const out = try sb.run(&.{ "bash", "-c", harness });
+        try expectSuccess(out);
+        var lines = std.mem.splitScalar(u8, out.stdout, '\n');
+        try testing.expectEqualStrings("create", lines.next().?);
+        try testing.expectEqualStrings("low medium high critical", lines.next().?);
+        try testing.expectEqualStrings(id, lines.next().?);
+    }
+    if (have(&sb, "fish")) {
+        const cmd = try std.fmt.allocPrint(
+            arena,
+            "source '{s}/completion.fish'; " ++
+                "complete -C 'git-issue show '; complete -C 'git-issue cr'",
+            .{dir},
+        );
+        const out = try sb.run(&.{ "fish", "--no-config", "-c", cmd });
+        try expectSuccess(out);
+        try testing.expect(std.mem.find(u8, out.stdout, id) != null);
+        try testing.expect(std.mem.find(u8, out.stdout, "create\t") != null);
+    }
+
+    const man = try std.fmt.allocPrint(arena, "{s}/man1", .{dir});
+    try expectSuccess(try gitIssue(&sb, &.{ "__manpages", man }));
+    if (have(&sb, "mandoc")) {
+        var pages = try std.Io.Dir.cwd().openDir(testing.io, man, .{ .iterate = true });
+        defer pages.close(testing.io);
+        var it = pages.iterate();
+        var n: usize = 0;
+        while (try it.next(testing.io)) |entry| : (n += 1) {
+            const page = try std.fmt.allocPrint(arena, "{s}/{s}", .{ man, entry.name });
+            const lint = try sb.run(&.{ "mandoc", "-T", "lint", "-W", "warning", page });
+            // The date is left out on purpose (reproducible pages).
+            var warnings = std.mem.tokenizeScalar(u8, lint.stdout, '\n');
+            while (warnings.next()) |w| if (std.mem.find(u8, w, "missing date") == null) {
+                std.debug.print("mandoc: {s}\n", .{w});
+                return error.ManPageLint;
+            };
+        }
+        try testing.expect(n >= 15);
+    }
 }
 
 test "tree and problems" {
@@ -745,4 +928,61 @@ test "attachments over git-lfs" {
     const after = try inOther(&sb, other, &.{ "attach", "cat", id, att });
     try expectSuccess(after);
     try testing.expectEqualSlices(u8, png, after.stdout);
+}
+
+test "json output" {
+    var sb = try Sandbox.init(.{});
+    defer sb.deinit();
+    const arena = sb.arena();
+    const parse = struct {
+        fn f(a: std.mem.Allocator, out: Sandbox.Output) !std.json.Value {
+            try expectSuccess(out);
+            return std.json.parseFromSliceLeaky(std.json.Value, a, out.stdout, .{});
+        }
+    }.f;
+    const id = blk: {
+        const out = try gitIssue(&sb, &.{ "create", "Epic", "-l", "ui", "-p", "high" });
+        try expectSuccess(out);
+        break :blk std.mem.trimEnd(u8, out.stdout["Created issue ".len..], "\n");
+    };
+    const child = try gitIssue(&sb, &.{ "create", "Child", "--parent", id, "--due", "2026-12-01" });
+    try expectSuccess(child);
+    try expectSuccess(try gitIssue(&sb, &.{ "comment", id, "-m", "Needle in a haystack" }));
+
+    const ls = try parse(arena, try gitIssue(&sb, &.{ "ls", "--json" }));
+    try testing.expectEqual(@as(usize, 2), ls.array.items.len);
+    // Same-second creations: find them by title.
+    const first_is_epic = std.mem.eql(u8, ls.array.items[0].object.get("title").?.string, "Epic");
+    const epic = ls.array.items[if (first_is_epic) 0 else 1].object;
+    try testing.expectEqualStrings("Epic", epic.get("title").?.string);
+    try testing.expectEqualStrings("high", epic.get("priority").?.string);
+    try testing.expectEqualStrings("ui", epic.get("labels").?.array.items[0].string);
+    try testing.expectEqual(@as(i64, 0), epic.get("progress").?.object.get("closed").?.integer);
+    const kid = ls.array.items[if (first_is_epic) 1 else 0].object;
+    try testing.expectEqualStrings("2026-12-01", kid.get("due").?.string);
+    try testing.expectEqualStrings(epic.get("id").?.string, kid.get("parent").?.string);
+
+    const show = try parse(arena, try gitIssue(&sb, &.{ "show", id, "--json" }));
+    const comments = show.object.get("comments").?.array.items;
+    const subject = comments[0].object.get("subject").?.string;
+    try testing.expectEqualStrings("Needle in a haystack", subject);
+    try testing.expect(show.object.get("description") != null);
+    // RFC 3339 with the author's offset.
+    try testing.expect(std.mem.findScalar(u8, show.object.get("created").?.string, 'T') != null);
+
+    const tree = try parse(arena, try gitIssue(&sb, &.{ "tree", "--json" }));
+    try testing.expectEqual(@as(usize, 1), tree.array.items.len);
+    const children = tree.array.items[0].object.get("children").?.array.items;
+    try testing.expectEqual(@as(usize, 1), children.len);
+
+    const found = try parse(arena, try gitIssue(&sb, &.{ "search", "haystack", "--json" }));
+    try testing.expectEqual(@as(usize, 1), found.array.items.len);
+    const status = try parse(arena, try gitIssue(&sb, &.{ "status", "--json" }));
+    try testing.expectEqual(@as(usize, 0), status.object.get("remotes").?.array.items.len);
+
+    try expectSuccess(try gitIssue(&sb, &.{ "milestone", "create", "v1" }));
+    try expectSuccess(try gitIssue(&sb, &.{ "edit", id, "--milestone", "v1" }));
+    const ms = try parse(arena, try gitIssue(&sb, &.{ "milestone", "show", "v1", "--json" }));
+    try testing.expectEqual(@as(usize, 2), ms.object.get("issues").?.array.items.len);
+    try testing.expectEqual(@as(i64, 1), ms.object.get("progress").?.object.get("total").?.integer);
 }

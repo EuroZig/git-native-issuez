@@ -25,6 +25,8 @@ const cmd_close = @import("cmd/close.zig");
 const cmd_milestone = @import("cmd/milestone.zig");
 const cmd_quarantine = @import("cmd/quarantine.zig");
 const cmd_attach = @import("cmd/attach.zig");
+const completion = @import("completion.zig");
+const manpage = @import("manpage.zig");
 
 pub const program = "git-issue";
 
@@ -59,6 +61,9 @@ pub const Command = enum {
     reopen,
     milestone,
     attach,
+    completion,
+    /// Writes the man pages at build time. Not in the usage.
+    __manpages,
 };
 
 pub const Invocation = struct {
@@ -115,6 +120,8 @@ pub fn run(
         .milestone => cmd_milestone.main(B, ctx, inv.args),
         .attach => cmd_attach.main(B, ctx, inv.args),
         .quarantine => cmd_quarantine.main(B, ctx, inv.args),
+        .completion => completion.main(B, ctx, inv.args),
+        .__manpages => manpage.main(B, ctx, inv.args),
         .sync => if (hasHelp(inv.args))
             cmd_merge.main(B, ctx, inv.args, .sync)
         else if (firstPositional(inv.args)) |target|

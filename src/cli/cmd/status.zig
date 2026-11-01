@@ -4,6 +4,7 @@ const std = @import("std");
 const context = @import("../context.zig");
 const common = @import("../common.zig");
 const issuez = @import("issuez");
+const json = @import("../json.zig");
 const sync_output = @import("../sync_output.zig");
 const uuid = issuez.format.uuid;
 
@@ -16,6 +17,7 @@ pub const help =
     \\`git issue merge <remote>` first to see the remote's latest changes.
     \\
     \\Options:
+    \\   --json        The same as JSON (docs/json.md)
     \\   -h, --help    Show this help
     \\
 ;
@@ -23,6 +25,7 @@ pub const help =
 pub fn main(comptime B: type, ctx: *context.Context(B), argv: []const []const u8) u8 {
     const arena = ctx.arena;
     var only: ?[]const u8 = null;
+    var as_json = false;
     var args: common.Args = .{ .list = argv };
     while (args.next()) |arg| {
         if (!args.isOption(arg)) {
@@ -32,6 +35,8 @@ pub fn main(comptime B: type, ctx: *context.Context(B), argv: []const []const u8
         } else if (common.isHelp(arg)) {
             ctx.out.writeAll(help) catch {};
             return common.exit_ok;
+        } else if (std.mem.eql(u8, arg, "--json")) {
+            as_json = true;
         } else {
             return common.unknownOption(ctx.err, "status", arg);
         }
@@ -47,6 +52,13 @@ pub fn main(comptime B: type, ctx: *context.Context(B), argv: []const []const u8
         ctx.err.print("error: remote '{s}' does not exist\n", .{r}) catch {};
         return common.exit_error;
     } else configured;
+    if (as_json) {
+        var js = json.begin(w);
+        writeJson(B, &js, arena, repo, s, remotes) catch |e|
+            return common.repoFailed(B, ctx, e);
+        json.end(&js);
+        return common.exit_ok;
+    }
     if (remotes.len == 0) w.writeAll("No remotes configured.\n") catch {};
 
     for (remotes) |remote| {
@@ -98,4 +110,64 @@ pub fn main(comptime B: type, ctx: *context.Context(B), argv: []const []const u8
         }) catch {};
     };
     return common.exit_ok;
+}
+
+fn writeJson(
+    comptime B: type,
+    js: *json.Stringify,
+    arena: std.mem.Allocator,
+    repo: issuez.engine.Repo(B),
+    s: issuez.Sync(B),
+    remotes: []const []const u8,
+) !void {
+    try js.beginObject();
+    try js.objectField("remotes");
+    try js.beginArray();
+    for (remotes) |remote| {
+        const st = try s.status(arena, remote);
+        try js.beginObject();
+        try js.objectField("name");
+        try js.write(remote);
+        try js.objectField("pending");
+        try js.beginArray();
+        for (st.pending) |ref| try js.write(ref.id());
+        try js.endArray();
+        try js.objectField("quarantined");
+        try js.beginArray();
+        for (st.quarantined) |q| {
+            try js.beginObject();
+            try js.objectField("id");
+            try js.write(q.id);
+            try js.objectField("kind");
+            try js.write(if (q.namespace == .milestones) "milestone" else "issue");
+            try js.objectField("title");
+            try js.write(q.title);
+            try js.objectField("remote_tip");
+            const hex = q.remote_tip.hex();
+            try js.write(hex.slice());
+            try js.objectField("reason");
+            if (q.reason) |r| try js.write(@tagName(r)) else try js.write(null);
+            try js.objectField("kept_local");
+            try js.write(q.kept_local);
+            try js.endObject();
+        }
+        try js.endArray();
+        try js.endObject();
+    }
+    try js.endArray();
+    try js.objectField("conflicts");
+    try js.beginArray();
+    for (try repo.loadAll(arena)) |issue| for (issue.conflicts) |c| {
+        try js.beginObject();
+        try js.objectField("id");
+        try js.write(issue.id);
+        try json.conflictField(js, c.target);
+        try js.objectField("kept");
+        try js.write(c.value);
+        try js.objectField("lost");
+        try js.write(c.lost);
+        try js.endObject();
+    };
+    try js.endArray();
+    try js.endObject();
 }

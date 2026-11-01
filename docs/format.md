@@ -46,7 +46,7 @@ never straight into `refs/issues/`, `refs/milestones/` or
   one. Upstream's readers skip empty values for its core fields, so a
   cleared core field may still show the old value there.
 - Unknown trailers are kept through merges and ignored by readers that don't
-  know them. They appear as plain fields in `show`.
+  know them. They appear as plain fields (`show`, `--json` `fields`).
 - Per-commit provenance trailers (`Provider-Comment-ID`, `Exported-Commit`,
   written by upstream's provider bridges) describe their commit, not the
   issue, and are not issue fields.

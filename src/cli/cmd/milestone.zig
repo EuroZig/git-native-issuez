@@ -4,6 +4,7 @@ const std = @import("std");
 const context = @import("../context.zig");
 const common = @import("../common.zig");
 const ext_flags = @import("../ext_flags.zig");
+const json = @import("../json.zig");
 const issuez = @import("issuez");
 const uuid = issuez.format.uuid;
 const Status = issuez.format.fields.MilestoneStatus;
@@ -31,6 +32,7 @@ pub const help =
     \\   --description <text>  The description (create), or replace it (edit)
     \\   -m, --message <text>  Description (create) or commit message
     \\   -a, --all             Include completed and retired milestones (ls)
+    \\   --json                As JSON (ls, show; docs/json.md)
     \\   -h, --help            Show this help
     \\
 ;
@@ -55,6 +57,7 @@ pub fn main(comptime B: type, ctx: *context.Context(B), argv: []const []const u8
     var description: ?[]const u8 = null;
     var message: ?[]const u8 = null;
     var all = false;
+    var as_json = false;
     var args: common.Args = .{ .list = argv[1..] };
     while (args.next()) |arg| {
         if (!args.isOption(arg)) {
@@ -75,6 +78,8 @@ pub fn main(comptime B: type, ctx: *context.Context(B), argv: []const []const u8
             message = args.value(ctx.err, "-m") orelse return common.exit_error;
         } else if (std.mem.eql(u8, arg, "-a") or std.mem.eql(u8, arg, "--all")) {
             all = true;
+        } else if (std.mem.eql(u8, arg, "--json")) {
+            as_json = true;
         } else {
             return common.unknownOption(ctx.err, "milestone", arg);
         }
@@ -84,6 +89,8 @@ pub fn main(comptime B: type, ctx: *context.Context(B), argv: []const []const u8
         return common.exit_error;
     };
 
+    if (as_json and sub != .ls and sub != .show)
+        return common.missing(ctx.err, "milestone", "--json goes with ls and show");
     if (all and sub != .ls) return common.missing(ctx.err, "milestone", "--all goes with ls");
     if (name != null and sub != .edit)
         return common.missing(ctx.err, "milestone", "--name goes with edit");
@@ -114,6 +121,16 @@ pub fn main(comptime B: type, ctx: *context.Context(B), argv: []const []const u8
         },
         .ls => {
             const list = cat.list(arena) catch |e| return common.repoFailed(B, ctx, e);
+            if (as_json) {
+                var s = json.begin(w);
+                s.beginArray() catch return common.exit_error;
+                for (list) |m| if (all or m.status == .open) {
+                    json.milestone(&s, m) catch return common.exit_error;
+                };
+                s.endArray() catch return common.exit_error;
+                json.end(&s);
+                return common.exit_ok;
+            }
             for (list) |m| {
                 if (!all and m.status != .open) continue;
                 w.print("{s} [{t}] {s}", .{ uuid.shortId(m.id), m.status, m.name }) catch {};
@@ -129,7 +146,12 @@ pub fn main(comptime B: type, ctx: *context.Context(B), argv: []const []const u8
             const m = ext_flags.findMilestone(B, ctx, cat, key) orelse return common.exit_error;
             const short = uuid.shortId(m.id);
             switch (sub) {
-                .show => {
+                .show => if (as_json) {
+                    const proj = ext_flags.project(B, ctx, repo) orelse return common.exit_error;
+                    var s = json.begin(w);
+                    json.milestoneDetail(&s, arena, m, proj) catch return common.exit_error;
+                    json.end(&s);
+                } else {
                     w.print("Milestone {s} [{t}]\n", .{ short, m.status }) catch {};
                     w.writeAll("=" ** 60 ++ "\n") catch {};
                     w.print("Name:    {s}\n", .{m.name}) catch {};

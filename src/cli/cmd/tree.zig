@@ -5,6 +5,7 @@ const context = @import("../context.zig");
 const common = @import("../common.zig");
 const ext_flags = @import("../ext_flags.zig");
 const issuez = @import("issuez");
+const json = @import("../json.zig");
 const uuid = issuez.format.uuid;
 const Projection = issuez.projection.Projection;
 
@@ -18,6 +19,7 @@ pub const help =
     \\Options:
     \\   -a, --all     Also show closed issues without open descendants, and
     \\                 deleted issues (otherwise their sub-issues take their place)
+    \\   --json        Nested {issue, children} nodes as JSON (docs/json.md)
     \\   -h, --help    Show this help
     \\
 ;
@@ -25,6 +27,7 @@ pub const help =
 pub fn main(comptime B: type, ctx: *context.Context(B), argv: []const []const u8) u8 {
     var prefix: ?[]const u8 = null;
     var all = false;
+    var as_json = false;
     var args: common.Args = .{ .list = argv };
     while (args.next()) |arg| {
         if (!args.isOption(arg)) {
@@ -36,6 +39,8 @@ pub fn main(comptime B: type, ctx: *context.Context(B), argv: []const []const u8
             return common.exit_ok;
         } else if (std.mem.eql(u8, arg, "-a") or std.mem.eql(u8, arg, "--all")) {
             all = true;
+        } else if (std.mem.eql(u8, arg, "--json")) {
+            as_json = true;
         } else {
             return common.unknownOption(ctx.err, "tree", arg);
         }
@@ -64,6 +69,12 @@ pub fn main(comptime B: type, ctx: *context.Context(B), argv: []const []const u8
         if (!all and proj.issues[r].deleted) {
             printer.shownChildren(r, &top) catch return common.oom(ctx.err);
         } else if (printer.shown[r]) top.append(ctx.arena, r) catch return common.oom(ctx.err);
+    }
+    if (as_json) {
+        var s = json.begin(ctx.out);
+        printer.jsonNodes(&s, top.items) catch return common.exit_error;
+        json.end(&s);
+        return common.exit_ok;
     }
     if (proj.issues.len == 0) {
         ctx.out.writeAll("No issues found.\n") catch {};
@@ -119,6 +130,33 @@ const Printer = struct {
                 var j = p.proj.children[c].len;
                 while (j > 0) : (j -= 1) try stack.append(p.arena, p.proj.children[c][j - 1]);
             } else if (p.shown[c]) try out.append(p.arena, c);
+        }
+    }
+
+    fn jsonNodes(p: *Printer, s: *json.Stringify, top: []const u32) !void {
+        const Frame = struct { nodes: []const u32, next: usize = 0 };
+        var stack: std.ArrayList(Frame) = .empty;
+        try s.beginArray();
+        try stack.append(p.arena, .{ .nodes = top });
+        while (stack.items.len > 0) {
+            const f = &stack.items[stack.items.len - 1];
+            if (f.next == f.nodes.len) {
+                try s.endArray();
+                _ = stack.pop();
+                // The node that owned these children.
+                if (stack.items.len > 0) try s.endObject();
+                continue;
+            }
+            const i = f.nodes[f.next];
+            f.next += 1;
+            try s.beginObject();
+            try s.objectField("issue");
+            try json.issue(s, p.arena, p.proj.issues[i], .{ .projection = p.proj });
+            try s.objectField("children");
+            try s.beginArray();
+            var shown: std.ArrayList(u32) = .empty;
+            try p.shownChildren(i, &shown);
+            try stack.append(p.arena, .{ .nodes = shown.items });
         }
     }
 

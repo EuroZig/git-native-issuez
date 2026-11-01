@@ -7,6 +7,7 @@ const core = @import("issuez").format.core;
 const issuez = @import("issuez");
 const query = issuez.query;
 const ext_flags = @import("../ext_flags.zig");
+const json = @import("../json.zig");
 const labels_fmt = issuez.format.labels;
 const uuid = issuez.format.uuid;
 
@@ -33,6 +34,7 @@ pub const help =
     \\   --conflicts             Only issues with fields edited concurrently, each
     \\                           with the conflict
     \\   --deleted               Only deleted issues (see git issue restore)
+    \\   --json                  JSON array of issues (docs/json.md); ignores -f
     \\   -h, --help              Show this help
     \\
     \\Formats:
@@ -58,6 +60,7 @@ pub fn main(comptime B: type, ctx: *context.Context(B), argv: []const []const u8
     var only_problems = false;
     var only_conflicts = false;
     var only_deleted = false;
+    var as_json = false;
 
     var args: common.Args = .{ .list = argv };
     while (args.next()) |arg| {
@@ -101,6 +104,8 @@ pub fn main(comptime B: type, ctx: *context.Context(B), argv: []const []const u8
             only_conflicts = true;
         } else if (std.mem.eql(u8, arg, "--deleted")) {
             only_deleted = true;
+        } else if (std.mem.eql(u8, arg, "--json")) {
+            as_json = true;
         } else {
             return common.unknownOption(ctx.err, "ls", arg);
         }
@@ -123,7 +128,7 @@ pub fn main(comptime B: type, ctx: *context.Context(B), argv: []const []const u8
         .reverse = reverse,
         .done_states = repo.done_states,
     }) catch return common.exit_error;
-    const proj = if (only_problems)
+    const proj = if (only_problems or as_json)
         ext_flags.project(B, ctx, repo) orelse return common.exit_error
     else
         null;
@@ -137,6 +142,12 @@ pub fn main(comptime B: type, ctx: *context.Context(B), argv: []const []const u8
         kept.append(arena, issue) catch return common.oom(ctx.err);
     }
     const listed = kept.items;
+    if (as_json) {
+        var s = json.begin(ctx.out);
+        writeJson(&s, arena, listed, proj.?) catch return common.exit_error;
+        json.end(&s);
+        return common.exit_ok;
+    }
 
     for (listed) |issue| {
         const short = uuid.shortId(issue.id);
@@ -187,4 +198,15 @@ pub fn main(comptime B: type, ctx: *context.Context(B), argv: []const []const u8
         ) catch {};
     }
     return common.exit_ok;
+}
+
+fn writeJson(
+    s: *json.Stringify,
+    arena: std.mem.Allocator,
+    listed: []const issuez.engine.Issue,
+    proj: issuez.projection.Projection,
+) json.Error!void {
+    try s.beginArray();
+    for (listed) |issue| try json.issue(s, arena, issue, .{ .projection = proj });
+    try s.endArray();
 }

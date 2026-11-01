@@ -4,6 +4,7 @@ const std = @import("std");
 const context = @import("../context.zig");
 const common = @import("../common.zig");
 const issuez = @import("issuez");
+const json = @import("../json.zig");
 const uuid = issuez.format.uuid;
 
 pub const help =
@@ -15,6 +16,7 @@ pub const help =
     \\Options:
     \\   -s, --state <state>   open, closed, any custom state, or all [default: all]
     \\   -i, --ignore-case     Case-insensitive search
+    \\   --json                JSON array of {issue, matches} (docs/json.md)
     \\   -h, --help            Show this help
     \\
 ;
@@ -26,6 +28,7 @@ pub fn main(comptime B: type, ctx: *context.Context(B), argv: []const []const u8
     var pattern: ?[]const u8 = null;
     var state_filter: ?issuez.format.core.State = null;
     var ignore_case = false;
+    var as_json = false;
 
     var args: common.Args = .{ .list = argv };
     while (args.next()) |arg| {
@@ -39,6 +42,8 @@ pub fn main(comptime B: type, ctx: *context.Context(B), argv: []const []const u8
             state_filter = common.stateFilter(args.value(ctx.err, "-s") orelse return common.exit_error);
         } else if (std.mem.eql(u8, arg, "-i") or std.mem.eql(u8, arg, "--ignore-case")) {
             ignore_case = true;
+        } else if (std.mem.eql(u8, arg, "--json")) {
+            as_json = true;
         } else {
             return common.unknownOption(ctx.err, "search", arg);
         }
@@ -52,10 +57,12 @@ pub fn main(comptime B: type, ctx: *context.Context(B), argv: []const []const u8
 
     const repo = common.openRepo(B, ctx) orelse return common.exit_fatal;
     const issues = repo.loadAll(arena) catch |e| return common.repoFailed(B, ctx, e);
-    if (issues.len == 0) {
+    if (issues.len == 0 and !as_json) {
         ctx.out.writeAll("No issues found.\n") catch {};
         return common.exit_ok;
     }
+    var s = json.begin(ctx.out);
+    if (as_json) s.beginArray() catch return common.exit_error;
 
     const filter: issuez.query.Filter = .{ .state = state_filter, .done = null };
     for (issues) |issue| {
@@ -64,6 +71,10 @@ pub fn main(comptime B: type, ctx: *context.Context(B), argv: []const []const u8
             .ignore_case = ignore_case,
         }) catch return common.oom(ctx.err);
         if (lines.len == 0) continue;
+        if (as_json) {
+            writeMatch(&s, arena, issue, lines) catch return common.exit_error;
+            continue;
+        }
         ctx.out.print(
             "{s} [{s}] {s}\n",
             .{ uuid.shortId(issue.id), issue.state.text(), issue.title },
@@ -77,5 +88,23 @@ pub fn main(comptime B: type, ctx: *context.Context(B), argv: []const []const u8
             .{shown - max_shown},
         ) catch {};
     }
+    if (as_json) {
+        s.endArray() catch return common.exit_error;
+        json.end(&s);
+    }
     return common.exit_ok;
+}
+
+fn writeMatch(
+    s: *json.Stringify,
+    arena: std.mem.Allocator,
+    issue: issuez.engine.Issue,
+    lines: []const []const u8,
+) json.Error!void {
+    try s.beginObject();
+    try s.objectField("issue");
+    try json.issue(s, arena, issue, .{});
+    try s.objectField("matches");
+    try s.write(lines);
+    try s.endObject();
 }

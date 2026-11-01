@@ -31,6 +31,7 @@ pub const text =
     \\   attach      Attach images to an issue (add, ls, cat, rename, rm)
     \\   status      Show unpushed, quarantined and conflicted issues
     \\   quarantine  Resolve a quarantined issue
+    \\   completion  Print a shell completion script (bash, zsh, fish)
     \\
     \\Run 'git issue <command> --help' for details on a command.
     \\Provider import/export (GitHub, GitLab, ...): use upstream git-native-issue's
