@@ -2,7 +2,9 @@
 //!
 //! Children get `LC_ALL=C` and `GIT_TERMINAL_PROMPT=0` and run in the
 //! repository, and their output is bounded. Reads go through one long-lived
-//! `git cat-file --batch`, ref changes through `git update-ref --stdin`.
+//! `git cat-file --batch`, object writes through one long-lived
+//! `git hash-object --stdin-paths` per type, ref changes through
+//! `git update-ref --stdin`.
 
 const GitProcess = @This();
 
@@ -25,7 +27,9 @@ env: std.process.Environ.Map,
 repo_path: []u8,
 format: ObjectFormat,
 cat_file: ?*CatFile,
-/// Resolved on first LFS use.
+/// One per object type, started on first use.
+hash_objects: [std.enums.values(ObjectKind).len]?*HashObject = @splat(null),
+/// Absolute, resolved at open.
 common_dir: ?[]u8 = null,
 /// git-lfs's object directory, resolved on first use.
 git_lfs_dir: ?[]u8 = null,
@@ -92,16 +96,23 @@ pub fn open(io: Io, gpa: Allocator, options: OpenOptions) Error!GitProcess {
     const version = parseGitVersion(version_out) orelse return error.GitFailed;
     if (version.order(min_git_version) == .lt) return error.GitTooOld;
 
-    const fmt = gp.run(arena, &.{ "git", "rev-parse", "--show-object-format" }, null) catch |err|
-        return err;
-    if (!fmt.ok()) return error.NotARepository;
-    gp.format = ObjectFormat.parse(std.mem.trimEnd(u8, fmt.stdout, "\n")) orelse
-        return error.GitFailed;
+    const rp = try gp.run(
+        arena,
+        &.{ "git", "rev-parse", "--show-object-format", "--git-common-dir" },
+        null,
+    );
+    if (!rp.ok()) return error.NotARepository;
+    var lines = std.mem.splitScalar(u8, rp.stdout, '\n');
+    gp.format = ObjectFormat.parse(lines.next() orelse "") orelse return error.GitFailed;
+    const common = lines.next() orelse return error.GitFailed;
+    if (common.len == 0) return error.GitFailed;
+    gp.common_dir = try std.fs.path.resolve(gpa, &.{ repo_path, common });
     return gp;
 }
 
 pub fn close(gp: *GitProcess) void {
     if (gp.cat_file) |cf| cf.deinit(gp.io, gp.gpa);
+    for (gp.hash_objects) |h| if (h) |ho| ho.deinit(gp.io, gp.gpa);
     if (gp.common_dir) |d| gp.gpa.free(d);
     if (gp.git_lfs_dir) |d| gp.gpa.free(d);
     gp.env.deinit();
@@ -128,7 +139,17 @@ pub fn readObject(gp: *GitProcess, arena: Allocator, oid: Oid) Error!?contract.O
     };
 }
 
+/// git writes the object, so its permissions, fsync and checks apply. The
+/// data goes through a temporary file to the type's `hash-object` session;
+/// if that fails, a one-off `hash-object` says why.
 pub fn writeObject(gp: *GitProcess, kind: ObjectKind, data: []const u8) Error!Oid {
+    if (gp.writeObjectSession(kind, data)) |oid| {
+        assert(oid.eql(object.hashObject(gp.format, kind, data)));
+        return oid;
+    } else |err| switch (err) {
+        error.OutOfMemory, error.Canceled => |e| return e,
+        else => {},
+    }
     var arena_state: std.heap.ArenaAllocator = .init(gp.gpa);
     defer arena_state.deinit();
     const out = try gp.runOk(
@@ -146,6 +167,37 @@ pub fn writeObject(gp: *GitProcess, kind: ObjectKind, data: []const u8) Error!Oi
 
 /// Through the `cat-file` session rather than a `rev-parse` per ref. It
 /// reads the ref each time, so it sees changes made since.
+fn writeObjectSession(gp: *GitProcess, kind: ObjectKind, data: []const u8) Error!Oid {
+    var arena_state: std.heap.ArenaAllocator = .init(gp.gpa);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const slot = &gp.hash_objects[@intFromEnum(kind)];
+    if (slot.* == null) slot.* = try HashObject.start(gp, kind);
+    const ho = slot.*.?;
+
+    const dir = try std.fs.path.join(arena, &.{ gp.common_dir.?, "issuez", "tmp" });
+    const cwd = Io.Dir.cwd();
+    cwd.createDirPath(gp.io, dir) catch return error.GitFailed;
+    var suffix: [8]u8 = undefined;
+    gp.io.random(&suffix);
+    const path = try std.fmt.allocPrint(arena, "{s}/object-{x}", .{ dir, suffix });
+    {
+        const file = cwd.createFile(gp.io, path, .{ .exclusive = true }) catch
+            return error.GitFailed;
+        defer file.close(gp.io);
+        file.writeStreamingAll(gp.io, data) catch {
+            cwd.deleteFile(gp.io, path) catch {};
+            return error.GitFailed;
+        };
+    }
+    defer cwd.deleteFile(gp.io, path) catch {};
+    return ho.hash(path) catch |err| {
+        ho.deinit(gp.io, gp.gpa);
+        slot.* = null;
+        return err;
+    };
+}
+
 pub fn resolveRef(gp: *GitProcess, name: []const u8) Error!?Oid {
     assert(contract.isValidRefName(name));
     const cf = try gp.catFile();
@@ -453,11 +505,6 @@ pub fn randomBytes(gp: *GitProcess, buf: []u8) void {
 
 /// The directory holding `ab/cd/<sha256>`.
 fn lfsObjectsDir(gp: *GitProcess, arena: Allocator, store: contract.LfsStore) Error![]const u8 {
-    if (gp.common_dir == null) {
-        const out = try gp.runOk(arena, &.{ "git", "rev-parse", "--git-common-dir" }, null);
-        const rel = std.mem.trimEnd(u8, out, "\n");
-        gp.common_dir = try std.fs.path.resolve(gp.gpa, &.{ gp.repo_path, rel });
-    }
     const common = gp.common_dir.?;
     switch (store) {
         .issuez => return std.fs.path.join(arena, &.{ common, "issuez", "lfs", "objects" }),
@@ -858,6 +905,54 @@ const CatFile = struct {
         if (it.next() != null) return error.GitFailed;
         r.discardAll(size + 1) catch return error.GitFailed;
         return oid;
+    }
+};
+
+/// `git hash-object -w -t <kind> --stdin-paths`: a path per line in, an
+/// OID per line out, flushed after each. stderr is dropped; the one-off
+/// fallback in `writeObject` reports errors.
+const HashObject = struct {
+    child: std.process.Child,
+    format: ObjectFormat,
+    writer: Io.File.Writer,
+    reader: Io.File.Reader,
+    write_buf: [512]u8,
+    read_buf: [256]u8,
+
+    fn start(gp: *GitProcess, kind: ObjectKind) Error!*HashObject {
+        const ho = try gp.gpa.create(HashObject);
+        errdefer gp.gpa.destroy(ho);
+        ho.child = std.process.spawn(gp.io, .{
+            .argv = &.{ "git", "hash-object", "-w", "-t", @tagName(kind), "--stdin-paths" },
+            .cwd = .{ .path = gp.repo_path },
+            .environ_map = &gp.env,
+            .stdin = .pipe,
+            .stdout = .pipe,
+            .stderr = .ignore,
+        }) catch |err| switch (err) {
+            error.OutOfMemory => return error.OutOfMemory,
+            error.Canceled => return error.Canceled,
+            else => return error.GitSpawnFailed,
+        };
+        ho.format = gp.format;
+        ho.writer = ho.child.stdin.?.writerStreaming(gp.io, &ho.write_buf);
+        ho.reader = ho.child.stdout.?.readerStreaming(gp.io, &ho.read_buf);
+        return ho;
+    }
+
+    fn deinit(ho: *HashObject, io: Io, gpa: Allocator) void {
+        ho.child.kill(io);
+        gpa.destroy(ho);
+    }
+
+    fn hash(ho: *HashObject, path: []const u8) Error!Oid {
+        assert(std.mem.findAny(u8, path, "\n\"") == null);
+        const w = &ho.writer.interface;
+        w.print("{s}\n", .{path}) catch return error.GitFailed;
+        w.flush() catch return error.GitFailed;
+        const r = &ho.reader.interface;
+        const line = r.takeDelimiterInclusive('\n') catch return error.GitFailed;
+        return Oid.parseHex(ho.format, line[0 .. line.len - 1]) catch error.GitFailed;
     }
 };
 

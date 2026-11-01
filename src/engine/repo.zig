@@ -360,8 +360,14 @@ pub fn Repo(comptime B: type) type {
             return out;
         }
 
-        /// Like upstream's `refs/issues/<prefix>*`.
+        /// Like upstream's `refs/issues/<prefix>*`. A full UUID is looked up
+        /// directly, without listing every issue.
         pub fn resolve(self: Self, arena: Allocator, prefix: []const u8) Error!Resolution {
+            if (uuid_fmt.isCanonical(prefix)) {
+                const name = try refNameOf(arena, prefix);
+                const tip = (try self.backend.resolveRef(name)) orelse return .none;
+                return .{ .one = .{ .name = name, .tip = tip } };
+            }
             const all = try self.refs(arena);
             var matches: std.ArrayList(IssueRef) = .empty;
             for (all) |r| if (std.mem.startsWith(u8, r.id(), prefix)) try matches.append(arena, r);
@@ -2117,7 +2123,7 @@ test "comments that would read as trailers are refused" {
 
 /// Lets another writer move a ref right before our first update, to
 /// exercise the CAS retry.
-const RacingSim = struct {
+pub const RacingSim = struct {
     sim: *GitSim,
     race: ?struct {
         ref: []const u8,

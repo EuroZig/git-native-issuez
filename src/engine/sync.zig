@@ -265,21 +265,26 @@ pub fn Sync(comptime B: type) type {
             }
             var entries: std.ArrayList(Entry) = .empty;
             var batch: Batch = .{};
+            var local: std.ArrayList(LocalWrite) = .empty;
             for (namespaces) |ns| {
                 const staging_prefix = try sourcePrefix(arena, remote, ns, options.fetch);
                 const staged = try self.b().listRefs(arena, staging_prefix);
-                const k = try self.readKnown(arena, remote, ns);
+                const k = try arena.create(Known);
+                k.* = try self.readKnown(arena, remote, ns);
                 for (staged) |s| {
                     const id = s.name[staging_prefix.len..];
                     // Remote-tracking branches named `issues/...` land here
                     // too. They aren't issues: leave them alone.
                     if (!uuid_fmt.isCanonical(id)) continue;
-                    var e = try self.mergeOne(arena, remote, ns, id, s, options, &k, &batch);
+                    const pending = local.items.len;
+                    var e = try self.mergeOne(arena, remote, ns, id, s, options, k, &batch, &local);
                     e.namespace = ns;
+                    if (local.items.len > pending) local.items[pending].entry = entries.items.len;
                     try entries.append(arena, e);
                 }
             }
             if (options.check) return .{ .entries = entries.items };
+            try self.applyLocal(arena, remote, options, local.items, entries.items, &batch);
             try self.apply(arena, &batch);
             return .{
                 .entries = entries.items,
@@ -339,6 +344,9 @@ pub fn Sync(comptime B: type) type {
             options: MergeOptions,
             k: *const Known,
             batch: *Batch,
+            /// Takes the first attempt's local ref write, for one
+            /// transaction with the others; null writes it here.
+            local: ?*std.ArrayList(LocalWrite),
         ) Error!Entry {
             const remote_tip = staged.oid;
             const local_name = try localRef(arena, ns, id);
@@ -422,20 +430,25 @@ pub fn Sync(comptime B: type) type {
                 };
                 if (options.check) return .{ .id = id, .title = title, .outcome = outcome };
 
+                const deferred = attempt == 0 and local != null and new_tip != null;
                 if (new_tip) |t| {
                     const op: contract.RefUpdate.Op = if (local_tip) |old|
                         .{ .update = .{ .new = t, .old = old } }
                     else
                         .{ .create = t };
-                    self.b().updateRefs(&.{.{
-                        .name = local_name,
-                        .op = op,
-                    }}) catch |err| switch (err) {
+                    const update: contract.RefUpdate = .{ .name = local_name, .op = op };
+                    if (deferred) try local.?.append(arena, .{
+                        .update = update,
+                        .records = records,
+                        .ns = ns,
+                        .id = id,
+                        .staged = staged,
+                    }) else self.b().updateRefs(&.{update}) catch |err| switch (err) {
                         error.RefConflict => continue, // a local writer moved it: redo
                         else => |e| return e,
                     };
                 }
-                try records.add(batch);
+                if (!deferred) try records.add(batch);
                 const final_tip = new_tip orelse local_tip.?;
                 const final_issue = if (final_tip.eql(remote_tip))
                     loaded
@@ -470,6 +483,46 @@ pub fn Sync(comptime B: type) type {
                     try recordRef(arena, remote, .quarantined, ns, ""),
                 ),
             };
+        }
+
+        /// A merged issue's local ref write, held for one transaction.
+        const LocalWrite = struct {
+            update: contract.RefUpdate,
+            records: RecordWrites,
+            ns: Namespace,
+            id: []const u8,
+            staged: contract.RefEntry,
+            /// Its place in the report.
+            entry: usize = 0,
+        };
+
+        /// All local ref writes of a merge in one transaction, then their
+        /// records. When one lost a race, those issues are merged again one
+        /// by one.
+        fn applyLocal(
+            self: Self,
+            arena: Allocator,
+            remote: []const u8,
+            options: MergeOptions,
+            writes: []const LocalWrite,
+            entries: []Entry,
+            batch: *Batch,
+        ) Error!void {
+            if (writes.len == 0) return;
+            var ops: std.ArrayList(contract.RefUpdate) = .empty;
+            for (writes) |w| try ops.append(arena, w.update);
+            if (self.b().updateRefs(ops.items)) {
+                for (writes) |w| try w.records.add(batch);
+                return;
+            } else |err| switch (err) {
+                error.RefConflict => {},
+                else => |e| return e,
+            }
+            for (writes) |w| {
+                var e = try self.mergeOne(arena, remote, w.ns, w.id, w.staged, options, w.records.k, batch, null);
+                e.namespace = w.ns;
+                entries[w.entry] = e;
+            }
         }
 
         /// The records a merged issue leaves.
@@ -565,12 +618,39 @@ pub fn Sync(comptime B: type) type {
         /// The remote no longer contains the tip merged last time. A remote
         /// reset to a tip the local issue already contains isn't rewound:
         /// nothing is lost, and the next push restores the local tip.
-        fn isRewound(self: Self, merged_before: Oid, remote_tip: Oid, local: ?Oid) Error!bool {
+        fn isRewound(
+            self: Self,
+            arena: Allocator,
+            merged_before: Oid,
+            remote_tip: Oid,
+            local: ?Oid,
+        ) Error!bool {
             if (merged_before.eql(remote_tip)) return false;
-            if (try self.b().isAncestor(merged_before, remote_tip)) return false;
+            if (try self.isAncestor(arena, merged_before, remote_tip)) return false;
             const l = local orelse return true;
             if (l.eql(remote_tip)) return false;
-            return !try self.b().isAncestor(remote_tip, l);
+            return !try self.isAncestor(arena, remote_tip, l);
+        }
+
+        /// A tip's history by OID, with each commit's parents. Null when it
+        /// can't be read as an issue's: then git answers instead.
+        const Ancestry = std.AutoHashMapUnmanaged([Oid.max_byte_len]u8, []const Oid);
+
+        fn ancestry(self: Self, arena: Allocator, tip: Oid) Error!?Ancestry {
+            const commits = self.repo.loadCommits(arena, tip) catch |e| switch (e) {
+                error.CorruptIssue, error.HistoryTooLong => return null,
+                else => |x| return x,
+            };
+            var out: Ancestry = .empty;
+            for (commits) |c| try out.put(arena, c.oid.bytes, c.parents);
+            return out;
+        }
+
+        /// Issue histories are small and read through the object session,
+        /// so this doesn't start a `git merge-base` per issue.
+        fn isAncestor(self: Self, arena: Allocator, a: Oid, b_tip: Oid) Error!bool {
+            const h = (try self.ancestry(arena, b_tip)) orelse return self.b().isAncestor(a, b_tip);
+            return h.contains(a.bytes);
         }
 
         fn mergeCommitIn(
@@ -796,7 +876,7 @@ pub fn Sync(comptime B: type) type {
             if ((try self.repo.checkCommits(arena, as_issue, commits, rootKeys(ns))).len > 0)
                 return invalid;
             if (merged) |before| {
-                if (try self.isRewound(before, remote_tip, local)) {
+                if (try self.isRewound(arena, before, remote_tip, local)) {
                     return .{ .refused = .{ .reason = .rewound, .title = titleIn(ns, loaded) } };
                 }
             }
@@ -820,6 +900,29 @@ pub fn Sync(comptime B: type) type {
         fn relate(self: Self, arena: Allocator, local: ?Oid, remote_tip: Oid) Error!Relation {
             const l = local orelse return .absent;
             if (l.eql(remote_tip)) return .same;
+            const rh = (try self.ancestry(arena, remote_tip)) orelse return self.relateByGit(arena, l, remote_tip);
+            if (rh.contains(l.bytes)) return .behind;
+            const lh = (try self.ancestry(arena, l)) orelse return self.relateByGit(arena, l, remote_tip);
+            if (lh.contains(remote_tip.bytes)) return .ahead;
+            // The common history is closed under parents, so its maximal
+            // commits, the merge bases, are those with no child in it.
+            var has_child: std.AutoHashMapUnmanaged([Oid.max_byte_len]u8, void) = .empty;
+            var it = lh.iterator();
+            while (it.next()) |e| if (rh.contains(e.key_ptr.*)) for (e.value_ptr.*) |p| {
+                try has_child.put(arena, p.bytes, {});
+            };
+            var base: ?Oid = null;
+            it = lh.iterator();
+            while (it.next()) |e| {
+                if (!rh.contains(e.key_ptr.*) or has_child.contains(e.key_ptr.*)) continue;
+                const oid: Oid = .{ .object_format = l.object_format, .bytes = e.key_ptr.* };
+                // Like `mergeBases`, sorted: the smallest.
+                if (base == null or oid.order(base.?) == .lt) base = oid;
+            }
+            return if (base) |x| .{ .diverged = x } else .unrelated;
+        }
+
+        fn relateByGit(self: Self, arena: Allocator, l: Oid, remote_tip: Oid) Error!Relation {
             if (try self.b().isAncestor(l, remote_tip)) return .behind;
             if (try self.b().isAncestor(remote_tip, l)) return .ahead;
             const bases = try self.b().mergeBases(arena, l, remote_tip);
@@ -1573,6 +1676,76 @@ test "merge without fetch" {
     try testing.expect(try bob.sim.resolveRef(staged) != null);
     const seen = try recordRef(arena, "origin", .seen, .issues, created.id.slice());
     try testing.expect(try bob.sim.resolveRef(seen) != null);
+}
+
+test "merge: when the batched local writes lose a race, issues merge one by one" {
+    var arena_state: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var world = testWorld();
+
+    var a = try onClone(arena, &world, 0);
+    const shared = try a.sync.repo.create(arena, .{ .title = "Shared" });
+    const shared_ref = try std.fmt.allocPrint(arena, "refs/issues/{s}", .{shared.id.slice()});
+    _ = try a.sync.push(arena, "origin");
+    try a.sim.commit();
+    var bob = try onClone(arena, &world, 1);
+    _ = try bob.sync.merge(arena, "origin", .{});
+    try bob.sim.commit();
+
+    a = try onClone(arena, &world, 0);
+    _ = try a.sync.repo.comment(arena, shared_ref, .{ .text = "From alice" });
+    const fresh = try a.sync.repo.create(arena, .{ .title = "New" });
+    _ = try a.sync.push(arena, "origin");
+    try a.sim.commit();
+
+    // Bob comments on the shared issue just before the merge's transaction.
+    var bob_sim = try GitSim.init(arena, &world, 1);
+    var racing: repo_mod.RacingSim = .{
+        .sim = &bob_sim,
+        .race = .{ .ref = shared_ref, .message = "From bob" },
+    };
+    const s = Sync(repo_mod.RacingSim).init(&racing);
+    const m = try s.merge(arena, "origin", .{});
+    try testing.expectEqual(@as(usize, 1), m.count(.created));
+    try testing.expectEqual(@as(usize, 1), m.count(.merged));
+    const issue = try s.repo.load(arena, .{
+        .name = shared_ref,
+        .tip = (try bob_sim.resolveRef(shared_ref)).?,
+    });
+    var said: usize = 0;
+    for (issue.comments) |c| said += @intFromBool(!c.is_merge);
+    try testing.expectEqual(@as(usize, 2), said);
+    const fresh_ref = try std.fmt.allocPrint(arena, "refs/issues/{s}", .{fresh.id.slice()});
+    try testing.expect((try bob_sim.resolveRef(fresh_ref)).?.eql(fresh.tip));
+}
+
+test "relate from loaded histories agrees with git" {
+    var arena_state: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var world = testWorld();
+    var a = try onClone(arena, &world, 0);
+    const repo = a.sync.repo;
+    const who = try repo.identity(arena, null);
+    const root = try repo.writeCommit(arena, &.{}, who, "T\n\nState: open\nFormat-Version: 1\n");
+    const x = try repo.writeCommit(arena, &.{root}, who, "X\n");
+    const y = try repo.writeCommit(arena, &.{root}, who, "Y\n");
+    // Criss-cross: two merge bases, x and y.
+    const m1 = try repo.writeCommit(arena, &.{ x, y }, who, "M1\n");
+    const m2 = try repo.writeCommit(arena, &.{ y, x }, who, "M2\n");
+    const later = try repo.writeCommit(arena, &.{m1}, who, "L\n");
+    const other = try repo.writeCommit(arena, &.{}, who, "U\n\nState: open\nFormat-Version: 1\n");
+    const pairs = [_][2]Oid{
+        .{ root, x },   .{ x, root },   .{ x, y },     .{ m1, m2 },
+        .{ m1, later }, .{ later, m2 }, .{ x, other },
+    };
+    for (pairs) |pr| {
+        const mine = try a.sync.relate(arena, pr[0], pr[1]);
+        const git = try a.sync.relateByGit(arena, pr[0], pr[1]);
+        try testing.expect(std.meta.eql(mine, git));
+    }
+    try testing.expect(try a.sync.relate(arena, m1, m2) == .diverged);
 }
 
 test "seen refs follow the remote, deleted refs are pushed again" {
