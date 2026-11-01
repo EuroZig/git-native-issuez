@@ -150,20 +150,24 @@ report them and never fail on them.
 An issue can have merge commits, written by this tool's `merge`, by
 upstream's or by hand.
 A field's value is computed from the whole DAG, never from the tip alone.
-Every value remembers the commit that set it, its *setter*. Walking commits
-parents first:
+Every value remembers its *setters*: the latest commits that set it, none
+an ancestor of another. Walking commits parents first:
 - a commit's explicit trailers set fields;
-- at a merge, two values are compared by their setters. If one setter is an
-  ancestor of the other, the descendant wins, whatever the clocks say.
-  Otherwise the setters are concurrent, and the one with the later author
-  time wins, then the larger OID. That case is a **conflict**, derived when
-  reading and never stored (`git issue ls --conflicts`);
+- at a merge, the setters of both sides are pooled, and those that another
+  setter descends from drop out: a descendant wins, whatever the clocks
+  say. When concurrent setters remain, the one with the later author time
+  wins, then the larger OID. When they disagree, that is a **conflict**,
+  derived when reading and never stored (`git issue ls --conflicts`);
 - a merge commit's own trailers apply after the merge. Restating the value
   the merge resolved to keeps a conflict visible; a different value resolves
   it.
 
+Keeping every latest setter matters after a merge: a later change on one
+branch replaces only that branch's setter, so a concurrent setter on the
+other branch still counts, even when the later change's clock is behind.
+
 Sets (`Labels`, `X-Blocked-By`): each member's presence has its own
-setters, the latest commits that changed it (none an ancestor of another).
+setters, the latest commits that changed it.
 A set trailer lists the whole set, adding and removing relative to the
 parent state. A concurrent add and remove resolves to add, also when the
 add was made on two branches and only one of them saw the removal. Keyed sets

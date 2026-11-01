@@ -81,9 +81,10 @@ set of plumbing operations:
 ## Reading an issue
 
 The model walks the commit DAG parents first. Every field value remembers
-the commit that set it. At a merge, a setter that descends from the other
-wins; only concurrent setters fall back to the later author time, and that
-case is reported as a conflict. The rule is in [format.md](format.md) §4.
+its latest setters, the commits that set it with none an ancestor of
+another. A merge pools both sides' setters and drops those another one
+descends from; only concurrent setters that remain fall back to the later
+author time, and a disagreement is reported as a conflict. The rule is in [format.md](format.md) §4.
 Conflicts are a function of the DAG, so they are found in merges made by any
 tool and nothing extra is stored.
 
