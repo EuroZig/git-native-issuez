@@ -417,6 +417,13 @@ the next sync. Milestones have the same refs, with `milestones` in place of
 - Clones can sync through either tool. Upstream's `merge` and this tool's
   read each other's merge commits, and the `refs/issuez-sync/` refs are
   invisible to upstream.
+- Concurrent edits can resolve differently. Upstream's `merge` compares
+  each side with one merge base and, when both changed a field, takes the
+  side whose tip has the later author time; this tool keeps every latest
+  setter (§4). They agree when clocks are right. They can differ when a
+  later edit on one branch carries an older clock than a concurrent edit
+  on the other, and in criss-cross histories. Either tool's merge commit
+  restates its result, so the other tool then shows the same value.
 - Provider bridges (import and export) are upstream's for now. Their
   trailers (`Provider-ID`, `Provider-Comment-ID`, `Exported-Commit`,
   `Parent-ID`) are kept and never written here.
