@@ -75,8 +75,9 @@ line. When the fuzzer fails, it also prints a replay command for that case
 
 ## Commits
 
-One topic per commit, subject `(<type>) <summary>`, where `<type>` is `add`,
-`fix` or `chore`, for example
+One topic per commit, subject `(<type>) <summary>`, where `<type>` is `add`
+(new behaviour), `change` (different behaviour), `fix`, `refactor` (same
+behaviour), `docs` or `chore`, for example
 `(add) search: --state filter`. The body says what changed and why, and
 names the tests that cover it. Update [CHANGELOG.md](CHANGELOG.md) under
 "Unreleased" for user-visible changes.

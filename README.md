@@ -156,7 +156,7 @@ zig build                      # git-issue, the git-issue-<sub> links, completio
 zig build test                 # unit, backend, CLI, simulator and fuzz smoke tests, examples
 zig build test-interop         # both tools on shared repositories (fetches upstream)
 zig build test-upstream-suite  # upstream's t/*.sh against our git-issue
-zig build test-perf            # `ls -a` over 10 000 issues within 1 s
+zig build test-perf            # `ls -a` over 10 000 issues within 2 s
 zig build ci -Dseed=N          # all of the above, plus long fuzz runs: what CI runs
 zig build update-snapshots     # rewrite examples/*.out after an intended output change
 ```
