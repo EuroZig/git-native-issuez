@@ -266,6 +266,14 @@ pub fn Repo(comptime B: type) type {
         limits: Limits = .{},
         /// Besides `closed`. See `core.State.isDone`.
         done_states: []const []const u8 = &core_fmt.default_done_states,
+        /// Set it to keep `refs` from listing the issues again within one
+        /// command, like resolving a prefix and then a write's guards. A
+        /// write clears it first, so every attempt after the first lists
+        /// afresh. Only `Repo`'s own writes clear it: leave it unset when
+        /// something else writes issue refs (sync).
+        listing: ?*Listing = null,
+
+        pub const Listing = struct { refs: ?[]IssueRef = null };
 
         pub const Error = B.Error || error{
             /// More commits than `Limits.max_commits_per_issue`.
@@ -354,10 +362,16 @@ pub fn Repo(comptime B: type) type {
 
         /// Sorted by name, so by UUID.
         pub fn refs(self: Self, arena: Allocator) Error![]IssueRef {
+            if (self.listing) |l| if (l.refs) |r| return r;
             const entries = try self.backend.listRefs(arena, issue_ref_prefix);
             const out = try arena.alloc(IssueRef, entries.len);
             for (entries, out) |e, *r| r.* = .{ .name = e.name, .tip = e.oid };
+            if (self.listing) |l| l.refs = out;
             return out;
+        }
+
+        fn forgetListing(self: Self) void {
+            if (self.listing) |l| l.refs = null;
         }
 
         /// Like upstream's `refs/issues/<prefix>*`. A full UUID is looked up
@@ -421,7 +435,8 @@ pub fn Repo(comptime B: type) type {
         pub fn loadAround(self: Self, arena: Allocator, ref: IssueRef) Error![]Issue {
             try self.checkLimits();
             const center = try self.load(arena, ref);
-            for (center.event_problems) |ep| if (ep.kind == .dangling) return self.loadAll(arena);
+            // Skipping what can't be loaded, like the rest of this.
+            for (center.event_problems) |ep| if (ep.kind == .dangling) return self.loadForGuards(arena);
 
             var out: std.ArrayList(Issue) = .empty;
             var have: std.StringHashMapUnmanaged(void) = .empty;
@@ -743,6 +758,7 @@ pub fn Repo(comptime B: type) type {
                 var ops: std.ArrayList(contract.RefUpdate) = .empty;
                 try ops.append(arena, .{ .name = name, .op = .{ .create = oid } });
                 try ops.appendSlice(arena, try guarded.ops(arena, oid));
+                self.forgetListing();
                 self.backend.updateRefs(ops.items) catch |err| switch (err) {
                     error.RefConflict => continue,
                     else => |e| return e,
@@ -1095,6 +1111,7 @@ pub fn Repo(comptime B: type) type {
                 // attachment ref.
                 if (@hasDecl(@TypeOf(builder), "after"))
                     try ops.appendSlice(arena, try builder.after(arena, current, oid));
+                self.forgetListing();
                 self.backend.updateRefs(ops.items) catch |err| switch (err) {
                     // Our ref moved, or an issue a guard read changed. With
                     // `expect` only the first is the caller's problem.

@@ -301,6 +301,25 @@ test "upstream's fetch refspec doesn't reset unpushed changes" {
     try testing.expectEqualStrings(local, on_hub.stdout);
 }
 
+test "sync fetches once" {
+    var sb = try Sandbox.init(.{});
+    defer sb.deinit();
+    const arena = sb.arena();
+    const hub = try std.fmt.allocPrint(arena, "{s}-hub.git", .{sb.repo});
+    try sb.git(&.{ "init", "-q", "--bare", hub });
+    try sb.git(&.{ "remote", "add", "origin", hub });
+    try expectSuccess(try gitIssue(&sb, &.{ "create", "Shared" }));
+
+    // The merge's fetch serves the push: one fetch, one `git remote`.
+    const trace = try std.fmt.allocPrint(arena, "{s}-trace", .{sb.repo});
+    try sb.env.put("GIT_TRACE", trace);
+    try expectSuccess(try gitIssue(&sb, &.{ "sync", "origin" }));
+    _ = sb.env.swapRemove("GIT_TRACE");
+    const log = try std.Io.Dir.cwd().readFileAlloc(testing.io, trace, arena, .limited(1 << 24));
+    try testing.expectEqual(@as(usize, 1), std.mem.count(u8, log, "built-in: git fetch "));
+    try testing.expectEqual(@as(usize, 1), std.mem.count(u8, log, "built-in: git remote\n"));
+}
+
 test "remote branches named issues/ are not issues" {
     var sb = try Sandbox.init(.{});
     defer sb.deinit();

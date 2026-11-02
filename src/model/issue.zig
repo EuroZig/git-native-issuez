@@ -202,8 +202,6 @@ pub const Error = error{
     NoRoot,
 } || Allocator.Error;
 
-const none_setter: u32 = std.math.maxInt(u32);
-
 /// A scalar. Like a set member it keeps every latest setter, so that a
 /// later change on one branch doesn't hide a concurrent setter on another.
 const Cell = struct {
@@ -441,8 +439,6 @@ const Ctx = struct {
     attachment_problems: *std.ArrayList(AttachmentProblem),
 
     fn isAncestor(ctx: Ctx, a: u32, b: u32) bool {
-        if (a == none_setter) return true;
-        if (b == none_setter) return false;
         return ctx.ancestors[b].isSet(a);
     }
 
@@ -522,6 +518,12 @@ const Ctx = struct {
         a: []const T,
         b: []const T,
     ) Allocator.Error![]const T {
+        // Most merges change a cell on one side or none: no allocation.
+        if (sameSetters(T, a, b)) return a;
+        if (a.len == 1 and b.len == 1) {
+            if (ctx.isAncestor(a[0].commit, b[0].commit)) return b;
+            if (ctx.isAncestor(b[0].commit, a[0].commit)) return a;
+        }
         var out: std.ArrayList(T) = .empty;
         for ([_][]const T{ a, b }) |side| {
             next: for (side) |x| {

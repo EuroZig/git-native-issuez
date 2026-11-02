@@ -1090,7 +1090,10 @@ fn checkAround(arena: Allocator, world: *World, clone_index: usize) CaseError!vo
         const i = full.find(r.id()) orelse continue;
         const around = repo.loadAround(arena, r) catch return error.ModelMismatch;
         const part = try issuez.projection.build(arena, around, options);
-        const j = part.find(r.id()).?;
+        const j = part.find(r.id()) orelse {
+            std.debug.print("  issue {s} isn't among the issues around it\n", .{r.id()});
+            return error.ModelMismatch;
+        };
         const same = sameProblems(full.problemsOf(i), part.problemsOf(j)) and
             std.meta.eql(full.progress(i), part.progress(j)) and
             sameText(full.milestone[i], part.milestone[j]) and

@@ -74,7 +74,7 @@ set of plumbing operations:
 
 | Backend      | Use                                                                                                                                                                                                                                                                                                                   |
 | ------------ | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `GitProcess` | Runs `git` from PATH with a fixed environment and `--` separators. Reads objects, and resolves single refs, through one long-lived `cat-file --batch`, and writes objects through one long-lived `hash-object -w --stdin-paths` per type, so git still checks them and applies its permissions. Output is bounded. LFS objects are files under the git dir; transfers run `git lfs push` and `git lfs fetch` when git-lfs is installed.                                                    |
+| `GitProcess` | Runs `git` from PATH with a fixed environment and `--` separators. Reads objects, and resolves single refs, through one long-lived `cat-file --batch`, and writes objects through one long-lived `hash-object -w --no-filters --stdin-paths` per type, so git still checks them and applies its permissions (and no attributes or filters). Output is bounded. LFS objects are files under the git dir; transfers run `git lfs push` and `git lfs fetch` when git-lfs is installed.                                                    |
 | `GitSim`     | An in-memory world of clones, serialised as ZON. Objects hash exactly like git, so OIDs are real. A remote is another clone of the world (`remote.<name>.url = sim:<clone>`). Clock and randomness come from the world. Each clone has both LFS stores, LFS transfers copy objects between clones, and like git-lfs a fetch fails on an unknown ref or an object the remote lacks. `sim.lfs = false` makes a clone without git-lfs. Breaking a protocol rule (a commit pointing at a missing object, an invalid ref name) panics. |
 | your own     | Wrap or replace either one. `examples/custom_backend.zig` logs every ref change and push, and refuses writes outside the issue and bookkeeping refs.                                                                                                                                                                  |
 
@@ -114,7 +114,8 @@ its ancestors, its descendants (through the parent cache, see "Writing an
 issue") and the issues its blockers lead to, and a projection over those
 gives that issue the same answers as one over every issue. `show` reads
 it that way. Only an event whose comment is missing, which may target
-another issue's comment, needs every issue.
+another issue's comment, needs every issue. Issues that can't be loaded
+are left out, as in the write guards (`fsck` reports them).
 
 ## Milestones
 

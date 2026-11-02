@@ -364,10 +364,11 @@ fn readWorkflowStates(
     comptime prefix: []const u8,
     comptime suffix: []const u8,
 ) ?[]const []const u8 {
-    const raw = repo.backend.configGet(ctx.arena, "issue.workflowStates") catch {
+    const set = ctx.workflow_states orelse repo.backend.configGet(ctx.arena, "issue.workflowStates") catch {
         ctx.err.writeAll(prefix ++ "could not read git config issue.workflowStates" ++ suffix) catch {};
         return null;
-    } orelse return &fields.default_workflow;
+    };
+    const raw = set orelse return &fields.default_workflow;
     var out: std.ArrayList([]const u8) = .empty;
     var it = std.mem.splitScalar(u8, raw, ',');
     while (it.next()) |part| {

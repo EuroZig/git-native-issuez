@@ -100,7 +100,24 @@ pub fn openRepo(comptime B: type, ctx: *context.Context(B)) ?engine.Repo(B) {
     warnUnsafeRefspecs(ctx.arena, config, ctx.err);
     var repo = engine.Repo(B).init(backend);
     repo.done_states = doneStates(ctx.arena, config, ctx.err) orelse return null;
+    ctx.workflow_states = lastValue(config, "issue.workflowstates");
+    // One listing of the issues per command, until a write.
+    repo.listing = ctx.arena.create(engine.Repo(B).Listing) catch {
+        _ = oom(ctx.err);
+        return null;
+    };
+    repo.listing.?.* = .{};
     return repo;
+}
+
+/// The last one wins, like `git config --get`. `key` as `--list` gives
+/// it: section and name lowercase.
+fn lastValue(config: anytype, key: []const u8) ?[]const u8 {
+    var found: ?[]const u8 = null;
+    for (config) |e| if (std.mem.eql(u8, e.key, key)) {
+        found = e.value;
+    };
+    return found;
 }
 
 /// `git config issue.doneStates "wontfix,duplicate"`: the states besides
@@ -110,11 +127,8 @@ fn doneStates(
     config: anytype,
     err: *std.Io.Writer,
 ) ?[]const []const u8 {
-    var found: ?[]const u8 = null;
-    for (config) |e| if (std.mem.eql(u8, e.key, "issue.donestates")) {
-        found = e.value; // the last one wins, like `git config --get`
-    };
-    const raw = found orelse return &issuez.format.core.default_done_states;
+    const raw = lastValue(config, "issue.donestates") orelse
+        return &issuez.format.core.default_done_states;
     var out: std.ArrayList([]const u8) = .empty;
     var it = std.mem.splitScalar(u8, raw, ',');
     while (it.next()) |part| {

@@ -31,6 +31,8 @@ cat_file: ?*CatFile,
 hash_objects: [std.enums.values(ObjectKind).len]?*HashObject = @splat(null),
 /// Absolute, resolved at open.
 common_dir: ?[]u8 = null,
+/// `$GIT_DIR/issuez/tmp`, created and swept on the first object write.
+tmp_dir: ?[]u8 = null,
 /// git-lfs's object directory, resolved on first use.
 git_lfs_dir: ?[]u8 = null,
 /// Whether `git lfs version` runs, checked once.
@@ -92,21 +94,27 @@ pub fn open(io: Io, gpa: Allocator, options: OpenOptions) Error!GitProcess {
     defer arena_state.deinit();
     const arena = arena_state.allocator();
 
-    const version_out = try gp.runOk(arena, &.{ "git", "version" }, null);
-    const version = parseGitVersion(version_out) orelse return error.GitFailed;
+    const both = try gp.runPair(
+        arena,
+        &.{ "git", "version" },
+        &.{ "git", "rev-parse", "--show-object-format", "--git-common-dir" },
+    );
+    if (!both[0].ok()) {
+        gp.keepStderr(both[0].stderr);
+        return error.GitFailed;
+    }
+    const version = parseGitVersion(both[0].stdout) orelse return error.GitFailed;
     if (version.order(min_git_version) == .lt) return error.GitTooOld;
 
-    const rp = try gp.run(
-        arena,
-        &.{ "git", "rev-parse", "--show-object-format", "--git-common-dir" },
-        null,
-    );
+    const rp = both[1];
     if (!rp.ok()) return error.NotARepository;
     var lines = std.mem.splitScalar(u8, rp.stdout, '\n');
     gp.format = ObjectFormat.parse(lines.next() orelse "") orelse return error.GitFailed;
     const common = lines.next() orelse return error.GitFailed;
     if (common.len == 0) return error.GitFailed;
-    gp.common_dir = try std.fs.path.resolve(gpa, &.{ repo_path, common });
+    // Absolute for real: git reads the temp files' paths from its own cwd.
+    const cwd = std.process.currentPathAlloc(io, arena) catch return error.GitFailed;
+    gp.common_dir = try std.fs.path.resolve(gpa, &.{ cwd, repo_path, common });
     return gp;
 }
 
@@ -114,6 +122,7 @@ pub fn close(gp: *GitProcess) void {
     if (gp.cat_file) |cf| cf.deinit(gp.io, gp.gpa);
     for (gp.hash_objects) |h| if (h) |ho| ho.deinit(gp.io, gp.gpa);
     if (gp.common_dir) |d| gp.gpa.free(d);
+    if (gp.tmp_dir) |d| gp.gpa.free(d);
     if (gp.git_lfs_dir) |d| gp.gpa.free(d);
     gp.env.deinit();
     gp.gpa.free(gp.repo_path);
@@ -165,22 +174,22 @@ pub fn writeObject(gp: *GitProcess, kind: ObjectKind, data: []const u8) Error!Oi
     return oid;
 }
 
-/// Through the `cat-file` session rather than a `rev-parse` per ref. It
-/// reads the ref each time, so it sees changes made since.
 fn writeObjectSession(gp: *GitProcess, kind: ObjectKind, data: []const u8) Error!Oid {
     var arena_state: std.heap.ArenaAllocator = .init(gp.gpa);
     defer arena_state.deinit();
     const arena = arena_state.allocator();
+    const dir = try gp.tmpDir();
+    var suffix: [8]u8 = undefined;
+    gp.io.random(&suffix);
+    const path = try std.fmt.allocPrint(arena, "{s}/object-{x}", .{ dir, suffix });
+    // git reads one path per line and unquotes a line starting with '"';
+    // the one-off fallback takes such a repository path.
+    if (std.mem.findScalar(u8, path, '\n') != null or path[0] == '"') return error.GitFailed;
     const slot = &gp.hash_objects[@intFromEnum(kind)];
     if (slot.* == null) slot.* = try HashObject.start(gp, kind);
     const ho = slot.*.?;
 
-    const dir = try std.fs.path.join(arena, &.{ gp.common_dir.?, "issuez", "tmp" });
     const cwd = Io.Dir.cwd();
-    cwd.createDirPath(gp.io, dir) catch return error.GitFailed;
-    var suffix: [8]u8 = undefined;
-    gp.io.random(&suffix);
-    const path = try std.fmt.allocPrint(arena, "{s}/object-{x}", .{ dir, suffix });
     {
         const file = cwd.createFile(gp.io, path, .{ .exclusive = true }) catch
             return error.GitFailed;
@@ -198,14 +207,64 @@ fn writeObjectSession(gp: *GitProcess, kind: ObjectKind, data: []const u8) Error
     };
 }
 
+/// Temporary files older than this are left over from a process that
+/// died mid-write.
+const tmp_max_age_ns = 24 * std.time.ns_per_hour;
+
+fn tmpDir(gp: *GitProcess) Error![]const u8 {
+    if (gp.tmp_dir) |d| return d;
+    const dir = try std.fs.path.join(gp.gpa, &.{ gp.common_dir.?, "issuez", "tmp" });
+    errdefer gp.gpa.free(dir);
+    const cwd = Io.Dir.cwd();
+    cwd.createDirPath(gp.io, dir) catch return error.GitFailed;
+    gp.tmp_dir = dir;
+    gp.sweepTmp(dir);
+    return dir;
+}
+
+/// Best effort: a stale file only takes space.
+fn sweepTmp(gp: *GitProcess, dir_path: []const u8) void {
+    var dir = Io.Dir.cwd().openDir(gp.io, dir_path, .{ .iterate = true }) catch return;
+    defer dir.close(gp.io);
+    const now = Io.Clock.real.now(gp.io).nanoseconds;
+    var it = dir.iterate();
+    while (it.next(gp.io) catch return) |e| {
+        if (e.kind != .file or !std.mem.startsWith(u8, e.name, "object-")) continue;
+        const st = dir.statFile(gp.io, e.name, .{}) catch continue;
+        if (now - st.mtime.nanoseconds < tmp_max_age_ns) continue;
+        dir.deleteFile(gp.io, e.name) catch {};
+    }
+}
+
+/// Through the `cat-file` session rather than a `rev-parse` per ref. It
+/// reads the ref each time, so it sees changes made since.
 pub fn resolveRef(gp: *GitProcess, name: []const u8) Error!?Oid {
     assert(contract.isValidRefName(name));
     const cf = try gp.catFile();
-    return cf.resolve(name) catch |err| {
+    const found = cf.resolve(name) catch |err| {
         cf.deinit(gp.io, gp.gpa);
         gp.cat_file = null;
         return err;
     };
+    return switch (found) {
+        .oid => |oid| oid,
+        // No such ref, or one whose object is missing: only `rev-parse`
+        // tells them apart, and a missing object is still the ref's value.
+        .missing => gp.revParseRef(name),
+    };
+}
+
+fn revParseRef(gp: *GitProcess, name: []const u8) Error!?Oid {
+    var arena_state: std.heap.ArenaAllocator = .init(gp.gpa);
+    defer arena_state.deinit();
+    const result = try gp.run(
+        arena_state.allocator(),
+        &.{ "git", "rev-parse", "-q", "--verify", "--end-of-options", name },
+        null,
+    );
+    if (!result.ok()) return null;
+    return Oid.parseHex(gp.format, std.mem.trimEnd(u8, result.stdout, "\n")) catch
+        error.GitFailed;
 }
 
 pub fn listRefs(gp: *GitProcess, arena: Allocator, prefix: []const u8) Error![]contract.RefEntry {
@@ -473,25 +532,21 @@ pub fn identity(
     gp: *GitProcess,
     arena: Allocator,
 ) (Error || error{IdentityUnknown})!contract.Identity {
+    // Like upstream, insist on a configured identity. Without useConfigOnly
+    // git makes one up from the login and hostname, and that would end up
+    // in the issue history. (`git var -l` ignores it, so two calls.)
+    const both = try gp.runPair(
+        arena,
+        &.{ "git", "-c", "user.useConfigOnly=true", "var", "GIT_AUTHOR_IDENT" },
+        &.{ "git", "-c", "user.useConfigOnly=true", "var", "GIT_COMMITTER_IDENT" },
+    );
     return .{
-        .author = try gp.ident(arena, "GIT_AUTHOR_IDENT"),
-        .committer = try gp.ident(arena, "GIT_COMMITTER_IDENT"),
+        .author = try gp.ident(both[0]),
+        .committer = try gp.ident(both[1]),
     };
 }
 
-fn ident(
-    gp: *GitProcess,
-    arena: Allocator,
-    variable: []const u8,
-) (Error || error{IdentityUnknown})!Signature {
-    // Like upstream, insist on a configured identity. Without useConfigOnly
-    // git makes one up from the login and hostname, and that would end up
-    // in the issue history.
-    const result = try gp.run(
-        arena,
-        &.{ "git", "-c", "user.useConfigOnly=true", "var", variable },
-        null,
-    );
+fn ident(gp: *GitProcess, result: RunResult) (Error || error{IdentityUnknown})!Signature {
     if (!result.ok()) {
         gp.keepStderr(result.stderr);
         return error.IdentityUnknown;
@@ -774,20 +829,8 @@ fn run(
     argv: []const []const u8,
     stdin: ?[]const u8,
 ) Error!RunResult {
-    assert(argv.len > 0 and std.mem.eql(u8, argv[0], "git"));
     const io = gp.io;
-    var child = std.process.spawn(io, .{
-        .argv = argv,
-        .cwd = .{ .path = gp.repo_path },
-        .environ_map = &gp.env,
-        .stdin = if (stdin != null) .pipe else .ignore,
-        .stdout = .pipe,
-        .stderr = .pipe,
-    }) catch |err| switch (err) {
-        error.OutOfMemory => return error.OutOfMemory,
-        error.Canceled => return error.Canceled,
-        else => return error.GitSpawnFailed,
-    };
+    var child = try gp.spawn(argv, stdin != null);
     defer child.kill(io);
 
     if (stdin) |data| {
@@ -796,7 +839,43 @@ fn run(
         child.stdin.?.close(io);
         child.stdin = null;
     }
+    return gp.collect(arena, &child);
+}
 
+/// Two commands at once, for the cost of about one: git's startup is
+/// most of a short command's time.
+fn runPair(
+    gp: *GitProcess,
+    arena: Allocator,
+    a: []const []const u8,
+    b: []const []const u8,
+) Error![2]RunResult {
+    var first = try gp.spawn(a, false);
+    defer first.kill(gp.io);
+    var second = try gp.spawn(b, false);
+    defer second.kill(gp.io);
+    return .{ try gp.collect(arena, &first), try gp.collect(arena, &second) };
+}
+
+fn spawn(gp: *GitProcess, argv: []const []const u8, stdin: bool) Error!std.process.Child {
+    assert(argv.len > 0 and std.mem.eql(u8, argv[0], "git"));
+    return std.process.spawn(gp.io, .{
+        .argv = argv,
+        .cwd = .{ .path = gp.repo_path },
+        .environ_map = &gp.env,
+        .stdin = if (stdin) .pipe else .ignore,
+        .stdout = .pipe,
+        .stderr = .pipe,
+    }) catch |err| switch (err) {
+        error.OutOfMemory => return error.OutOfMemory,
+        error.Canceled => return error.Canceled,
+        else => return error.GitSpawnFailed,
+    };
+}
+
+/// Reads a started command's output to the end and waits for it.
+fn collect(gp: *GitProcess, arena: Allocator, child: *std.process.Child) Error!RunResult {
+    const io = gp.io;
     var mr_buffer: Io.File.MultiReader.Buffer(2) = undefined;
     var mr: Io.File.MultiReader = undefined;
     mr.init(arena, io, mr_buffer.toStreams(), &.{ child.stdout.?, child.stderr.? });
@@ -919,9 +998,9 @@ const CatFile = struct {
         return .{ .kind = kind, .data = data };
     }
 
-    /// What `name` points at, null when there is no such ref. The object
-    /// comes along and is skipped.
-    fn resolve(cf: *CatFile, name: []const u8) Error!?Oid {
+    /// What `name` points at. `missing` when there is no such ref or its
+    /// object is missing. The object comes along and is skipped.
+    fn resolve(cf: *CatFile, name: []const u8) Error!union(enum) { oid: Oid, missing } {
         const w = &cf.writer.interface;
         w.print("{s}\n", .{name}) catch return error.GitFailed;
         w.flush() catch return error.GitFailed;
@@ -932,7 +1011,7 @@ const CatFile = struct {
 
         // "<name> missing", or "<oid> <type> <size>" and the object.
         if (std.mem.endsWith(u8, line, " missing") and
-            std.mem.eql(u8, line[0 .. line.len - " missing".len], name)) return null;
+            std.mem.eql(u8, line[0 .. line.len - " missing".len], name)) return .missing;
         var it = std.mem.splitScalar(u8, line, ' ');
         const oid = Oid.parseHex(cf.format, it.next() orelse return error.GitFailed) catch
             return error.GitFailed;
@@ -942,13 +1021,15 @@ const CatFile = struct {
             return error.GitFailed;
         if (it.next() != null) return error.GitFailed;
         r.discardAll(size + 1) catch return error.GitFailed;
-        return oid;
+        return .{ .oid = oid };
     }
 };
 
-/// `git hash-object -w -t <kind> --stdin-paths`: a path per line in, an
-/// OID per line out, flushed after each. stderr is dropped; the one-off
-/// fallback in `writeObject` reports errors.
+/// `git hash-object -w -t <kind> --no-filters --stdin-paths`: a path per
+/// line in, an OID per line out, flushed after each. `--no-filters`, since
+/// the data is the object, as with `--stdin`: no attributes or eol
+/// conversion apply. stderr is dropped; the one-off fallback in
+/// `writeObject` reports errors.
 const HashObject = struct {
     child: std.process.Child,
     format: ObjectFormat,
@@ -961,7 +1042,9 @@ const HashObject = struct {
         const ho = try gp.gpa.create(HashObject);
         errdefer gp.gpa.destroy(ho);
         ho.child = std.process.spawn(gp.io, .{
-            .argv = &.{ "git", "hash-object", "-w", "-t", @tagName(kind), "--stdin-paths" },
+            .argv = &.{
+                "git", "hash-object", "-w", "-t", @tagName(kind), "--no-filters", "--stdin-paths",
+            },
             .cwd = .{ .path = gp.repo_path },
             .environ_map = &gp.env,
             .stdin = .pipe,
@@ -984,7 +1067,7 @@ const HashObject = struct {
     }
 
     fn hash(ho: *HashObject, path: []const u8) Error!Oid {
-        assert(std.mem.findAny(u8, path, "\n\"") == null);
+        assert(std.mem.findScalar(u8, path, '\n') == null and path[0] != '"');
         const w = &ho.writer.interface;
         w.print("{s}\n", .{path}) catch return error.GitFailed;
         w.flush() catch return error.GitFailed;

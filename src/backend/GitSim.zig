@@ -625,26 +625,33 @@ pub fn fetch(
     const remote_clone = sim.world.clones[idx];
     const format = sim.world.format;
     const remote_objects = try objectsOf(arena, format, remote_clone);
+    // Like `git fetch --prune`: a ref under a glob destination goes when no
+    // refspec maps a remote ref to it any more (all refspecs together).
+    if (prune) {
+        var wanted: std.StringHashMapUnmanaged(void) = .empty;
+        for (refspecs) |raw| {
+            const spec = parseRefspec(raw);
+            for (remote_clone.refs) |r| {
+                const dst = (try mapRef(arena, r.name, spec)) orelse continue;
+                try wanted.put(arena, dst, {});
+            }
+        }
+        var gone: std.ArrayList([]const u8) = .empty;
+        var it = sim.refs.iterator();
+        while (it.next()) |e| {
+            const name = e.key_ptr.*;
+            if (wanted.contains(name)) continue;
+            const pruned = for (refspecs) |raw| {
+                const spec = parseRefspec(raw);
+                if (!std.mem.endsWith(u8, spec.dst, "*")) continue;
+                if (std.mem.startsWith(u8, name, spec.dst[0 .. spec.dst.len - 1])) break true;
+            } else false;
+            if (pruned) try gone.append(arena, name);
+        }
+        for (gone.items) |name| _ = sim.refs.orderedRemove(name);
+    }
     for (refspecs) |raw| {
         const spec = parseRefspec(raw);
-        // Like `git fetch --prune`: what the remote no longer has goes,
-        // for glob refspecs.
-        if (prune and std.mem.endsWith(u8, spec.dst, "*")) {
-            const dst_prefix = spec.dst[0 .. spec.dst.len - 1];
-            const src_prefix = spec.src[0 .. spec.src.len - 1];
-            var gone: std.ArrayList([]const u8) = .empty;
-            var it = sim.refs.iterator();
-            while (it.next()) |e| {
-                const name = e.key_ptr.*;
-                if (!std.mem.startsWith(u8, name, dst_prefix)) continue;
-                const src = try std.mem.concat(arena, u8, &.{ src_prefix, name[dst_prefix.len..] });
-                const there = for (remote_clone.refs) |r| {
-                    if (std.mem.eql(u8, r.name, src)) break true;
-                } else false;
-                if (!there) try gone.append(arena, name);
-            }
-            for (gone.items) |name| _ = sim.refs.orderedRemove(name);
-        }
         for (remote_clone.refs) |r| {
             const dst = (try mapRef(arena, r.name, spec)) orelse continue;
             if (!contract.isValidRefName(dst)) protocolViolation(
@@ -852,6 +859,34 @@ test "merge bases and ancestry" {
     // Criss-cross: two best common ancestors.
     const two = try sim.mergeBases(arena, m1, m2);
     try testing.expectEqual(@as(usize, 2), two.len);
+}
+
+test "fetch prunes against all refspecs together, like git" {
+    var arena_state: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var world: World = .{ .clones = &.{
+        .{ .name = "hub" },
+        .{ .name = "a", .config = &.{.{ .key = "remote.hub.url", .value = "sim:hub" }} },
+    } };
+    var hub: GitSim = try .init(arena, &world, 0);
+    const root = try testCommit(&hub, &.{}, "root\n");
+    try hub.updateRefs(&.{
+        .{ .name = "refs/x/one", .op = .{ .create = root } },
+        .{ .name = "refs/y/two", .op = .{ .create = root } },
+    });
+    try hub.commit();
+
+    var a: GitSim = try .init(arena, &world, 1);
+    const own = try testCommit(&a, &.{}, "own\n");
+    try a.updateRefs(&.{.{ .name = "refs/m/stale", .op = .{ .create = own } }});
+    // The first destination lies inside the second: git keeps `m/y/two`
+    // although the second refspec has no `y/two`, and prunes `m/stale`.
+    try a.fetch(arena, "hub", &.{ "+refs/y/*:refs/m/y/*", "+refs/x/*:refs/m/*" }, true);
+    const left = try a.listRefs(arena, "refs/m/");
+    try testing.expectEqual(@as(usize, 2), left.len);
+    try testing.expectEqualStrings("refs/m/one", left[0].name);
+    try testing.expectEqualStrings("refs/m/y/two", left[1].name);
 }
 
 test "world round trip through ZON is lossless" {
