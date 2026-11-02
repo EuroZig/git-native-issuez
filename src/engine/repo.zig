@@ -1551,6 +1551,7 @@ pub fn Repo(comptime B: type) type {
             var text: std.ArrayList(u8) = .empty;
             try text.appendSlice(arena, parent_cache_header);
             var hits: usize = 0;
+            var unloadable: usize = 0;
             for (all) |r| {
                 const id = r.id();
                 const entry: ?ParentEntry = if (cached) |c| c.get(id) else null;
@@ -1563,7 +1564,10 @@ pub fn Repo(comptime B: type) type {
                         error.HistoryTooLong,
                         error.MissingParent,
                         error.NoRoot,
-                        => continue,
+                        => {
+                            unloadable += 1;
+                            continue;
+                        },
                         else => |e| return e,
                     };
                     try index.loaded.put(arena, id, issue);
@@ -1580,8 +1584,12 @@ pub fn Repo(comptime B: type) type {
                 try gop.value_ptr.append(arena, r);
             }
             // Loading a few stale entries costs no git call, rewriting the
-            // cache two, and every write leaves its own entry stale.
-            const stale = if (cached) |c| (all.len - hits) + (c.count() - hits) else all.len;
+            // cache two, and every write leaves its own entry stale. Issues
+            // that can't be loaded never get an entry.
+            const stale = if (cached) |c|
+                (all.len - hits - unloadable) + (c.count() - hits)
+            else
+                all.len;
             if (cached == null or stale >= parent_cache_slack)
                 index.refreshed = .{ .old = cache_tip, .text = text.items };
             return index;

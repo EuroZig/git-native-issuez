@@ -545,3 +545,77 @@ test "pre-push hook" {
     const log = try std.Io.Dir.cwd().readFileAlloc(io, seen, arena, .limited(4096));
     try testing.expect(std.mem.find(u8, log, name) != null);
 }
+
+test "a hung git times out" {
+    const gpa = testing.allocator;
+    var arena_state: std.heap.ArenaAllocator = .init(gpa);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    var hub = try Repo.init(gpa, &.{"--bare"});
+    defer hub.deinit(gpa);
+    var a = try Repo.init(gpa, &.{});
+    defer a.deinit(gpa);
+    const cwd = try std.process.currentPathAlloc(io, arena);
+    const hub_url = try std.fmt.allocPrint(arena, "{s}/{s}", .{ cwd, hub.path });
+    try runGit(gpa, &a.env, a.path, &.{ "git", "remote", "add", "origin", hub_url });
+    // Would hold back the sessions' answers.
+    try a.env.put("GIT_FLUSH", "0");
+
+    var ga = try a.open(gpa);
+    defer ga.close();
+    ga.timeouts.request = .fromSeconds(5);
+    const one = "refs/issues/a7f3b2c1-4e5d-4a8b-9c1e-2f3a4b5c6d7e";
+    const two = "refs/issues/b8e4c3d2-5f6e-4b9c-8d2f-3a4b5c6d7e8f";
+    const root = try ga.writeObject(.commit, try commitBytes(arena, .sha1, &.{}, "root\n"));
+    try testing.expect(ga.hash_objects[@intFromEnum(object.ObjectKind.commit)] != null);
+
+    const hooks = try std.fmt.allocPrint(arena, "{s}/.git/hooks", .{a.path});
+    const rt = try std.fmt.allocPrint(arena, "{s}/reference-transaction", .{hooks});
+    const pp = try std.fmt.allocPrint(arena, "{s}/pre-push", .{hooks});
+    const short: GitProcess.Timeouts = .{
+        .command = .fromMilliseconds(300),
+        .network = .fromMilliseconds(300),
+    };
+    const started = std.Io.Clock.awake.now(io);
+
+    // update-ref, with its input on stdin, waits on its hook before the
+    // refs move...
+    try writeHook(gpa, &a.env, rt, "#!/bin/sh\nexec sleep 10\n");
+    ga.timeouts = short;
+    try testing.expectError(
+        error.GitTimedOut,
+        ga.updateRefs(&.{.{ .name = one, .op = .{ .create = root } }}),
+    );
+    ga.timeouts = .{};
+    try testing.expect(try ga.resolveRef(one) == null);
+
+    // ...or after: then the update is done.
+    try writeHook(gpa, &a.env, rt, "#!/bin/sh\ntest \"$1\" = committed && exec sleep 10\nexit 0\n");
+    ga.timeouts = short;
+    try ga.updateRefs(&.{.{ .name = one, .op = .{ .create = root } }});
+    ga.timeouts = .{};
+    try testing.expect((try ga.resolveRef(one)).?.eql(root));
+    try std.Io.Dir.cwd().deleteFile(io, rt);
+    try ga.updateRefs(&.{.{ .name = two, .op = .{ .create = root } }});
+
+    // push, under the network limit.
+    try writeHook(gpa, &a.env, pp, "#!/bin/sh\nexec sleep 10\n");
+    ga.timeouts = short;
+    try testing.expectError(
+        error.GitTimedOut,
+        ga.push(arena, "origin", &.{one ++ ":" ++ one}, true),
+    );
+    const took = started.durationTo(std.Io.Clock.awake.now(io));
+    try testing.expect(took.toSeconds() < 5);
+}
+
+fn writeHook(
+    gpa: Allocator,
+    env: *const std.process.Environ.Map,
+    path: []const u8,
+    script: []const u8,
+) !void {
+    try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = path, .data = script });
+    try runGit(gpa, env, ".", &.{ "chmod", "+x", path });
+}

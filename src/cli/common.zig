@@ -290,6 +290,7 @@ pub fn reportEngineError(err: *std.Io.Writer, e: anyerror) void {
         error.GitFailed => "error: a git command failed\n",
         error.GitSpawnFailed => "fatal: could not run git (is it installed and on PATH?)\n",
         error.OutputTooLong => "error: git produced more output than allowed\n",
+        error.GitTimedOut => "error: git took too long and was stopped\n",
         else => {
             err.print("error: {t}\n", .{e}) catch {};
             return;
