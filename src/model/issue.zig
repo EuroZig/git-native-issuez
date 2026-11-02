@@ -1,16 +1,16 @@
 //! Reads an issue from its commit DAG.
 //!
-//! Every field value remembers the commit that set it. Walking the commits
-//! parents first, each commit's trailers set fields. When a merge brings
-//! two values together and one setter is an ancestor of the other, the
-//! newer one wins whatever the clocks say. Only concurrent setters fall
-//! back to last writer wins (author time, then OID), and that case is
-//! reported as a conflict. A missing trailer never clears a field, an
-//! empty value does.
+//! Every field value remembers its latest setters: the commits that set it,
+//! none an ancestor of another. Walking the commits parents first, each
+//! commit's trailers set fields. A merge keeps the setters of both sides
+//! that no setter descends from, so a newer one wins whatever the clocks
+//! say. Only concurrent setters fall back to last writer wins (author time,
+//! then OID), and that case is reported as a conflict. A missing trailer
+//! never clears a field, an empty value does.
 //!
-//! Set members (`Labels`, `X-Blocked-By`) each track their own setter, and
-//! a concurrent add and remove resolves to add. No merge base is needed,
-//! so criss-cross histories are fine too.
+//! Set members (`Labels`, `X-Blocked-By`) and attachments each keep their
+//! own setters, and a concurrent add and remove resolves to add. No merge
+//! base is needed, so criss-cross histories are fine too.
 
 const std = @import("std");
 const assert = std.debug.assert;
@@ -202,17 +202,41 @@ pub const Error = error{
     NoRoot,
 } || Allocator.Error;
 
-const none_setter: u32 = std.math.maxInt(u32);
-
+/// A scalar. Like a set member it keeps every latest setter, so that a
+/// later change on one branch doesn't hide a concurrent setter on another.
 const Cell = struct {
+    /// The newest setter's.
     value: []const u8,
-    setter: u32,
+    /// None an ancestor of another.
+    setters: []const Setter,
     lost: ?[]const u8 = null,
+
+    const Setter = struct { commit: u32, value: []const u8 };
+
+    fn set(arena: Allocator, value: []const u8, commit: u32) Allocator.Error!Cell {
+        return .{
+            .value = value,
+            .setters = try arena.dupe(Setter, &.{.{ .commit = commit, .value = value }}),
+        };
+    }
 };
 
+/// A set member. Two branches can each set it, and a later change on one
+/// of them doesn't overrule the other, so every latest setter is kept.
 const LabelCell = struct {
+    /// Concurrent setters that disagree resolve to present (add wins).
     present: bool,
-    setter: u32,
+    /// None an ancestor of another.
+    setters: []const Setter,
+
+    const Setter = struct { commit: u32, present: bool };
+
+    fn set(arena: Allocator, present: bool, commit: u32) Allocator.Error!LabelCell {
+        return .{
+            .present = present,
+            .setters = try arena.dupe(Setter, &.{.{ .commit = commit, .present = present }}),
+        };
+    }
 };
 
 const SetState = struct {
@@ -230,12 +254,35 @@ const FoldState = struct {
 };
 
 const AttachmentCell = struct {
+    /// The newest present setter's, or the newest setter's when removed.
     spec: attachment_fmt.Spec,
+    /// Concurrent setters that disagree resolve to present (add wins).
     present: bool,
-    /// Last add, rename or removal.
-    setter: u32,
+    /// The latest adds, renames and removals, none an ancestor of another.
+    setters: []const Setter,
     /// First commit that added this object under this UUID.
     added_in: u32,
+
+    const Setter = struct { commit: u32, present: bool, spec: attachment_fmt.Spec };
+
+    fn set(
+        arena: Allocator,
+        spec: attachment_fmt.Spec,
+        present: bool,
+        commit: u32,
+        added_in: u32,
+    ) Allocator.Error!AttachmentCell {
+        return .{
+            .spec = spec,
+            .present = present,
+            .setters = try arena.dupe(Setter, &.{.{
+                .commit = commit,
+                .present = present,
+                .spec = spec,
+            }}),
+            .added_in = added_in,
+        };
+    }
 };
 
 pub const set_keys = [_][]const u8{ "Labels", "X-Blocked-By" };
@@ -392,8 +439,6 @@ const Ctx = struct {
     attachment_problems: *std.ArrayList(AttachmentProblem),
 
     fn isAncestor(ctx: Ctx, a: u32, b: u32) bool {
-        if (a == none_setter) return true;
-        if (b == none_setter) return false;
         return ctx.ancestors[b].isSet(a);
     }
 
@@ -412,7 +457,7 @@ const Ctx = struct {
                 gop.value_ptr.* = bc;
                 continue;
             }
-            gop.value_ptr.* = ctx.mergeCell(gop.value_ptr.*, bc);
+            gop.value_ptr.* = try ctx.mergeCell(arena, gop.value_ptr.*, bc);
         }
         for (b.sets.keys(), b.sets.values()) |key, bset| {
             const gop = try out.sets.getOrPut(arena, key);
@@ -452,17 +497,50 @@ const Ctx = struct {
             });
             return keep;
         }
-        var out = if (a.setter == b.setter)
-            a
-        else if (ctx.isAncestor(a.setter, b.setter))
-            b
-        else if (ctx.isAncestor(b.setter, a.setter))
-            a
-        else if (a.present != b.present)
-            (if (a.present) a else b)
-        else if (ctx.lwwWins(b.setter, a.setter)) b else a;
-        out.added_in = if (ctx.lwwWins(a.added_in, b.added_in)) b.added_in else a.added_in;
-        return out;
+        const added_in = if (ctx.lwwWins(a.added_in, b.added_in)) b.added_in else a.added_in;
+        const setters = try ctx.latest(AttachmentCell.Setter, arena, a.setters, b.setters);
+        var present = false;
+        for (setters) |x| present = present or x.present;
+        var best: ?AttachmentCell.Setter = null;
+        for (setters) |x| {
+            if (present and !x.present) continue;
+            if (best == null or ctx.lwwWins(x.commit, best.?.commit)) best = x;
+        }
+        return .{ .spec = best.?.spec, .present = present, .setters = setters, .added_in = added_in };
+    }
+
+    /// The setters of both sides that no setter on either side descends
+    /// from. Sorted by commit, so the same setters compare equal.
+    fn latest(
+        ctx: Ctx,
+        comptime T: type,
+        arena: Allocator,
+        a: []const T,
+        b: []const T,
+    ) Allocator.Error![]const T {
+        // Most merges change a cell on one side or none: no allocation.
+        if (sameSetters(T, a, b)) return a;
+        if (a.len == 1 and b.len == 1) {
+            if (ctx.isAncestor(a[0].commit, b[0].commit)) return b;
+            if (ctx.isAncestor(b[0].commit, a[0].commit)) return a;
+        }
+        var out: std.ArrayList(T) = .empty;
+        for ([_][]const T{ a, b }) |side| {
+            next: for (side) |x| {
+                for (out.items) |y| if (y.commit == x.commit) continue :next;
+                for ([_][]const T{ a, b }) |other| {
+                    for (other) |y| if (y.commit != x.commit and ctx.isAncestor(x.commit, y.commit))
+                        continue :next;
+                }
+                try out.append(arena, x);
+            }
+        }
+        std.mem.sort(T, out.items, {}, struct {
+            fn lt(_: void, x: T, y: T) bool {
+                return x.commit < y.commit;
+            }
+        }.lt);
+        return out.items;
     }
 
     fn mergeSets(ctx: Ctx, arena: Allocator, a: SetState, b: SetState) Allocator.Error!SetState {
@@ -475,17 +553,17 @@ const Ctx = struct {
                 continue;
             }
             const ac = gop.value_ptr.*;
-            if (ac.setter == bc.setter) continue;
-            if (ctx.isAncestor(ac.setter, bc.setter)) {
-                gop.value_ptr.* = bc;
-                b_wins_order = true;
-            } else if (ctx.isAncestor(bc.setter, ac.setter)) {
-                // keep a
-            } else if (ac.present != bc.present) {
-                gop.value_ptr.* = if (ac.present) ac else bc; // add wins
-            } else if (ctx.lwwWins(bc.setter, ac.setter)) {
-                gop.value_ptr.* = bc;
+            const setters = try ctx.latest(LabelCell.Setter, arena, ac.setters, bc.setters);
+            var present = false;
+            var a_kept = false;
+            for (setters) |x| {
+                present = present or x.present;
+                if (!containsSetter(LabelCell.Setter, bc.setters, x.commit)) a_kept = true;
             }
+            // b's changes are newer than everything a has: b's order.
+            if (!a_kept and !sameSetters(LabelCell.Setter, ac.setters, bc.setters))
+                b_wins_order = true;
+            gop.value_ptr.* = .{ .present = present, .setters = setters };
         }
         out.order = if (b_wins_order)
             try concatOrder(arena, b.order, a.order)
@@ -494,15 +572,27 @@ const Ctx = struct {
         return out;
     }
 
-    fn mergeCell(ctx: Ctx, a: Cell, b: Cell) Cell {
-        if (a.setter == b.setter) return a;
-        if (ctx.isAncestor(a.setter, b.setter)) return b;
-        if (ctx.isAncestor(b.setter, a.setter)) return a;
-        const b_wins = ctx.lwwWins(b.setter, a.setter);
-        var winner = if (b_wins) b else a;
-        const loser = if (b_wins) a else b;
-        if (!std.mem.eql(u8, winner.value, loser.value)) winner.lost = loser.value;
-        return winner;
+    /// The newest latest setter wins; the newest one with another value
+    /// is the conflict's lost value.
+    fn mergeCell(ctx: Ctx, arena: Allocator, a: Cell, b: Cell) Allocator.Error!Cell {
+        const setters = try ctx.latest(Cell.Setter, arena, a.setters, b.setters);
+        if (sameSetters(Cell.Setter, setters, a.setters)) return a;
+        if (sameSetters(Cell.Setter, setters, b.setters)) return b;
+        var best = setters[0];
+        for (setters[1..]) |x| if (ctx.lwwWins(x.commit, best.commit)) {
+            best = x;
+        };
+        var lost: ?Cell.Setter = null;
+        for (setters) |x| if (!std.mem.eql(u8, x.value, best.value)) {
+            if (lost == null or ctx.lwwWins(x.commit, lost.?.commit)) lost = x;
+        };
+        // All agree: a conflict a merge restated stays.
+        const carried = if (containsSetter(Cell.Setter, a.setters, best.commit)) a.lost else b.lost;
+        return .{
+            .value = best.value,
+            .setters = setters,
+            .lost = if (lost) |l| l.value else carried,
+        };
     }
 };
 
@@ -543,12 +633,14 @@ fn applyTrailers(
         }
         const key = canonicalKey(t.key);
         const gop = try s.scalars.getOrPut(arena, key);
-        if (gop.found_existing and is_merge and std.mem.eql(u8, gop.value_ptr.value, t.value)) {
+        const lost = if (gop.found_existing and is_merge and
+            std.mem.eql(u8, gop.value_ptr.value, t.value))
             // Restating the merge's own result keeps the conflict.
-            gop.value_ptr.setter = setter;
-        } else {
-            gop.value_ptr.* = .{ .value = t.value, .setter = setter };
-        }
+            gop.value_ptr.lost
+        else
+            null;
+        gop.value_ptr.* = try .set(arena, t.value, setter);
+        gop.value_ptr.lost = lost;
     }
 }
 
@@ -564,8 +656,7 @@ fn applyAttachment(
     if (std.ascii.eqlIgnoreCase(t.key, attachment_fmt.remove_key)) {
         if (!uuid_fmt.isCanonical(t.value)) return problems.append(arena, bad);
         const cell = s.attachments.getPtr(t.value) orelse return;
-        cell.present = false;
-        cell.setter = setter;
+        cell.* = try .set(arena, cell.spec, false, setter, cell.added_in);
         return;
     }
     const spec = attachment_fmt.parseSpec(t.value) orelse return problems.append(arena, bad);
@@ -576,12 +667,10 @@ fn applyAttachment(
             .kind = .changed_object,
             .value = spec.id,
         });
-        gop.value_ptr.spec = spec;
-        gop.value_ptr.present = true;
-        gop.value_ptr.setter = setter;
+        gop.value_ptr.* = try .set(arena, spec, true, setter, gop.value_ptr.added_in);
         return;
     }
-    gop.value_ptr.* = .{ .spec = spec, .present = true, .setter = setter, .added_in = setter };
+    gop.value_ptr.* = try .set(arena, spec, true, setter, setter);
 }
 
 /// Criss-cross merges can run into the same conflict twice.
@@ -721,7 +810,7 @@ fn classifyEvents(
 fn applyEvent(arena: Allocator, s: *FoldState, e: Event, setter: u32) Allocator.Error!void {
     const put = struct {
         fn f(a: Allocator, st: *FoldState, key: []const u8, value: []const u8, by: u32) !void {
-            try st.scalars.put(a, key, .{ .value = value, .setter = by });
+            try st.scalars.put(a, key, try .set(a, value, by));
         }
     }.f;
     switch (e.kind) {
@@ -737,6 +826,17 @@ fn applyEvent(arena: Allocator, s: *FoldState, e: Event, setter: u32) Allocator.
     }
 }
 
+fn containsSetter(comptime T: type, list: []const T, commit: u32) bool {
+    for (list) |x| if (x.commit == commit) return true;
+    return false;
+}
+
+fn sameSetters(comptime T: type, a: []const T, b: []const T) bool {
+    if (a.len != b.len) return false;
+    for (a) |x| if (!containsSetter(T, b, x.commit)) return false;
+    return true;
+}
+
 fn applySet(
     arena: Allocator,
     s: *FoldState,
@@ -749,17 +849,13 @@ fn applySet(
     if (!gop.found_existing) gop.value_ptr.* = .{};
     const set = gop.value_ptr;
     for (set.members.keys(), set.members.values()) |m, *cell| {
-        if (cell.present and !labels_fmt.contains(wanted, m)) cell.* = .{
-            .present = false,
-            .setter = setter,
-        };
+        if (cell.present and !labels_fmt.contains(wanted, m))
+            cell.* = try .set(arena, false, setter);
     }
     for (wanted) |m| {
         const mg = try set.members.getOrPut(arena, m);
-        if (!mg.found_existing or !mg.value_ptr.present) mg.value_ptr.* = .{
-            .present = true,
-            .setter = setter,
-        };
+        if (!mg.found_existing or !mg.value_ptr.present)
+            mg.value_ptr.* = try .set(arena, true, setter);
     }
     set.order = wanted;
 }
@@ -1202,6 +1298,23 @@ test "concurrent add vs remove of a label: add wins" {
     try testing.expectEqualStrings("x", j.labels[0]);
 }
 
+test "a set member added on two branches survives a removal on one" {
+    var arena_state: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena_state.deinit();
+    var d: TestDag = .{ .arena = arena_state.allocator() };
+    const root = try d.add(&.{}, 100, "T\n\nState: open\nFormat-Version: 1\n");
+    const left = try d.add(&.{root}, 120, "L\n\nLabels: x\n");
+    const right = try d.add(&.{root}, 180, "R\n\nLabels: x\n");
+    // A merge that doesn't restate: both adds stay its latest setters.
+    const both = try d.add(&.{ left, right }, 400, "Merge\n");
+    // Removed after the right add only, so concurrent with the left one.
+    const removed = try d.add(&.{right}, 600, "Edit\n\nLabels: y\n");
+    const i = try d.issue(try d.add(&.{ both, removed }, 700, "Merge\n"));
+    try testing.expectEqual(@as(usize, 2), i.labels.len);
+    try testing.expect(labels_fmt.contains(i.labels, "x"));
+    try testing.expect(labels_fmt.contains(i.labels, "y"));
+}
+
 test "criss-cross merges are deterministic" {
     var arena_state: std.heap.ArenaAllocator = .init(testing.allocator);
     defer arena_state.deinit();
@@ -1532,4 +1645,41 @@ test "attachment merges" {
     try testing.expectEqual(@as(usize, 2), i.attachments.len);
     try testing.expectEqualStrings("first.png", i.attachments[1].name);
     try testing.expectEqual(@as(usize, 1), i.attachment_problems.len);
+}
+
+test "a skewed clock after a merge doesn't hide a concurrent setter" {
+    var arena_state: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena_state.deinit();
+    var d: TestDag = .{ .arena = arena_state.allocator() };
+    const root = try d.add(&.{}, 100, "T\n\nState: open\nFormat-Version: 1\n");
+    const x = try d.add(&.{root}, 300, "X\n\nPriority: high\n");
+    const y = try d.add(&.{root}, 200, "Y\n\nPriority: medium\n");
+    // Doesn't restate: x and y stay its latest setters, x wins.
+    const both = try d.add(&.{ x, y }, 400, "Merge\n");
+    try testing.expectEqualStrings("high", (try d.issue(both)).field("Priority").?);
+    // After x only, with a clock behind y's: concurrent with y, y is newer.
+    const after_x = try d.add(&.{x}, 50, "X2\n\nPriority: low\n");
+    const i = try d.issue(try d.add(&.{ both, after_x }, 500, "Merge\n"));
+    try testing.expectEqualStrings("medium", i.field("Priority").?);
+    try testing.expectEqual(@as(usize, 1), i.conflicts.len);
+    try testing.expectEqualStrings("low", i.conflicts[0].lost);
+}
+
+test "an attachment renamed on two branches survives a removal on one" {
+    var arena_state: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena_state.deinit();
+    var d: TestDag = .{ .arena = arena_state.allocator() };
+    const id = "1b4e28ba-2fa1-4d3b-a3f5-ef19b5a7633b";
+    const h = " image/png 10 sha256:" ++ "a" ** 64 ++ " ";
+    const root = try d.add(&.{}, 100, "Crash\n\nState: open\nX-Attachment: " ++ id ++ h ++
+        "a.png\nFormat-Version: 1\n");
+    const left = try d.add(&.{root}, 300, "Rename\n\nX-Attachment: " ++ id ++ h ++ "l.png\n");
+    const right = try d.add(&.{root}, 200, "Rename\n\nX-Attachment: " ++ id ++ h ++ "r.png\n");
+    const both = try d.add(&.{ left, right }, 400, "Merge\n");
+    try testing.expectEqualStrings("l.png", (try d.issue(both)).attachments[0].name);
+    // Removed after the left rename only: concurrent with the right one.
+    const removed = try d.add(&.{left}, 500, "Remove\n\nX-Attachment-Removed: " ++ id ++ "\n");
+    const i = try d.issue(try d.add(&.{ both, removed }, 600, "Merge\n"));
+    try testing.expectEqual(@as(usize, 1), i.attachments.len);
+    try testing.expectEqualStrings("r.png", i.attachments[0].name);
 }

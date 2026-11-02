@@ -63,25 +63,28 @@ set of plumbing operations:
   every update states the value it expects;
 - graph: is-ancestor and merge bases;
 - config, remotes, the default identity;
-- transport: fetch with explicit refspecs, and push (optionally atomic)
-  with a result per ref;
+- transport: fetch with explicit refspecs (optionally pruning), and push
+  (optionally atomic) with a result per ref;
 - random bytes, for UUIDs;
-- optionally, the LFS stores for attachment bytes (read, atomic write,
-  list) and LFS transfer (push and fetch objects). A backend without them
+- optionally, an LFS store for attachment bytes (read, atomic write, list,
+  and optionally the size without reading) and LFS transfer (push and
+  fetch objects). Where transfers keep copies is the backend's business:
+  the git backend goes through git-lfs's store. A backend without a store
   works for everything but attachments.
 
 | Backend      | Use                                                                                                                                                                                                                                                                                                                   |
 | ------------ | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `GitProcess` | Runs `git` from PATH with a fixed environment and `--` separators. Reads objects through one long-lived `cat-file --batch`. Output is bounded. LFS objects are files under the git dir; transfers run `git lfs push` and `git lfs fetch` when git-lfs is installed.                                                    |
+| `GitProcess` | Runs `git` from PATH with a fixed environment and `--` separators. Reads objects, and resolves single refs, through one long-lived `cat-file --batch`, and writes objects through one long-lived `hash-object -w --no-filters --stdin-paths` per type, so git still checks them and applies its permissions (and no attributes or filters). Output is bounded, and so is time: each call has a deadline (`Timeouts`), after which git is stopped. LFS objects are files under the git dir; transfers run `git lfs push` and `git lfs fetch` when git-lfs is installed.                                                    |
 | `GitSim`     | An in-memory world of clones, serialised as ZON. Objects hash exactly like git, so OIDs are real. A remote is another clone of the world (`remote.<name>.url = sim:<clone>`). Clock and randomness come from the world. Each clone has both LFS stores, LFS transfers copy objects between clones, and like git-lfs a fetch fails on an unknown ref or an object the remote lacks. `sim.lfs = false` makes a clone without git-lfs. Breaking a protocol rule (a commit pointing at a missing object, an invalid ref name) panics. |
 | your own     | Wrap or replace either one. `examples/custom_backend.zig` logs every ref change and push, and refuses writes outside the issue and bookkeeping refs.                                                                                                                                                                  |
 
 ## Reading an issue
 
 The model walks the commit DAG parents first. Every field value remembers
-the commit that set it. At a merge, a setter that descends from the other
-wins; only concurrent setters fall back to the later author time, and that
-case is reported as a conflict. The rule is in [format.md](format.md) §4.
+its latest setters, the commits that set it with none an ancestor of
+another. A merge pools both sides' setters and drops those another one
+descends from; only concurrent setters that remain fall back to the later
+author time, and a disagreement is reported as a conflict. The rule is in [format.md](format.md) §4.
 Conflicts are a function of the DAG, so they are found in merges made by any
 tool and nothing extra is stored.
 
@@ -105,6 +108,14 @@ graph, so it accepts every input and never loops: a parent that is missing,
 the issue itself, or part of a cycle is reported and the issue becomes a
 root, so the tree still shows every issue exactly once. `tree`,
 `ls --problems`, `fsck` and `milestone show` read it.
+
+One issue's answers need fewer issues: `Repo.loadAround` loads the issue,
+its ancestors, its descendants (through the parent cache, see "Writing an
+issue") and the issues its blockers lead to, and a projection over those
+gives that issue the same answers as one over every issue. `show` reads
+it that way. Only an event whose comment is missing, which may target
+another issue's comment, needs every issue. Issues that can't be loaded
+are left out, as in the write guards (`fsck` reports them).
 
 ## Milestones
 
@@ -156,7 +167,9 @@ Writes that touch the hierarchy also run guards
 a closed one, no deleting an issue with live sub-issues. A guard reads other
 issues, and every issue it reads gets a `verify` line in the same ref
 transaction as the write. When one of them moves concurrently, the
-transaction fails and the write starts again from step 1. A `verify` can't
+transaction fails and the write starts again from step 1. Sub-issues are
+found through `refs/issuez-cache/parents`, a blob of every issue's tip and
+parent: only issues whose tip changed since are read. A `verify` can't
 pin an absence, like no child under the issue being closed, so those
 writes also move a local guard ref (`refs/issuez-guard/<uuid>`) of the
 issue whose children matter, and two of them conflict. Milestones are
@@ -175,21 +188,29 @@ changed, like an HTTP ETag.
 
 `Sync(B)` (`src/engine/sync.zig`) sits on top of `Repo(B)`:
 
-1. Fetch into `refs/remotes/<remote>/issues/` and
-   `refs/remotes/<remote>/milestones/`. A fetch never writes `refs/issues/`
-   or `refs/milestones/` directly. Milestones go through the same steps as
+1. Fetch into `refs/issuez-sync/<remote>/seen/` with `--prune`. It stays
+   between syncs, so an unchanged remote costs no ref writes, and the push
+   of a `sync` reuses it. A fetch never writes `refs/issues/` or
+   `refs/milestones/` directly. Milestones go through the same steps as
    issues.
 2. Classify each fetched issue against the local one: new, fast-forward, up
    to date, local ahead, diverged, or to be quarantined (unrelated history,
-   rewritten since the last merge, fails `fsck`).
+   rewritten since the last merge, fails `fsck`). Local refs and records are
+   read once per namespace, and an issue already merged at the same tip
+   isn't checked again.
 3. Fast-forward, or write a deterministic merge commit, with the same
-   compare and swap as every other write.
+   compare and swap as every other write. How the tips relate (and the
+   merge bases) comes from the loaded histories, not a `git merge-base`
+   per issue. The local ref writes go in one transaction; if it loses a
+   race, those issues are merged again one by one.
 4. Fetch again to learn what the remote has (someone may have
    force-pushed), then push what differs, atomically in batches. A
    rejection means the remote moved: merge again and retry, up to a fixed
    number of rounds.
-5. Record what was merged and pushed in `refs/issuez-sync/`, and report
-   every issue's outcome.
+5. Record what was merged and pushed in `refs/issuez-sync/`, a ref
+   transaction per merge and per pushed batch (a quarantine marker and
+   the attachments' records go on their own), and report every issue's
+   outcome.
 
 The bookkeeping refs are a cache: they make rewound remotes detectable and
 `status` cheap, and losing them only costs a slower next sync. Nothing is
@@ -289,7 +310,9 @@ way, to go unnoticed.
   Every command is checked by the oracle, and the engine's reading of each
   issue is compared with the oracle's. After every write the projection
   must show no new guard violation: a guard can only be broken by other
-  tools or concurrent clones, never by one of our own writes. What the
+  tools or concurrent clones, never by one of our own writes. After every
+  step, each issue must project the same from `loadAround` as from every
+  issue. What the
   oracle has no rule for is counted as skipped, so gaps show up in the
   statistics. At the end every clone syncs, taking
   the hub's version of anything quarantined, until nothing changes, and

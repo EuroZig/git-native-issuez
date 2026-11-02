@@ -192,8 +192,10 @@ are installed.
   ([format.md](format.md) §8). Upstream ignores them.
 - The remote must be a configured remote name. URLs and paths are refused
   with a `git remote add` hint; upstream fails on them too, at the fetch.
-- `--no-fetch` keeps the staging refs, like upstream. A fetching merge
-  removes the ones it merged.
+- `--no-fetch` merges the refs a plain `git fetch` brought to
+  `refs/remotes/<remote>/`, and keeps them, like upstream. A fetching merge
+  fetches into its own `refs/issuez-sync/<remote>/seen/` instead, which
+  stays between syncs, so an unchanged remote costs no ref writes.
 
 ## Commands upstream doesn't have
 
@@ -238,8 +240,9 @@ are installed.
   bash and zsh scripts; these are written from scratch (upstream is
   GPL-2.0) and generated from the help texts. They complete `git-issue`,
   `git issue` and the `git-issue-<command>` entry points: commands,
-  options, option values, issue IDs (with titles in zsh and fish) and
-  remotes.
+  subcommands, options, option values, and each argument by its position
+  (issue IDs with titles in zsh and fish, remotes, files). They work with
+  fish 3 and 4.
 - Man pages: `git-issue(1)`, which `git issue --help` opens through git,
   and `git-issue-<command>(1)` for every command, like upstream's. The
   pages carry no date, so builds are reproducible.

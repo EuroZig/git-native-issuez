@@ -364,10 +364,11 @@ fn readWorkflowStates(
     comptime prefix: []const u8,
     comptime suffix: []const u8,
 ) ?[]const []const u8 {
-    const raw = repo.backend.configGet(ctx.arena, "issue.workflowStates") catch {
+    const set = ctx.workflow_states orelse repo.backend.configGet(ctx.arena, "issue.workflowStates") catch {
         ctx.err.writeAll(prefix ++ "could not read git config issue.workflowStates" ++ suffix) catch {};
         return null;
-    } orelse return &fields.default_workflow;
+    };
+    const raw = set orelse return &fields.default_workflow;
     var out: std.ArrayList([]const u8) = .empty;
     var it = std.mem.splitScalar(u8, raw, ',');
     while (it.next()) |part| {
@@ -408,6 +409,21 @@ pub fn project(
     repo: issuez.engine.Repo(B),
 ) ?issuez.projection.Projection {
     const issues = repo.loadAll(ctx.arena) catch |e| {
+        common.reportRepoError(B, ctx, e);
+        return null;
+    };
+    return projectIssues(B, ctx, repo, issues);
+}
+
+/// `project` for one issue: the same answers for it, from the issues
+/// around it (`Repo.loadAround`).
+pub fn projectAround(
+    comptime B: type,
+    ctx: *context.Context(B),
+    repo: issuez.engine.Repo(B),
+    ref: issuez.engine.IssueRef,
+) ?issuez.projection.Projection {
+    const issues = repo.loadAround(ctx.arena, ref) catch |e| {
         common.reportRepoError(B, ctx, e);
         return null;
     };

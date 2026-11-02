@@ -54,8 +54,12 @@ pub const World = struct {
         lfs: []const LfsObject = &.{},
     };
 
+    /// Like GitProcess: `issuez` is the store, `git_lfs` git-lfs's copy
+    /// for transfers.
+    pub const LfsStore = enum { issuez, git_lfs };
+
     pub const LfsObject = struct {
-        store: contract.LfsStore,
+        store: LfsStore,
         sha256: []const u8,
         data: []const u8,
     };
@@ -328,6 +332,23 @@ pub fn configUnsetValue(sim: *GitSim, key: []const u8, value: []const u8) Error!
     }
 }
 
+/// Like `GitProcess.configList`: section and name lowercase, the
+/// subsection as written.
+pub fn configList(sim: *GitSim, arena: Allocator) Error![]const World.ConfigEntry {
+    const out = try arena.alloc(World.ConfigEntry, sim.config.items.len);
+    for (sim.config.items, out) |e, *o| {
+        const key = try arena.dupe(u8, e.key);
+        const first = std.mem.findScalar(u8, key, '.') orelse key.len;
+        const last = std.mem.findScalarLast(u8, key, '.') orelse key.len;
+        for (key[0..first]) |*c| c.* = std.ascii.toLower(c.*);
+        if (last < key.len) for (key[last..]) |*c| {
+            c.* = std.ascii.toLower(c.*);
+        };
+        o.* = .{ .key = key, .value = e.value };
+    }
+    return out;
+}
+
 /// In first-seen order.
 pub fn remoteNames(sim: *GitSim, arena: Allocator) Error![]const []const u8 {
     var out: std.ArrayList([]const u8) = .empty;
@@ -370,57 +391,66 @@ pub fn randomBytes(sim: *GitSim, buf: []u8) void {
     sim.prng.random().bytes(buf);
 }
 
-pub fn lfsRead(
-    sim: *GitSim,
-    arena: Allocator,
-    store: contract.LfsStore,
-    sha256: []const u8,
-) Error!?[]const u8 {
+/// Ours when it hashes right, else git-lfs's put into ours when it does,
+/// else whatever there is. Like GitProcess.
+pub fn lfsRead(sim: *GitSim, arena: Allocator, sha256: []const u8) Error!?[]const u8 {
     _ = arena;
     checkSha(sha256);
-    for (sim.lfs.items) |o| if (o.store == store and std.mem.eql(u8, o.sha256, sha256)) {
+    const ours = sim.stored(.issuez, sha256);
+    if (ours) |data| if (hashes(data, sha256)) return data;
+    const theirs = sim.stored(.git_lfs, sha256) orelse return ours;
+    if (!hashes(theirs, sha256)) return ours orelse theirs;
+    try sim.store(.issuez, sha256, theirs);
+    return theirs;
+}
+
+pub fn lfsSize(sim: *GitSim, sha256: []const u8) Error!?u64 {
+    checkSha(sha256);
+    return if (sim.stored(.issuez, sha256)) |d| d.len else null;
+}
+
+pub fn lfsWrite(sim: *GitSim, sha256: []const u8, data: []const u8) Error!void {
+    checkSha(sha256);
+    if (!hashes(data, sha256)) protocolViolation("LFS object stored under a wrong hash", .{});
+    try sim.store(.issuez, sha256, data);
+}
+
+pub fn lfsList(sim: *GitSim, arena: Allocator) Error![]const []const u8 {
+    var out: std.ArrayList([]const u8) = .empty;
+    for (sim.lfs.items) |o| if (o.store == .issuez) try out.append(arena, o.sha256);
+    std.mem.sort([]const u8, out.items, {}, stringLessThan);
+    return out.items;
+}
+
+fn stored(sim: *GitSim, s: World.LfsStore, sha256: []const u8) ?[]const u8 {
+    for (sim.lfs.items) |o| if (o.store == s and std.mem.eql(u8, o.sha256, sha256)) {
         return o.data;
     };
     return null;
 }
 
-pub fn lfsWrite(
-    sim: *GitSim,
-    store: contract.LfsStore,
-    sha256: []const u8,
-    data: []const u8,
-) Error!void {
-    checkSha(sha256);
-    var digest: [32]u8 = undefined;
-    std.crypto.hash.sha2.Sha256.hash(data, &digest, .{});
-    const hex = std.fmt.bytesToHex(digest, .lower);
-    if (!std.mem.eql(u8, &hex, sha256))
-        protocolViolation("LFS object stored under a wrong hash", .{});
-    // Replaces a damaged copy.
-    for (sim.lfs.items) |*o| if (o.store == store and std.mem.eql(u8, o.sha256, sha256)) {
+/// Replaces a damaged copy.
+fn store(sim: *GitSim, s: World.LfsStore, sha256: []const u8, data: []const u8) Error!void {
+    for (sim.lfs.items) |*o| if (o.store == s and std.mem.eql(u8, o.sha256, sha256)) {
         o.data = try sim.arena.dupe(u8, data);
         return;
     };
     try sim.lfs.append(sim.arena, .{
-        .store = store,
+        .store = s,
         .sha256 = try sim.arena.dupe(u8, sha256),
         .data = try sim.arena.dupe(u8, data),
     });
 }
 
-pub fn lfsList(
-    sim: *GitSim,
-    arena: Allocator,
-    store: contract.LfsStore,
-) Error![]const []const u8 {
-    var out: std.ArrayList([]const u8) = .empty;
-    for (sim.lfs.items) |o| if (o.store == store) try out.append(arena, o.sha256);
-    std.mem.sort([]const u8, out.items, {}, stringLessThan);
-    return out.items;
+fn hashes(data: []const u8, sha256: []const u8) bool {
+    var digest: [32]u8 = undefined;
+    std.crypto.hash.sha2.Sha256.hash(data, &digest, .{});
+    const hex = std.fmt.bytesToHex(digest, .lower);
+    return std.mem.eql(u8, &hex, sha256);
 }
 
-/// Moves objects between the clones' git-lfs stores. A clone with
-/// `sim.lfs = false` has no git-lfs.
+/// Copies our objects into git-lfs's store, like GitProcess, then into the
+/// remote clone's. A clone with `sim.lfs = false` has no git-lfs.
 pub fn lfsPush(
     sim: *GitSim,
     arena: Allocator,
@@ -433,7 +463,11 @@ pub fn lfsPush(
     try target.appendSlice(arena, sim.world.clones[idx].lfs);
     for (shas) |sha| {
         checkSha(sha);
-        const data = (try sim.lfsRead(arena, .git_lfs, sha)) orelse return error.LfsTransferFailed;
+        if (sim.stored(.git_lfs, sha) == null) {
+            const ours = sim.stored(.issuez, sha) orelse return error.LfsTransferFailed;
+            try sim.store(.git_lfs, sha, ours);
+        }
+        const data = sim.stored(.git_lfs, sha).?;
         const have = for (target.items) |o| {
             if (o.store == .git_lfs and std.mem.eql(u8, o.sha256, sha)) break true;
         } else false;
@@ -477,7 +511,7 @@ pub fn lfsFetch(
             const found = for (sim.world.clones[idx].lfs) |o| {
                 if (o.store == .git_lfs and std.mem.eql(u8, o.sha256, sha)) break o;
             } else null;
-            if (found) |o| try sim.lfsWrite(.git_lfs, sha, o.data) else lacking = true;
+            if (found) |o| try sim.store(.git_lfs, sha, o.data) else lacking = true;
         }
     }
     if (lacking) return error.LfsTransferFailed;
@@ -585,11 +619,37 @@ pub fn fetch(
     arena: Allocator,
     remote: []const u8,
     refspecs: []const []const u8,
+    prune: bool,
 ) (Error || error{FetchFailed})!void {
     const idx = (try sim.remoteClone(arena, remote)) orelse return error.FetchFailed;
     const remote_clone = sim.world.clones[idx];
     const format = sim.world.format;
     const remote_objects = try objectsOf(arena, format, remote_clone);
+    // Like `git fetch --prune`: a ref under a glob destination goes when no
+    // refspec maps a remote ref to it any more (all refspecs together).
+    if (prune) {
+        var wanted: std.StringHashMapUnmanaged(void) = .empty;
+        for (refspecs) |raw| {
+            const spec = parseRefspec(raw);
+            for (remote_clone.refs) |r| {
+                const dst = (try mapRef(arena, r.name, spec)) orelse continue;
+                try wanted.put(arena, dst, {});
+            }
+        }
+        var gone: std.ArrayList([]const u8) = .empty;
+        var it = sim.refs.iterator();
+        while (it.next()) |e| {
+            const name = e.key_ptr.*;
+            if (wanted.contains(name)) continue;
+            const pruned = for (refspecs) |raw| {
+                const spec = parseRefspec(raw);
+                if (!std.mem.endsWith(u8, spec.dst, "*")) continue;
+                if (std.mem.startsWith(u8, name, spec.dst[0 .. spec.dst.len - 1])) break true;
+            } else false;
+            if (pruned) try gone.append(arena, name);
+        }
+        for (gone.items) |name| _ = sim.refs.orderedRemove(name);
+    }
     for (refspecs) |raw| {
         const spec = parseRefspec(raw);
         for (remote_clone.refs) |r| {
@@ -799,6 +859,34 @@ test "merge bases and ancestry" {
     // Criss-cross: two best common ancestors.
     const two = try sim.mergeBases(arena, m1, m2);
     try testing.expectEqual(@as(usize, 2), two.len);
+}
+
+test "fetch prunes against all refspecs together, like git" {
+    var arena_state: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var world: World = .{ .clones = &.{
+        .{ .name = "hub" },
+        .{ .name = "a", .config = &.{.{ .key = "remote.hub.url", .value = "sim:hub" }} },
+    } };
+    var hub: GitSim = try .init(arena, &world, 0);
+    const root = try testCommit(&hub, &.{}, "root\n");
+    try hub.updateRefs(&.{
+        .{ .name = "refs/x/one", .op = .{ .create = root } },
+        .{ .name = "refs/y/two", .op = .{ .create = root } },
+    });
+    try hub.commit();
+
+    var a: GitSim = try .init(arena, &world, 1);
+    const own = try testCommit(&a, &.{}, "own\n");
+    try a.updateRefs(&.{.{ .name = "refs/m/stale", .op = .{ .create = own } }});
+    // The first destination lies inside the second: git keeps `m/y/two`
+    // although the second refspec has no `y/two`, and prunes `m/stale`.
+    try a.fetch(arena, "hub", &.{ "+refs/y/*:refs/m/y/*", "+refs/x/*:refs/m/*" }, true);
+    const left = try a.listRefs(arena, "refs/m/");
+    try testing.expectEqual(@as(usize, 2), left.len);
+    try testing.expectEqualStrings("refs/m/one", left[0].name);
+    try testing.expectEqualStrings("refs/m/y/two", left[1].name);
 }
 
 test "world round trip through ZON is lossless" {

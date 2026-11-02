@@ -43,6 +43,7 @@ pub const owned_prefixes = [_][]const u8{
     "refs/attachments/",
     "refs/issuez-sync/",
     "refs/issuez-guard/",
+    "refs/issuez-cache/",
 };
 
 pub fn isOwnedRef(name: []const u8) bool {
@@ -61,6 +62,10 @@ pub fn isOwnedRef(name: []const u8) bool {
 /// Local refs that serialize guarded writes, see the engine's
 /// `guard_ref_prefix`. The per-command rules ignore them.
 const guard_prefix = "refs/issuez-guard/";
+
+/// Local caches, see the engine's `parent_cache_ref`. The per-command
+/// rules ignore them; `checkParentCache` checks what they say.
+const cache_prefix = "refs/issuez-cache/";
 
 /// Must hold whatever the command.
 pub fn checkInvariants(
@@ -164,6 +169,8 @@ fn checkClone(
         );
     }
 
+    try checkParentCache(arena, format, a, report);
+
     // Refs outside our namespaces never change.
     for (b.refs) |r| if (!isOwnedRef(r.name)) {
         const now = findRef(a, r.name);
@@ -172,6 +179,41 @@ fn checkClone(
     };
     for (a.refs) |r| if (!isOwnedRef(r.name) and findRef(b, r.name) == null)
         try report.fail("clone '{s}': foreign ref {s} was created", .{ a.name, r.name });
+}
+
+/// Every entry of the parent cache whose tip is still the issue's names the
+/// parent the history gives (a canonical UUID), or none.
+fn checkParentCache(
+    arena: Allocator,
+    format: object.ObjectFormat,
+    a: World.Clone,
+    report: *Report,
+) Allocator.Error!void {
+    const tip = findRef(a, issuez.engine.parent_cache_ref) orelse return;
+    const c = try commands.Clone.init(arena, format, a);
+    const blob = c.objects.get(tip) orelse {
+        try report.fail("clone '{s}': parent cache points at a missing object", .{a.name});
+        return;
+    };
+    var lines = std.mem.splitScalar(u8, blob.data, '\n');
+    _ = lines.next(); // header
+    while (lines.next()) |line| {
+        if (line.len == 0) continue;
+        var it = std.mem.splitScalar(u8, line, ' ');
+        const id = it.next() orelse continue;
+        const entry_tip = it.next() orelse continue;
+        const rest = it.rest();
+        const name = try std.fmt.allocPrint(arena, "refs/issues/{s}", .{id});
+        const now = c.ref(name) orelse continue;
+        if (!std.mem.eql(u8, now, entry_tip)) continue;
+        const naive = c.naive(now) catch continue;
+        const want: []const u8 = if (issuez.format.uuid.isCanonical(naive.parent)) naive.parent else "";
+        const got: []const u8 = if (rest.len > 0 and rest[0] == '=') rest[1..] else "";
+        if (!std.mem.eql(u8, want, got)) try report.fail(
+            "clone '{s}': parent cache says {s} has parent '{s}', history says '{s}'",
+            .{ a.name, id, got, want },
+        );
+    }
 }
 
 /// Format 1 issues and milestones only use the empty tree.
@@ -668,13 +710,15 @@ fn refChanges(
     var out: std.ArrayList(RefChange) = .empty;
     for (a.clone.refs) |r| {
         if (std.mem.startsWith(u8, r.name, guard_prefix)) continue;
+        if (std.mem.startsWith(u8, r.name, cache_prefix)) continue;
         const old = b.ref(r.name);
         if (old == null or !std.mem.eql(u8, old.?, r.oid)) try out.append(
             arena,
             .{ .name = r.name, .old = old, .new = r.oid },
         );
     }
-    for (b.clone.refs) |r| if (a.ref(r.name) == null) try out.append(
+    for (b.clone.refs) |r| if (a.ref(r.name) == null and
+        !std.mem.startsWith(u8, r.name, cache_prefix)) try out.append(
         arena,
         .{ .name = r.name, .old = r.oid, .new = null },
     );
@@ -1353,18 +1397,29 @@ fn expectCloneUnchanged(
     report: *Report,
     objects_too: bool,
 ) Allocator.Error!void {
+    // A read may refresh the parent cache: its ref and the blob.
+    const cache_before = findRef(b, issuez.engine.parent_cache_ref);
+    const cache_after = findRef(a, issuez.engine.parent_cache_ref);
+    const cache_moved = cache_after != null and
+        (cache_before == null or !std.mem.eql(u8, cache_before.?, cache_after.?));
     if (objects_too) {
         const bo = try objectSet(arena, format, b);
         const ao = try objectSet(arena, format, a);
-        if (bo.count() != ao.count())
+        const cache_blob: u32 = @intFromBool(cache_moved and !bo.contains(cache_after.?));
+        if (bo.count() + cache_blob != ao.count())
             try report.fail(
                 "clone '{s}': objects changed ({d} -> {d})",
                 .{ a.name, bo.count(), ao.count() },
             );
     }
-    if (b.refs.len != a.refs.len) {
+    var b_refs: usize = 0;
+    var a_refs: usize = 0;
+    for (b.refs) |r| b_refs += @intFromBool(!std.mem.startsWith(u8, r.name, cache_prefix));
+    for (a.refs) |r| a_refs += @intFromBool(!std.mem.startsWith(u8, r.name, cache_prefix));
+    if (b_refs != a_refs) {
         try report.fail("clone '{s}': refs changed", .{a.name});
     } else for (b.refs) |r| {
+        if (std.mem.startsWith(u8, r.name, cache_prefix)) continue;
         const now = findRef(a, r.name);
         if (now == null or !std.mem.eql(u8, now.?, r.oid))
             try report.fail("clone '{s}': ref {s} changed", .{ a.name, r.name });

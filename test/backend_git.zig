@@ -160,6 +160,8 @@ test "cat-file session" {
         try testing.expect(oids[i].eql(object.hashObject(.sha1, .commit, datas[i])));
         parent = oids[i];
     }
+    // Written through one `hash-object` session.
+    try testing.expect(git.hash_objects[@intFromEnum(object.ObjectKind.commit)] != null);
     // Interleave reads in reverse order through the same session.
     var i: usize = n;
     while (i > 0) {
@@ -361,7 +363,7 @@ test "push and fetch" {
     );
 
     // b fetches into staging, builds on it, pushes.
-    try gb.fetch(arena, "origin", &.{"+refs/issues/*:refs/remotes/origin/issues/*"});
+    try gb.fetch(arena, "origin", &.{"+refs/issues/*:refs/remotes/origin/issues/*"}, false);
     const staged_name = "refs/remotes/origin/issues/a7f3b2c1-4e5d-4a8b-9c1e-2f3a4b5c6d7e";
     const staged = (try gb.resolveRef(staged_name)).?;
     try testing.expect(staged.eql(root));
@@ -383,16 +385,115 @@ test "push and fetch" {
     try ga.updateRefs(&.{.{ .name = other, .op = .{ .create = root } }});
     const rejected = try ga.push(arena, "origin", &.{ spec, other ++ ":" ++ other }, true);
     try testing.expect(rejected.rejected());
-    try gb.fetch(arena, "origin", &.{"+refs/issues/*:refs/remotes/origin/issues/*"});
+    try gb.fetch(arena, "origin", &.{"+refs/issues/*:refs/remotes/origin/issues/*"}, false);
     const other_staged = "refs/remotes/origin/issues/b8e4c3d2-5f6e-4b9c-8d2f-3a4b5c6d7e8f";
     try testing.expect(try gb.resolveRef(other_staged) == null);
 
     // An unknown remote is a fetch failure with git's explanation kept.
     try testing.expectError(
         error.FetchFailed,
-        ga.fetch(arena, "nosuchremote", &.{"+refs/issues/*:refs/remotes/x/issues/*"}),
+        ga.fetch(arena, "nosuchremote", &.{"+refs/issues/*:refs/remotes/x/issues/*"}, false),
     );
     try testing.expect(ga.lastStderr().len > 0);
+}
+
+test "object writes ignore attributes and filters" {
+    const gpa = testing.allocator;
+    var repo = try Repo.init(gpa, &.{});
+    defer repo.deinit(gpa);
+    var arena_state: std.heap.ArenaAllocator = .init(gpa);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    // A clean filter and eol conversion for every path, the temp files
+    // included. The object has to be the bytes, as with `--stdin`.
+    const attributes = try std.fs.path.join(arena, &.{ repo.path, ".git", "info", "attributes" });
+    try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = attributes, .data = "* filter=up text eol=crlf\n" });
+    try runGit(gpa, &repo.env, repo.path, &.{ "git", "config", "filter.up.clean", "tr a-z A-Z" });
+    // A temp file a dead process left behind a day ago is swept.
+    const tmp = try std.fs.path.join(arena, &.{ repo.path, ".git", "issuez", "tmp" });
+    try std.Io.Dir.cwd().createDirPath(io, tmp);
+    const stale = try std.fs.path.join(arena, &.{ tmp, "object-stale" });
+    try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = stale, .data = "x" });
+    try runGit(gpa, &repo.env, ".", &.{ "touch", "-t", "202001010000", stale });
+
+    var git = try repo.open(gpa);
+    defer git.close();
+    const data = "hello\nworld\n";
+    const oid = try git.writeObject(.blob, data);
+    try testing.expect(oid.eql(object.hashObject(.sha1, .blob, data)));
+    try testing.expectEqualStrings(data, (try git.readObject(arena, oid)).?.data);
+    // Through the session, not the one-off fallback (which drops it).
+    try testing.expect(git.hash_objects[@intFromEnum(object.ObjectKind.blob)] != null);
+    try testing.expectError(error.FileNotFound, std.Io.Dir.cwd().statFile(io, stale, .{}));
+}
+
+test "a ref to a missing object still resolves" {
+    const gpa = testing.allocator;
+    var repo = try Repo.init(gpa, &.{});
+    defer repo.deinit(gpa);
+    var git = try repo.open(gpa);
+    defer git.close();
+    var arena_state: std.heap.ArenaAllocator = .init(gpa);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    const name = "refs/issues/a7f3b2c1-4e5d-4a8b-9c1e-2f3a4b5c6d7e";
+    const oid = try git.writeObject(.commit, try commitBytes(arena, .sha1, &.{}, "root\n"));
+    try git.updateRefs(&.{.{ .name = name, .op = .{ .create = oid } }});
+    const hex = oid.hex();
+    const loose = try std.fmt.allocPrint(arena, "{s}/.git/objects/{s}/{s}", .{
+        repo.path, hex.slice()[0..2], hex.slice()[2..],
+    });
+    try std.Io.Dir.cwd().deleteFile(io, loose);
+
+    // cat-file says "missing" for both; the ref is there, its object isn't.
+    try testing.expect((try git.resolveRef(name)).?.eql(oid));
+    try testing.expect(try git.readObject(arena, oid) == null);
+    try testing.expect(try git.resolveRef("refs/issues/b8e4c3d2-5f6e-4b9c-8d2f-3a4b5c6d7e8f") == null);
+}
+
+test "fetch with prune" {
+    const gpa = testing.allocator;
+    var arena_state: std.heap.ArenaAllocator = .init(gpa);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    var hub = try Repo.init(gpa, &.{});
+    defer hub.deinit(gpa);
+    var b = try Repo.init(gpa, &.{});
+    defer b.deinit(gpa);
+    const cwd = try std.process.currentPathAlloc(io, arena);
+    const hub_url = try std.fmt.allocPrint(arena, "{s}/{s}", .{ cwd, hub.path });
+    try runGit(gpa, &b.env, b.path, &.{ "git", "remote", "add", "origin", hub_url });
+
+    var gh = try hub.open(gpa);
+    defer gh.close();
+    var gb = try b.open(gpa);
+    defer gb.close();
+    const one = "refs/issues/a7f3b2c1-4e5d-4a8b-9c1e-2f3a4b5c6d7e";
+    const two = "refs/issues/b8e4c3d2-5f6e-4b9c-8d2f-3a4b5c6d7e8f";
+    const root = try gh.writeObject(.commit, try commitBytes(arena, .sha1, &.{}, "root\n"));
+    try gh.updateRefs(&.{
+        .{ .name = one, .op = .{ .create = root } },
+        .{ .name = two, .op = .{ .create = root } },
+    });
+
+    const specs: []const []const u8 = &.{
+        "+refs/issues/*:refs/issuez-sync/origin/seen/issues/*",
+        "+refs/milestones/*:refs/issuez-sync/origin/seen/milestones/*",
+    };
+    try gb.fetch(arena, "origin", specs, true);
+    try testing.expectEqual(@as(usize, 2), (try gb.listRefs(arena, "refs/issuez-sync/")).len);
+    // Refs outside the destinations stay.
+    try gb.updateRefs(&.{.{ .name = "refs/issuez-sync/origin/merged/issues/x", .op = .{ .create = root } }});
+
+    try gh.updateRefs(&.{.{ .name = two, .op = .{ .delete = root } }});
+    try gb.fetch(arena, "origin", specs, true);
+    const left = try gb.listRefs(arena, "refs/issuez-sync/");
+    try testing.expectEqual(@as(usize, 2), left.len);
+    try testing.expectEqualStrings("refs/issuez-sync/origin/merged/issues/x", left[0].name);
+    try testing.expectEqualStrings("refs/issuez-sync/origin/seen/issues/" ++ one["refs/issues/".len..], left[1].name);
 }
 
 test "pre-push hook" {
@@ -443,4 +544,78 @@ test "pre-push hook" {
     try testing.expect(!pushed.rejected());
     const log = try std.Io.Dir.cwd().readFileAlloc(io, seen, arena, .limited(4096));
     try testing.expect(std.mem.find(u8, log, name) != null);
+}
+
+test "a hung git times out" {
+    const gpa = testing.allocator;
+    var arena_state: std.heap.ArenaAllocator = .init(gpa);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    var hub = try Repo.init(gpa, &.{"--bare"});
+    defer hub.deinit(gpa);
+    var a = try Repo.init(gpa, &.{});
+    defer a.deinit(gpa);
+    const cwd = try std.process.currentPathAlloc(io, arena);
+    const hub_url = try std.fmt.allocPrint(arena, "{s}/{s}", .{ cwd, hub.path });
+    try runGit(gpa, &a.env, a.path, &.{ "git", "remote", "add", "origin", hub_url });
+    // Would hold back the sessions' answers.
+    try a.env.put("GIT_FLUSH", "0");
+
+    var ga = try a.open(gpa);
+    defer ga.close();
+    ga.timeouts.request = .fromSeconds(5);
+    const one = "refs/issues/a7f3b2c1-4e5d-4a8b-9c1e-2f3a4b5c6d7e";
+    const two = "refs/issues/b8e4c3d2-5f6e-4b9c-8d2f-3a4b5c6d7e8f";
+    const root = try ga.writeObject(.commit, try commitBytes(arena, .sha1, &.{}, "root\n"));
+    try testing.expect(ga.hash_objects[@intFromEnum(object.ObjectKind.commit)] != null);
+
+    const hooks = try std.fmt.allocPrint(arena, "{s}/.git/hooks", .{a.path});
+    const rt = try std.fmt.allocPrint(arena, "{s}/reference-transaction", .{hooks});
+    const pp = try std.fmt.allocPrint(arena, "{s}/pre-push", .{hooks});
+    const short: GitProcess.Timeouts = .{
+        .command = .fromMilliseconds(300),
+        .network = .fromMilliseconds(300),
+    };
+    const started = std.Io.Clock.awake.now(io);
+
+    // update-ref, with its input on stdin, waits on its hook before the
+    // refs move...
+    try writeHook(gpa, &a.env, rt, "#!/bin/sh\nexec sleep 10\n");
+    ga.timeouts = short;
+    try testing.expectError(
+        error.GitTimedOut,
+        ga.updateRefs(&.{.{ .name = one, .op = .{ .create = root } }}),
+    );
+    ga.timeouts = .{};
+    try testing.expect(try ga.resolveRef(one) == null);
+
+    // ...or after: then the update is done.
+    try writeHook(gpa, &a.env, rt, "#!/bin/sh\ntest \"$1\" = committed && exec sleep 10\nexit 0\n");
+    ga.timeouts = short;
+    try ga.updateRefs(&.{.{ .name = one, .op = .{ .create = root } }});
+    ga.timeouts = .{};
+    try testing.expect((try ga.resolveRef(one)).?.eql(root));
+    try std.Io.Dir.cwd().deleteFile(io, rt);
+    try ga.updateRefs(&.{.{ .name = two, .op = .{ .create = root } }});
+
+    // push, under the network limit.
+    try writeHook(gpa, &a.env, pp, "#!/bin/sh\nexec sleep 10\n");
+    ga.timeouts = short;
+    try testing.expectError(
+        error.GitTimedOut,
+        ga.push(arena, "origin", &.{one ++ ":" ++ one}, true),
+    );
+    const took = started.durationTo(std.Io.Clock.awake.now(io));
+    try testing.expect(took.toSeconds() < 5);
+}
+
+fn writeHook(
+    gpa: Allocator,
+    env: *const std.process.Environ.Map,
+    path: []const u8,
+    script: []const u8,
+) !void {
+    try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = path, .data = script });
+    try runGit(gpa, env, ".", &.{ "chmod", "+x", path });
 }

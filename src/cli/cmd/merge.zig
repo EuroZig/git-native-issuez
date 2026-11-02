@@ -95,7 +95,9 @@ pub fn main(
         output.printMerge(ctx.out, ctx.err, r, report, check);
     }
     if (mode == .push or mode == .sync) {
-        const report = s.push(arena, r) catch |e| return syncError(B, ctx, e, r);
+        // A fetching merge just brought `seen/` up to date.
+        const pushed = if (mode == .sync and fetch) s.pushFetched(arena, r, .{}) else s.push(arena, r);
+        const report = pushed catch |e| return syncError(B, ctx, e, r);
         output.printPush(ctx.out, ctx.err, r, report);
     }
     return common.exit_ok;

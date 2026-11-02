@@ -92,24 +92,43 @@ pub fn openRepo(comptime B: type, ctx: *context.Context(B)) ?engine.Repo(B) {
         reportOpenError(ctx.err, err);
         return null;
     };
-    warnUnsafeRefspecs(B, backend, ctx.arena, ctx.err);
+    // One git call for every setting read here.
+    const config = backend.configList(ctx.arena) catch {
+        ctx.err.writeAll("error: could not read git config\n") catch {};
+        return null;
+    };
+    warnUnsafeRefspecs(ctx.arena, config, ctx.err);
     var repo = engine.Repo(B).init(backend);
-    repo.done_states = doneStates(B, backend, ctx.arena, ctx.err) orelse return null;
+    repo.done_states = doneStates(ctx.arena, config, ctx.err) orelse return null;
+    ctx.workflow_states = lastValue(config, "issue.workflowstates");
+    // One listing of the issues per command, until a write.
+    repo.listing = ctx.arena.create(engine.Repo(B).Listing) catch {
+        _ = oom(ctx.err);
+        return null;
+    };
+    repo.listing.?.* = .{};
     return repo;
+}
+
+/// The last one wins, like `git config --get`. `key` as `--list` gives
+/// it: section and name lowercase.
+fn lastValue(config: anytype, key: []const u8) ?[]const u8 {
+    var found: ?[]const u8 = null;
+    for (config) |e| if (std.mem.eql(u8, e.key, key)) {
+        found = e.value;
+    };
+    return found;
 }
 
 /// `git config issue.doneStates "wontfix,duplicate"`: the states besides
 /// `closed` that count as done. Empty for none.
 fn doneStates(
-    comptime B: type,
-    backend: *B,
     arena: std.mem.Allocator,
+    config: anytype,
     err: *std.Io.Writer,
 ) ?[]const []const u8 {
-    const raw = backend.configGet(arena, "issue.doneStates") catch {
-        err.writeAll("error: could not read git config issue.doneStates\n") catch {};
-        return null;
-    } orelse return &issuez.format.core.default_done_states;
+    const raw = lastValue(config, "issue.donestates") orelse
+        return &issuez.format.core.default_done_states;
     var out: std.ArrayList([]const u8) = .empty;
     var it = std.mem.splitScalar(u8, raw, ',');
     while (it.next()) |part| {
@@ -140,31 +159,27 @@ pub fn openRepoQuiet(comptime B: type, ctx: *context.Context(B)) ?engine.Repo(B)
 /// Upstream's `init` sets `+refs/issues/*:refs/issues/*`, so a plain
 /// `git fetch` can overwrite local issue refs and lose unpushed commits.
 /// We warn on every command until it is fixed.
-fn warnUnsafeRefspecs(
-    comptime B: type,
-    backend: *B,
-    arena: std.mem.Allocator,
-    err: *std.Io.Writer,
-) void {
-    const remotes = backend.remoteNames(arena) catch return;
-    for (remotes) |remote| {
-        const key = std.fmt.allocPrint(arena, "remote.{s}.fetch", .{remote}) catch return;
-        const specs = backend.configGetAll(arena, key) catch continue;
-        for (specs) |spec| {
-            if (!std.mem.eql(
-                u8,
-                std.mem.trimStart(u8, spec, "+"),
-                "refs/issues/*:refs/issues/*",
-            )) continue;
-            err.print(
-                "warning: remote '{s}' fetches straight into refs/issues/*\n" ++
-                    "         (set by upstream git-issue init). A plain 'git fetch' can then\n" ++
-                    "         overwrite local issues and drop unpushed changes.\n" ++
-                    "         Fix with: git issue init {s} --fix-refspec\n",
-                .{ remote, remote },
-            ) catch {};
-            break;
-        }
+fn warnUnsafeRefspecs(arena: std.mem.Allocator, config: anytype, err: *std.Io.Writer) void {
+    var warned: std.ArrayList([]const u8) = .empty;
+    for (config) |e| {
+        if (!std.mem.startsWith(u8, e.key, "remote.") or !std.mem.endsWith(u8, e.key, ".fetch"))
+            continue;
+        if (e.key.len <= "remote.".len + ".fetch".len) continue;
+        const remote = e.key["remote.".len .. e.key.len - ".fetch".len];
+        if (!std.mem.eql(u8, std.mem.trimStart(u8, e.value, "+"), "refs/issues/*:refs/issues/*"))
+            continue;
+        const seen = for (warned.items) |w| {
+            if (std.mem.eql(u8, w, remote)) break true;
+        } else false;
+        if (seen) continue;
+        warned.append(arena, remote) catch return;
+        err.print(
+            "warning: remote '{s}' fetches straight into refs/issues/*\n" ++
+                "         (set by upstream git-issue init). A plain 'git fetch' can then\n" ++
+                "         overwrite local issues and drop unpushed changes.\n" ++
+                "         Fix with: git issue init {s} --fix-refspec\n",
+            .{ remote, remote },
+        ) catch {};
     }
 }
 
@@ -275,6 +290,7 @@ pub fn reportEngineError(err: *std.Io.Writer, e: anyerror) void {
         error.GitFailed => "error: a git command failed\n",
         error.GitSpawnFailed => "fatal: could not run git (is it installed and on PATH?)\n",
         error.OutputTooLong => "error: git produced more output than allowed\n",
+        error.GitTimedOut => "error: git took too long and was stopped\n",
         else => {
             err.print("error: {t}\n", .{e}) catch {};
             return;

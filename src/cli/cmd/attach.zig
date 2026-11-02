@@ -126,7 +126,7 @@ pub fn main(comptime B: type, ctx: *context.Context(B), argv: []const []const u8
         },
         .ls => {
             const issue = repo.load(arena, ref) catch |e| return common.repoFailed(B, ctx, e);
-            const entries = att.list(arena, issue) catch |e| return common.repoFailed(B, ctx, e);
+            const entries = att.list(arena, issue, .{}) catch |e| return common.repoFailed(B, ctx, e);
             if (as_json) {
                 var s = json.begin(ctx.out);
                 json.attachmentList(&s, entries) catch |e| return json.failed(ctx.err, e);

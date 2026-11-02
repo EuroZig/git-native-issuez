@@ -1,12 +1,15 @@
 //! Backend that runs the `git` binary found in PATH.
 //!
-//! Children get `LC_ALL=C` and `GIT_TERMINAL_PROMPT=0` and run in the
-//! repository, and their output is bounded. Reads go through one long-lived
-//! `git cat-file --batch`, ref changes through `git update-ref --stdin`.
+//! Children get `LC_ALL=C`, `GIT_TERMINAL_PROMPT=0` and `GIT_FLUSH=1` and run in the
+//! repository, and their output and time are bounded. Reads go through one long-lived
+//! `git cat-file --batch`, object writes through one long-lived
+//! `git hash-object --stdin-paths` per type, ref changes through
+//! `git update-ref --stdin`.
 
 const GitProcess = @This();
 
 const std = @import("std");
+const builtin = @import("builtin");
 const assert = std.debug.assert;
 const Allocator = std.mem.Allocator;
 const Io = std.Io;
@@ -24,9 +27,14 @@ gpa: Allocator,
 env: std.process.Environ.Map,
 repo_path: []u8,
 format: ObjectFormat,
+timeouts: Timeouts,
 cat_file: ?*CatFile,
-/// Resolved on first LFS use.
+/// One per object type, started on first use.
+hash_objects: [std.enums.values(ObjectKind).len]?*HashObject = @splat(null),
+/// Absolute, resolved at open.
 common_dir: ?[]u8 = null,
+/// `$GIT_DIR/issuez/tmp`, created and swept on the first object write.
+tmp_dir: ?[]u8 = null,
 /// git-lfs's object directory, resolved on first use.
 git_lfs_dir: ?[]u8 = null,
 /// Whether `git lfs version` runs, checked once.
@@ -44,6 +52,8 @@ pub const Error = error{
     GitTooOld,
     NotARepository,
     OutputTooLong,
+    /// Took longer than its `Timeouts` allow, and was killed.
+    GitTimedOut,
     Canceled,
     /// Reading or writing an LFS store file failed.
     StoreFailed,
@@ -57,11 +67,29 @@ const max_stdout_bytes = 64 * 1024 * 1024;
 const max_stderr_bytes = 64 * 1024;
 const max_stderr_kept = 1024;
 const max_object_bytes = 64 * 1024 * 1024;
+/// POSIX's PIPE_BUF.
+const pipe_buf = if (builtin.os.tag == .linux) 4096 else 512;
 
 pub const OpenOptions = struct {
     /// Any directory inside the repository, or the git dir of a bare one.
     path: []const u8,
     environ_map: *const std.process.Environ.Map,
+    timeouts: Timeouts = .{},
+};
+
+/// The longest a call may take, start to finish, before git is stopped and
+/// the call fails with `GitTimedOut`. Generous, so that a slow call still
+/// finishes: they are there for a git that hangs, on a hook, a credential
+/// helper or a dead connection. git gets SIGTERM, so it removes its locks.
+pub const Timeouts = struct {
+    /// A local command, from start to exit.
+    command: Io.Duration = .fromSeconds(120),
+    /// One request to the long-lived `cat-file` or `hash-object`.
+    request: Io.Duration = .fromSeconds(60),
+    /// `fetch` and `push`, from start to exit.
+    network: Io.Duration = .fromSeconds(600),
+    /// One batch of git-lfs transfers, from start to exit.
+    transfer: Io.Duration = .fromSeconds(1800),
 };
 
 pub fn open(io: Io, gpa: Allocator, options: OpenOptions) Error!GitProcess {
@@ -69,6 +97,8 @@ pub fn open(io: Io, gpa: Allocator, options: OpenOptions) Error!GitProcess {
     errdefer env.deinit();
     try env.put("LC_ALL", "C");
     try env.put("GIT_TERMINAL_PROMPT", "0");
+    // The sessions wait for each answer; `GIT_FLUSH=0` would hold them back.
+    try env.put("GIT_FLUSH", "1");
 
     const repo_path = try gpa.dupe(u8, options.path);
     errdefer gpa.free(repo_path);
@@ -79,6 +109,7 @@ pub fn open(io: Io, gpa: Allocator, options: OpenOptions) Error!GitProcess {
         .env = env,
         .repo_path = repo_path,
         .format = .sha1,
+        .timeouts = options.timeouts,
         .cat_file = null,
         .last_stderr = undefined,
         .last_stderr_len = 0,
@@ -88,21 +119,35 @@ pub fn open(io: Io, gpa: Allocator, options: OpenOptions) Error!GitProcess {
     defer arena_state.deinit();
     const arena = arena_state.allocator();
 
-    const version_out = try gp.runOk(arena, &.{ "git", "version" }, null);
-    const version = parseGitVersion(version_out) orelse return error.GitFailed;
+    const both = try gp.runPair(
+        arena,
+        &.{ "git", "version" },
+        &.{ "git", "rev-parse", "--show-object-format", "--git-common-dir" },
+    );
+    if (!both[0].ok()) {
+        gp.keepStderr(both[0].stderr);
+        return error.GitFailed;
+    }
+    const version = parseGitVersion(both[0].stdout) orelse return error.GitFailed;
     if (version.order(min_git_version) == .lt) return error.GitTooOld;
 
-    const fmt = gp.run(arena, &.{ "git", "rev-parse", "--show-object-format" }, null) catch |err|
-        return err;
-    if (!fmt.ok()) return error.NotARepository;
-    gp.format = ObjectFormat.parse(std.mem.trimEnd(u8, fmt.stdout, "\n")) orelse
-        return error.GitFailed;
+    const rp = both[1];
+    if (!rp.ok()) return error.NotARepository;
+    var lines = std.mem.splitScalar(u8, rp.stdout, '\n');
+    gp.format = ObjectFormat.parse(lines.next() orelse "") orelse return error.GitFailed;
+    const common = lines.next() orelse return error.GitFailed;
+    if (common.len == 0) return error.GitFailed;
+    // Absolute for real: git reads the temp files' paths from its own cwd.
+    const cwd = std.process.currentPathAlloc(io, arena) catch return error.GitFailed;
+    gp.common_dir = try std.fs.path.resolve(gpa, &.{ cwd, repo_path, common });
     return gp;
 }
 
 pub fn close(gp: *GitProcess) void {
     if (gp.cat_file) |cf| cf.deinit(gp.io, gp.gpa);
+    for (gp.hash_objects) |h| if (h) |ho| ho.deinit(gp.io, gp.gpa);
     if (gp.common_dir) |d| gp.gpa.free(d);
+    if (gp.tmp_dir) |d| gp.gpa.free(d);
     if (gp.git_lfs_dir) |d| gp.gpa.free(d);
     gp.env.deinit();
     gp.gpa.free(gp.repo_path);
@@ -120,7 +165,7 @@ pub fn objectFormat(gp: *const GitProcess) ObjectFormat {
 pub fn readObject(gp: *GitProcess, arena: Allocator, oid: Oid) Error!?contract.Object {
     assert(oid.object_format == gp.format);
     const cf = try gp.catFile();
-    return cf.read(arena, oid) catch |err| {
+    return cf.read(arena, oid, gp.deadline(gp.timeouts.request)) catch |err| {
         // A broken session can't be reused. The next read starts a new one.
         cf.deinit(gp.io, gp.gpa);
         gp.cat_file = null;
@@ -128,7 +173,18 @@ pub fn readObject(gp: *GitProcess, arena: Allocator, oid: Oid) Error!?contract.O
     };
 }
 
+/// git writes the object, so its permissions, fsync and checks apply. The
+/// data goes through a temporary file to the type's `hash-object` session;
+/// if that fails, a one-off `hash-object` says why.
 pub fn writeObject(gp: *GitProcess, kind: ObjectKind, data: []const u8) Error!Oid {
+    if (gp.writeObjectSession(kind, data)) |oid| {
+        assert(oid.eql(object.hashObject(gp.format, kind, data)));
+        return oid;
+    } else |err| switch (err) {
+        // Another git would wait on whatever this one waited on.
+        error.OutOfMemory, error.Canceled, error.GitTimedOut => |e| return e,
+        else => {},
+    }
     var arena_state: std.heap.ArenaAllocator = .init(gp.gpa);
     defer arena_state.deinit();
     const out = try gp.runOk(
@@ -144,21 +200,97 @@ pub fn writeObject(gp: *GitProcess, kind: ObjectKind, data: []const u8) Error!Oi
     return oid;
 }
 
+fn writeObjectSession(gp: *GitProcess, kind: ObjectKind, data: []const u8) Error!Oid {
+    var arena_state: std.heap.ArenaAllocator = .init(gp.gpa);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const dir = try gp.tmpDir();
+    var suffix: [8]u8 = undefined;
+    gp.io.random(&suffix);
+    const path = try std.fmt.allocPrint(arena, "{s}/object-{x}", .{ dir, suffix });
+    // git reads one path per line and unquotes a line starting with '"';
+    // the one-off fallback takes such a repository path.
+    if (std.mem.findScalar(u8, path, '\n') != null or path[0] == '"') return error.GitFailed;
+    const slot = &gp.hash_objects[@intFromEnum(kind)];
+    if (slot.* == null) slot.* = try HashObject.start(gp, kind);
+    const ho = slot.*.?;
+
+    const cwd = Io.Dir.cwd();
+    {
+        const file = cwd.createFile(gp.io, path, .{ .exclusive = true }) catch
+            return error.GitFailed;
+        defer file.close(gp.io);
+        file.writeStreamingAll(gp.io, data) catch {
+            cwd.deleteFile(gp.io, path) catch {};
+            return error.GitFailed;
+        };
+    }
+    defer cwd.deleteFile(gp.io, path) catch {};
+    return ho.hash(path, gp.deadline(gp.timeouts.request)) catch |err| {
+        ho.deinit(gp.io, gp.gpa);
+        slot.* = null;
+        return err;
+    };
+}
+
+/// Temporary files older than this are left over from a process that
+/// died mid-write.
+const tmp_max_age_ns = 24 * std.time.ns_per_hour;
+
+fn tmpDir(gp: *GitProcess) Error![]const u8 {
+    if (gp.tmp_dir) |d| return d;
+    const dir = try std.fs.path.join(gp.gpa, &.{ gp.common_dir.?, "issuez", "tmp" });
+    errdefer gp.gpa.free(dir);
+    const cwd = Io.Dir.cwd();
+    cwd.createDirPath(gp.io, dir) catch return error.GitFailed;
+    gp.tmp_dir = dir;
+    gp.sweepTmp(dir);
+    return dir;
+}
+
+/// Best effort: a stale file only takes space.
+fn sweepTmp(gp: *GitProcess, dir_path: []const u8) void {
+    var dir = Io.Dir.cwd().openDir(gp.io, dir_path, .{ .iterate = true }) catch return;
+    defer dir.close(gp.io);
+    const now = Io.Clock.real.now(gp.io).nanoseconds;
+    var it = dir.iterate();
+    while (it.next(gp.io) catch return) |e| {
+        if (e.kind != .file or !std.mem.startsWith(u8, e.name, "object-")) continue;
+        const st = dir.statFile(gp.io, e.name, .{}) catch continue;
+        if (now - st.mtime.nanoseconds < tmp_max_age_ns) continue;
+        dir.deleteFile(gp.io, e.name) catch {};
+    }
+}
+
+/// Through the `cat-file` session rather than a `rev-parse` per ref. It
+/// reads the ref each time, so it sees changes made since.
 pub fn resolveRef(gp: *GitProcess, name: []const u8) Error!?Oid {
     assert(contract.isValidRefName(name));
+    const cf = try gp.catFile();
+    const found = cf.resolve(name, gp.deadline(gp.timeouts.request)) catch |err| {
+        cf.deinit(gp.io, gp.gpa);
+        gp.cat_file = null;
+        return err;
+    };
+    return switch (found) {
+        .oid => |oid| oid,
+        // No such ref, or one whose object is missing: only `rev-parse`
+        // tells them apart, and a missing object is still the ref's value.
+        .missing => gp.revParseRef(name),
+    };
+}
+
+fn revParseRef(gp: *GitProcess, name: []const u8) Error!?Oid {
     var arena_state: std.heap.ArenaAllocator = .init(gp.gpa);
     defer arena_state.deinit();
     const result = try gp.run(
         arena_state.allocator(),
-        &.{ "git", "rev-parse", "--verify", "--quiet", "--end-of-options", name },
+        &.{ "git", "rev-parse", "-q", "--verify", "--end-of-options", name },
         null,
     );
-    if (!result.ok()) {
-        if (result.exitCode() == 1) return null;
-        gp.keepStderr(result.stderr);
-        return error.GitFailed;
-    }
-    return Oid.parseHex(gp.format, std.mem.trimEnd(u8, result.stdout, "\n")) catch error.GitFailed;
+    if (!result.ok()) return null;
+    return Oid.parseHex(gp.format, std.mem.trimEnd(u8, result.stdout, "\n")) catch
+        error.GitFailed;
 }
 
 pub fn listRefs(gp: *GitProcess, arena: Allocator, prefix: []const u8) Error![]contract.RefEntry {
@@ -201,24 +333,40 @@ pub fn updateRefs(
         written catch return error.OutOfMemory;
     }
 
-    const result = try gp.run(arena, &.{ "git", "update-ref", "--stdin" }, aw.written());
+    const result = gp.run(arena, &.{ "git", "update-ref", "--stdin" }, aw.written()) catch |err|
+        switch (err) {
+            // Hooks also run once the refs have moved, so it may be done.
+            error.GitTimedOut => if (try gp.refsAre(updates, .new)) return else return err,
+            else => return err,
+        };
     if (result.ok()) return;
 
     // Tell a lost CAS race from other failures by re-reading the expected
     // values.
+    if (!try gp.refsAre(updates, .old)) return error.RefConflict;
+    gp.keepStderr(result.stderr);
+    return error.GitFailed;
+}
+
+/// Whether every ref has the value it should have before, or after, the
+/// updates.
+fn refsAre(
+    gp: *GitProcess,
+    updates: []const contract.RefUpdate,
+    side: enum { old, new },
+) Error!bool {
     for (updates) |u| {
         const expected: ?Oid = switch (u.op) {
-            .create => null,
-            .update => |x| x.old,
-            .delete => |old| old,
+            .create => |new| if (side == .new) new else null,
+            .update => |x| if (side == .new) x.new else x.old,
+            .delete => |old| if (side == .new) null else old,
             .verify => |old| old,
         };
         const actual = try gp.resolveRef(u.name);
         const same = if (expected) |e| (actual != null and actual.?.eql(e)) else actual == null;
-        if (!same) return error.RefConflict;
+        if (!same) return false;
     }
-    gp.keepStderr(result.stderr);
-    return error.GitFailed;
+    return true;
 }
 
 pub fn isAncestor(gp: *GitProcess, ancestor: Oid, descendant: Oid) Error!bool {
@@ -305,6 +453,26 @@ pub fn configUnsetValue(gp: *GitProcess, key: []const u8, value: []const u8) Err
     }
 }
 
+pub const ConfigEntry = struct { key: []const u8, value: []const u8 };
+
+/// Every config entry in git's order, keys as `git config --list` prints
+/// them (section and name lowercase). Not part of the contract: the CLI
+/// reads its settings with it in one git call.
+pub fn configList(gp: *GitProcess, arena: Allocator) Error![]const ConfigEntry {
+    const out = try gp.runOk(arena, &.{ "git", "config", "--list", "-z" }, null);
+    var entries: std.ArrayList(ConfigEntry) = .empty;
+    var it = std.mem.tokenizeScalar(u8, out, 0);
+    while (it.next()) |item| {
+        // A key without `=` in the file has no value, and no newline here.
+        const nl = std.mem.findScalar(u8, item, '\n');
+        try entries.append(arena, .{
+            .key = if (nl) |n| item[0..n] else item,
+            .value = if (nl) |n| item[n + 1 ..] else "",
+        });
+    }
+    return entries.items;
+}
+
 pub fn remoteNames(gp: *GitProcess, arena: Allocator) Error![]const []const u8 {
     return splitLines(arena, try gp.runOk(arena, &.{ "git", "remote" }, null));
 }
@@ -312,24 +480,22 @@ pub fn remoteNames(gp: *GitProcess, arena: Allocator) Error![]const []const u8 {
 /// Only the given refspecs write refs: `--refmap=` stops git from also
 /// updating refs through `remote.<name>.fetch`, which with upstream's
 /// `+refs/issues/*:refs/issues/*` would reset unpushed local issues. Tags
-/// and FETCH_HEAD are left alone.
+/// and FETCH_HEAD are left alone. `prune` deletes the refs under the
+/// refspecs' destinations that the remote no longer has.
 pub fn fetch(
     gp: *GitProcess,
     arena: Allocator,
     remote: []const u8,
     refspecs: []const []const u8,
+    prune: bool,
 ) (Error || error{FetchFailed})!void {
     assert(contract.isValidRemoteName(remote));
     var argv: std.ArrayList([]const u8) = .empty;
-    try argv.appendSlice(
-        arena,
-        &.{
-            "git",     "fetch", "--no-tags", "--no-write-fetch-head", "--refmap=",
-            "--quiet", "--",    remote,
-        },
-    );
+    try argv.appendSlice(arena, &.{ "git", "fetch", "--no-tags", "--no-write-fetch-head" });
+    if (prune) try argv.append(arena, "--prune");
+    try argv.appendSlice(arena, &.{ "--refmap=", "--quiet", "--", remote });
     try argv.appendSlice(arena, refspecs);
-    const result = try gp.run(arena, argv.items, null);
+    const result = try gp.runWithin(arena, argv.items, null, gp.timeouts.network);
     if (!result.ok()) {
         gp.keepStderr(result.stderr);
         return error.FetchFailed;
@@ -358,7 +524,7 @@ pub fn push(
     if (atomic) try argv.append(arena, "--atomic");
     try argv.appendSlice(arena, &.{ "--", remote });
     try argv.appendSlice(arena, refspecs);
-    const result = try gp.run(arena, argv.items, null);
+    const result = try gp.runWithin(arena, argv.items, null, gp.timeouts.network);
     if (atomic and !result.ok() and std.mem.find(
         u8,
         result.stderr,
@@ -408,25 +574,21 @@ pub fn identity(
     gp: *GitProcess,
     arena: Allocator,
 ) (Error || error{IdentityUnknown})!contract.Identity {
+    // Like upstream, insist on a configured identity. Without useConfigOnly
+    // git makes one up from the login and hostname, and that would end up
+    // in the issue history. (`git var -l` ignores it, so two calls.)
+    const both = try gp.runPair(
+        arena,
+        &.{ "git", "-c", "user.useConfigOnly=true", "var", "GIT_AUTHOR_IDENT" },
+        &.{ "git", "-c", "user.useConfigOnly=true", "var", "GIT_COMMITTER_IDENT" },
+    );
     return .{
-        .author = try gp.ident(arena, "GIT_AUTHOR_IDENT"),
-        .committer = try gp.ident(arena, "GIT_COMMITTER_IDENT"),
+        .author = try gp.ident(both[0]),
+        .committer = try gp.ident(both[1]),
     };
 }
 
-fn ident(
-    gp: *GitProcess,
-    arena: Allocator,
-    variable: []const u8,
-) (Error || error{IdentityUnknown})!Signature {
-    // Like upstream, insist on a configured identity. Without useConfigOnly
-    // git makes one up from the login and hostname, and that would end up
-    // in the issue history.
-    const result = try gp.run(
-        arena,
-        &.{ "git", "-c", "user.useConfigOnly=true", "var", variable },
-        null,
-    );
+fn ident(gp: *GitProcess, result: RunResult) (Error || error{IdentityUnknown})!Signature {
     if (!result.ok()) {
         gp.keepStderr(result.stderr);
         return error.IdentityUnknown;
@@ -438,13 +600,13 @@ pub fn randomBytes(gp: *GitProcess, buf: []u8) void {
     gp.io.random(buf);
 }
 
+/// `issuez` is `$GIT_DIR/issuez/lfs/objects/`, the store; `git lfs prune`
+/// doesn't look there. `git_lfs` is git-lfs's (`$GIT_DIR/lfs/objects/` or
+/// `lfs.storage`), only a copy for transfers.
+const Store = enum { issuez, git_lfs };
+
 /// The directory holding `ab/cd/<sha256>`.
-fn lfsObjectsDir(gp: *GitProcess, arena: Allocator, store: contract.LfsStore) Error![]const u8 {
-    if (gp.common_dir == null) {
-        const out = try gp.runOk(arena, &.{ "git", "rev-parse", "--git-common-dir" }, null);
-        const rel = std.mem.trimEnd(u8, out, "\n");
-        gp.common_dir = try std.fs.path.resolve(gp.gpa, &.{ gp.repo_path, rel });
-    }
+fn lfsObjectsDir(gp: *GitProcess, arena: Allocator, store: Store) Error![]const u8 {
     const common = gp.common_dir.?;
     switch (store) {
         .issuez => return std.fs.path.join(arena, &.{ common, "issuez", "lfs", "objects" }),
@@ -472,12 +634,42 @@ fn isSha256Hex(s: []const u8) bool {
     return s.len == 64 and hex_fmt.isLower(s);
 }
 
-pub fn lfsRead(
-    gp: *GitProcess,
-    arena: Allocator,
-    store: contract.LfsStore,
-    sha256: []const u8,
-) Error!?[]const u8 {
+/// Our copy when it hashes right. Otherwise git-lfs's, e.g. after a
+/// `git lfs fetch`, put into our store when it hashes right; else whatever
+/// we have.
+pub fn lfsRead(gp: *GitProcess, arena: Allocator, sha256: []const u8) Error!?[]const u8 {
+    const ours = try gp.readStore(arena, .issuez, sha256);
+    if (ours) |data| if (hashes(data, sha256)) return data;
+    const theirs = (try gp.readStore(arena, .git_lfs, sha256)) orelse return ours;
+    if (!hashes(theirs, sha256)) return ours orelse theirs;
+    try gp.writeStore(.issuez, sha256, theirs);
+    return theirs;
+}
+
+/// The size of our copy, without reading it.
+pub fn lfsSize(gp: *GitProcess, sha256: []const u8) Error!?u64 {
+    var arena_state: std.heap.ArenaAllocator = .init(gp.gpa);
+    defer arena_state.deinit();
+    return gp.storeSize(arena_state.allocator(), .issuez, sha256);
+}
+
+fn storeSize(gp: *GitProcess, arena: Allocator, store: Store, sha256: []const u8) Error!?u64 {
+    const path = try lfsPath(arena, try gp.lfsObjectsDir(arena, store), sha256);
+    const st = Io.Dir.cwd().statFile(gp.io, path, .{}) catch |e| switch (e) {
+        error.FileNotFound, error.NotDir => return null,
+        else => return storeError(e),
+    };
+    return if (st.kind == .file) st.size else null;
+}
+
+fn hashes(data: []const u8, sha256: []const u8) bool {
+    var digest: [32]u8 = undefined;
+    std.crypto.hash.sha2.Sha256.hash(data, &digest, .{});
+    const hex = std.fmt.bytesToHex(digest, .lower);
+    return std.mem.eql(u8, &hex, sha256);
+}
+
+fn readStore(gp: *GitProcess, arena: Allocator, store: Store, sha256: []const u8) Error!?[]const u8 {
     const path = try lfsPath(arena, try gp.lfsObjectsDir(arena, store), sha256);
     // The limit fails once reached, and a maximal object is valid.
     const limit: Io.Limit = .limited(attachment_fmt.max_object_bytes + 1);
@@ -490,14 +682,13 @@ pub fn lfsRead(
         };
 }
 
+pub fn lfsWrite(gp: *GitProcess, sha256: []const u8, data: []const u8) Error!void {
+    return gp.writeStore(.issuez, sha256, data);
+}
+
 /// Temp file, fsync, rename, so a crash leaves nothing or the whole
 /// object. Replaces an existing copy, which may be damaged.
-pub fn lfsWrite(
-    gp: *GitProcess,
-    store: contract.LfsStore,
-    sha256: []const u8,
-    data: []const u8,
-) Error!void {
+fn writeStore(gp: *GitProcess, store: Store, sha256: []const u8, data: []const u8) Error!void {
     var arena_state: std.heap.ArenaAllocator = .init(gp.gpa);
     defer arena_state.deinit();
     const arena = arena_state.allocator();
@@ -527,7 +718,8 @@ pub fn lfsWrite(
     };
 }
 
-/// Only uploads what the server doesn't have yet.
+/// Copies each object into git-lfs's store first, where `git lfs push`
+/// looks. Only uploads what the server doesn't have yet.
 pub fn lfsPush(
     gp: *GitProcess,
     arena: Allocator,
@@ -536,6 +728,12 @@ pub fn lfsPush(
 ) (Error || contract.LfsTransportError)!void {
     assert(contract.isValidRemoteName(remote));
     try gp.requireGitLfs(arena);
+    for (shas) |s| {
+        assert(isSha256Hex(s));
+        if (try gp.storeSize(arena, .git_lfs, s) != null) continue;
+        const data = (try gp.readStore(arena, .issuez, s)) orelse return error.LfsTransferFailed;
+        try gp.writeStore(.git_lfs, s, data);
+    }
     var start: usize = 0;
     while (start < shas.len) : (start += 64) {
         var argv: std.ArrayList([]const u8) = .empty;
@@ -544,7 +742,7 @@ pub fn lfsPush(
             assert(isSha256Hex(s));
             try argv.append(arena, s);
         }
-        const r = try gp.run(arena, argv.items, null);
+        const r = try gp.runWithin(arena, argv.items, null, gp.timeouts.transfer);
         if (!r.ok()) {
             gp.keepStderr(r.stderr);
             return error.LfsTransferFailed;
@@ -552,7 +750,7 @@ pub fn lfsPush(
     }
 }
 
-/// Downloads into git-lfs's store, in batches, the objects the trees of
+/// Downloads into git-lfs's store, where `lfsRead` finds them, in batches, the objects the trees of
 /// these refs or commit OIDs point at. Objects that arrived stay when a
 /// later batch, or an object in the same batch, fails.
 pub fn lfsFetch(
@@ -574,7 +772,7 @@ pub fn lfsFetch(
             assert(oid or contract.isValidRefName(r));
             try argv.append(arena, r);
         }
-        const r = try gp.run(arena, argv.items, null);
+        const r = try gp.runWithin(arena, argv.items, null, gp.timeouts.transfer);
         if (!r.ok()) {
             gp.keepStderr(r.stderr);
             failed = true;
@@ -608,12 +806,9 @@ fn storeError(e: anyerror) Error {
     };
 }
 
-pub fn lfsList(
-    gp: *GitProcess,
-    arena: Allocator,
-    store: contract.LfsStore,
-) Error![]const []const u8 {
-    const objects = try gp.lfsObjectsDir(arena, store);
+/// Our store only.
+pub fn lfsList(gp: *GitProcess, arena: Allocator) Error![]const []const u8 {
+    const objects = try gp.lfsObjectsDir(arena, .issuez);
     var out: std.ArrayList([]const u8) = .empty;
     var root = Io.Dir.cwd().openDir(gp.io, objects, .{ .iterate = true }) catch |e| switch (e) {
         error.FileNotFound, error.NotDir => return &.{},
@@ -676,13 +871,82 @@ fn run(
     argv: []const []const u8,
     stdin: ?[]const u8,
 ) Error!RunResult {
-    assert(argv.len > 0 and std.mem.eql(u8, argv[0], "git"));
+    return gp.runWithin(arena, argv, stdin, gp.timeouts.command);
+}
+
+fn runWithin(
+    gp: *GitProcess,
+    arena: Allocator,
+    argv: []const []const u8,
+    stdin: ?[]const u8,
+    limit: Io.Duration,
+) Error!RunResult {
     const io = gp.io;
-    var child = std.process.spawn(io, .{
+    const by = gp.deadline(limit);
+    var child = try gp.spawn(argv, stdin != null);
+    defer child.kill(io);
+
+    if (stdin) |data| {
+        var rest = data;
+        while (rest.len > 0) {
+            // A writable pipe takes this much without blocking, so the
+            // deadline holds while git isn't reading.
+            const done = try operateBy(io, .{ .file_write_streaming = .{
+                .file = child.stdin.?,
+                .data = &.{rest[0..@min(rest.len, pipe_buf)]},
+            } }, by);
+            rest = rest[done.file_write_streaming catch return error.GitFailed ..];
+        }
+        child.stdin.?.close(io);
+        child.stdin = null;
+    }
+    return gp.collect(arena, &child, by);
+}
+
+/// Two commands at once, for the cost of about one: git's startup is
+/// most of a short command's time.
+fn runPair(
+    gp: *GitProcess,
+    arena: Allocator,
+    a: []const []const u8,
+    b: []const []const u8,
+) Error![2]RunResult {
+    const by = gp.deadline(gp.timeouts.command);
+    var first = try gp.spawn(a, false);
+    defer first.kill(gp.io);
+    var second = try gp.spawn(b, false);
+    defer second.kill(gp.io);
+    return .{ try gp.collect(arena, &first, by), try gp.collect(arena, &second, by) };
+}
+
+fn deadline(gp: *GitProcess, limit: Io.Duration) Io.Timeout {
+    const t: Io.Timeout = .{ .duration = .{ .raw = limit, .clock = .awake } };
+    return t.toDeadline(gp.io);
+}
+
+/// One operation that fails with `GitTimedOut` at `by`.
+fn operateBy(io: Io, op: Io.Operation, by: Io.Timeout) Error!Io.Operation.Result {
+    var storage: [1]Io.Operation.Storage = undefined;
+    var batch: Io.Batch = .init(&storage);
+    batch.addAt(0, op);
+    batch.awaitConcurrent(io, by) catch |err| {
+        batch.cancel(io);
+        return switch (err) {
+            error.Timeout => error.GitTimedOut,
+            error.Canceled => error.Canceled,
+            else => error.GitFailed,
+        };
+    };
+    return batch.next().?.result;
+}
+
+fn spawn(gp: *GitProcess, argv: []const []const u8, stdin: bool) Error!std.process.Child {
+    assert(argv.len > 0 and std.mem.eql(u8, argv[0], "git"));
+    return std.process.spawn(gp.io, .{
         .argv = argv,
         .cwd = .{ .path = gp.repo_path },
         .environ_map = &gp.env,
-        .stdin = if (stdin != null) .pipe else .ignore,
+        .stdin = if (stdin) .pipe else .ignore,
         .stdout = .pipe,
         .stderr = .pipe,
     }) catch |err| switch (err) {
@@ -690,25 +954,27 @@ fn run(
         error.Canceled => return error.Canceled,
         else => return error.GitSpawnFailed,
     };
-    defer child.kill(io);
+}
 
-    if (stdin) |data| {
-        var stdin_writer = child.stdin.?.writerStreaming(io, &.{});
-        stdin_writer.interface.writeAll(data) catch return error.GitFailed;
-        child.stdin.?.close(io);
-        child.stdin = null;
-    }
-
+/// Reads a started command's output to the end and waits for it.
+fn collect(
+    gp: *GitProcess,
+    arena: Allocator,
+    child: *std.process.Child,
+    by: Io.Timeout,
+) Error!RunResult {
+    const io = gp.io;
     var mr_buffer: Io.File.MultiReader.Buffer(2) = undefined;
     var mr: Io.File.MultiReader = undefined;
     mr.init(arena, io, mr_buffer.toStreams(), &.{ child.stdout.?, child.stderr.? });
     defer mr.deinit();
 
-    while (mr.fill(256, .none)) |_| {
+    while (mr.fill(256, by)) |_| {
         if (mr.reader(0).buffered().len > max_stdout_bytes) return error.OutputTooLong;
         if (mr.reader(1).buffered().len > max_stderr_bytes) return error.OutputTooLong;
     } else |err| switch (err) {
         error.EndOfStream => {},
+        error.Timeout => return error.GitTimedOut,
         error.Canceled => return error.Canceled,
         else => return error.GitFailed,
     }
@@ -760,7 +1026,7 @@ const CatFile = struct {
     child: std.process.Child,
     format: ObjectFormat,
     writer: Io.File.Writer,
-    reader: Io.File.Reader,
+    reader: PipeReader,
     write_buf: [256]u8,
     read_buf: [64 * 1024]u8,
 
@@ -781,7 +1047,7 @@ const CatFile = struct {
         };
         cf.format = gp.format;
         cf.writer = cf.child.stdin.?.writerStreaming(gp.io, &cf.write_buf);
-        cf.reader = cf.child.stdout.?.readerStreaming(gp.io, &cf.read_buf);
+        cf.reader = .init(gp.io, cf.child.stdout.?, &cf.read_buf);
         return cf;
     }
 
@@ -790,13 +1056,14 @@ const CatFile = struct {
         gpa.destroy(cf);
     }
 
-    fn read(cf: *CatFile, arena: Allocator, oid: Oid) Error!?contract.Object {
+    fn read(cf: *CatFile, arena: Allocator, oid: Oid, by: Io.Timeout) Error!?contract.Object {
+        cf.reader.by = by;
         const w = &cf.writer.interface;
         w.print("{f}\n", .{oid}) catch return error.GitFailed;
         w.flush() catch return error.GitFailed;
 
         const r = &cf.reader.interface;
-        const line_raw = r.takeDelimiterInclusive('\n') catch return error.GitFailed;
+        const line_raw = r.takeDelimiterInclusive('\n') catch return cf.reader.failure();
         const line = line_raw[0 .. line_raw.len - 1];
 
         // "<oid> missing" or "<oid> <type> <size>"
@@ -814,11 +1081,150 @@ const CatFile = struct {
 
         const data = r.readAlloc(arena, size) catch |err| switch (err) {
             error.OutOfMemory => return error.OutOfMemory,
-            else => return error.GitFailed,
+            else => return cf.reader.failure(),
         };
-        const nl = r.takeByte() catch return error.GitFailed;
+        const nl = r.takeByte() catch return cf.reader.failure();
         if (nl != '\n') return error.GitFailed;
         return .{ .kind = kind, .data = data };
+    }
+
+    /// What `name` points at. `missing` when there is no such ref or its
+    /// object is missing. The object comes along and is skipped.
+    fn resolve(cf: *CatFile, name: []const u8, by: Io.Timeout) Error!union(enum) { oid: Oid, missing } {
+        cf.reader.by = by;
+        const w = &cf.writer.interface;
+        w.print("{s}\n", .{name}) catch return error.GitFailed;
+        w.flush() catch return error.GitFailed;
+
+        const r = &cf.reader.interface;
+        const line_raw = r.takeDelimiterInclusive('\n') catch return cf.reader.failure();
+        const line = line_raw[0 .. line_raw.len - 1];
+
+        // "<name> missing", or "<oid> <type> <size>" and the object.
+        if (std.mem.endsWith(u8, line, " missing") and
+            std.mem.eql(u8, line[0 .. line.len - " missing".len], name)) return .missing;
+        var it = std.mem.splitScalar(u8, line, ' ');
+        const oid = Oid.parseHex(cf.format, it.next() orelse return error.GitFailed) catch
+            return error.GitFailed;
+        _ = ObjectKind.parse(it.next() orelse return error.GitFailed) orelse
+            return error.GitFailed;
+        const size = std.fmt.parseInt(usize, it.next() orelse return error.GitFailed, 10) catch
+            return error.GitFailed;
+        if (it.next() != null) return error.GitFailed;
+        r.discardAll(size + 1) catch return cf.reader.failure();
+        return .{ .oid = oid };
+    }
+};
+
+/// `git hash-object -w -t <kind> --no-filters --stdin-paths`: a path per
+/// line in, an OID per line out, flushed after each. `--no-filters`, since
+/// the data is the object, as with `--stdin`: no attributes or eol
+/// conversion apply. stderr is dropped; the one-off fallback in
+/// `writeObject` reports errors.
+const HashObject = struct {
+    child: std.process.Child,
+    format: ObjectFormat,
+    writer: Io.File.Writer,
+    reader: PipeReader,
+    write_buf: [512]u8,
+    read_buf: [256]u8,
+
+    fn start(gp: *GitProcess, kind: ObjectKind) Error!*HashObject {
+        const ho = try gp.gpa.create(HashObject);
+        errdefer gp.gpa.destroy(ho);
+        ho.child = std.process.spawn(gp.io, .{
+            .argv = &.{
+                "git", "hash-object", "-w", "-t", @tagName(kind), "--no-filters", "--stdin-paths",
+            },
+            .cwd = .{ .path = gp.repo_path },
+            .environ_map = &gp.env,
+            .stdin = .pipe,
+            .stdout = .pipe,
+            .stderr = .ignore,
+        }) catch |err| switch (err) {
+            error.OutOfMemory => return error.OutOfMemory,
+            error.Canceled => return error.Canceled,
+            else => return error.GitSpawnFailed,
+        };
+        ho.format = gp.format;
+        ho.writer = ho.child.stdin.?.writerStreaming(gp.io, &ho.write_buf);
+        ho.reader = .init(gp.io, ho.child.stdout.?, &ho.read_buf);
+        return ho;
+    }
+
+    fn deinit(ho: *HashObject, io: Io, gpa: Allocator) void {
+        ho.child.kill(io);
+        gpa.destroy(ho);
+    }
+
+    fn hash(ho: *HashObject, path: []const u8, by: Io.Timeout) Error!Oid {
+        assert(std.mem.findScalar(u8, path, '\n') == null and path[0] != '"');
+        ho.reader.by = by;
+        const w = &ho.writer.interface;
+        w.print("{s}\n", .{path}) catch return error.GitFailed;
+        w.flush() catch return error.GitFailed;
+        const r = &ho.reader.interface;
+        const line = r.takeDelimiterInclusive('\n') catch return ho.reader.failure();
+        return Oid.parseHex(ho.format, line[0 .. line.len - 1]) catch error.GitFailed;
+    }
+};
+
+/// A session's stdout. Each read waits until `by` at most, so a git that
+/// stops answering fails the request instead of hanging the caller. The
+/// requests are single lines that git reads right away, so the writes
+/// can't block.
+const PipeReader = struct {
+    io: Io,
+    file: Io.File,
+    by: Io.Timeout = .none,
+    err: ?Error = null,
+    interface: Io.Reader,
+
+    fn init(io: Io, file: Io.File, buffer: []u8) PipeReader {
+        return .{
+            .io = io,
+            .file = file,
+            .interface = .{
+                .vtable = &.{ .stream = stream, .readVec = readVec },
+                .buffer = buffer,
+                .seek = 0,
+                .end = 0,
+            },
+        };
+    }
+
+    /// Why the last read failed.
+    fn failure(p: *const PipeReader) Error {
+        return p.err orelse error.GitFailed;
+    }
+
+    fn stream(r: *Io.Reader, w: *Io.Writer, limit: Io.Limit) Io.Reader.StreamError!usize {
+        var data: [1][]u8 = .{limit.slice(try w.writableSliceGreedy(1))};
+        const n = try readVec(r, &data);
+        w.advance(n);
+        return n;
+    }
+
+    fn readVec(r: *Io.Reader, data: [][]u8) Io.Reader.Error!usize {
+        const p: *PipeReader = @alignCast(@fieldParentPtr("interface", r));
+        var vecs: [8][]u8 = undefined;
+        const dest_n, const data_size = try r.writableVector(&vecs, data);
+        const done = operateBy(p.io, .{ .file_read_streaming = .{
+            .file = p.file,
+            .data = vecs[0..dest_n],
+        } }, p.by) catch |err| {
+            p.err = err;
+            return error.ReadFailed;
+        };
+        const n = done.file_read_streaming catch |err| switch (err) {
+            error.EndOfStream => return error.EndOfStream,
+            else => return error.ReadFailed,
+        };
+        if (n > data_size) {
+            r.end += n - data_size;
+            return data_size;
+        }
+        return n;
     }
 };
 

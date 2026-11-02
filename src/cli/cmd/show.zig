@@ -70,7 +70,7 @@ pub fn main(comptime B: type, ctx: *context.Context(B), argv: []const []const u8
     const issue = repo.load(arena, ref) catch |e| return common.repoFailed(B, ctx, e);
 
     if (as_json) {
-        const proj = ext_flags.project(B, ctx, repo) orelse return common.exit_error;
+        const proj = ext_flags.projectAround(B, ctx, repo, ref) orelse return common.exit_error;
         var s = json.begin(ctx.out);
         json.issue(&s, arena, issue, .{ .full = true, .projection = proj }) catch |e|
             return json.failed(ctx.err, e);
@@ -111,7 +111,7 @@ pub fn main(comptime B: type, ctx: *context.Context(B), argv: []const []const u8
             .{ c.target, c.value, c.lost },
         ) catch {};
     }
-    printProblems(B, ctx, repo, issue);
+    printProblems(B, ctx, repo, ref, issue);
     if (issue.attachments.len > 0) {
         w.print("Attachments ({d}):\n", .{issue.attachments.len}) catch {};
         for (issue.attachments) |a| w.print("  {s}  {s:<10}  {f}  {s}\n", .{
@@ -216,14 +216,15 @@ fn reference(
 }
 
 /// Problems can come from other issues too, like an open child of a
-/// closed issue, so this always builds the projection.
+/// closed issue, so this always projects the issues around it.
 fn printProblems(
     comptime B: type,
     ctx: *context.Context(B),
     repo: issuez.engine.Repo(B),
+    ref: issuez.engine.IssueRef,
     issue: issuez.engine.Issue,
 ) void {
-    const proj = ext_flags.project(B, ctx, repo) orelse return;
+    const proj = ext_flags.projectAround(B, ctx, repo, ref) orelse return;
     const i = proj.find(issue.id) orelse return;
     for (proj.problemsOf(i)) |p| ctx.out.print(
         "Problem: {s}\n",

@@ -37,13 +37,6 @@ pub const Upload = struct {
     data: []const u8,
 };
 
-pub const UploadMode = enum {
-    /// Also copied into git-lfs's store, for `git lfs push`.
-    git_lfs,
-    /// Only handed to the caller, e.g. a `before_push` hook.
-    caller,
-};
-
 /// Same identity as merge commits, so two clones deriving the same state
 /// from the same parent write the same commit.
 pub const derived_identity_name = @import("sync.zig").merge_identity_name;
@@ -303,22 +296,17 @@ pub fn Attachments(comptime B: type) type {
             corrupt,
         };
 
-        /// Tries our store, then git-lfs's (after a `git lfs fetch`), and
-        /// copies a good copy found there into ours, over a damaged one.
+        /// The backend's store. GitProcess also looks in git-lfs's store
+        /// (after a `git lfs fetch`) and copies a good copy found there
+        /// into its own, over a damaged one.
         pub fn read(self: Self, arena: Allocator, a: Attachment) Error!Content {
             try self.ready(arena);
             return self.readStored(arena, a);
         }
 
         fn readStored(self: Self, arena: Allocator, a: Attachment) Error!Content {
-            const sha = a.sha256.slice();
-            const ours = try self.lfsRead(arena, .issuez, sha);
-            if (ours) |data| if (matches(a, data)) return .{ .bytes = data };
-            const data = (try self.lfsRead(arena, .git_lfs, sha)) orelse
-                return if (ours == null) .missing else .corrupt;
-            if (!matches(a, data)) return .corrupt;
-            try self.lfsWrite(.issuez, sha, data);
-            return .{ .bytes = data };
+            const data = (try self.lfsRead(arena, a.sha256.slice())) orelse return .missing;
+            return if (matches(a, data)) .{ .bytes = data } else .corrupt;
         }
 
         pub const Availability = enum { local, missing, corrupt };
@@ -328,13 +316,26 @@ pub fn Attachments(comptime B: type) type {
             availability: Availability,
         };
 
-        /// Reads each object once to check it.
-        pub fn list(self: Self, arena: Allocator, issue: Issue) Error![]const Entry {
+        pub const ListOptions = struct {
+            /// Read and hash every object. Otherwise an object of the
+            /// right size counts as `local` (when the backend can tell
+            /// the size without reading it).
+            verify: bool = false,
+        };
+
+        pub fn list(
+            self: Self,
+            arena: Allocator,
+            issue: Issue,
+            options: ListOptions,
+        ) Error![]const Entry {
             try self.ready(arena);
             const out = try arena.alloc(Entry, issue.attachments.len);
             for (issue.attachments, out) |a, *e| e.* = .{
                 .attachment = a,
-                .availability = switch (try self.readStored(arena, a)) {
+                .availability = if (!options.verify and try self.lfsSize(a) == a.size)
+                    .local
+                else switch (try self.readStored(arena, a)) {
                     .bytes => .local,
                     .missing => .missing,
                     .corrupt => .corrupt,
@@ -391,7 +392,7 @@ pub fn Attachments(comptime B: type) type {
                 }
             }
             var out: std.ArrayList([]const u8) = .empty;
-            for (try self.lfsList(arena, .issuez)) |sha| {
+            for (try self.lfsList(arena)) |sha| {
                 if (!used.contains(sha)) try out.append(arena, sha);
             }
             return out.items;
@@ -662,7 +663,6 @@ pub fn Attachments(comptime B: type) type {
             self: Self,
             arena: Allocator,
             list_: []const Attachment,
-            mode: UploadMode,
         ) Error![]const Upload {
             try requireStore();
             var out: std.ArrayList(Upload) = .empty;
@@ -673,8 +673,6 @@ pub fn Attachments(comptime B: type) type {
                     .bytes => |d| d,
                     else => continue :next,
                 };
-                if (mode == .git_lfs and try self.lfsRead(arena, .git_lfs, sha) == null)
-                    try self.lfsWrite(.git_lfs, sha, data);
                 try out.append(arena, .{
                     .sha256 = try arena.dupe(u8, sha),
                     .size = a.size,
@@ -691,7 +689,7 @@ pub fn Attachments(comptime B: type) type {
         }
 
         fn store(self: Self, sha: fmt.Sha256, data: []const u8) Error!void {
-            return self.lfsWrite(.issuez, sha.slice(), data);
+            return self.lfsWrite(sha.slice(), data);
         }
 
         fn requireStore() Error!void {
@@ -699,29 +697,26 @@ pub fn Attachments(comptime B: type) type {
         }
 
         // Wrapped so backends without LFS still compile.
-        fn lfsRead(
-            self: Self,
-            arena: Allocator,
-            s: contract.LfsStore,
-            sha: []const u8,
-        ) Error!?[]const u8 {
-            if (comptime contract.hasLfs(B)) return self.repo.backend.lfsRead(arena, s, sha);
+        fn lfsRead(self: Self, arena: Allocator, sha: []const u8) Error!?[]const u8 {
+            if (comptime contract.hasLfs(B)) return self.repo.backend.lfsRead(arena, sha);
             return error.AttachmentsUnsupported;
         }
 
-        fn lfsWrite(
-            self: Self,
-            s: contract.LfsStore,
-            sha: []const u8,
-            data: []const u8,
-        ) Error!void {
-            if (comptime contract.hasLfs(B)) return self.repo.backend.lfsWrite(s, sha, data);
+        fn lfsWrite(self: Self, sha: []const u8, data: []const u8) Error!void {
+            if (comptime contract.hasLfs(B)) return self.repo.backend.lfsWrite(sha, data);
             return error.AttachmentsUnsupported;
         }
 
-        fn lfsList(self: Self, arena: Allocator, s: contract.LfsStore) Error![]const []const u8 {
-            if (comptime contract.hasLfs(B)) return self.repo.backend.lfsList(arena, s);
+        fn lfsList(self: Self, arena: Allocator) Error![]const []const u8 {
+            if (comptime contract.hasLfs(B)) return self.repo.backend.lfsList(arena);
             return error.AttachmentsUnsupported;
+        }
+
+        /// Null when the backend can't tell without reading.
+        fn lfsSize(self: Self, a: Attachment) Error!?u64 {
+            if (comptime contract.hasLfsSize(B))
+                return self.repo.backend.lfsSize(a.sha256.slice());
+            return null;
         }
     };
 }
@@ -844,11 +839,21 @@ test "limits, missing bytes, repair, orphans" {
         .bytes => {},
         else => return error.TestUnexpectedResult,
     }
-    try testing.expect(try sim.lfsRead(arena, .issuez, sha) != null);
+    try testing.expect(try sim.lfsSize(sha) != null);
+    // Damaged at the same size: only a verifying list reads and sees it.
+    const Availability = Attachments(GitSim).Availability;
+    for (sim.lfs.items) |*o| {
+        const bad = try arena.dupe(u8, o.data);
+        bad[bad.len - 1] ^= 1;
+        o.data = bad;
+    }
+    try testing.expectEqual(Availability.local, (try att.list(arena, issue, .{}))[0].availability);
+    const verified = try att.list(arena, issue, .{ .verify = true });
+    try testing.expectEqual(Availability.corrupt, verified[0].availability);
     // Gone from both: missing, not an error.
     sim.lfs.clearRetainingCapacity();
-    const entries = try att.list(arena, issue);
-    try testing.expectEqual(Attachments(GitSim).Availability.missing, entries[0].availability);
+    const entries = try att.list(arena, issue, .{});
+    try testing.expectEqual(Availability.missing, entries[0].availability);
 
     // A deleted derived ref comes back with repair, once.
     const dname = try Attachments(GitSim).derivedRefName(arena, issue.id);
@@ -860,7 +865,7 @@ test "limits, missing bytes, repair, orphans" {
     try testing.expect(!try att.repair(arena, issue));
 
     // An object written by a failed add is an orphan.
-    try sim.lfsWrite(.issuez, fmt.Sha256.of(samples.webp).slice(), samples.webp);
+    try sim.lfsWrite(fmt.Sha256.of(samples.webp).slice(), samples.webp);
     issue = try latest(repo, arena, &sim, ref);
     const orphans = try att.orphans(arena, &.{issue});
     try testing.expectEqual(@as(usize, 1), orphans.len);

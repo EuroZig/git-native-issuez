@@ -33,12 +33,26 @@ pub const attachment_ref_prefix = "refs/attachments/";
 /// issue, completing the milestone. Two such writes then conflict.
 pub const guard_ref_prefix = "refs/issuez-guard/";
 
+/// A blob listing every issue's parent, so finding an issue's children
+/// doesn't load every issue. Lines are `<id> <tip> -` (no parent) or
+/// `<id> <tip> =<parent>`. An entry counts only while its tip is the
+/// issue's, so a stale or broken cache costs loads, never a wrong answer.
+/// Local, never pushed, can be deleted at any time.
+pub const parent_cache_ref = "refs/issuez-cache/parents";
+const parent_cache_header = "issuez-parents 1\n";
+/// Stale or missing entries before the cache is rewritten.
+const parent_cache_slack = 64;
+
 /// What a builder's `guard` returns.
 pub const Guarded = struct {
     /// Refs it read.
     verify: []const contract.RefUpdate = &.{},
     /// Guard refs to move to the new commit.
     bump: []const Bump = &.{},
+    /// A refreshed `parent_cache_ref`, written once the write succeeded.
+    parent_cache: ?ParentCache = null,
+
+    pub const ParentCache = struct { old: ?Oid, text: []const u8 };
 
     pub const Bump = struct { name: []const u8, old: ?Oid };
 
@@ -252,6 +266,14 @@ pub fn Repo(comptime B: type) type {
         limits: Limits = .{},
         /// Besides `closed`. See `core.State.isDone`.
         done_states: []const []const u8 = &core_fmt.default_done_states,
+        /// Set it to keep `refs` from listing the issues again within one
+        /// command, like resolving a prefix and then a write's guards. A
+        /// write clears it first, so every attempt after the first lists
+        /// afresh. Only `Repo`'s own writes clear it: leave it unset when
+        /// something else writes issue refs (sync).
+        listing: ?*Listing = null,
+
+        pub const Listing = struct { refs: ?[]IssueRef = null };
 
         pub const Error = B.Error || error{
             /// More commits than `Limits.max_commits_per_issue`.
@@ -340,14 +362,26 @@ pub fn Repo(comptime B: type) type {
 
         /// Sorted by name, so by UUID.
         pub fn refs(self: Self, arena: Allocator) Error![]IssueRef {
+            if (self.listing) |l| if (l.refs) |r| return r;
             const entries = try self.backend.listRefs(arena, issue_ref_prefix);
             const out = try arena.alloc(IssueRef, entries.len);
             for (entries, out) |e, *r| r.* = .{ .name = e.name, .tip = e.oid };
+            if (self.listing) |l| l.refs = out;
             return out;
         }
 
-        /// Like upstream's `refs/issues/<prefix>*`.
+        fn forgetListing(self: Self) void {
+            if (self.listing) |l| l.refs = null;
+        }
+
+        /// Like upstream's `refs/issues/<prefix>*`. A full UUID is looked up
+        /// directly, without listing every issue.
         pub fn resolve(self: Self, arena: Allocator, prefix: []const u8) Error!Resolution {
+            if (uuid_fmt.isCanonical(prefix)) {
+                const name = try refNameOf(arena, prefix);
+                const tip = (try self.backend.resolveRef(name)) orelse return .none;
+                return .{ .one = .{ .name = name, .tip = tip } };
+            }
             const all = try self.refs(arena);
             var matches: std.ArrayList(IssueRef) = .empty;
             for (all) |r| if (std.mem.startsWith(u8, r.id(), prefix)) try matches.append(arena, r);
@@ -389,6 +423,96 @@ pub fn Repo(comptime B: type) type {
                 });
             }
             return out.items;
+        }
+
+        /// What `projection.build` needs to project one issue as it would
+        /// among all of them: the issue, its ancestors, its descendants and
+        /// every issue its blockers lead to. Sub-issues come from
+        /// `parent_cache_ref`, which this refreshes when stale (best effort).
+        /// An event whose comment is missing may target another issue's
+        /// comment, and then it is every issue. Other issues that can't be
+        /// loaded are left out, as in the guards.
+        pub fn loadAround(self: Self, arena: Allocator, ref: IssueRef) Error![]Issue {
+            try self.checkLimits();
+            const center = try self.load(arena, ref);
+            // Skipping what can't be loaded, like the rest of this.
+            for (center.event_problems) |ep| if (ep.kind == .dangling) return self.loadForGuards(arena);
+
+            var out: std.ArrayList(Issue) = .empty;
+            var have: std.StringHashMapUnmanaged(void) = .empty;
+            try out.append(arena, center);
+            try have.put(arena, center.id, {});
+            const Add = struct {
+                fn f(o: *std.ArrayList(Issue), h: *std.StringHashMapUnmanaged(void), a: Allocator, issue: Issue) !void {
+                    if ((try h.getOrPut(a, issue.id)).found_existing) return;
+                    try o.append(a, issue);
+                }
+            }.f;
+
+            // Up. Each walk has its own `seen`: in a parent cycle the
+            // ancestors are descendants too.
+            var seen: std.StringHashMapUnmanaged(void) = .empty;
+            try seen.put(arena, center.id, {});
+            var up = center.ext.parent;
+            while (up) |id| {
+                if ((try seen.getOrPut(arena, id)).found_existing) break;
+                const issue = (try self.loadById(arena, id)) orelse break;
+                try Add(&out, &have, arena, issue);
+                up = issue.ext.parent;
+            }
+
+            // Down.
+            const index = try self.childIndex(arena);
+            if (index.refreshed) |c| self.writeParentCache(c);
+            seen.clearRetainingCapacity();
+            try seen.put(arena, center.id, {});
+            var stack: std.ArrayList([]const u8) = .empty;
+            try stack.append(arena, center.id);
+            while (stack.pop()) |id| {
+                const kids = index.children.get(id) orelse continue;
+                for (kids.items) |r| {
+                    if ((try seen.getOrPut(arena, r.id())).found_existing) continue;
+                    const issue = index.loaded.get(r.id()) orelse
+                        self.load(arena, r) catch |err| switch (err) {
+                        error.CorruptIssue,
+                        error.HistoryTooLong,
+                        error.MissingParent,
+                        error.NoRoot,
+                        => continue,
+                        else => |e| return e,
+                    };
+                    try Add(&out, &have, arena, issue);
+                    try stack.append(arena, issue.id);
+                }
+            }
+
+            // Along the blockers, for cycles through this issue.
+            seen.clearRetainingCapacity();
+            try seen.put(arena, center.id, {});
+            var blocked: std.ArrayList(Issue) = .empty;
+            try blocked.append(arena, center);
+            while (blocked.pop()) |x| for (x.ext.blocked_by) |id| {
+                if ((try seen.getOrPut(arena, id)).found_existing) continue;
+                const issue = (try self.loadById(arena, id)) orelse continue;
+                try Add(&out, &have, arena, issue);
+                try blocked.append(arena, issue);
+            };
+            return out.items;
+        }
+
+        /// Null when there's no such issue, or it can't be loaded.
+        fn loadById(self: Self, arena: Allocator, id: []const u8) Error!?Issue {
+            if (!uuid_fmt.isCanonical(id)) return null;
+            const name = try refNameOf(arena, id);
+            const tip = (try self.backend.resolveRef(name)) orelse return null;
+            return self.load(arena, .{ .name = name, .tip = tip }) catch |err| switch (err) {
+                error.CorruptIssue,
+                error.HistoryTooLong,
+                error.MissingParent,
+                error.NoRoot,
+                => null,
+                else => |e| return e,
+            };
         }
 
         pub const Page = struct {
@@ -484,15 +608,28 @@ pub fn Repo(comptime B: type) type {
             ref: IssueRef,
             root_keys: []const []const u8,
         ) Allocator.Error![]const Problem {
-            var problems: std.ArrayList(Problem) = .empty;
-            if (!uuid_fmt.isCanonical(ref.id())) try problems.append(arena, .invalid_uuid);
             const commits = self.loadCommits(arena, ref.tip) catch |e| switch (e) {
                 error.OutOfMemory => return error.OutOfMemory,
                 else => {
+                    var problems: std.ArrayList(Problem) = .empty;
+                    if (!uuid_fmt.isCanonical(ref.id())) try problems.append(arena, .invalid_uuid);
                     try problems.append(arena, .{ .unreadable = e });
                     return problems.items;
                 },
             };
+            return self.checkCommits(arena, ref, commits, root_keys);
+        }
+
+        /// `checkWith` on commits already loaded with `loadCommits`.
+        pub fn checkCommits(
+            self: Self,
+            arena: Allocator,
+            ref: IssueRef,
+            commits: []const issue_model.CommitInput,
+            root_keys: []const []const u8,
+        ) Allocator.Error![]const Problem {
+            var problems: std.ArrayList(Problem) = .empty;
+            if (!uuid_fmt.isCanonical(ref.id())) try problems.append(arena, .invalid_uuid);
             const empty = object.emptyTree(self.backend.objectFormat());
             var roots: usize = 0;
             var root_message: ?[]const u8 = null;
@@ -621,6 +758,7 @@ pub fn Repo(comptime B: type) type {
                 var ops: std.ArrayList(contract.RefUpdate) = .empty;
                 try ops.append(arena, .{ .name = name, .op = .{ .create = oid } });
                 try ops.appendSlice(arena, try guarded.ops(arena, oid));
+                self.forgetListing();
                 self.backend.updateRefs(ops.items) catch |err| switch (err) {
                     error.RefConflict => continue,
                     else => |e| return e,
@@ -973,6 +1111,7 @@ pub fn Repo(comptime B: type) type {
                 // attachment ref.
                 if (@hasDecl(@TypeOf(builder), "after"))
                     try ops.appendSlice(arena, try builder.after(arena, current, oid));
+                self.forgetListing();
                 self.backend.updateRefs(ops.items) catch |err| switch (err) {
                     // Our ref moved, or an issue a guard read changed. With
                     // `expect` only the first is the caller's problem.
@@ -984,6 +1123,7 @@ pub fn Repo(comptime B: type) type {
                     } else continue,
                     else => |e| return e,
                 };
+                if (guarded.parent_cache) |c| self.writeParentCache(c);
                 return oid;
             }
             return error.ConcurrentModification;
@@ -1226,8 +1366,10 @@ pub fn Repo(comptime B: type) type {
             verify: std.ArrayList(contract.RefUpdate) = .empty,
             bump: std.ArrayList(Guarded.Bump) = .empty,
             scanned: u32 = 0,
-            /// Parent ID to children, built on first use.
-            children: ?std.StringHashMapUnmanaged(std.ArrayList(Issue)) = null,
+            /// Built on first use.
+            index: ?ChildIndex = null,
+            /// `childrenOf` results, by parent ID.
+            children: std.StringHashMapUnmanaged([]const Issue) = .empty,
             milestones: std.StringHashMapUnmanaged(?MilestoneInfo) = .empty,
 
             fn get(g: *Guard, id: []const u8) Error!?Issue {
@@ -1255,7 +1397,11 @@ pub fn Repo(comptime B: type) type {
             }
 
             fn result(g: *Guard) Guarded {
-                return .{ .verify = g.verify.items, .bump = g.bump.items };
+                return .{
+                    .verify = g.verify.items,
+                    .bump = g.bump.items,
+                    .parent_cache = if (g.index) |i| i.refreshed else null,
+                };
             }
 
             fn pin(g: *Guard, name: []const u8, id: []const u8, tip: Oid) Error!void {
@@ -1332,21 +1478,26 @@ pub fn Repo(comptime B: type) type {
                 return false;
             }
 
+            /// Issues that can't be loaded are skipped, as in `loadForGuards`.
             fn childrenOf(g: *Guard, id: []const u8) Error![]const Issue {
-                if (g.children == null) {
-                    var index: std.StringHashMapUnmanaged(std.ArrayList(Issue)) = .empty;
-                    for (try g.repo.loadForGuards(g.arena)) |issue| {
-                        const parent = issue.ext.parent orelse continue;
-                        // Its own parent, from another tool: not a child.
-                        if (std.mem.eql(u8, parent, issue.id)) continue;
-                        const gop = try index.getOrPut(g.arena, parent);
-                        if (!gop.found_existing) gop.value_ptr.* = .empty;
-                        try gop.value_ptr.append(g.arena, issue);
-                    }
-                    g.children = index;
-                }
-                const list = g.children.?.get(id) orelse return &.{};
-                return list.items;
+                if (g.children.get(id)) |hit| return hit;
+                if (g.index == null) g.index = try g.repo.childIndex(g.arena);
+                const index = &g.index.?;
+                var out: std.ArrayList(Issue) = .empty;
+                if (index.children.get(id)) |kids| for (kids.items) |r| {
+                    const issue = index.loaded.get(r.id()) orelse
+                        g.repo.load(g.arena, r) catch |err| switch (err) {
+                        error.CorruptIssue,
+                        error.HistoryTooLong,
+                        error.MissingParent,
+                        error.NoRoot,
+                        => continue,
+                        else => |e| return e,
+                    };
+                    try out.append(g.arena, issue);
+                };
+                try g.children.put(g.arena, id, out.items);
+                return out.items;
             }
 
             /// Each one pinned with a verify line. Cycle-safe. `height` gets
@@ -1376,6 +1527,120 @@ pub fn Repo(comptime B: type) type {
                 return out.items;
             }
         };
+
+        const ChildIndex = struct {
+            /// Parent ID to child refs, in ref order.
+            children: std.StringHashMapUnmanaged(std.ArrayList(IssueRef)) = .empty,
+            /// Issues loaded to bring it up to date, by ID.
+            loaded: std.StringHashMapUnmanaged(Issue) = .empty,
+            /// The cache to write, when it changed.
+            refreshed: ?Guarded.ParentCache = null,
+        };
+
+        /// From `parent_cache_ref`, loading only issues whose tip changed.
+        /// The refreshed cache is written by a write that succeeds, so a
+        /// refused one changes nothing. Issues that can't be loaded aren't
+        /// cached, and are no one's children.
+        fn childIndex(self: Self, arena: Allocator) Error!ChildIndex {
+            const all = try self.refs(arena);
+            if (all.len > self.limits.max_guard_scan) return error.GuardScanTooLarge;
+            const cache_tip = try self.backend.resolveRef(parent_cache_ref);
+            const cached = if (cache_tip) |t| try self.readParentCache(arena, t) else null;
+
+            var index: ChildIndex = .{};
+            var text: std.ArrayList(u8) = .empty;
+            try text.appendSlice(arena, parent_cache_header);
+            var hits: usize = 0;
+            var unloadable: usize = 0;
+            for (all) |r| {
+                const id = r.id();
+                const entry: ?ParentEntry = if (cached) |c| c.get(id) else null;
+                const parent: ?[]const u8 = if (entry != null and entry.?.tip.eql(r.tip)) blk: {
+                    hits += 1;
+                    break :blk entry.?.parent;
+                } else blk: {
+                    const issue = self.load(arena, r) catch |err| switch (err) {
+                        error.CorruptIssue,
+                        error.HistoryTooLong,
+                        error.MissingParent,
+                        error.NoRoot,
+                        => {
+                            unloadable += 1;
+                            continue;
+                        },
+                        else => |e| return e,
+                    };
+                    try index.loaded.put(arena, id, issue);
+                    break :blk issue.ext.parent;
+                };
+                const hex = r.tip.hex();
+                try text.print(arena, "{s} {s} ", .{ id, hex.slice() });
+                if (parent) |p| try text.print(arena, "={s}\n", .{p}) else try text.appendSlice(arena, "-\n");
+                const p = parent orelse continue;
+                // Its own parent, from another tool: not a child.
+                if (std.mem.eql(u8, p, id)) continue;
+                const gop = try index.children.getOrPut(arena, p);
+                if (!gop.found_existing) gop.value_ptr.* = .empty;
+                try gop.value_ptr.append(arena, r);
+            }
+            // Loading a few stale entries costs no git call, rewriting the
+            // cache two, and every write leaves its own entry stale. Issues
+            // that can't be loaded never get an entry.
+            const stale = if (cached) |c|
+                (all.len - hits - unloadable) + (c.count() - hits)
+            else
+                all.len;
+            if (cached == null or stale >= parent_cache_slack)
+                index.refreshed = .{ .old = cache_tip, .text = text.items };
+            return index;
+        }
+
+        const ParentEntry = struct { tip: Oid, parent: ?[]const u8 };
+
+        /// Null when it isn't a cache we can read.
+        fn readParentCache(
+            self: Self,
+            arena: Allocator,
+            tip: Oid,
+        ) Error!?std.StringHashMapUnmanaged(ParentEntry) {
+            const o = (try self.backend.readObject(arena, tip)) orelse return null;
+            if (o.kind != .blob or !std.mem.startsWith(u8, o.data, parent_cache_header)) return null;
+            var out: std.StringHashMapUnmanaged(ParentEntry) = .empty;
+            var lines = std.mem.splitScalar(u8, o.data[parent_cache_header.len..], '\n');
+            while (lines.next()) |line| {
+                if (line.len == 0) continue;
+                var it = std.mem.splitScalar(u8, line, ' ');
+                const id = it.next() orelse return null;
+                const tip_hex = it.next() orelse return null;
+                const rest = it.rest();
+                const parent: ?[]const u8 = if (std.mem.eql(u8, rest, "-"))
+                    null
+                else if (rest.len > 1 and rest[0] == '=')
+                    rest[1..]
+                else
+                    return null;
+                const t = Oid.parseHex(self.backend.objectFormat(), tip_hex) catch return null;
+                try out.put(arena, id, .{ .tip = t, .parent = parent });
+            }
+            return out;
+        }
+
+        /// Best effort: it's only a cache.
+        fn writeParentCache(self: Self, cache: Guarded.ParentCache) void {
+            self.writeParentCacheOrFail(cache.old, cache.text) catch {};
+        }
+
+        fn writeParentCacheOrFail(self: Self, old: ?Oid, text: []const u8) Error!void {
+            const oid = try self.backend.writeObject(.blob, text);
+            if (old != null and old.?.eql(oid)) return;
+            self.backend.updateRefs(&.{.{ .name = parent_cache_ref, .op = if (old) |o|
+                .{ .update = .{ .new = oid, .old = o } }
+            else
+                .{ .create = oid } }}) catch |err| switch (err) {
+                error.RefConflict => {}, // someone else refreshed it
+                else => |e| return e,
+            };
+        }
 
         /// Returns verify lines for every issue it read.
         fn runGuards(self: Self, arena: Allocator, p: Proposal) Error!Guarded {
@@ -1883,7 +2148,7 @@ test "comments that would read as trailers are refused" {
 
 /// Lets another writer move a ref right before our first update, to
 /// exercise the CAS retry.
-const RacingSim = struct {
+pub const RacingSim = struct {
     sim: *GitSim,
     race: ?struct {
         ref: []const u8,
@@ -1954,8 +2219,9 @@ const RacingSim = struct {
         arena: Allocator,
         remote: []const u8,
         refspecs: []const []const u8,
+        prune: bool,
     ) (Error || error{FetchFailed})!void {
-        return r.sim.fetch(arena, remote, refspecs);
+        return r.sim.fetch(arena, remote, refspecs, prune);
     }
     pub fn push(
         r: *RacingSim,
@@ -2053,6 +2319,59 @@ test "guards" {
     const issues = try repo.loadAll(arena);
     const proj = try @import("projection.zig").build(arena, issues, .{});
     try testing.expectEqual(@as(usize, 0), proj.problems.len);
+}
+
+test "parent cache: stale entries are reloaded, a broken cache is ignored" {
+    var arena_state: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var world: GitSim.World = .{ .seed = 37, .clones = &.{.{ .name = "a" }} };
+    var sim = try GitSim.init(arena, &world, 0);
+    const repo = Repo(GitSim).init(&sim);
+    const nameOf = struct {
+        fn f(a: Allocator, c: Repo(GitSim).Created) ![]const u8 {
+            return std.fmt.allocPrint(a, "refs/issues/{s}", .{c.id.slice()});
+        }
+    }.f;
+
+    const epic = try repo.create(arena, .{ .title = "Epic" });
+    const one = try repo.create(arena, .{ .title = "One", .parent = epic.id.slice() });
+    // A refused close writes nothing, not even the cache.
+    try testing.expectError(error.OpenDescendants, repo.setState(
+        arena,
+        try nameOf(arena, epic),
+        .{ .state = .closed },
+    ));
+    try testing.expect(try sim.resolveRef(parent_cache_ref) == null);
+    _ = try repo.setState(arena, try nameOf(arena, one), .{ .state = .closed });
+    const first = (try sim.resolveRef(parent_cache_ref)).?;
+
+    // Not in the cache yet: found by loading it.
+    const two = try repo.create(arena, .{ .title = "Two", .parent = epic.id.slice() });
+    try testing.expectError(error.OpenDescendants, repo.setState(
+        arena,
+        try nameOf(arena, epic),
+        .{ .state = .closed },
+    ));
+    _ = try repo.setState(arena, try nameOf(arena, two), .{ .state = .closed });
+    // A few stale entries don't make it worth rewriting.
+    try testing.expect((try sim.resolveRef(parent_cache_ref)).?.eql(first));
+
+    // Garbage instead of a cache: it's rebuilt.
+    const junk = try sim.writeObject(.blob, "not a cache\n");
+    try sim.updateRefs(&.{.{
+        .name = parent_cache_ref,
+        .op = .{ .update = .{ .new = junk, .old = (try sim.resolveRef(parent_cache_ref)).? } },
+    }});
+    _ = try repo.setState(arena, try nameOf(arena, two), .{ .state = .open });
+    try testing.expectError(error.OpenDescendants, repo.setState(
+        arena,
+        try nameOf(arena, epic),
+        .{ .state = .closed },
+    ));
+    _ = try repo.setState(arena, try nameOf(arena, two), .{ .state = .closed });
+    _ = try repo.setState(arena, try nameOf(arena, epic), .{ .state = .closed });
+    try testing.expect(!(try sim.resolveRef(parent_cache_ref)).?.eql(junk));
 }
 
 test "guards on foreign cycles" {
