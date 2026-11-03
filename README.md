@@ -131,10 +131,33 @@ other clients.
   scripts calling them keep working.
 - [lazygit](https://github.com/jesseduffield/lazygit): an issues menu under
   one key ([docs/lazygit.md](docs/lazygit.md)).
-- Importing from GitHub, GitLab, Gitea/Forgejo or Azure DevOps: use
-  upstream's `git-issue-import` and `git-issue-export` in the same
-  repository. Those bridges aren't reimplemented here (contributions are
-  welcome); the issues they write work as they are.
+
+### Importing from GitHub, GitLab and others
+
+Import, export and two-way sync with GitHub, GitLab and Gitea/Forgejo, and
+import from Azure DevOps, are upstream's: install
+[git-native-issue](https://github.com/remenoscodes/git-native-issue) next to
+this one and run its bridges in the same repository. Both tools share the
+issue refs, so what they import works here as it is. git-native-issuez
+doesn't install the `git-issue-import`, `git-issue-export` or
+`git-issue-sync` entry points, so with both on `PATH` the hyphenated names
+run upstream's; `git issue import` runs this one, which refuses and points
+there. Both install a `git-issue`: `git issue` runs whichever comes first on
+`PATH`, so put this one's directory first.
+
+```sh
+git-issue-import github:owner/repo --state all   # all issues, with comments
+git-issue-export github:owner/repo               # local issues back to GitHub
+git-issue-sync gitlab:group/project              # import, then export
+```
+
+Upstream's docs cover the providers, tokens and options:
+[Platform Bridges](https://github.com/remenoscodes/git-native-issue#platform-bridges),
+the [GitLab](https://github.com/remenoscodes/git-native-issue/blob/main/docs/gitlab-bridge.md)
+and [Gitea/Forgejo](https://github.com/remenoscodes/git-native-issue/blob/main/docs/gitea-bridge.md)
+bridges, and the
+[migration guide](https://github.com/remenoscodes/git-native-issue/blob/main/docs/migration-guide.md).
+The bridges aren't reimplemented here (contributions are welcome).
 
 ## Using the library
 

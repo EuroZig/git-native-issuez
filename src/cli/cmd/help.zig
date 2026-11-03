@@ -41,7 +41,8 @@ pub const text =
 ++ (if (build_options.tui) "\nIn a terminal, 'git issue' alone opens the terminal UI." else "") ++
     \\
     \\Provider import/export (GitHub, GitLab, ...): use upstream git-native-issue's
-    \\git-issue-import / git-issue-export on the same repository.
+    \\git-issue-import / git-issue-export on the same repository, see
+    \\https://github.com/remenoscodes/git-native-issue#platform-bridges
     \\
 ;
 

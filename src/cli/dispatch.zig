@@ -157,10 +157,8 @@ pub fn run(
                 cmd_merge.main(B, ctx, inv.args, .sync))
         else
             common.missing(ctx.err, sub, "remote or provider is required"),
-        .import, .@"export" => if (firstPositional(inv.args) == null)
-            common.missing(ctx.err, sub, "provider is required (provider bridges stay upstream)")
-        else
-            unsupportedBridge(B, ctx, sub),
+        // Always upstream's, with or without a provider or --help.
+        .import, .@"export" => unsupportedBridge(B, ctx, sub),
     };
 }
 
@@ -184,13 +182,10 @@ fn firstPositional(args: []const []const u8) ?[]const u8 {
 
 fn unsupportedBridge(comptime B: type, ctx: *context.Context(B), sub: []const u8) u8 {
     ctx.err.print(
-        "git-issue: '{s}' with a provider (GitHub, GitLab, Gitea, ...) is not supported\n" ++
-            "by git-native-issuez. Provider import, export and sync are done by\n" ++
-            "upstream git-native-issue: run its git-issue-import, git-issue-export\n" ++
-            "or git-issue-sync in this repository; both tools share the same issue\n" ++
-            "refs. To share issues between clones, use 'git issue sync <remote>'\n" ++
-            "or plain git push/fetch.\n",
-        .{sub},
+        "git-issue: '{s}' with a provider (GitHub, GitLab, ...) is upstream's: run\n" ++
+            "git-native-issue's git-issue-{s} in this repository, see\n" ++
+            "https://github.com/remenoscodes/git-native-issue#platform-bridges\n",
+        .{ sub, sub },
     ) catch {};
     return common.exit_error;
 }
