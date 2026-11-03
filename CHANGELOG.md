@@ -8,6 +8,13 @@ versions may change the library API; the on-disk format only ever grows (see
 
 ## [Unreleased]
 
+### Changed
+- `install.sh` is a quarter of its size: download, check against
+  `SHA256SUMS`, unpack, and write `update-git-native-issuez`. `--uninstall`
+  stays. Gone: the sudo handling (pipe it into `sudo sh` for a system
+  prefix), the downgrade and reinstall guards, and the wget and openssl
+  fallbacks (it needs `curl`, and `sha256sum` or `shasum`).
+
 ## [0.2.0] - 2026-11-03
 
 ### Added

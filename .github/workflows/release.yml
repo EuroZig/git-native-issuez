@@ -146,9 +146,8 @@ jobs:
             test -L "$prefix/bin/git-issue-ls"
             test -f "$prefix/share/man/man1/git-issue.1"
             test -x "$prefix/bin/update-git-native-issuez"
-            # The same version again is left alone.
-            sh install.sh --from zig-out/release --version "$VERSION" --flavor "$flavor" --prefix "$prefix" |
-              grep -q 'is already installed'
+            # Again over it, as an update does.
+            sh install.sh --from zig-out/release --version "$VERSION" --flavor "$flavor" --prefix "$prefix"
             # Uninstalling removes all of it and nothing else.
             touch "$prefix/bin/git-issue-import" "$prefix/share/man/man1/other.1"
             sh install.sh --uninstall --prefix "$prefix"

@@ -214,18 +214,19 @@ On macOS, an archive downloaded with a browser is quarantined and
 ### install.sh
 
 It downloads the latest release for your machine, checks it against
-`SHA256SUMS` and installs it into `~/.local`.
+`SHA256SUMS` and unpacks it into `~/.local`.
 
 - Options go after `sh -s --`: `--flavor minimal`, `--version 0.2.0`,
-  `--prefix /usr/local`; `--help` lists them all.
-- Only the copy into a prefix you can't write to uses `sudo` (or `doas`).
-  Don't run the whole script with `sudo`.
+  `--prefix /usr/local`. For a prefix you can't write to, pipe it into
+  `sudo sh -s -- --prefix /usr/local`.
 - It doesn't touch your shell configuration: if `~/.local/bin` isn't on
-  `PATH`, it says what to add.
+  `PATH`, it says so.
 - To read it first, download it and run `sh install.sh`.
 - `update-git-native-issuez`, installed next to `git-issue`, updates with
-  the same flavor and prefix. It refuses a downgrade without
-  `--allow-downgrade`.
+  the same flavor and prefix; extra arguments (`--version`, `--no-verify`)
+  go to `install.sh`. It refuses an `install.sh` older than the one it came
+  from.
+- `--no-verify` skips the checksum check, for that run only.
 - `update-git-native-issuez --uninstall` (or
   `install.sh --uninstall --prefix <dir>`) removes everything it installed,
   and nothing else. The issues in your repositories stay.
