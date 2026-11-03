@@ -87,6 +87,7 @@ With `show --json`, the issue also has:
   "comments": [
     {
       "id": "1c0e3933b900007b3e513b8b33fb15245148e165",
+      "kind": "comment",
       "author": { "name": "Ada", "email": "ada@example.com" },
       "date": "2026-10-20T20:57:44+05:30",
       "subject": "Here's a screenshot",
@@ -101,6 +102,13 @@ With `show --json`, the issue also has:
 ```
 
 - `id` is the commit, the ID `comment --edit/--delete/--restore` takes.
+- `comments` has every commit after the first, apart from events
+  (description edits and comment edits, deletions and restores, which
+  show as the text they changed). `kind` is `comment` for text someone
+  wrote, and `update` for a commit that only changed fields or the state,
+  merged or recorded an export: its `text` is empty and its `subject` is
+  the commit message, the default one saying what changed ("Update
+  labels") or the message given with the change.
 - `text` is the body without its trailers (the edited text for edited
   comments).
 - `deleted` comments are included, so check the flag before showing them.

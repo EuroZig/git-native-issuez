@@ -20,6 +20,7 @@ const fields_fmt = @import("../format/fields.zig");
 const uuid_fmt = @import("../format/uuid.zig");
 const repo_mod = @import("repo.zig");
 const projection_mod = @import("projection.zig");
+const Issue = @import("../model/issue.zig").Issue;
 
 const Oid = object.Oid;
 
@@ -123,7 +124,10 @@ pub fn Catalog(comptime B: type) type {
 
         /// By ID prefix, else by exact name. Retired ones only match by ID.
         pub fn resolve(self: Self, arena: Allocator, key: []const u8) Error!Match {
-            const all = try self.list(arena);
+            return match(arena, try self.list(arena), key);
+        }
+
+        fn match(arena: Allocator, all: []const Milestone, key: []const u8) Allocator.Error!Match {
             var hits: std.ArrayList(Milestone) = .empty;
             if (key.len >= 4) for (all) |m| {
                 if (std.mem.startsWith(u8, m.id, key)) try hits.append(arena, m);
@@ -137,6 +141,130 @@ pub fn Catalog(comptime B: type) type {
                 1 => .{ .one = hits.items[0] },
                 else => .{ .many = hits.items },
             };
+        }
+
+        pub const Lookup = union(enum) {
+            one: Milestone,
+            /// Nothing matches, but a retired milestone has this name:
+            /// name it by its ID.
+            retired_name: Milestone,
+            none,
+            many: []const Milestone,
+        };
+
+        /// `resolve`, telling a retired milestone's name apart from no match.
+        pub fn lookup(self: Self, arena: Allocator, key: []const u8) Error!Lookup {
+            const all = try self.list(arena);
+            return switch (try match(arena, all, key)) {
+                .one => |m| .{ .one = m },
+                .many => |ms| .{ .many = ms },
+                .none => for (all) |m| {
+                    if (std.mem.eql(u8, m.name, key)) break .{ .retired_name = m };
+                } else .none,
+            };
+        }
+
+        /// What an issue write asks for. Null leaves a part unchanged.
+        pub const ChoiceSpec = struct {
+            /// A milestone name, like `--milestone`: it links the one open
+            /// milestone with exactly this name, else it is written as plain
+            /// text (as upstream writes it). Empty clears the milestone, and
+            /// stops inheriting one.
+            name: ?[]const u8 = null,
+            /// A catalog milestone by ID prefix or name, like `--milestone-id`.
+            /// Doesn't go with `name`.
+            id: ?[]const u8 = null,
+            mode: ?fields_fmt.MilestoneMode = null,
+            /// The issue being edited. Null on create.
+            current: ?Issue = null,
+            /// The same write sets a parent, so the issue may inherit.
+            parent_given: bool = false,
+        };
+
+        /// For `CreateSpec`/`EditSpec`'s `milestone`, `milestone_id` and
+        /// `milestone_mode`.
+        pub const Choice = struct {
+            text: ?[]const u8 = null,
+            id: ?[]const u8 = null,
+            mode: ?fields_fmt.MilestoneMode = null,
+            /// `name` matched no open milestone of a non-empty catalog and is
+            /// kept as text only.
+            text_only: bool = false,
+        };
+
+        pub const Refusal = union(enum) {
+            /// `id` and `name` both given.
+            id_with_name,
+            /// `id` with mode `inherit` or `none`.
+            id_with_mode: fields_fmt.MilestoneMode,
+            /// Mode `explicit` with an empty name.
+            explicit_needs_milestone,
+            /// Mode `explicit` with neither a name nor an `id`, and the issue
+            /// isn't linked to a catalog milestone yet.
+            explicit_needs_id,
+            /// `id` matches no milestone.
+            no_such_milestone: []const u8,
+            /// `id` names a retired milestone, which only matches by ID.
+            retired_name: Milestone,
+            ambiguous_id: []const Milestone,
+            /// `name` belongs to a completed or retired milestone only.
+            not_open: Milestone,
+            /// Mode `explicit` with a `name` no open milestone has.
+            no_open_named: []const u8,
+            ambiguous_name: []const Milestone,
+        };
+
+        pub const Chosen = union(enum) { ok: Choice, refused: Refusal };
+
+        /// Turns a milestone name, ID and mode into what to write. The same
+        /// rules as `git issue create/edit --milestone`, `--milestone-id`,
+        /// `--milestone-mode` and `--no-milestone`.
+        pub fn choose(self: Self, arena: Allocator, spec: ChoiceSpec) Error!Chosen {
+            var out: Choice = .{ .text = spec.name, .mode = spec.mode };
+            if (spec.id) |key| {
+                if (spec.name != null) return .{ .refused = .id_with_name };
+                if (spec.mode) |m| if (m != .explicit) return .{ .refused = .{ .id_with_mode = m } };
+                return switch (try self.lookup(arena, key)) {
+                    .one => |m| .{ .ok = .{ .id = m.id } },
+                    .retired_name => |m| .{ .refused = .{ .retired_name = m } },
+                    .none => .{ .refused = .{ .no_such_milestone = key } },
+                    .many => |ms| .{ .refused = .{ .ambiguous_id = ms } },
+                };
+            }
+            const current_id = if (spec.current) |c| c.ext.milestone_id != null else false;
+            if (out.mode == .explicit) {
+                if (out.text) |t| {
+                    if (t.len == 0) return .{ .refused = .explicit_needs_milestone };
+                } else if (!current_id) return .{ .refused = .explicit_needs_id };
+            }
+            const has_link = spec.parent_given or if (spec.current) |c|
+                c.ext.milestone_id != null or c.ext.milestone_mode != null or c.ext.parent != null
+            else
+                false;
+            const name = out.text orelse return .{ .ok = out };
+            if (name.len == 0) {
+                if (out.mode == null and has_link) out.mode = .none;
+                return .{ .ok = out };
+            }
+            // inherit/none with a name: keep the text, no catalog link.
+            if (out.mode != null and out.mode.? != .explicit) return .{ .ok = out };
+            const all = try self.list(arena);
+            var hits: std.ArrayList(Milestone) = .empty;
+            for (all) |m| if (m.status == .open and std.mem.eql(u8, m.name, name)) {
+                try hits.append(arena, m);
+            };
+            switch (hits.items.len) {
+                0 => {
+                    for (all) |m| if (std.mem.eql(u8, m.name, name)) return .{ .refused = .{ .not_open = m } };
+                    if (out.mode == .explicit) return .{ .refused = .{ .no_open_named = name } };
+                    out.text_only = all.len > 0;
+                    // The text replaces a catalog link.
+                    if (current_id) out.mode = .none;
+                    return .{ .ok = out };
+                },
+                1 => return .{ .ok = .{ .id = hits.items[0].id } },
+                else => return .{ .refused = .{ .ambiguous_name = hits.items } },
+            }
         }
 
         pub const CreateSpec = struct {
@@ -219,7 +347,7 @@ pub fn Catalog(comptime B: type) type {
             if (tl.items.len == 0) return error.NothingToEdit;
             for (tl.items) |x| if (x.value.len > limits.max_trailer_value_bytes)
                 return error.TooLong;
-            const subject = spec.message orelse if (spec.status) |s| switch (s) {
+            const subject = repo_mod.givenMessage(spec.message) orelse if (spec.status) |s| switch (s) {
                 .completed => "Complete milestone",
                 .retired => "Retire milestone",
                 .open => "Reopen milestone",
@@ -282,7 +410,8 @@ pub fn Catalog(comptime B: type) type {
                 for (known) |*info| {
                     if (std.mem.eql(u8, info.id, c.id)) info.status = .open;
                 }
-                const proj = try c.catalog.projectionWith(arena, known);
+                const issues = try c.catalog.repo.loadForGuards(arena);
+                const proj = try c.catalog.projectWith(arena, issues, known, null);
                 var verify: std.ArrayList(@import("../backend/contract.zig").RefUpdate) = .empty;
                 for (proj.issues, proj.milestone, 0..) |issue, m, i| {
                     if (issue.deleted) continue;
@@ -303,27 +432,54 @@ pub fn Catalog(comptime B: type) type {
 
         /// For projection options.
         pub fn infos(self: Self, arena: Allocator) Error![]projection_mod.MilestoneInfo {
-            const all = try self.list(arena);
+            return infosOf(arena, try self.list(arena));
+        }
+
+        fn infosOf(arena: Allocator, all: []const Milestone) Allocator.Error![]projection_mod.MilestoneInfo {
             const out = try arena.alloc(projection_mod.MilestoneInfo, all.len);
             for (all, out) |m, *info| info.* = .{ .id = m.id, .status = m.status };
             return out;
         }
 
-        /// Issues that can't be loaded are left out, as in the guards.
-        pub fn projection(self: Self, arena: Allocator) Error!projection_mod.Projection {
-            return self.projectionWith(arena, try self.infos(arena));
-        }
+        pub const ProjectOptions = struct {
+            /// For the default workflow state. Null takes the repo's
+            /// `workflow_states`, or the built-in states without valid ones.
+            workflow: ?[]const []const u8 = null,
+            /// The milestones, if already loaded. Null loads them.
+            milestones: ?[]const Milestone = null,
+        };
 
-        fn projectionWith(
+        /// `projection.build` over `issues` (every issue, or `loadAround`'s)
+        /// with the repo's limits and done states and the milestones'
+        /// statuses: what front ends show.
+        pub fn project(
             self: Self,
             arena: Allocator,
-            milestones: []const projection_mod.MilestoneInfo,
+            issues: []const Issue,
+            options: ProjectOptions,
         ) Error!projection_mod.Projection {
-            return projection_mod.build(arena, try self.repo.loadForGuards(arena), .{
+            const milestones = if (options.milestones) |ms| try infosOf(arena, ms) else try self.infos(arena);
+            return self.projectWith(arena, issues, milestones, options.workflow);
+        }
+
+        fn projectWith(
+            self: Self,
+            arena: Allocator,
+            issues: []const Issue,
+            milestones: []const projection_mod.MilestoneInfo,
+            workflow: ?[]const []const u8,
+        ) Error!projection_mod.Projection {
+            return projection_mod.build(arena, issues, .{
                 .max_depth = self.repo.limits.max_depth,
+                .workflow = workflow orelse self.repo.workflow_states orelse &fields_fmt.default_workflow,
                 .milestones = milestones,
                 .done_states = self.repo.done_states,
             });
+        }
+
+        /// Issues that can't be loaded are left out, as in the guards.
+        pub fn projection(self: Self, arena: Allocator) Error!projection_mod.Projection {
+            return self.project(arena, try self.repo.loadForGuards(arena), .{});
         }
 
         /// Closed and total leaves.
@@ -593,4 +749,50 @@ test "milestone guards: retired, inherited work, damaged issues" {
     const m = (try cat.find(arena, m1)).?;
     try testing.expectEqualStrings("m1 GA", m.name);
     try testing.expectEqualStrings("All of it.", m.description);
+}
+
+test "Catalog.choose" {
+    var arena_state: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var world: GitSim.World = .{ .seed = 52, .clones = &.{.{ .name = "a" }} };
+    var sim = try GitSim.init(arena, &world, 0);
+    const repo = repo_mod.Repo(GitSim).init(&sim);
+    const cat = Catalog(GitSim).of(repo);
+
+    const v1 = try cat.create(arena, .{ .name = "v1" });
+    const v1_id = v1.id.slice();
+    // A name that is another milestone's ID prefix.
+    const prefix = try arena.dupe(u8, v1_id[0..4]);
+    const named = try cat.create(arena, .{ .name = prefix });
+
+    // Names match by name only, never as an ID prefix.
+    const by_name = (try cat.choose(arena, .{ .name = prefix })).ok;
+    try testing.expectEqualStrings(named.id.slice(), by_name.id.?);
+    // `id` takes the prefix.
+    try testing.expectEqualStrings(v1_id, (try cat.choose(arena, .{ .id = prefix })).ok.id.?);
+
+    // Plain text on an issue linked to the catalog drops the link.
+    const linked_ref = try repo.create(arena, .{ .title = "Linked", .milestone_id = v1_id });
+    const linked = try repo.load(arena, .{
+        .name = try std.fmt.allocPrint(arena, "refs/issues/{s}", .{linked_ref.id.slice()}),
+        .tip = linked_ref.tip,
+    });
+    const text = (try cat.choose(arena, .{ .name = "someday", .current = linked })).ok;
+    try testing.expectEqualStrings("someday", text.text.?);
+    try testing.expectEqual(fields_fmt.MilestoneMode.none, text.mode.?);
+    try testing.expect(text.text_only);
+
+    // Clearing stops inheriting through a parent given in the same write.
+    const cleared = (try cat.choose(arena, .{ .name = "", .parent_given = true })).ok;
+    try testing.expectEqual(fields_fmt.MilestoneMode.none, cleared.mode.?);
+    try testing.expect((try cat.choose(arena, .{ .name = "" })).ok.mode == null);
+
+    try testing.expect((try cat.choose(arena, .{ .name = "v1", .id = prefix })).refused == .id_with_name);
+    try testing.expect((try cat.choose(arena, .{ .mode = .explicit })).refused == .explicit_needs_id);
+    try testing.expect((try cat.choose(arena, .{ .name = "v9", .mode = .explicit })).refused == .no_open_named);
+
+    _ = try cat.edit(arena, v1_id, .{ .status = .retired });
+    try testing.expect((try cat.choose(arena, .{ .name = "v1" })).refused == .not_open);
+    try testing.expect((try cat.choose(arena, .{ .id = "v1" })).refused == .retired_name);
 }

@@ -5,8 +5,8 @@ How git-native-issuez is put together, and why.
 ## Principles
 
 1. **Format over tool.** The product is a git data format and a library that
-   implements it. The CLI is a thin front end over the library, and so is
-   any program that embeds it.
+   implements it. The CLI and the MCP server are thin front ends over the
+   library, and so is any program that embeds it.
 2. **Git is the only source of truth.** All data lives in git objects
    reachable from refs.
 3. **Upstream compatibility is a hard constraint.** Everything written here
@@ -36,7 +36,7 @@ How git-native-issuez is put together, and why.
 Each layer only imports the layers below it.
 
 ```
-cli ──► engine ──► model ──► format
+cli, mcp ──► engine ──► model ──► format
           │
           └──► backend (comptime parameter)
 ```
@@ -45,9 +45,10 @@ cli ──► engine ──► model ──► format
 | --------- | --------------------- | --------------------------------------------------------------------------------------------------------- |
 | `format`  | `src/format/`         | trailers exactly as git parses them, labels, UUIDs, hex, upstream's value rules, extension field grammars, attachment trailers and image types |
 | `model`   | `src/model/issue.zig` | one issue from its commit DAG: fields, comments, events, attachments, conflicts                           |
-| `engine`  | `src/engine/`         | `Repo` (read, create, comment, edit, state, delete, check, guards), `Catalog`, `Attachments`, `Sync`, `query`, `projection` |
+| `engine`  | `src/engine/`         | `Repo` (read, create, comment, edit, state, delete, check, guards), `Catalog`, `Attachments`, `Sync`, `query`, `projection`, `settings`, `errors` |
 | `backend` | `src/backend/`        | the contract, `GitProcess`, `GitSim`, git objects                                                         |
 | `cli`     | `src/cli/`            | argument parsing, output, exit codes                                                                      |
+| `mcp`     | `src/mcp/`            | the MCP server: tools over the engine, typed results                                                      |
 
 `format`, `model` and the projection are tested without git.
 
@@ -223,8 +224,10 @@ hold identical refs: the fuzzer checks exactly that.
 
 ## Errors and resources
 
-- The library returns explicit error sets. Front ends turn them into
-  messages and exit codes at the edge (`src/cli/common.zig`).
+- The library returns explicit error sets. `errors.describe` says what each
+  error means (a test checks that every one has a description), and front
+  ends turn them into messages and exit codes at the edge
+  (`src/cli/common.zig`), with their own wording where they say more.
 - Process-ending errors are only used by entry points (`src/cli/fatal.zig`).
   Commands return an exit code.
 - The caller passes the allocator and `std.Io`. Each operation allocates
@@ -250,6 +253,35 @@ hold identical refs: the fuzzer checks exactly that.
   they can't drift from the options. `zig build install` runs the built
   binary to write them (`git-issue completion <shell>` and the hidden
   `git-issue __manpages <dir>`), so only native builds install them.
+
+## The MCP server
+
+- `git issue mcp` serves the issues to coding agents over the Model Context
+  Protocol on stdio, built on [blitzmcp](https://github.com/StaffinityAI/blitzmcp).
+  It is part of the default build and left out with `-Dminimal` or
+  `-Dmcp=false`; as a dependency, the package builds neither it nor
+  blitzmcp. See [mcp.md](mcp.md).
+- Each tool calls the library (`Repo`, `query`, `projection`, `Catalog`),
+  never the CLI's commands, and returns a typed result with an output
+  schema. Rules both front ends need live in the library: milestone choice
+  (`Catalog.choose`), the projection (`Catalog.project`), git config
+  settings (`settings`), error descriptions (`errors`).
+- One `GitProcess` per repository: the server's own (`--repo`, else the
+  directory the client started it in) and up to 16 that tools name with
+  `repo`. Each is opened on the first call that needs it, so the server
+  starts outside a repository too. `GitProcess.refresh` ends its
+  `cat-file` session before each call, so a call sees what other tools
+  wrote in the meantime. Calls are handled one at a time.
+- The server doesn't ask for the client's roots. Claude Code's are the
+  directory it was started in and its `--add-dir` directories; a `cd` in
+  its shell changes neither. The `--add-dir` directories are all that
+  roots would add, and with several roots the server can't tell which one
+  a call is for, so the call would still pass `repo`.
+- The tools are generic over the backend; their tests drive them over
+  JSON-RPC on `GitSim`. `zig build e2e` (part of `zig build ci`) drives
+  the real `git-issue mcp` over stdio on real git repositories with the
+  official MCP TypeScript SDK client, which also checks every result
+  against the tool's output schema (`test/mcp_e2e/`).
 
 ## Simulator, oracle and fuzzer
 

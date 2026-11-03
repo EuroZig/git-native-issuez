@@ -17,9 +17,8 @@ pub fn Context(comptime B: type) type {
         /// Opened before dispatch. Only commands that need a repository
         /// report the error, so `version` and `help` work anywhere.
         backend: B.Error!*B,
-        /// `issue.workflowStates` from the config `openRepo` read. Null
-        /// when it read none; the inner null when the key isn't set.
-        workflow_states: ??[]const u8 = null,
+        /// What `openRepo` read from git config. Null before.
+        settings: ?@import("issuez").Settings = null,
 
         const Self = @This();
 

@@ -4,6 +4,7 @@
 //! output match upstream's dispatcher.
 
 const std = @import("std");
+const build_options = @import("build_options");
 const context = @import("context.zig");
 const common = @import("common.zig");
 const cmd_version = @import("cmd/version.zig");
@@ -27,6 +28,7 @@ const cmd_quarantine = @import("cmd/quarantine.zig");
 const cmd_attach = @import("cmd/attach.zig");
 const completion = @import("completion.zig");
 const manpage = @import("manpage.zig");
+const mcp = if (build_options.mcp) @import("mcp") else struct {};
 
 pub const program = "git-issue";
 
@@ -51,6 +53,7 @@ pub const Command = enum {
     help,
     @"--help",
     @"-h",
+    mcp,
     push,
     status,
     quarantine,
@@ -100,6 +103,10 @@ pub fn run(
     return switch (cmd) {
         .version, .@"--version", .@"-v" => cmd_version.main(B, ctx, inv.args),
         .help, .@"--help", .@"-h" => cmd_help.usage(B, ctx),
+        .mcp => if (build_options.mcp)
+            mcp.main(ctx.io, ctx.gpa, ctx.environ_map, ctx.out, ctx.err, inv.args)
+        else
+            unavailable(B, ctx, sub, "-Dmcp=true"),
         .create => cmd_create.main(B, ctx, inv.args),
         .ls => cmd_ls.main(B, ctx, inv.args),
         .show => cmd_show.main(B, ctx, inv.args),
@@ -164,6 +171,19 @@ fn unsupportedBridge(comptime B: type, ctx: *context.Context(B), sub: []const u8
             "or git-issue-sync in this repository; both tools share the same issue\n" ++
             "refs. To share issues between clones, use 'git issue sync <remote>'\n" ++
             "or plain git push/fetch.\n",
+        .{sub},
+    ) catch {};
+    return common.exit_error;
+}
+
+fn unavailable(
+    comptime B: type,
+    ctx: *context.Context(B),
+    sub: []const u8,
+    comptime option: []const u8,
+) u8 {
+    ctx.err.print(
+        "git-issue: '{s}' is not in this build; build with " ++ option ++ " to include it.\n",
         .{sub},
     ) catch {};
     return common.exit_error;

@@ -50,6 +50,7 @@ pub const Error = error{
     /// Failed, or printed something we couldn't parse.
     GitFailed,
     GitTooOld,
+    /// Not inside a repository, or the path doesn't exist.
     NotARepository,
     OutputTooLong,
     /// Took longer than its `Timeouts` allow, and was killed.
@@ -99,6 +100,13 @@ pub fn open(io: Io, gpa: Allocator, options: OpenOptions) Error!GitProcess {
     try env.put("GIT_TERMINAL_PROMPT", "0");
     // The sessions wait for each answer; `GIT_FLUSH=0` would hold them back.
     try env.put("GIT_FLUSH", "1");
+
+    // git runs in `path`; a missing one would fail as `GitSpawnFailed`,
+    // which says git isn't installed.
+    Io.Dir.cwd().access(io, options.path, .{}) catch |e| switch (e) {
+        error.FileNotFound => return error.NotARepository,
+        else => {},
+    };
 
     const repo_path = try gpa.dupe(u8, options.path);
     errdefer gpa.free(repo_path);
@@ -154,6 +162,19 @@ pub fn close(gp: *GitProcess) void {
     gp.* = undefined;
 }
 
+/// Ends the long-lived `cat-file` session; the next read starts a new one.
+/// For a long-running program between operations: the session may keep
+/// its view of the refs, and others write them meanwhile. The
+/// `hash-object` sessions only write objects, so they stay, and the
+/// repository isn't looked up again.
+pub fn refresh(gp: *GitProcess) void {
+    if (gp.cat_file) |cf| cf.deinit(gp.io, gp.gpa);
+    gp.cat_file = null;
+}
+
+/// The error output of the latest git command if it failed, up to 1 KiB;
+/// empty after a command that succeeded. Read it right after the failing
+/// call, before anything else runs git. See `issuez.errors.gitDetail`.
 pub fn lastStderr(gp: *const GitProcess) []const u8 {
     return gp.last_stderr[0..gp.last_stderr_len];
 }
@@ -761,7 +782,8 @@ pub fn lfsFetch(
 ) (Error || contract.LfsTransportError)!void {
     assert(contract.isValidRemoteName(remote));
     try gp.requireGitLfs(arena);
-    var failed = false;
+    // The first failing batch's output, which later batches would clear.
+    var failure: ?[]const u8 = null;
     var start: usize = 0;
     while (start < local_refs.len) : (start += 32) {
         var argv: std.ArrayList([]const u8) = .empty;
@@ -773,12 +795,12 @@ pub fn lfsFetch(
             try argv.append(arena, r);
         }
         const r = try gp.runWithin(arena, argv.items, null, gp.timeouts.transfer);
-        if (!r.ok()) {
-            gp.keepStderr(r.stderr);
-            failed = true;
-        }
+        if (!r.ok() and failure == null) failure = r.stderr;
     }
-    if (failed) return error.LfsTransferFailed;
+    if (failure) |f| {
+        gp.keepStderr(f);
+        return error.LfsTransferFailed;
+    }
 }
 
 pub fn lfsAvailable(gp: *GitProcess, arena: Allocator) Error!bool {
@@ -942,6 +964,8 @@ fn operateBy(io: Io, op: Io.Operation, by: Io.Timeout) Error!Io.Operation.Result
 
 fn spawn(gp: *GitProcess, argv: []const []const u8, stdin: bool) Error!std.process.Child {
     assert(argv.len > 0 and std.mem.eql(u8, argv[0], "git"));
+    // `lastStderr` belongs to the latest command.
+    gp.last_stderr_len = 0;
     return std.process.spawn(gp.io, .{
         .argv = argv,
         .cwd = .{ .path = gp.repo_path },

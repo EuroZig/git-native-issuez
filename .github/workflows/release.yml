@@ -1,0 +1,158 @@
+# On a `vX.Y.Z` tag: checks the version, runs the tests natively on Linux
+# and macOS (x86_64 and aarch64), and only then has `zig build release`
+# cross-compile git-issue in both flavors (default, with the MCP server, and
+# -Dminimal, the CLI only) for Linux, macOS and Windows and publishes a
+# GitHub release with the archives, SHA256SUMS and the CHANGELOG.md entry
+# as notes. See CONTRIBUTING.md, "Releasing".
+
+name: release
+
+on:
+  push:
+    tags: ["v*"]
+
+# Read-only for check and test; only release writes (the GitHub release).
+permissions:
+  contents: read
+
+env:
+  ZIG_VERSION: 0.16.0
+
+jobs:
+  check:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+    steps:
+      - uses: actions/checkout@v7
+
+      # The tag must match build.zig.zon, and CHANGELOG.md must have the
+      # version.
+      - name: Check the version
+        id: version
+        run: |
+          version=$(sed -n 's/^ *\.version = "\(.*\)",$/\1/p' build.zig.zon)
+          if [ "$GITHUB_REF_NAME" != "v$version" ]; then
+            echo "::error::Tag $GITHUB_REF_NAME does not match the version in build.zig.zon ($version)."
+            exit 1
+          fi
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+
+      - name: Extract the release notes
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
+        run: |
+          awk -v heading="## [$VERSION] - " '
+            index($0, heading) == 1 { found = 1; next }
+            found && /^## \[/ { exit }
+            found && /^\[[^]]+\]: / { exit }
+            found { print }
+          ' CHANGELOG.md > notes.md
+          if ! grep -q '[^[:space:]]' notes.md; then
+            echo "::error::CHANGELOG.md has no entry for $VERSION."
+            exit 1
+          fi
+          # On the release page, links to files in the repository need the tag.
+          sed -i -E "s#\]\(((docs|examples)/[^)]*|[A-Z]+\.md)\)#](https://github.com/$GITHUB_REPOSITORY/blob/$GITHUB_REF_NAME/\1)#g" notes.md
+          cat notes.md
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: notes
+          path: notes.md
+
+  # The gate: every platform the release targets natively, both flavors.
+  # Windows isn't tested yet (CHANGELOG.md, "Known limitations").
+  test:
+    needs: check
+    name: test ${{ matrix.platform.name }}
+    runs-on: ${{ matrix.platform.runner }}
+    timeout-minutes: 60
+    strategy:
+      fail-fast: true
+      matrix:
+        platform:
+          # Also interop, upstream's suite, perf and long fuzz runs, like ci.yml.
+          - { name: x86_64-linux, runner: ubuntu-24.04, apt: true, step: ci }
+          - { name: aarch64-linux, runner: ubuntu-24.04-arm, apt: true, step: test }
+          - { name: x86_64-macos, runner: macos-15-intel, apt: false, step: test }
+          - { name: aarch64-macos, runner: macos-15, apt: false, step: test }
+    steps:
+      - uses: actions/checkout@v7
+      - uses: mlugg/setup-zig@v2
+        with:
+          version: ${{ env.ZIG_VERSION }}
+
+      # The same tools as ci.yml. macOS has zsh and mandoc; the tests that
+      # need a missing tool are skipped.
+      - if: matrix.platform.apt
+        run: sudo apt-get update -qq && sudo apt-get install -y -qq gawk uuid-runtime git-lfs zsh fish mandoc
+
+      - run: zig build ${{ matrix.platform.step }} -Dseed=${{ github.run_id }} --summary line
+      - run: zig build test -Dminimal --summary line
+
+  release:
+    needs: [check, test]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    permissions:
+      contents: write
+    env:
+      VERSION: ${{ needs.check.outputs.version }}
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/download-artifact@v4
+        with:
+          name: notes
+
+      - uses: mlugg/setup-zig@v2
+        with:
+          version: ${{ env.ZIG_VERSION }}
+
+      - name: Build
+        run: zig build release --summary line
+
+      # The runner's own packages; the others are cross-compiled from the
+      # same code.
+      - name: Smoke test
+        run: |
+          cd zig-out/release
+          sha256sum -c SHA256SUMS
+          for flavor in full minimal; do
+            name="git-native-issuez-$VERSION-$flavor-x86_64-linux"
+            tar -xzf "$name.tar.gz"
+            "$name/bin/git-issue" version
+            # Like upstream's, the overview exits 1, so check what it prints.
+            "$name/bin/git-issue" --help > help.txt || true
+            grep -q '^usage: git issue' help.txt
+            "$name/bin/git-issue-ls" --help
+          done
+          "git-native-issuez-$VERSION-full-x86_64-linux/bin/git-issue" mcp --help
+          if "git-native-issuez-$VERSION-minimal-x86_64-linux/bin/git-issue" mcp --help; then
+            echo "::error::The minimal build has the MCP server."
+            exit 1
+          fi
+
+      # install.sh as users run it, on these archives instead of downloads.
+      - name: Install with install.sh
+        run: |
+          for flavor in full minimal; do
+            prefix="$RUNNER_TEMP/$flavor"
+            sh install.sh --from zig-out/release --version "$VERSION" --flavor "$flavor" --prefix "$prefix"
+            "$prefix/bin/git-issue" version
+            test -L "$prefix/bin/git-issue-ls"
+            test -f "$prefix/share/man/man1/git-issue.1"
+            test -x "$prefix/bin/update-git-native-issuez"
+            # The same version again is left alone.
+            sh install.sh --from zig-out/release --version "$VERSION" --flavor "$flavor" --prefix "$prefix" |
+              grep -q 'is already installed'
+          done
+
+      - name: Publish
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: >
+          gh release create "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" --verify-tag
+          --title "v$VERSION" --notes-file notes.md
+          zig-out/release/*.tar.gz zig-out/release/*.zip zig-out/release/SHA256SUMS

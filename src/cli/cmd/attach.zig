@@ -234,7 +234,7 @@ fn fetchCmd(
         };
         if (report.transfer_failed) {
             ctx.err.print("warning: git-lfs failed for some objects from '{s}':\n", .{r}) catch {};
-            printBackendDetail(B, ctx);
+            common.printGitDetail(B, ctx, error.LfsTransferFailed);
         }
         total += report.fetched;
         missing = report.missing.len;
@@ -286,15 +286,6 @@ fn remotesFor(
         return null;
     }
     return out.items;
-}
-
-fn printBackendDetail(comptime B: type, ctx: *context.Context(B)) void {
-    if (!@hasDecl(B, "lastStderr")) return;
-    const backend = ctx.backend catch return;
-    const detail = std.mem.trim(u8, backend.lastStderr(), " \t\r\n");
-    var lines = std.mem.splitScalar(u8, detail, '\n');
-    while (lines.next()) |line| if (line.len > 0)
-        ctx.err.print("       git: {s}\n", .{line}) catch {};
 }
 
 /// Errors only matter if the bytes are still missing afterwards.
