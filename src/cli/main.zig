@@ -5,6 +5,7 @@ const issuez = @import("issuez");
 const context = @import("context.zig");
 const dispatch = @import("dispatch.zig");
 const fatal = @import("fatal.zig");
+const build_options = @import("build_options");
 
 const GitProcess = issuez.backend.GitProcess;
 
@@ -13,6 +14,10 @@ pub const std_options: std.Options = .{
     // into a user's terminal.
     .log_scope_levels = &.{.{ .scope = .vaxis, .level = .warn }},
 };
+
+/// With the TUI, a panic first gives the terminal back: cooked mode, the
+/// main screen, no mouse reports.
+pub const panic = std.debug.FullPanic(if (build_options.tui) @import("tui").panic else std.debug.defaultPanic);
 
 var stdout_buffer: [16 * 1024]u8 = undefined;
 var stderr_buffer: [4 * 1024]u8 = undefined;

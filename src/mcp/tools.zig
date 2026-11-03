@@ -462,6 +462,21 @@ pub const Subscriptions = struct {
         s.lens[i] = s.lens[s.count];
     }
 
+    /// `send(context, uri)` if `uri` is still subscribed, under the lock:
+    /// once an unsubscribe is answered, no notification for it follows.
+    pub fn sendIfSubscribed(
+        s: *Subscriptions,
+        io: std.Io,
+        uri: []const u8,
+        context: anytype,
+        comptime send: fn (@TypeOf(context), []const u8) anyerror!void,
+    ) anyerror!void {
+        s.mutex.lockUncancelable(io);
+        defer s.mutex.unlock(io);
+        if (s.find(uri) == null) return;
+        try send(context, uri);
+    }
+
     fn find(s: *const Subscriptions, uri: []const u8) ?usize {
         for (0..s.count) |i| if (std.mem.eql(u8, s.at(i), uri)) return i;
         return null;

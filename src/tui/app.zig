@@ -72,7 +72,11 @@ pub fn App(comptime B: type) type {
             var buf: [400]u8 = undefined;
             const msg = self.store.describe(err, &buf);
             self.state.fail("{s}", .{msg});
-            if (err == error.VersionMismatch) self.store.reload() catch {};
+            if (err == error.VersionMismatch) {
+                self.store.reload() catch {};
+                // Told, so saving again replaces what is there now.
+                self.state.rebaseModal();
+            }
         }
 
         fn perform(self: *Self, action: State.Action) bool {
@@ -95,12 +99,14 @@ pub fn App(comptime B: type) type {
                     s.select(id);
                 },
                 .edit => |e| {
-                    st.edit(e.id.slice(), e.spec) catch |err| return self.failed(err);
+                    var spec = e.spec;
+                    spec.expect = s.expectedTip(e.id.slice());
+                    st.edit(e.id.slice(), spec) catch |err| return self.failed(err);
                     s.closeModal();
                     s.info("saved", .{});
                 },
                 .milestone => |m| {
-                    st.setMilestone(m.id.slice(), m.name) catch |err| return self.failed(err);
+                    st.setMilestone(m.id.slice(), m.name, s.expectedTip(m.id.slice())) catch |err| return self.failed(err);
                     s.closeModal();
                     s.info("saved", .{});
                 },
@@ -109,7 +115,7 @@ pub fn App(comptime B: type) type {
                         s.fail("'{s}' isn't a state", .{x.state});
                         return true;
                     }
-                    st.setState(x.id.slice(), core.State.parse(x.state)) catch |err| return self.failed(err);
+                    st.setState(x.id.slice(), core.State.parse(x.state), s.expectedTip(x.id.slice())) catch |err| return self.failed(err);
                     s.info("now {s}", .{x.state});
                     s.closeModal();
                 },
@@ -121,11 +127,13 @@ pub fn App(comptime B: type) type {
                 .toggle => |id| {
                     const i = st.snap.find(id.slice()) orelse return true;
                     const done = st.snap.isDone(i);
-                    st.setState(id.slice(), if (done) .open else .closed) catch |err| return self.failed(err);
+                    st.setState(id.slice(), if (done) .open else .closed, null) catch |err| return self.failed(err);
                     s.info("{s} #{s}", .{ if (done) "reopened" else "closed", shortId(id.slice()) });
                 },
                 .move => |m| self.move(m.id, m.column, m.done),
             }
+            // The write went through; showing it didn't.
+            if (st.takeReloadError()) |e| self.failWith(e);
             return true;
         }
 
@@ -144,7 +152,7 @@ pub fn App(comptime B: type) type {
             const done = st.snap.isDone(i);
             if (to_done) {
                 if (done) return;
-                st.setState(id.slice(), .closed) catch |e| return self.failWith(e);
+                st.setState(id.slice(), .closed, null) catch |e| return self.failWith(e);
                 s.info("closed #{s}", .{shortId(id.slice())});
                 return;
             }
@@ -156,7 +164,10 @@ pub fn App(comptime B: type) type {
             const workflow = if (std.mem.eql(u8, name, "(none)")) "" else name;
             // Checked before reopening, so a refused state changes nothing.
             if (workflow.len > 0) st.snap.settings.checkWorkflow(workflow) catch |e| return self.failWith(e);
-            if (done) st.setState(id.slice(), .open) catch |e| return self.failWith(e);
+            if (done) {
+                st.setState(id.slice(), .open, null) catch |e| return self.failWith(e);
+                if (st.takeReloadError()) |e| return self.failWith(e);
+            }
             const now = st.snap.find(id.slice()) orelse return;
             // The column it shows in, the default state included.
             const current = st.snap.proj.workflow(now) orelse "";
@@ -436,7 +447,7 @@ test "list: filter, scope and sort" {
     _ = try h.app.store.create(.{ .title = "Alpha", .labels = &.{"ui"}, .priority = .low });
     _ = try h.app.store.create(.{ .title = "Beta", .priority = .critical });
     const gamma = try h.app.store.create(.{ .title = "Gamma" });
-    try h.app.store.setState(gamma.slice(), .closed);
+    try h.app.store.setState(gamma.slice(), .closed, null);
     try h.draw();
     try testing.expectEqual(@as(usize, 2), h.app.state.list.rows.len);
 
@@ -507,7 +518,7 @@ test "dialogs keep their values, also across a reload" {
 
     // A menu outlives a reload, as when the terminal gets the focus back:
     // the custom state among the options is the snapshot's.
-    try h.app.store.setState(id.slice(), core.State.parse("on-hold"));
+    try h.app.store.setState(id.slice(), core.State.parse("on-hold"), null);
     try h.press('s', .{});
     h.app.refresh();
     try h.draw();
@@ -638,7 +649,7 @@ test "board: a column for a state that isn't configured takes no cards" {
     defer h.deinit();
     _ = try h.app.store.create(.{ .title = "Stale", .workflow = "review" });
     const card = try h.app.store.create(.{ .title = "Done" });
-    try h.app.store.setState(card.slice(), .closed);
+    try h.app.store.setState(card.slice(), .closed, null);
     try setConfig(&h, "issue.workflowStates", "backlog, ready");
     try h.press('2', .{});
     try h.click(.{ .scope = .all });
@@ -823,10 +834,90 @@ test "a description changed meanwhile isn't overwritten without asking" {
     }.of;
     try testing.expect(h.app.state.modal != null);
     try testing.expectEqualStrings("Theirs", desc(&h, id));
-    try testing.expect(std.mem.startsWith(u8, h.app.state.status(), "the description changed"));
+    try testing.expect(std.mem.endsWith(u8, h.app.state.status(), "changed meanwhile: save again to replace it with yours"));
     try h.press('s', .{ .ctrl = true });
     try testing.expect(h.app.state.modal == null);
     try testing.expectEqualStrings("Text mine", desc(&h, id));
+}
+
+test "a field changed elsewhere while its dialog is open isn't overwritten without asking" {
+    var h: Harness = undefined;
+    try h.init();
+    defer h.deinit();
+    const id = try h.app.store.create(.{ .title = "Shared", .labels = &.{"bug"} });
+    h.app.state.openIssue(id.slice());
+    try h.draw();
+    try h.press('l', .{});
+    try h.typeText(", ui");
+    // Another process adds one, and the TUI follows.
+    const ref = try std.fmt.allocPrint(h.arena_state.allocator(), "{s}{s}", .{ issuez.engine.issue_ref_prefix, id.slice() });
+    _ = try issuez.Repo(GitSim).init(&h.sim).edit(h.arena_state.allocator(), ref, .{ .add_labels = &.{"urgent"} });
+    h.app.changedElsewhere(false);
+    try h.draw();
+    const labels = struct {
+        fn of(hh: *Harness, i: store_mod.Id) []const []const u8 {
+            return hh.snap().issues[hh.snap().find(i.slice()).?].labels;
+        }
+    }.of;
+    try testing.expectEqual(@as(usize, 2), labels(&h, id).len);
+
+    try h.press(K.enter, .{});
+    try testing.expect(h.app.state.modal != null);
+    try testing.expectEqual(@as(usize, 2), labels(&h, id).len);
+    try testing.expect(std.mem.endsWith(u8, h.app.state.status(), "changed meanwhile: save again to replace it with yours"));
+    // Told, saving again is meant.
+    try h.press(K.enter, .{});
+    try testing.expect(h.app.state.modal == null);
+    const now = labels(&h, id);
+    try testing.expectEqual(@as(usize, 2), now.len);
+    for (now) |l| try testing.expect(std.mem.eql(u8, l, "bug") or std.mem.eql(u8, l, "ui"));
+}
+
+test "a menu answer that was the issue's when it opened still writes once it changed" {
+    var h: Harness = undefined;
+    try h.init();
+    defer h.deinit();
+    const id = try h.app.store.create(.{ .title = "Shared" });
+    h.app.state.openIssue(id.slice());
+    try h.draw();
+    try h.press('p', .{}); // on the current "(none)"
+    try h.app.store.edit(id.slice(), .{ .priority = .{ .set = .high } });
+    try h.press(K.enter, .{});
+    try testing.expect(h.app.state.modal != null);
+    try h.press(K.enter, .{});
+    try testing.expect(h.app.state.modal == null);
+    try testing.expectEqual(@as(?[]const u8, null), h.snap().issues[h.snap().find(id.slice()).?].field("Priority"));
+}
+
+test "a failed reload after a create doesn't keep the form for a second one" {
+    var h: Harness = undefined;
+    try h.init();
+    defer h.deinit();
+    try h.press('n', .{});
+    try h.typeText("Once");
+    try h.sim.configAdd("issue.doneStates", "open");
+    try h.press('s', .{ .ctrl = true });
+    try testing.expect(h.app.state.modal == null);
+    try testing.expect(std.mem.startsWith(u8, h.app.state.status(), "git config issue.doneStates is invalid"));
+    try h.sim.configUnsetValue("issue.doneStates", "open");
+    try h.app.store.reload();
+    try testing.expectEqual(@as(usize, 1), h.snap().issues.len);
+}
+
+test "a terminal too small shows nothing and keys act on nothing" {
+    var h: Harness = undefined;
+    try h.init();
+    defer h.deinit();
+    _ = try h.app.store.create(.{ .title = "Keep open" });
+    try h.draw();
+    var small = h.win();
+    small.width = 10;
+    small.height = 4;
+    try h.app.draw(small, 0);
+    try testing.expectEqual(@as(usize, 0), h.app.state.list.rows.len);
+    try testing.expect(try h.app.handle(.{ .key = .{ .codepoint = 'x' } }, h.now_ms));
+    try testing.expect(!h.snap().isDone(0));
+    try testing.expect(!try h.app.handle(.{ .key = .{ .codepoint = 'q', .text = "q" } }, h.now_ms));
 }
 
 test "an ID prefix picks the issue that isn't deleted" {

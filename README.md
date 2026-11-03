@@ -5,21 +5,20 @@ command. It reads and writes the format of
 [git-native-issue](https://github.com/remenoscodes/git-native-issue) (format
 1), so issues written by either tool work with the other.
 
-Issues live under `refs/issues/<uuid>` as chains of commits with an empty
-tree. There is no server, no database and nothing in the working tree.
+- **No server, no database:** issues are commit chains under
+  `refs/issues/<uuid>`, shared through any git remote.
+- **More than format 1:** parent issues, blockers, dates, estimates,
+  workflow states, milestones and image attachments, as extra trailers that
+  upstream keeps and shows.
+- **A terminal UI:** a list, a kanban board and a detail view, usable with
+  the mouse, updating live when anyone else writes.
+- **For coding agents:** `git issue mcp`, a Model Context Protocol server.
+- **For scripts:** `--json` on every read command, man pages and shell
+  completions.
 
-**Status:** early. This version covers format 1: creating, listing,
-showing, commenting on, editing, closing and searching issues, `fsck` and
-`init`, and sharing issues between clones through any git remote (`merge`,
-`push`, `sync`). On top of format 1 it adds planning fields (parent issues,
-blockers, dates, estimates, workflow states), milestones, lifecycle
-events (editing and deleting comments, deleting and restoring issues) and
-image attachments, as extra trailers that upstream keeps and shows. Read
-commands print JSON with `--json`, `git issue tui` is a terminal UI (a
-list, a kanban board and a detail view, all usable with the mouse),
-`git issue mcp` serves the issues to coding agents, and the install
-includes shell completions and man pages. The TUI and the MCP server
-update live when other processes write.
+![The list: issues with their labels, priority, workflow state, assignee and due date, sorted by priority](docs/issuez-list.png)
+
+![The board: a column per workflow state, cards with priority, progress, labels and assignee](docs/issuez-board.png)
 
 > [!WARNING]
 > Generative AI was used to edit and/or produce large portions of this code.
@@ -27,161 +26,115 @@ update live when other processes write.
 
 ## Install
 
-On Linux and macOS, `install.sh` downloads the latest release for your
-machine, checks it against the release's `SHA256SUMS` and installs it into
-`~/.local`:
-
 ```sh
+# Linux and macOS
 curl -fsSL https://raw.githubusercontent.com/EuroZig/git-native-issuez/main/install.sh | sh
-```
 
-`sh -s -- --flavor minimal` picks the CLI-only flavor, `--version 0.2.0`
-a release, `--prefix /usr/local` another place (`--help` lists them all).
-Only the copy into a prefix you can't write to runs with `sudo` (or
-`doas`), which asks for your password once; don't run the whole script
-with `sudo`. It doesn't touch your shell configuration: if `~/.local/bin`
-isn't on `PATH`, it says what to add. To read it first, download it and
-run `sh install.sh`.
-
-`update-git-native-issuez`, installed next to `git-issue`, updates to the
-latest release with the same flavor and prefix. It leaves an up-to-date
-install alone and refuses a downgrade without `--allow-downgrade`.
-
-Each [release](https://github.com/EuroZig/git-native-issuez/releases) has
-archives for Linux and macOS (x86_64 and aarch64) and Windows (x86_64), in
-two flavors: `full`, the default with the terminal UI and the MCP server,
-and `minimal`, the CLI only. The Linux and macOS archives also have the shell completions,
-man pages and docs under `share/`; the Windows archive has `git-issue.exe`
-only, so run `git issue <command>` there. `SHA256SUMS` lists the checksums. By
-hand, unpack one (`.tar.gz`, or `.zip` for Windows) into a prefix that has
-`bin/` on your `PATH`, such as `~/.local`:
-
-```sh
-gh release download v0.2.0 --repo EuroZig/git-native-issuez --pattern '*-full-aarch64-macos.tar.gz'
-tar -xzf git-native-issuez-0.2.0-full-aarch64-macos.tar.gz --strip-components=1 -C ~/.local
-```
-
-On macOS, an archive downloaded with a browser is quarantined and the
-unpacked `git-issue` won't run; download it with `gh` or `curl -LO`
-instead, or clear the flag with `xattr -d com.apple.quarantine <archive>`
-before unpacking.
-
-Or build it, with Zig 0.16.0: `zig build -Doptimize=ReleaseSafe --prefix ~/.local`
-(add `-Dminimal` for the CLI only).
-
-### Homebrew
-
-On macOS (13 or later) and Linux, Homebrew installs the latest release from
-the [EuroZig tap](https://github.com/EuroZig/homebrew-tap), with the man
-pages and the bash, zsh and fish completions:
-
-```sh
+# Homebrew (macOS 13 or later, Linux)
 brew tap eurozig/tap
 brew trust eurozig/tap
 brew install git-native-issuez
 ```
 
-Homebrew only loads formulae from taps outside its own once you trust
-them; `brew trust` does that once for the tap, so `brew upgrade` keeps
-updating git-native-issuez with your other packages. A Homebrew without
-`brew trust` doesn't need that line. The formula installs the default
-flavor, with the terminal UI and the MCP server.
+Windows archives, the CLI-only flavor, the installer's options and building
+from source: [Installing in detail](#installing-in-detail).
 
-## Usage
+## Quick start
 
 ```sh
 git issue create "Login page crashes" -l bug -p high
 git issue ls
 git issue comment a7f3 -m "Happens on Safari only."
-git issue edit a7f3 -a ada@example.com
-git issue create "Release 1.0" --due 2026-12-01
-git issue edit a7f3 --parent 5e21 --estimate 2h
-git issue tree                   # parents, sub-issues, progress, blockers
-git issue milestone create v1.0 --due 2026-12-01
-git issue edit 5e21 --milestone v1.0   # sub-issues inherit it
-git issue milestone show v1.0    # its issues and progress
-git issue comment a7f3 -m "Cut off on small screens." --attach login.png
-git issue attach cat a7f3 fc7b > login.png
+git issue edit a7f3 -a ada@example.com --estimate 2h
 git issue close a7f3 --fixed-by 1a2b3c4
-git issue show a7f3
-git issue search -i safari
-git issue ls --json              # for scripts, see docs/json.md
-git issue fsck
 git issue sync origin            # merge the remote's issues, push ours
-git issue                        # at a terminal: the terminal UI (also git issue tui)
+git issue                        # at a terminal: the terminal UI
 ```
 
 Issue IDs can be shortened to any unique prefix.
+`git issue <command> --help` (or `man git-issue-<command>`) describes each
+command.
 
-Edits never rewrite history: `git issue comment <id> --edit <comment-id>`,
-`--delete` and `--restore`, `git issue edit <id> --description` and
-`git issue delete`/`restore` each add a commit. `git issue show --ids`
-shows comment IDs, `git issue ls --problems` lists issues whose parent or
-blocker is missing or loops back.
+## Features
 
-Milestones live under `refs/milestones/<uuid>` and sync with the issues.
-An issue is in a milestone directly or through its parent, and a
-milestone can only be completed once all of its issues are closed. Linking
-one also writes upstream's `Milestone:` field, so upstream shows its
-name.
+### Planning and milestones
 
-Attachments are PNG, JPEG or WebP images. The issue history records each
-one (ID, type, size, sha256, name), and the bytes are git-lfs objects:
-`git issue sync` uploads them with `git lfs push` and `attach cat` or
-`attach fetch` downloads them when needed. They are kept in a store that
-`git lfs prune` doesn't touch. Attachments need git-lfs: without it the
-attachment commands refuse, and everything else works. See
-[docs/attachments.md](docs/attachments.md).
+```sh
+git issue edit a7f3 --parent 5e21 --due 2026-12-01
+git issue tree                         # parents, sub-issues, progress, blockers
+git issue milestone create v1.0 --due 2026-12-01
+git issue edit 5e21 --milestone v1.0   # sub-issues inherit it
+git issue milestone show v1.0          # its issues and progress
+```
 
-`git issue sync <remote>` fetches the remote's issues and milestones,
-merges them, and pushes the local ones. Concurrent edits get a merge commit; which value
-wins follows from the history, and `git issue ls --conflicts` shows where
-two clones disagreed. Sync never force-pushes and never drops a version: a
-remote issue whose history was rewritten is quarantined until you decide
-(`git issue status`, `git issue quarantine`). Clones can sync with
-upstream's `git issue merge` and `git push` too.
+- An issue is in a milestone directly or through its parent; a milestone
+  completes once all of its issues are closed.
+- Milestones live under `refs/milestones/<uuid>` and sync with the issues.
+  Linking one also writes upstream's `Milestone:` field.
 
-`git issue tui` (or plain `git issue` at a terminal) opens the terminal
-UI: a list, optionally as a tree of sub-issues, a kanban board by workflow
-state, and a detail view where every field is edited in place. `?` shows
-the keys; the mouse works everywhere. It follows what others write as it
-happens: `git issue` in another terminal, another TUI, an agent through
-`git issue mcp`, a sync.
+### History is never rewritten
 
-![The list: issues with their labels, priority, workflow state, assignee and due date, sorted by priority](docs/issuez-list.png)
+- Editing, deleting and restoring comments (`comment --edit`, `--delete`,
+  `--restore`) and issues (`delete`, `restore`) each add a commit.
+- `git issue show --ids` shows comment IDs; `git issue ls --problems` lists
+  issues whose parent or blocker is missing or loops back.
 
-![The board: a column per workflow state, cards with priority, progress, labels and assignee](docs/issuez-board.png)
+### Sync
 
-`git issue <command> --help` describes each command. The same texts are
-installed as man pages (`man git-issue-create`; `git issue --help` opens
-`git-issue(1)` through git). `zig build install` puts them and the bash,
-zsh and fish completions under the prefix's `share/`, for native builds.
-`git issue completion <shell>` prints a completion script by hand.
+- `git issue sync <remote>` fetches, merges and pushes issues and
+  milestones. Concurrent edits get a merge commit, and
+  `git issue ls --conflicts` shows where clones disagreed.
+- It never force-pushes or drops a version: an issue whose remote history
+  was rewritten is quarantined until you decide (`git issue status`,
+  `git issue quarantine`).
+- Clones can also sync with upstream's `git issue merge` and `git push`.
 
-`--json` on `ls`, `show`, `tree`, `search`, `status`, `attach ls`,
-`milestone ls` and `milestone show` prints JSON for scripts and programs
-that don't link the library. Fields are only ever added
-([docs/json.md](docs/json.md)).
+### Attachments
 
-For [lazygit](https://github.com/jesseduffield/lazygit),
-[docs/lazygit.md](docs/lazygit.md) has an issues menu under one key.
+```sh
+git issue comment a7f3 -m "Cut off on small screens." --attach login.png
+git issue attach cat a7f3 fc7b > login.png
+```
 
-`git issue mcp` is a [Model Context Protocol](https://modelcontextprotocol.io)
-server on stdio for coding agents: it lists, shows and searches issues and
-milestones, and creates, comments on, edits, closes and reopens issues,
-through the library. For Claude Code, run `git issue mcp install` once for
-every project; [docs/mcp.md](docs/mcp.md) has the tools, the install scopes
-and other clients.
+PNG, JPEG or WebP images, stored as git-lfs objects that `git issue sync`
+uploads and downloads. Without git-lfs only the attachment commands refuse.
+See [docs/attachments.md](docs/attachments.md).
 
-Like upstream, the `git-issue-<command>` entry points are installed next to
-`git-issue`, so scripts that call them directly keep working.
+### Terminal UI
 
-**Importing from GitHub, GitLab, Gitea/Forgejo or Azure DevOps:** use
-upstream's `git-issue-import <provider>:<path>` (and `git-issue-export` to
-go back) in the same repository. The provider bridges are not reimplemented
-here and are currently not planned, contributions are welcome though. The
-issues they write work with this tool as they are, because both tools share
-the format.
+`git issue tui`, or plain `git issue` at a terminal:
+
+- a list, optionally as a tree of sub-issues, sortable and filterable
+  (`label:ui @ada p:high is:blocked -label:wontfix`);
+- a kanban board with a column per workflow state;
+- a detail view where every field is edited in place.
+
+`?` shows the keys, and the mouse works everywhere. It follows what others
+write as it happens: `git issue` in another terminal, another TUI, an agent,
+a sync.
+
+### Coding agents (MCP)
+
+`git issue mcp` serves the issues over the
+[Model Context Protocol](https://modelcontextprotocol.io) on stdio: tools to
+list, show, search, create, comment on, edit and close issues, and resources
+that notify subscribers of changes. For Claude Code, run
+`git issue mcp install` once; [docs/mcp.md](docs/mcp.md) has the tools and
+other clients.
+
+### Scripts and other tools
+
+- `--json` on `ls`, `show`, `tree`, `search`, `status`, `attach ls`,
+  `milestone ls` and `milestone show`; fields are only ever added
+  ([docs/json.md](docs/json.md)).
+- The `git-issue-<command>` entry points are installed like upstream's, so
+  scripts calling them keep working.
+- [lazygit](https://github.com/jesseduffield/lazygit): an issues menu under
+  one key ([docs/lazygit.md](docs/lazygit.md)).
+- Importing from GitHub, GitLab, Gitea/Forgejo or Azure DevOps: use
+  upstream's `git-issue-import` and `git-issue-export` in the same
+  repository. Those bridges aren't reimplemented here (contributions are
+  welcome); the issues they write work as they are.
 
 ## Using the library
 
@@ -193,11 +146,6 @@ module:
 const issuez_dep = b.dependency("git_native_issuez", .{ .target = target, .optimize = optimize });
 exe.root_module.addImport("issuez", issuez_dep.module("issuez"));
 ```
-
-As a dependency the package builds only the library, so libvaxis,
-blitzmcp and nightwatch (the TUI's and the MCP server's dependencies) are
-never fetched; pass `.tui = true` or `.mcp = true` to also get them in the
-`git-issue` build.
 
 ```zig
 const issuez = @import("issuez");
@@ -211,9 +159,12 @@ const open = try issuez.query.list(arena, try repo.loadAll(arena), .{ .state = .
 for (open) |issue| std.debug.print("{s} {s}\n", .{ issue.state.text(), issue.title });
 ```
 
-`Repo` is generic over its backend. `GitProcess` drives the `git` binary,
-`GitSim` is an in-memory repository for tests, and you can bring your own
-(see [docs/design.md](docs/design.md)).
+- `Repo` is generic over its backend: `GitProcess` drives the `git` binary,
+  `GitSim` is an in-memory repository for tests, or bring your own
+  ([docs/design.md](docs/design.md)).
+- As a dependency the package builds only the library: libvaxis, blitzmcp
+  and nightwatch are never fetched. Pass `.tui = true` or `.mcp = true` to
+  build them into `git-issue`.
 
 | Example                                           | Shows                                                                                  | Run                                        |
 | ------------------------------------------------- | -------------------------------------------------------------------------------------- | ------------------------------------------ |
@@ -226,8 +177,8 @@ for (open) |issue| std.debug.print("{s} {s}\n", .{ issue.state.text(), issue.tit
 ## Docs
 
 - [docs/format.md](docs/format.md): the format on disk.
-- [docs/attachments.md](docs/attachments.md): attachments in the CLI and
-  the library.
+- [docs/attachments.md](docs/attachments.md): attachments in the CLI and the
+  library.
 - [docs/json.md](docs/json.md): the `--json` output.
 - [docs/lazygit.md](docs/lazygit.md): an issues menu for lazygit.
 - [docs/mcp.md](docs/mcp.md): the MCP server for coding agents.
@@ -236,34 +187,91 @@ for (open) |issue| std.debug.print("{s} {s}\n", .{ issue.state.text(), issue.tit
   upstream on purpose.
 - [CHANGELOG.md](CHANGELOG.md): what changed.
 
-## Development
+## Installing in detail
 
-Requires Zig 0.16.0 and git 2.30 or newer.
+### Flavors and archives
+
+Each [release](https://github.com/EuroZig/git-native-issuez/releases) has
+two flavors, for Linux and macOS (x86_64, aarch64) and Windows (x86_64):
+
+- `full`, the default: with the terminal UI and the MCP server;
+- `minimal`: the CLI only.
+
+The Linux and macOS archives also have the shell completions, man pages and
+docs under `share/`. The Windows archive has `git-issue.exe` only: run
+`git issue <command>` there. `SHA256SUMS` lists the checksums. To install
+one by hand, unpack it into a prefix with `bin/` on your `PATH`:
 
 ```sh
-zig build                      # git-issue with the TUI and the MCP server, the git-issue-<sub> links, completions, man pages
-zig build -Dminimal            # the same without the TUI and the MCP server (or -Dtui=false / -Dmcp=false)
+gh release download v0.2.0 --repo EuroZig/git-native-issuez --pattern '*-full-aarch64-macos.tar.gz'
+tar -xzf git-native-issuez-0.2.0-full-aarch64-macos.tar.gz --strip-components=1 -C ~/.local
+```
+
+On macOS, an archive downloaded with a browser is quarantined and
+`git-issue` won't run: download it with `gh` or `curl -LO`, or run
+`xattr -d com.apple.quarantine <archive>` before unpacking.
+
+### install.sh
+
+It downloads the latest release for your machine, checks it against
+`SHA256SUMS` and installs it into `~/.local`.
+
+- Options go after `sh -s --`: `--flavor minimal`, `--version 0.2.0`,
+  `--prefix /usr/local`; `--help` lists them all.
+- Only the copy into a prefix you can't write to uses `sudo` (or `doas`).
+  Don't run the whole script with `sudo`.
+- It doesn't touch your shell configuration: if `~/.local/bin` isn't on
+  `PATH`, it says what to add.
+- To read it first, download it and run `sh install.sh`.
+- `update-git-native-issuez`, installed next to `git-issue`, updates with
+  the same flavor and prefix. It refuses a downgrade without
+  `--allow-downgrade`.
+- `update-git-native-issuez --uninstall` (or
+  `install.sh --uninstall --prefix <dir>`) removes everything it installed,
+  and nothing else. The issues in your repositories stay.
+
+### Homebrew
+
+The [EuroZig tap](https://github.com/EuroZig/homebrew-tap) installs the full
+flavor with the man pages and the bash, zsh and fish completions. Homebrew
+only loads formulae from taps outside its own once you trust them, so
+`brew trust eurozig/tap` is needed once; after that, `brew upgrade` keeps
+git-native-issuez up to date with your other packages. A Homebrew without
+`brew trust` doesn't need that line.
+
+### From source
+
+With Zig 0.16.0 and git 2.30 or newer:
+
+```sh
+zig build -Doptimize=ReleaseSafe --prefix ~/.local   # add -Dminimal for the CLI only
+```
+
+## Development
+
+```sh
+zig build                      # git-issue with the TUI and the MCP server, links, completions, man pages
+zig build -Dminimal            # without the TUI and the MCP server (or -Dtui=false / -Dmcp=false)
 zig build test                 # unit, backend, CLI, simulator and fuzz smoke tests, examples
 zig build test-interop         # both tools on shared repositories (fetches upstream)
-zig build e2e                  # `git issue mcp` against the official MCP SDK client (Node.js, npm),
+zig build e2e                  # the MCP server with the official SDK client (Node.js, npm),
                                # and two TUIs on pseudo-terminals following each other's writes
 zig build test-tui-e2e         # only the TUIs' (Linux, macOS)
 zig build test-upstream-suite  # upstream's t/*.sh against our git-issue
 zig build test-perf            # `ls -a` over 10 000 issues within 2 s
 zig build ci -Dseed=N          # all of the above, plus long fuzz runs: what CI runs
 zig build update-snapshots     # rewrite examples/*.out after an intended output change
-zig build release              # the release archives for every platform, cross-compiled, in zig-out/release/
+zig build release              # the release archives for every platform, in zig-out/release/
 ```
 
-`zig build test` runs every example. The in-memory ones must print exactly
-their snapshot (`examples/<name>.out`), and `real-repo` runs against a fresh
-repository in a temporary directory.
-
-Every command runs in a simulator on an in-memory repository, and an
-independent oracle checks what it may change. The fuzzer runs random
-commands through both; see [docs/design.md](docs/design.md). Upstream is
-only fetched for `test-interop` and `test-upstream-suite`, and never
-vendored. [CONTRIBUTING.md](CONTRIBUTING.md) has the rules for changes.
+- Every command also runs in a simulator on an in-memory repository, where
+  an independent oracle checks what it may change, and a fuzzer runs random
+  commands through both ([docs/design.md](docs/design.md)).
+- The in-memory examples must print exactly their snapshot
+  (`examples/<name>.out`).
+- Upstream is only fetched for `test-interop` and `test-upstream-suite`, and
+  never vendored.
+- [CONTRIBUTING.md](CONTRIBUTING.md) has the rules for changes.
 
 ## License
 

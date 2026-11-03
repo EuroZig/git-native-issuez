@@ -1,7 +1,7 @@
 # On a `vX.Y.Z` tag: checks the version, runs the tests natively on Linux
 # and macOS (x86_64 and aarch64), and only then has `zig build release`
-# cross-compile git-issue in both flavors (default, with the MCP server, and
-# -Dminimal, the CLI only) for Linux, macOS and Windows and publishes a
+# cross-compile git-issue in both flavors (default, with the terminal UI and
+# the MCP server, and -Dminimal, the CLI only) for Linux, macOS and Windows and publishes a
 # GitHub release with the archives, SHA256SUMS and the CHANGELOG.md entry
 # as notes. See CONTRIBUTING.md, "Releasing".
 
@@ -128,11 +128,13 @@ jobs:
             grep -q '^usage: git issue' help.txt
             "$name/bin/git-issue-ls" --help
           done
-          "git-native-issuez-$VERSION-full-x86_64-linux/bin/git-issue" mcp --help
-          if "git-native-issuez-$VERSION-minimal-x86_64-linux/bin/git-issue" mcp --help; then
-            echo "::error::The minimal build has the MCP server."
-            exit 1
-          fi
+          for part in tui mcp; do
+            "git-native-issuez-$VERSION-full-x86_64-linux/bin/git-issue" "$part" --help
+            if "git-native-issuez-$VERSION-minimal-x86_64-linux/bin/git-issue" "$part" --help; then
+              echo "::error::The minimal build has '$part'."
+              exit 1
+            fi
+          done
 
       # install.sh as users run it, on these archives instead of downloads.
       - name: Install with install.sh
@@ -147,6 +149,14 @@ jobs:
             # The same version again is left alone.
             sh install.sh --from zig-out/release --version "$VERSION" --flavor "$flavor" --prefix "$prefix" |
               grep -q 'is already installed'
+            # Uninstalling removes all of it and nothing else.
+            touch "$prefix/bin/git-issue-import" "$prefix/share/man/man1/other.1"
+            sh install.sh --uninstall --prefix "$prefix"
+            left=$(cd "$prefix" && find . ! -type d | sort | tr '\n' ' ')
+            if [ "$left" != "./bin/git-issue-import ./share/man/man1/other.1 " ]; then
+              echo "::error::--uninstall left or removed the wrong files: $left"
+              exit 1
+            fi
           done
 
       - name: Publish

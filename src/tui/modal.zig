@@ -61,6 +61,16 @@ pub const Purpose = union(enum) {
     comment: Id,
     /// The list and board order, not a write.
     sort,
+
+    /// The issue whose fields the answer replaces, so its write expects
+    /// the tip the dialog showed. A comment replaces nothing.
+    pub fn issue(p: Purpose) ?Id {
+        return switch (p) {
+            .title, .description => |id| id,
+            .field => |fp| fp.id,
+            .comment, .sort => null,
+        };
+    }
 };
 
 pub const Prompt = struct {
@@ -83,7 +93,7 @@ pub const Editor = struct {
 
 pub const Menu = struct {
     title: []const u8,
-    options: []const Option,
+    options: []Option,
     selected: u16 = 0,
     scroll: u16 = 0,
     purpose: Purpose,
@@ -111,6 +121,15 @@ pub const Modal = union(enum) {
             .form => |*f| f.deinit(gpa),
             .menu, .help => {},
         }
+    }
+
+    pub fn issue(m: *const Modal) ?Id {
+        return switch (m.*) {
+            .prompt => |*p| p.purpose.issue(),
+            .editor => |*e| e.purpose.issue(),
+            .menu => |*mn| mn.purpose.issue(),
+            .form, .help => null,
+        };
     }
 
     /// Whether closing it loses something typed.
@@ -223,9 +242,12 @@ fn print(s: *AppState, comptime format: []const u8, args: anytype) []const u8 {
 
 /// `value` may live in the modal arena, which closing the open dialog
 /// resets: it is copied first. `value` is the issue's, unless `fresh`.
+/// From a dialog on the same issue (a menu's "Other…"), the tip that one
+/// showed is kept.
 fn openPrompt(s: *AppState, title: []const u8, hint: []const u8, value: []const u8, purpose: Purpose, fresh: bool) void {
     var input: TextArea = .init(false);
     input.set(s.gpa, value) catch {};
+    const kept = s.modal_tip;
     s.closeModal();
     s.openModal(.{ .prompt = .{
         .title = dupe(s, title),
@@ -234,6 +256,9 @@ fn openPrompt(s: *AppState, title: []const u8, hint: []const u8, value: []const 
         .input = input,
         .purpose = purpose,
     } });
+    if (kept) |k| if (s.modal_tip) |*t| if (t.id.eql(k.id.slice())) {
+        t.tip = k.tip;
+    };
 }
 
 /// For an answer that is what the issue already has: no write.
@@ -476,9 +501,34 @@ fn pasteKey(s: *AppState, m: *Modal, k: vaxis.Key) Allocator.Error!void {
 
 // Answers into actions.
 
+/// The issue changed since the dialog opened (`AppState.modalStale`):
+/// what it showed as unchanged may not be any more. Once the user has
+/// been told, saving again replaces what is there now.
+pub fn rebase(s: *AppState) void {
+    const m = &(s.modal orelse return);
+    switch (m.*) {
+        // Any answer is a change now.
+        .prompt => |*p| p.original = null,
+        .menu => |*mn| for (mn.options) |*o| {
+            o.current = false;
+        },
+        .editor => |*e| if (e.purpose == .description) {
+            const i = s.snap.find(e.purpose.description.slice()) orelse return;
+            e.original = dupe(s, s.snap.issues[i].description);
+        },
+        .form, .help => {},
+    }
+}
+
 fn submit(s: *AppState) Action {
     const m = &s.modal.?;
     const a = s.modalArena();
+    if (s.modalStale()) {
+        const id = m.issue().?;
+        s.rebaseModal();
+        s.fail("#{s} changed meanwhile: save again to replace it with yours", .{shortId(id.slice())});
+        return .none;
+    }
     switch (m.*) {
         .help => return .none,
         .form => |*fm| return fm.submit(s),
@@ -486,16 +536,6 @@ fn submit(s: *AppState) Action {
             const t = e.input.text();
             switch (e.purpose) {
                 .description => |id| {
-                    // Changed since the editor opened, as a failed save
-                    // finds: say so once instead of writing over it.
-                    if (s.snap.find(id.slice())) |i| {
-                        const now = s.snap.issues[i].description;
-                        if (!std.mem.eql(u8, now, e.original)) {
-                            e.original = a.dupe(u8, now) catch "";
-                            s.fail("the description changed meanwhile: ctrl+s again replaces it with yours", .{});
-                            return .none;
-                        }
-                    }
                     if (std.mem.eql(u8, t, e.original)) return unchanged(s);
                     return .{ .edit = .{ .id = id, .spec = .{ .description = t } } };
                 },

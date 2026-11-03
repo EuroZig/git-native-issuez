@@ -5,6 +5,7 @@
 #
 #   curl -fsSL https://raw.githubusercontent.com/EuroZig/git-native-issuez/main/install.sh | sh
 #   sh install.sh --flavor minimal --prefix /usr/local
+#   sh install.sh --uninstall                  # or: update-git-native-issuez --uninstall
 #
 # Every archive is checked against the release's SHA256SUMS before
 # anything is installed. Only the copy into a prefix you can't write to
@@ -24,16 +25,19 @@ force=0
 allow_downgrade=0
 # --no-verify does not persist: it has to be asked for on every run
 no_verify=0
+uninstall=0
 
 usage() {
     cat <<EOF
 usage: install.sh [--version <x.y.z>] [--flavor full|minimal] [--prefix <dir>]
                   [--from <dir>] [--force] [--allow-downgrade] [--no-verify]
+       install.sh --uninstall [--prefix <dir>]
 
 Installs git-native-issuez from its GitHub releases ($repo).
 
   --version <x.y.z>   The release (default: the latest)
-  --flavor <name>     full, with the MCP server (default), or minimal, the CLI only
+  --flavor <name>     full, with the terminal UI and the MCP server (default),
+                      or minimal, the CLI only
   --prefix <dir>      Where bin/ and share/ go (default: ~/.local). One you can't
                       write to is written with sudo (or doas)
   --from <dir>        Take the archive and SHA256SUMS from <dir> instead of
@@ -41,6 +45,9 @@ Installs git-native-issuez from its GitHub releases ($repo).
   --force             Install even if this version and flavor are installed
   --allow-downgrade   Install an older version than the installed one
   --no-verify         Install without checking SHA256SUMS
+  --uninstall         Remove git-native-issuez from the prefix: git-issue, its
+                      entry points, completions, man pages, docs and
+                      update-git-native-issuez. Issues in your repositories stay
   -h, --help          Show this help
 EOF
 }
@@ -48,6 +55,46 @@ EOF
 die() {
     echo "error: $*" >&2
     exit 1
+}
+
+# Sets SUDO to sudo or doas if the files listed in $1 (relative to the
+# prefix) need it, else to nothing. The nearest existing ancestor of every
+# directory a file goes into (or is removed from) has to be writable;
+# moving a file into place or removing it needs its directory, not the
+# file. $2 says what for: install or uninstall.
+find_sudo() {
+    need_sudo=''
+    for d in $(sed 's|/[^/]*$||' "$1" | sort -u) .; do
+        probe="$prefix/$d"
+        while [ ! -e "$probe" ]; do
+            parent=$(dirname "$probe")
+            [ "$parent" != "$probe" ] || break
+            probe=$parent
+        done
+        if [ ! -w "$probe" ]; then
+            need_sudo=$probe
+            break
+        fi
+    done
+    SUDO=''
+    [ -n "$need_sudo" ] || return 0
+    if command -v sudo >/dev/null 2>&1; then
+        SUDO=sudo
+    elif command -v doas >/dev/null 2>&1; then
+        SUDO=doas
+    else
+        die "$need_sudo is not writable, and there is no sudo or doas;" \
+            "give another --prefix"
+    fi
+    # sudo asks on the terminal, also when this script comes through a pipe
+    (: </dev/tty) 2>/dev/null ||
+        die "$need_sudo is not writable, and there is no terminal to ask" \
+            "for $SUDO's password; give another --prefix or run it in one"
+    if [ "$2" = install ]; then
+        echo "$need_sudo is not writable: $SUDO will ask for your password to install into $prefix"
+    else
+        echo "$need_sudo is not writable: $SUDO will ask for your password to uninstall from $prefix"
+    fi
 }
 
 # quotes a value for the generated updater
@@ -70,6 +117,7 @@ while [ $# -gt 0 ]; do
     --force) force=1 && shift ;;
     --allow-downgrade) allow_downgrade=1 && shift ;;
     --no-verify) no_verify=1 && shift ;;
+    --uninstall) uninstall=1 && shift ;;
     -h | --help)
         usage
         exit 0
@@ -77,6 +125,12 @@ while [ $# -gt 0 ]; do
     *) die "unknown option '$1' (see --help)" ;;
     esac
 done
+
+# --flavor is allowed, and ignored: update-git-native-issuez passes it.
+if [ "$uninstall" -eq 1 ]; then
+    [ -z "$version$from" ] && [ "$force$allow_downgrade$no_verify" = 000 ] ||
+        die "--uninstall takes only --prefix"
+fi
 
 case "$flavor" in
 full | minimal) ;;
@@ -97,6 +151,74 @@ case "$prefix" in
 /*) ;;
 *) prefix="$(pwd)/$prefix" ;;
 esac
+
+tmp=$(mktemp -d "${TMPDIR:-/tmp}/git-native-issuez.XXXXXXXXX")
+trap 'rm -rf "$tmp"' EXIT
+trap 'exit 130' INT TERM
+
+# --uninstall: what an install put into the prefix, found from what is
+# there now, so installs by older versions of this script are removed too.
+# The installed git-issue lists its own man pages, which also tells it from
+# upstream's git-issue (or anything else of that name): only ours has
+# __manpages. Entry points are the links to git-issue; upstream's
+# git-issue-import and the like are scripts, and stay.
+if [ "$uninstall" -eq 1 ]; then
+    bin="$prefix/bin"
+    [ -e "$bin/git-issue" ] || die "nothing to uninstall: there is no $bin/git-issue"
+    "$bin/git-issue" __manpages "$tmp/man1" >/dev/null 2>&1 ||
+        die "$bin/git-issue isn't git-native-issuez's (or doesn't run here);" \
+            "nothing was removed"
+    installed=$("$bin/git-issue" version 2>/dev/null | sed -n 's/^git-issue version //p') || true
+    {
+        for f in "$bin"/git-issue-*; do
+            [ -L "$f" ] && [ "$(readlink "$f")" = git-issue ] || continue
+            name=${f##*/}
+            echo "bin/$name"
+            echo "share/bash-completion/completions/$name"
+            echo "share/fish/vendor_completions.d/$name.fish"
+        done
+        for f in "$tmp/man1"/*.1; do
+            echo "share/man/man1/${f##*/}"
+        done
+        echo share/bash-completion/completions/git-issue
+        echo share/fish/vendor_completions.d/git-issue.fish
+        echo share/zsh/site-functions/_git-issue
+        for f in README.md LICENSE CHANGELOG.md; do
+            echo "share/doc/git-native-issuez/$f"
+        done
+        echo bin/update-git-native-issuez
+        # Last: the entry points never point at a missing binary while
+        # they are still there.
+        echo bin/git-issue
+    } >"$tmp/candidates"
+    : >"$tmp/files"
+    while IFS= read -r f; do
+        if [ -e "$prefix/$f" ] || [ -L "$prefix/$f" ]; then
+            echo "$f" >>"$tmp/files"
+        fi
+    done <"$tmp/candidates"
+    find_sudo "$tmp/files" uninstall
+    # One sh, so sudo or doas asks once. The docs directory is ours alone:
+    # it goes once empty.
+    remove_script='
+set -eu
+prefix=$1 files=$2
+while IFS= read -r f; do
+    rm -f "$prefix/$f" || { echo "error: could not remove $prefix/$f" >&2; exit 1; }
+done <"$files"
+rmdir "$prefix/share/doc/git-native-issuez" 2>/dev/null || true
+'
+    $SUDO sh -c "$remove_script" sh "$prefix" "$tmp/files" ||
+        die "could not uninstall from $prefix"
+    echo "Uninstalled git-native-issuez${installed:+ $installed} from $prefix ($(wc -l <"$tmp/files" | tr -d ' ') files)"
+    echo "The issues stay in your repositories, under refs/issues/."
+    if command -v claude >/dev/null 2>&1; then
+        echo
+        echo "If you registered the MCP server with 'git issue mcp install', remove it"
+        echo "from Claude Code with: claude mcp remove git-issue"
+    fi
+    exit 0
+fi
 
 case "$(uname -s)" in
 Linux) os=linux ;;
@@ -151,10 +273,6 @@ version_cmp() {
         print "same"
     }'
 }
-
-tmp=$(mktemp -d "${TMPDIR:-/tmp}/git-native-issuez.XXXXXXXXX")
-trap 'rm -rf "$tmp"' EXIT
-trap 'exit 130' INT TERM
 
 if [ -z "$version" ]; then
     [ -z "$from" ] || die "--from needs --version"
@@ -242,37 +360,7 @@ installed=$("$root/bin/git-issue" version) ||
     die "the downloaded git-issue doesn't run on this machine"
 (cd "$root" && find bin share ! -type d -print) >"$tmp/files"
 
-# The nearest existing ancestor of every directory a file goes into has to
-# be writable; moving a file into place needs its directory, not the file.
-need_sudo=''
-for d in $(sed 's|/[^/]*$||' "$tmp/files" | sort -u) .; do
-    probe="$prefix/$d"
-    while [ ! -e "$probe" ]; do
-        parent=$(dirname "$probe")
-        [ "$parent" != "$probe" ] || break
-        probe=$parent
-    done
-    if [ ! -w "$probe" ]; then
-        need_sudo=$probe
-        break
-    fi
-done
-SUDO=''
-if [ -n "$need_sudo" ]; then
-    if command -v sudo >/dev/null 2>&1; then
-        SUDO=sudo
-    elif command -v doas >/dev/null 2>&1; then
-        SUDO=doas
-    else
-        die "$need_sudo is not writable, and there is no sudo or doas;" \
-            "give another --prefix"
-    fi
-    # sudo asks on the terminal, also when this script comes through a pipe
-    (: </dev/tty) 2>/dev/null ||
-        die "$need_sudo is not writable, and there is no terminal to ask" \
-            "for $SUDO's password; give another --prefix or run it in one"
-    echo "$need_sudo is not writable: $SUDO will ask for your password to install into $prefix"
-fi
+find_sudo "$tmp/files" install
 
 # update-git-native-issuez runs the current install.sh with these options.
 cat >"$tmp/updater" <<EOF

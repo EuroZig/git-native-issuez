@@ -79,8 +79,8 @@ const ProcessRepos = struct {
         const live = try r.gpa.create(Live);
         errdefer r.gpa.destroy(live);
         // Its own process: the watcher's thread reads the refs with it.
-        var git = try r.openPath(ctx, r.path, true);
-        errdefer git.close();
+        // `start` owns it from here on, also on failure.
+        const git = try r.openPath(ctx, r.path, true);
         live.start(r.io, r.gpa, git, transport, subscriptions) catch |e| return switch (e) {
             error.OutOfMemory => e,
             else => ctx.fail(e, "can't watch the repository for changes: {t}", .{e}),
@@ -156,6 +156,9 @@ const Live = struct {
         live.refs = try (try changes.RefState.read(arena_state.allocator(), &live.git)).clone(gpa);
         errdefer live.refs.deinit(gpa);
         try live.watcher.init(io, gpa, live.git.common_dir.?, .{ .context = live, .changed = changed }, .{});
+        // A write between reading the refs and the first watch made no
+        // event: look once more, on the watcher's thread like the rest.
+        live.watcher.poke(.{ .refs = true });
     }
 
     fn stop(live: *Live) void {
@@ -184,15 +187,30 @@ const Live = struct {
         var next = try now.clone(live.gpa);
         std.mem.swap(changes.RefState, &live.refs, &next);
         next.deinit(live.gpa);
-        for (uris) |uri| try live.transport.writeNotification(
-            live.io,
-            arena,
-            "notifications/resources/updated",
-            mcp.types.ResourceUpdatedNotificationParams,
-            .{ .uri = uri },
-            .{ .emit_null_optional_fields = false },
-        );
+        // Every subscriber hears of it even if one write fails.
+        var failed: ?anyerror = null;
+        const send: Send = .{ .live = live, .arena = arena };
+        for (uris) |uri| live.subscriptions.sendIfSubscribed(live.io, uri, send, Send.call) catch |e| {
+            failed = failed orelse e;
+        };
+        if (failed) |e| return e;
     }
+
+    const Send = struct {
+        live: *Live,
+        arena: std.mem.Allocator,
+
+        fn call(send: Send, uri: []const u8) anyerror!void {
+            try send.live.transport.writeNotification(
+                send.live.io,
+                send.arena,
+                "notifications/resources/updated",
+                mcp.types.ResourceUpdatedNotificationParams,
+                .{ .uri = uri },
+                .{ .emit_null_optional_fields = false },
+            );
+        }
+    };
 };
 
 const Server = tools.Server(ProcessRepos, version);

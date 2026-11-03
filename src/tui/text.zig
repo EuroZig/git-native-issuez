@@ -24,7 +24,7 @@ pub const max_rows = 20_000;
 /// tab is drawn as this many spaces: see `expandTabs`.
 pub const tab_width = 4;
 
-/// The display width of one codepoint's UTF-8 bytes.
+/// The display width of one grapheme cluster's UTF-8 bytes.
 pub fn width(bytes: []const u8) u16 {
     if (bytes.len == 1 and bytes[0] == '\t') return tab_width;
     return vaxis.gwidth.gwidth(bytes, .unicode);
@@ -59,6 +59,21 @@ pub fn seqLen(text: []const u8, i: usize) u32 {
     return n;
 }
 
+/// The byte length of the grapheme cluster starting at `text[i]`, what
+/// vaxis draws as one cell or two: an emoji with a skin tone or joined
+/// ones, a letter with its accents. Never into a newline, at least 1.
+pub fn clusterLen(text: []const u8, i: usize) u32 {
+    assert(i < text.len);
+    const first = seqLen(text, i);
+    // ASCII followed by ASCII (or the end) is a cluster of its own.
+    if (text[i] < 0x80 and (i + 1 == text.len or text[i + 1] < 0x80)) return 1;
+    const line_end = std.mem.findScalarPos(u8, text, i, '\n') orelse text.len;
+    if (line_end == i) return 1;
+    var it = vaxis.unicode.graphemeIterator(text[i..line_end]);
+    const g = it.next() orelse return first;
+    return @intCast(@max(g.len, 1));
+}
+
 /// Wraps `text` at `cols` columns, at a space where one is on the row.
 /// An empty text is one empty row.
 pub fn layout(arena: Allocator, text: []const u8, cols: u16) Allocator.Error![]const Row {
@@ -79,7 +94,7 @@ pub fn layout(arena: Allocator, text: []const u8, cols: u16) Allocator.Error![]c
             var i = row_start;
             var last_space: ?u32 = null;
             while (i < line_end) {
-                const len = seqLen(text, i);
+                const len = clusterLen(text, i);
                 const cw = width(text[i .. i + len]);
                 if (col + cw > w and i > row_start) break;
                 col += cw;
@@ -122,7 +137,7 @@ pub fn colOf(text: []const u8, row: Row, pos: u32) u16 {
     var col: u16 = 0;
     var i = row.start;
     while (i < end) {
-        const len = seqLen(text, i);
+        const len = clusterLen(text, i);
         col +|= width(text[i .. i + len]);
         i += len;
     }
@@ -130,13 +145,13 @@ pub fn colOf(text: []const u8, row: Row, pos: u32) u16 {
 }
 
 /// The byte offset in `row` nearest to column `col`.
-pub fn posAt(text: []const u8, row: Row, col: u16) u32 {
-    var c: u16 = 0;
+pub fn posAt(text: []const u8, row: Row, col: u32) u32 {
+    var c: u32 = 0;
     var i = row.start;
     // A soft row ends with the space it broke at; stay before it.
     const end = if (row.soft and row.end > row.start and text[row.end - 1] == ' ') row.end - 1 else row.end;
     while (i < end) {
-        const len = seqLen(text, i);
+        const len = clusterLen(text, i);
         const cw = width(text[i .. i + len]);
         if (c + cw > col) break;
         c += cw;
@@ -149,7 +164,7 @@ pub fn posAt(text: []const u8, row: Row, col: u16) u32 {
 /// caller's to handle.
 pub const TextArea = struct {
     buf: std.ArrayList(u8) = .empty,
-    /// A byte offset, always at a codepoint boundary.
+    /// A byte offset, always at a grapheme cluster boundary.
     cursor: u32 = 0,
     multiline: bool,
     /// The first visual row shown.
@@ -214,17 +229,24 @@ pub const TextArea = struct {
         assert(t.cursor <= t.buf.items.len);
     }
 
+    /// The cluster boundary before `pos`: clusters only read forward, so
+    /// from the line's start.
     fn prevPos(t: *const TextArea, pos: u32) u32 {
         if (pos == 0) return 0;
-        var p = pos - 1;
-        while (p > 0 and (t.buf.items[p] & 0xC0) == 0x80) p -= 1;
-        return p;
+        const s = t.buf.items;
+        if (s[pos - 1] == '\n') return pos - 1;
+        var p = t.lineStart(pos - 1);
+        while (true) {
+            const next = p + clusterLen(s, p);
+            if (next >= pos) return p;
+            p = next;
+        }
     }
 
     fn nextPos(t: *const TextArea, pos: u32) u32 {
         const s = t.buf.items;
         if (pos >= s.len) return @intCast(s.len);
-        return pos + seqLen(s, pos);
+        return pos + clusterLen(s, pos);
     }
 
     fn wordLeft(t: *const TextArea, pos: u32) u32 {
@@ -431,7 +453,7 @@ pub const TextArea = struct {
     pub fn clickLine(t: *TextArea, col: u16) void {
         const s = t.buf.items;
         const row: Row = .{ .start = 0, .end = @intCast(s.len), .soft = false };
-        t.cursor = posAt(s, row, col +| @as(u16, @intCast(@min(t.scroll, std.math.maxInt(u16)))));
+        t.cursor = posAt(s, row, @as(u32, col) + t.scroll);
     }
 };
 
@@ -497,6 +519,54 @@ test "TextArea editing" {
     try line.set(gpa, "a\nb");
     try testing.expectEqualStrings("a b", line.text());
     try testing.expectEqual(TextArea.Outcome.ignored, try line.key(gpa, arena, .{ .codepoint = K.enter }));
+}
+
+test "an emoji with a skin tone or joined ones is one cluster, as drawn" {
+    var arena_state: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const gpa = testing.allocator;
+    const K = vaxis.Key;
+    const thumb = "👍🏽";
+    const family = "👨\u{200d}👩\u{200d}👧";
+    const accent = "e\u{301}";
+    try testing.expectEqual(@as(u32, thumb.len), clusterLen(thumb, 0));
+    try testing.expectEqual(@as(u32, family.len), clusterLen(family, 0));
+    try testing.expectEqual(@as(u32, accent.len), clusterLen(accent, 0));
+    try testing.expectEqual(@as(u32, 1), clusterLen("ab", 0));
+    try testing.expectEqual(@as(u32, 1), clusterLen("\n\n", 0));
+
+    const text = "a" ++ thumb ++ family ++ "b";
+    const row: Row = .{ .start = 0, .end = text.len, .soft = false };
+    const w_thumb = width(thumb);
+    const w_family = width(family);
+    try testing.expectEqual(@as(u16, 1 + w_thumb + w_family + 1), colOf(text, row, text.len));
+    try testing.expectEqual(@as(u32, 1 + thumb.len), posAt(text, row, 1 + w_thumb));
+
+    var t: TextArea = .init(true);
+    defer t.deinit(gpa);
+    t.cols = 80;
+    try t.set(gpa, text);
+    _ = try t.key(gpa, arena, .{ .codepoint = K.left });
+    _ = try t.key(gpa, arena, .{ .codepoint = K.left });
+    try testing.expectEqual(@as(u32, 1 + thumb.len), t.cursor);
+    _ = try t.key(gpa, arena, .{ .codepoint = K.backspace });
+    try testing.expectEqualStrings("a" ++ family ++ "b", t.text());
+    _ = try t.key(gpa, arena, .{ .codepoint = K.delete });
+    try testing.expectEqualStrings("ab", t.text());
+}
+
+test "a click far into a long line doesn't overflow" {
+    const gpa = testing.allocator;
+    var t: TextArea = .init(false);
+    defer t.deinit(gpa);
+    const long = try gpa.alloc(u8, 70_000);
+    defer gpa.free(long);
+    @memset(long, 'x');
+    try t.set(gpa, long);
+    t.scroll = 69_000;
+    t.clickLine(std.math.maxInt(u16));
+    try testing.expectEqual(@as(u32, @intCast(long.len)), t.cursor);
 }
 
 test "text past max_rows: the cursor stays usable" {

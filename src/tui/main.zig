@@ -107,6 +107,13 @@ pub fn main(
     return 0;
 }
 
+/// The panic handler of a program with the TUI: the terminal back to
+/// how it was, if the TUI has it, then the default handler.
+pub fn panic(msg: []const u8, first_trace_addr: ?usize) noreturn {
+    vaxis.recover();
+    std.debug.defaultPanic(msg, first_trace_addr);
+}
+
 /// For double-clicks: a clock that doesn't jump.
 fn nowMs(io: std.Io) i64 {
     const t = std.Io.Timestamp.now(io, .awake);
@@ -128,7 +135,11 @@ fn run(
 ) !void {
     var buffer: [4096]u8 = undefined;
     var tty = try vaxis.Tty.init(io, &buffer);
-    defer tty.deinit();
+    defer {
+        tty.deinit();
+        // Given back: a panic after this leaves the terminal alone.
+        vaxis.tty.global_tty = null;
+    }
     const writer = tty.writer();
 
     var vx = try vaxis.init(io, gpa, environ_map, .{});

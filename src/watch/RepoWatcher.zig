@@ -163,7 +163,13 @@ fn shouldWatch(h: *Watcher.Handler, path: []const u8, kind: nightwatch.ObjectTyp
 fn note(self: *RepoWatcher, path: []const u8) void {
     var buf: [std.fs.max_path_bytes]u8 = undefined;
     const rel = self.relative(path, &buf) orelse return;
-    const change = classify(rel);
+    self.poke(classify(rel));
+}
+
+/// Reports `change` as if the paths had shown it, coalesced with what
+/// they do show: for a listener that may have missed writes, such as
+/// those between its first read and `init`.
+pub fn poke(self: *RepoWatcher, change: Change) void {
     if (!change.any()) return;
     _ = self.pending.fetchOr(@bitCast(change), .acq_rel);
     self.wake.set(self.io);

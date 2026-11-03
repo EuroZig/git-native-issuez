@@ -117,6 +117,8 @@ pub fn Store(comptime B: type) type {
         generation: u32 = 0,
         /// The refs as the snapshot read them, in its arena.
         refs: issuez.changes.RefState = .{},
+        /// Why the reload after a write that worked failed, until taken.
+        reload_error: ?anyerror = null,
 
         pub fn init(gpa: Allocator, backend: *B) Self {
             return .{
@@ -219,11 +221,27 @@ pub fn Store(comptime B: type) type {
             return std.fmt.allocPrint(a, "{s}{s}", .{ issuez.engine.issue_ref_prefix, id });
         }
 
-        /// The tip the snapshot shows, so a write fails instead of
-        /// overwriting a change made meanwhile.
-        fn expect(self: *Self, id: []const u8) ?Oid {
+        /// The tip a write expects, so it fails instead of overwriting a
+        /// change made meanwhile: `given` (what a dialog showed when it
+        /// opened), else what the snapshot shows.
+        fn expect(self: *Self, id: []const u8, given: ?Oid) ?Oid {
+            if (given) |g| return g;
             const i = self.snap.find(id) orelse return null;
             return self.snap.issues[i].tip;
+        }
+
+        /// After a write that worked. A failed reload isn't the write's
+        /// failure: it would keep the dialog open, and saving again would
+        /// write twice. `takeReloadError` has it.
+        fn reloadAfterWrite(self: *Self) void {
+            self.reload() catch |e| {
+                self.reload_error = e;
+            };
+        }
+
+        pub fn takeReloadError(self: *Self) ?anyerror {
+            defer self.reload_error = null;
+            return self.reload_error;
         }
 
         /// Returns the new issue's ID.
@@ -240,22 +258,23 @@ pub fn Store(comptime B: type) type {
                 .parent = input.parent,
             });
             const id: Id = .of(created.id.slice());
-            try self.reload();
+            self.reloadAfterWrite();
             return id;
         }
 
+        /// `spec.expect` null: what the snapshot shows.
         pub fn edit(self: *Self, id: []const u8, spec_in: issuez.engine.EditSpec) !void {
             const a = self.begin();
             var spec = spec_in;
-            spec.expect = self.expect(id);
+            spec.expect = self.expect(id, spec.expect);
             if (spec.workflow) |w| if (w.len > 0) try self.snap.settings.checkWorkflow(w);
             _ = try self.repo().edit(a, try refName(a, id), spec);
-            try self.reload();
+            self.reloadAfterWrite();
         }
 
         /// Links an open catalog milestone of that name, else writes the
         /// text, like `git issue edit --milestone`. Empty clears it.
-        pub fn setMilestone(self: *Self, id: []const u8, name: []const u8) !void {
+        pub fn setMilestone(self: *Self, id: []const u8, name: []const u8, expected: ?Oid) !void {
             const a = self.begin();
             const i = self.snap.find(id) orelse return error.IssueDisappeared;
             const chosen = try Catalog.of(self.repo()).choose(a, .{
@@ -270,27 +289,28 @@ pub fn Store(comptime B: type) type {
                 .milestone = c.text,
                 .milestone_id = c.id,
                 .milestone_mode = c.mode,
-                .expect = self.expect(id),
+                .expect = self.expect(id, expected),
             });
-            try self.reload();
+            self.reloadAfterWrite();
         }
 
-        pub fn setState(self: *Self, id: []const u8, state: core.State) !void {
+        /// `expected` null: what the snapshot shows.
+        pub fn setState(self: *Self, id: []const u8, state: core.State, expected: ?Oid) !void {
             const a = self.begin();
             _ = try self.repo().setState(a, try refName(a, id), .{
                 .state = state,
-                .expect = self.expect(id),
+                .expect = self.expect(id, expected),
             });
-            try self.reload();
+            self.reloadAfterWrite();
         }
 
         pub fn comment(self: *Self, id: []const u8, text: []const u8) !void {
             const a = self.begin();
             _ = try self.repo().comment(a, try refName(a, id), .{
                 .text = text,
-                .expect = self.expect(id),
+                .expect = self.expect(id, null),
             });
-            try self.reload();
+            self.reloadAfterWrite();
         }
 
         /// What went wrong, for the status line, in `buf`.
@@ -344,7 +364,7 @@ test "create, edit, comment and close through the store" {
 
     try store.edit(child.slice(), .{ .title = "Child, renamed", .add_labels = &.{"ui"} });
     try store.comment(child.slice(), "Looks good.");
-    try store.setState(child.slice(), .closed);
+    try store.setState(child.slice(), .closed, null);
     const c = store.snap.issues[store.snap.find(child.slice()).?];
     try testing.expectEqualStrings("Child, renamed", c.title);
     try testing.expect(store.snap.isDone(store.snap.find(child.slice()).?));

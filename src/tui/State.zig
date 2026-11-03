@@ -64,6 +64,9 @@ list: list_view.State = .{},
 board: board_view.State = .{},
 detail: detail_view.State = .{},
 modal: ?Modal = null,
+/// The issue the open modal edits, at the tip it showed when it opened:
+/// what its write expects, so a change made meanwhile isn't overwritten.
+modal_tip: ?ModalTip = null,
 /// Strings of the open modal and its action.
 modal_arena: std.heap.ArenaAllocator,
 hits: ui.Hits = .{},
@@ -80,8 +83,13 @@ drag: ?Drag = null,
 pasting: bool = false,
 /// A second Escape in a form with text in it discards it.
 discard_armed: bool = false,
+/// The last frame showed nothing but "Terminal too small": keys act on
+/// nothing but quitting.
+too_small: bool = false,
 
 const Click = struct { target: ui.Target, ms: i64 };
+
+pub const ModalTip = struct { id: Id, tip: ?issuez.engine.Oid };
 
 /// A card held with the mouse.
 pub const Drag = struct {
@@ -159,13 +167,43 @@ pub fn openModal(s: *State, m: Modal) void {
     if (s.modal) |*old| old.deinit(s.gpa);
     s.modal = m;
     s.discard_armed = false;
+    s.modal_tip = if (m.issue()) |id| .{ .id = id, .tip = s.tipOf(id.slice()) } else null;
 }
 
 pub fn closeModal(s: *State) void {
     if (s.modal) |*m| m.deinit(s.gpa);
     s.modal = null;
+    s.modal_tip = null;
     _ = s.modal_arena.reset(.retain_capacity);
     s.discard_armed = false;
+}
+
+/// The issue's tip in the snapshot shown; null when it isn't there.
+pub fn tipOf(s: *const State, id: []const u8) ?issuez.engine.Oid {
+    const i = s.snap.find(id) orelse return null;
+    return s.snap.issues[i].tip;
+}
+
+/// What a write to `id` expects: the tip the open modal showed, else the
+/// one shown now.
+pub fn expectedTip(s: *const State, id: []const u8) ?issuez.engine.Oid {
+    if (s.modal_tip) |t| if (t.id.eql(id)) return t.tip;
+    return s.tipOf(id);
+}
+
+/// Whether the issue the open modal edits changed since it opened.
+pub fn modalStale(s: *const State) bool {
+    const t = s.modal_tip orelse return false;
+    const now = s.tipOf(t.id.slice());
+    if (t.tip == null or now == null) return t.tip != null or now != null;
+    return !t.tip.?.eql(now.?);
+}
+
+/// After the user was told the issue changed: the next save is meant to
+/// replace what is there now.
+pub fn rebaseModal(s: *State) void {
+    if (s.modal_tip) |*t| t.tip = s.tipOf(t.id.slice()) else return;
+    modal_mod.rebase(s);
 }
 
 pub fn modalArena(s: *State) Allocator {
@@ -241,7 +279,11 @@ pub fn draw(s: *State, win: ui.Window, now_s: i64) Allocator.Error!void {
     const f: ui.Frame = .{ .gpa = s.gpa, .arena = s.frame_arena.allocator(), .hits = &s.hits, .now = now_s };
     win.clear();
     win.hideCursor();
-    if (win.width < 20 or win.height < 6) {
+    s.too_small = win.width < 20 or win.height < 6;
+    if (s.too_small) {
+        // Nothing shown: the rows and columns were in the frame arena.
+        s.list.rows = &.{};
+        s.board.columns = &.{};
         _ = ui.text(win, 0, 0, "Terminal too small", .{ .fg = ui.palette.err });
         return;
     }
@@ -352,6 +394,7 @@ fn handleKey(s: *State, k: vaxis.Key) Allocator.Error!Action {
         };
         return .quit;
     }
+    if (s.too_small) return if (k.matches('q', .{})) .quit else .none;
     if (s.modal != null) return modal_mod.key(s, k);
     if (s.search_focused) return s.searchKey(k);
     // Pasted text isn't commands.
@@ -481,6 +524,8 @@ fn handleMouse(s: *State, m: vaxis.Mouse, now_ms: i64) Allocator.Error!Action {
         },
     }
 
+    // A press starts afresh: a drag whose release never came is over.
+    s.drag = null;
     s.clearStatus();
     const h = found orelse return .none;
     const double = if (s.last_click) |c|

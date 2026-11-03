@@ -311,6 +311,8 @@ hold identical refs: the fuzzer checks exactly that.
   The store reloads only if `changes.RefState` moved since its last
   reload, which its own writes already did, and the status line says
   which issue changed elsewhere. Selection, view and open dialogs stay.
+  Saving a dialog onto an issue that changed since the dialog opened says
+  so and writes nothing; saving again replaces what is there now.
   Getting the terminal focus back runs the same check and rereads git
   config; without a watcher, that and `ctrl+r` still reload.
 

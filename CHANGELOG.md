@@ -33,6 +33,10 @@ versions may change the library API; the on-disk format only ever grows (see
 - `git issue` without a command opens the terminal UI when run by a person
   at a terminal in a repository. Elsewhere (a pipe, a script, outside a
   repository, a minimal build) it still prints the usage.
+- `install.sh --uninstall` (also `update-git-native-issuez --uninstall`)
+  removes git-issue, its entry points, completions, man pages, docs and the
+  updater from the prefix, installs by 0.1.0's script included. Other
+  tools' `git-issue-*` files and the issues in your repositories stay.
 
 ### Changed
 - The full build flavor, the default, now includes the terminal UI;
