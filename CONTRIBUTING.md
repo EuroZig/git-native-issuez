@@ -15,6 +15,9 @@ approach before you put in the work.
   test is skipped.
 - For the completion and man page test: zsh, fish and mandoc. Each check
   is skipped without its tool.
+- For the MCP server's end-to-end tests (`zig build e2e`, part of
+  `zig build ci`): Node.js 20 or newer and npm. They drive `git-issue mcp`
+  with the official MCP TypeScript SDK client (`test/mcp_e2e/`).
 
 ```sh
 zig build test                 # the quick check
@@ -81,3 +84,29 @@ behaviour), `docs` or `chore`, for example
 `(add) search: --state filter`. The body says what changed and why, and
 names the tests that cover it. Update [CHANGELOG.md](CHANGELOG.md) under
 "Unreleased" for user-visible changes.
+
+## Releasing
+
+1. Move the entries under `## [Unreleased]` in `CHANGELOG.md` to a new
+   `## [X.Y.Z] - YYYY-MM-DD` section and set `.version = "X.Y.Z"` in
+   `build.zig.zon`.
+2. Merge to `main`, then tag the merge commit and push the tag:
+
+   ```sh
+   git tag vX.Y.Z && git push origin vX.Y.Z
+   ```
+
+   `.github/workflows/release.yml` checks that the tag matches
+   `build.zig.zon` and that `CHANGELOG.md` has the version, runs the
+   tests natively on Linux and macOS (x86_64 and aarch64, both flavors;
+   `zig build ci` on x86_64 Linux), and only if they all pass runs
+   `zig build release` and publishes the release with the changelog entry
+   as its notes. A failed gate publishes nothing: fix it, then move the
+   tag (`git tag -f vX.Y.Z && git push -f origin vX.Y.Z`).
+
+`zig build release` cross-compiles both flavors for every platform and
+writes the archives and their `SHA256SUMS` to `zig-out/release/`; run it
+before tagging to check them. It needs `sh`, `tar` and `zip`. To try
+`install.sh` on them, run
+`sh install.sh --from zig-out/release --version X.Y.Z --prefix /tmp/try`;
+the release workflow does the same before it publishes.

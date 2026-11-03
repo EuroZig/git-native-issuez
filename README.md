@@ -15,17 +15,60 @@ showing, commenting on, editing, closing and searching issues, `fsck` and
 blockers, dates, estimates, workflow states), milestones, lifecycle
 events (editing and deleting comments, deleting and restoring issues) and
 image attachments, as extra trailers that upstream keeps and shows. Read
-commands print JSON with `--json`, and the install includes shell
-completions and man pages.
+commands print JSON with `--json`, `git issue mcp` serves the issues to
+coding agents, and the install includes shell completions and man pages.
 
 > [!WARNING]
 > Generative AI was used to edit and/or produce large portions of this code.
 > Every line in this repo was verified by a human.
 
+## Install
+
+On Linux and macOS, `install.sh` downloads the latest release for your
+machine, checks it against the release's `SHA256SUMS` and installs it into
+`~/.local`:
+
+```sh
+curl -fsSL https://raw.githubusercontent.com/EuroZig/git-native-issuez/main/install.sh | sh
+```
+
+`sh -s -- --flavor minimal` picks the CLI-only flavor, `--version 0.1.0`
+a release, `--prefix /usr/local` another place (`--help` lists them all).
+Only the copy into a prefix you can't write to runs with `sudo` (or
+`doas`), which asks for your password once; don't run the whole script
+with `sudo`. It doesn't touch your shell configuration: if `~/.local/bin`
+isn't on `PATH`, it says what to add. To read it first, download it and
+run `sh install.sh`.
+
+`update-git-native-issuez`, installed next to `git-issue`, updates to the
+latest release with the same flavor and prefix. It leaves an up-to-date
+install alone and refuses a downgrade without `--allow-downgrade`.
+
+Each [release](https://github.com/EuroZig/git-native-issuez/releases) has
+archives for Linux and macOS (x86_64 and aarch64) and Windows (x86_64), in
+two flavors: `full`, the default with the MCP server, and `minimal`, the
+CLI only. The Linux and macOS archives also have the shell completions,
+man pages and docs under `share/`; the Windows archive has `git-issue.exe`
+only, so run `git issue <command>` there. `SHA256SUMS` lists the checksums. By
+hand, unpack one (`.tar.gz`, or `.zip` for Windows) into a prefix that has
+`bin/` on your `PATH`, such as `~/.local`:
+
+```sh
+gh release download v0.1.0 --repo EuroZig/git-native-issuez --pattern '*-full-aarch64-macos.tar.gz'
+tar -xzf git-native-issuez-0.1.0-full-aarch64-macos.tar.gz --strip-components=1 -C ~/.local
+```
+
+On macOS, an archive downloaded with a browser is quarantined and the
+unpacked `git-issue` won't run; download it with `gh` or `curl -LO`
+instead, or clear the flag with `xattr -d com.apple.quarantine <archive>`
+before unpacking.
+
+Or build it, with Zig 0.16.0: `zig build -Doptimize=ReleaseSafe --prefix ~/.local`
+(add `-Dminimal` for the CLI only).
+
 ## Usage
 
 ```sh
-zig build --prefix ~/.local     # git-issue, the git-issue-<sub> links, completions, man pages
 git issue create "Login page crashes" -l bug -p high
 git issue ls
 git issue comment a7f3 -m "Happens on Safari only."
@@ -90,6 +133,13 @@ that don't link the library. Fields are only ever added
 For [lazygit](https://github.com/jesseduffield/lazygit),
 [docs/lazygit.md](docs/lazygit.md) has an issues menu under one key.
 
+`git issue mcp` is a [Model Context Protocol](https://modelcontextprotocol.io)
+server on stdio for coding agents: it lists, shows and searches issues and
+milestones, and creates, comments on, edits, closes and reopens issues,
+through the library. For Claude Code, run `git issue mcp install` once for
+every project; [docs/mcp.md](docs/mcp.md) has the tools, the install scopes
+and other clients.
+
 Like upstream, the `git-issue-<command>` entry points are installed next to
 `git-issue`, so scripts that call them directly keep working.
 
@@ -110,6 +160,10 @@ module:
 const issuez_dep = b.dependency("git_native_issuez", .{ .target = target, .optimize = optimize });
 exe.root_module.addImport("issuez", issuez_dep.module("issuez"));
 ```
+
+As a dependency the package builds only the library, so blitzmcp (the MCP
+server's dependency) is never fetched; pass `.mcp = true` to also get it in
+the `git-issue` build.
 
 ```zig
 const issuez = @import("issuez");
@@ -142,6 +196,7 @@ for (open) |issue| std.debug.print("{s} {s}\n", .{ issue.state.text(), issue.tit
   the library.
 - [docs/json.md](docs/json.md): the `--json` output.
 - [docs/lazygit.md](docs/lazygit.md): an issues menu for lazygit.
+- [docs/mcp.md](docs/mcp.md): the MCP server for coding agents.
 - [docs/design.md](docs/design.md): how the library is put together.
 - [docs/compatibility.md](docs/compatibility.md): where the CLI differs from
   upstream on purpose.
@@ -152,13 +207,16 @@ for (open) |issue| std.debug.print("{s} {s}\n", .{ issue.state.text(), issue.tit
 Requires Zig 0.16.0 and git 2.30 or newer.
 
 ```sh
-zig build                      # git-issue, the git-issue-<sub> links, completions, man pages
+zig build                      # git-issue with the MCP server, the git-issue-<sub> links, completions, man pages
+zig build -Dminimal            # the same without the MCP server
 zig build test                 # unit, backend, CLI, simulator and fuzz smoke tests, examples
 zig build test-interop         # both tools on shared repositories (fetches upstream)
+zig build e2e                  # `git issue mcp` against the official MCP SDK client (Node.js, npm)
 zig build test-upstream-suite  # upstream's t/*.sh against our git-issue
 zig build test-perf            # `ls -a` over 10 000 issues within 2 s
 zig build ci -Dseed=N          # all of the above, plus long fuzz runs: what CI runs
 zig build update-snapshots     # rewrite examples/*.out after an intended output change
+zig build release              # the release archives for every platform, cross-compiled, in zig-out/release/
 ```
 
 `zig build test` runs every example. The in-memory ones must print exactly

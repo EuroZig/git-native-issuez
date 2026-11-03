@@ -14,6 +14,7 @@ const Allocator = std.mem.Allocator;
 const issue_model = @import("../model/issue.zig");
 const fields_fmt = @import("../format/fields.zig");
 const core_fmt = @import("../format/core.zig");
+const uuid_fmt = @import("../format/uuid.zig");
 
 const Issue = issue_model.Issue;
 
@@ -44,6 +45,22 @@ pub const Problem = struct {
     /// For `invalid_value`.
     key: ?[]const u8 = null,
     value: ?[]const u8 = null,
+
+    /// What `ls --problems` prints: the kind's description, with the other
+    /// issue's short ID or the invalid value.
+    pub fn describe(p: Problem, arena: Allocator) Allocator.Error![]const u8 {
+        if (p.kind == .invalid_value) return std.fmt.allocPrint(
+            arena,
+            "{s} '{s}' is not valid and is ignored",
+            .{ p.key.?, p.value.? },
+        );
+        if (p.other) |o| return std.fmt.allocPrint(
+            arena,
+            "{s} ({s})",
+            .{ p.kind.describe(), uuid_fmt.shortId(o) },
+        );
+        return p.kind.describe();
+    }
 
     pub const Kind = enum {
         parent_missing,

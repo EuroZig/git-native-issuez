@@ -200,6 +200,7 @@ pub fn issue(s: *Stringify, arena: Allocator, i: Issue, options: IssueOptions) E
             try s.beginObject();
             const hex = c.oid.hex();
             try field(s, "id", hex.slice());
+            try field(s, "kind", @tagName(c.kind));
             try person(s, "author", c.author);
             try time(s, "date", c.author.time, c.author.tz_offset_minutes);
             try field(s, "subject", c.subject);
@@ -339,8 +340,8 @@ test "the documented keys, in order" {
     };
     const full_keys = [_][]const u8{ "description", "comments" };
     const comment_keys = [_][]const u8{
-        "id",    "author", "date",    "subject",     "text", "state_change",
-        "merge", "edited", "deleted", "attachments",
+        "id",           "kind",  "author", "date",    "subject",     "text",
+        "state_change", "merge", "edited", "deleted", "attachments",
     };
     const attachment_keys = [_][]const u8{
         "id", "name", "media_type", "size", "sha256", "added_in", "added_by", "availability",

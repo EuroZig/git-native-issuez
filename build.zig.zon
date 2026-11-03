@@ -1,9 +1,16 @@
 .{
     .name = .git_native_issuez,
-    .version = "0.0.1",
+    .version = "0.1.0",
     .minimum_zig_version = "0.16.0",
     .fingerprint = 0x7bba8a1d2cbb8815,
     .dependencies = .{
+        // MCP server (`git issue mcp`). The zig-0.16.0 branch of blitzmcp;
+        // only fetched when -Dmcp=true (default).
+        .blitzmcp = .{
+            .url = "git+https://github.com/StaffinityAI/blitzmcp#ff5b14ce91e8249d88bc8f9ce6107bde780bbb8b",
+            .hash = "blitzmcp-0.1.0-R76_bY8zBAA-QeYgAbjXUDut0vftxy0wSUIS_vwbGPB7",
+            .lazy = true,
+        },
         // Upstream git-native-issue (GPL-2.0), the interop test oracle.
         // Never vendored; only fetched by test-interop / test-upstream-suite.
         .git_native_issue = .{

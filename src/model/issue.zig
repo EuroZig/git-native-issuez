@@ -84,6 +84,16 @@ pub const Comment = struct {
     /// Attachments this commit added that are still present, in trailer
     /// order.
     attachments: []const []const u8 = &.{},
+    kind: Kind = .comment,
+
+    pub const Kind = enum {
+        /// Text someone wrote, possibly with fields or attachments.
+        comment,
+        /// A commit that only changed fields or the state, merged, or
+        /// recorded an export: no text beyond its subject, which the tool
+        /// wrote ("Update labels").
+        update,
+    };
 };
 
 /// Read the bytes through `issuez.Attachments`.
@@ -942,30 +952,42 @@ fn cloneSet(arena: Allocator, set: SetState) Allocator.Error!SetState {
     return .{ .members = try set.members.clone(arena), .order = set.order };
 }
 
+/// The scalar fields this tool and upstream write, in their usual case.
+const scalar_keys = [_][]const u8{
+    "State",
+    "Title",
+    "Assignee",
+    "Priority",
+    "Milestone",
+    "Format-Version",
+    "Fixed-By",
+    "Release",
+    "Reason",
+    "X-Parent",
+    "X-Start-Date",
+    "X-Due-Date",
+    "X-Estimate-Minutes",
+    "X-Workflow-State",
+    "X-Deleted",
+    "X-Milestone-Id",
+    "X-Milestone-Mode",
+};
+
 /// git matches keys case-insensitively, so `state:` and `State:` are one
 /// field.
 fn canonicalKey(key: []const u8) []const u8 {
-    const core = [_][]const u8{
-        "State",
-        "Title",
-        "Assignee",
-        "Priority",
-        "Milestone",
-        "Format-Version",
-        "Fixed-By",
-        "Release",
-        "Reason",
-        "X-Parent",
-        "X-Start-Date",
-        "X-Due-Date",
-        "X-Estimate-Minutes",
-        "X-Workflow-State",
-        "X-Deleted",
-        "X-Milestone-Id",
-        "X-Milestone-Mode",
-    };
-    for (core) |c| if (std.ascii.eqlIgnoreCase(c, key)) return c;
+    for (scalar_keys) |c| if (std.ascii.eqlIgnoreCase(c, key)) return c;
     return key;
+}
+
+/// A trailer that a write of this tool or upstream's makes: a field, or an
+/// export record. A comment's last paragraph can parse as trailers too
+/// (`Version: 2.3.1`); those are none of these.
+fn isToolKey(key: []const u8) bool {
+    for (scalar_keys ++ set_keys ++ [_][]const u8{"Exported-Commit"}) |k| {
+        if (std.ascii.eqlIgnoreCase(k, key)) return true;
+    }
+    return false;
 }
 
 fn cloneState(arena: Allocator, s: FoldState) Allocator.Error!FoldState {
@@ -1094,6 +1116,12 @@ fn comments(
                 try added.append(arena, spec.id);
         }
         c.attachments = added.items;
+        // A comment may be just a subject, with an image, an import ID or
+        // a last paragraph that parses as trailers.
+        const tool_trailer = for (node.block.trailers) |t| {
+            if (isToolKey(t.key)) break true;
+        } else false;
+        if (c.body.len == 0 and (tool_trailer or c.is_merge)) c.kind = .update;
         if (edited) |e| {
             // The edit replaces the whole comment.
             var lines = std.mem.splitScalar(u8, e.value, '\n');
@@ -1104,6 +1132,7 @@ fn comments(
             c.text = rest.items;
             c.body = rest.items;
             c.edited = true;
+            c.kind = .comment;
         }
         try out.append(arena, c);
     }
@@ -1367,6 +1396,42 @@ test "description and comment text" {
     try testing.expectEqual(@as(usize, 1), i.comments[0].text.len);
     try testing.expectEqualStrings("State: closed", i.comments[0].text[0]);
     try testing.expectEqualStrings("closed", i.comments[0].state_change.?.text());
+    // Closing with a message only is an update.
+    try testing.expectEqual(Comment.Kind.update, i.comments[0].kind);
+}
+
+test "comment kinds" {
+    var arena_state: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena_state.deinit();
+    var d: TestDag = .{ .arena = arena_state.allocator() };
+    const root = try d.add(&.{}, 100, "T\n\nState: open\nFormat-Version: 1\n");
+    const one_line = try d.add(&.{root}, 200, "LGTM\n");
+    const with_text = try d.add(&.{one_line}, 300, "Draft\n\nIn the wiki.\n\nPriority: high\n");
+    const edit = try d.add(&.{with_text}, 400, "Update labels\n\nLabels: bug\n");
+    const image = try d.add(&.{edit}, 500, "Screenshot\n\n" ++
+        "X-Attachment: 720964d9-80f3-4953-bf91-3b32b2897504 image/png 10 " ++
+        "0000000000000000000000000000000000000000000000000000000000000000 a.png\n");
+    const imported = try d.add(&.{image}, 600, "Looks bad\n\nProvider-Comment-ID: github:o/r#c-1\n");
+    const trailer_like = try d.add(&.{imported}, 650, "Still happens\n\nVersion: 2.3.1\n");
+    const record = try d.add(&.{trailer_like}, 700, "Record export\n\nExported-Commit: 0123abc\n");
+    const side = try d.add(&.{record}, 800, "Update priority\n\nPriority: low\n");
+    const other = try d.add(&.{record}, 800, "Update assignee\n\nAssignee: a@example.com\n");
+    const merge = try d.add(&.{ side, other }, 900, "Merge issue\n\nPriority: low\n");
+    const i = try d.issue(merge);
+    var kinds: std.ArrayList(Comment.Kind) = .empty;
+    for (i.comments) |c| try kinds.append(arena_state.allocator(), c.kind);
+    try testing.expectEqualSlices(Comment.Kind, &.{
+        .comment, // LGTM
+        .comment, // text with a field
+        .update, // Update labels
+        .comment, // an image with a subject
+        .comment, // an imported one-liner
+        .comment, // a last paragraph that parses as a trailer
+        .update, // an export record
+        .update,
+        .update,
+        .update, // the merge
+    }, kinds.items);
 }
 
 test "per-commit trailers" {

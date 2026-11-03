@@ -135,6 +135,11 @@ test "open" {
         error.NotARepository,
         GitProcess.open(io, gpa, .{ .path = plain_path, .environ_map = &env }),
     );
+    // A path that doesn't exist: not "could not run git".
+    try testing.expectError(
+        error.NotARepository,
+        GitProcess.open(io, gpa, .{ .path = "/nonexistent/issuez-test", .environ_map = &env }),
+    );
 }
 
 test "cat-file session" {

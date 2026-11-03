@@ -84,6 +84,7 @@ const command_helps = [_]struct { []const u8, []const u8 }{
     .{ "attach", @import("cmd/attach.zig").help },
     .{ "quarantine", @import("cmd/quarantine.zig").help },
     .{ "completion", help },
+    .{ "mcp", @import("mcp_help").text },
 };
 
 pub const Option = struct {

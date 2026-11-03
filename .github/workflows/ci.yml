@@ -5,6 +5,9 @@ on:
     branches: [main]
   pull_request:
 
+permissions:
+  contents: read
+
 jobs:
   test:
     runs-on: ubuntu-latest
@@ -22,3 +25,6 @@ jobs:
 
       # `zig build ci -Dseed=<run id>` reproduces a run locally.
       - run: zig build ci -Dseed=${{ github.run_id }} --summary all
+
+      # The CLI-only flavor, which releases ship too.
+      - run: zig build test -Dminimal --summary line

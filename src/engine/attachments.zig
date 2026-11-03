@@ -72,7 +72,7 @@ pub fn Attachments(comptime B: type) type {
         pub const AddSpec = struct {
             files: []const Input,
             /// Posted in the same commit as the images. Null gives an "Add
-            /// attachment" commit.
+            /// attachment" commit; blank is `EmptyText`.
             comment: ?[]const u8 = null,
             author: ?Signature = null,
             /// Only apply on top of this issue tip, see `Repo`.
@@ -142,9 +142,10 @@ pub fn Attachments(comptime B: type) type {
                 .key = fmt.add_key,
                 .value = try std.fmt.allocPrint(arena, "{f}", .{s}),
             });
+            if (spec.comment) |c| try repo_mod.checkNotBlank(c);
+            try self.checkMessage(spec.comment);
             const text = spec.comment orelse
                 (if (specs.len == 1) "Add attachment" else "Add attachments");
-            if (text.len > self.repo.limits.max_body_bytes) return error.TooLong;
             const split = repo_mod.splitMessage(text);
             const message = try trailers.build(arena, split.subject, split.body, tl.items);
             // Bytes before the commit, so a failed commit leaves at most an
@@ -156,6 +157,14 @@ pub fn Attachments(comptime B: type) type {
                 .added = specs,
             });
             return .{ .tip = tip, .ids = ids };
+        }
+
+        /// The size of a message or comment the caller gave. A blank
+        /// `remove`/`rename` message gives the default; `add` refuses a
+        /// blank comment, as `Repo.comment` does.
+        fn checkMessage(self: Self, text: ?[]const u8) Error!void {
+            const t = text orelse return;
+            if (t.len > self.repo.limits.max_body_bytes) return error.TooLong;
         }
 
         /// The bytes stay, since history still references them.
@@ -173,7 +182,8 @@ pub fn Attachments(comptime B: type) type {
                 if (!uuid_fmt.isCanonical(id)) return error.AttachmentNotFound;
                 try tl.append(arena, .{ .key = fmt.remove_key, .value = id });
             }
-            const subject = spec.message orelse
+            try self.checkMessage(spec.message);
+            const subject = repo_mod.givenMessage(spec.message) orelse
                 (if (ids.len == 1) "Remove attachment" else "Remove attachments");
             const split = repo_mod.splitMessage(subject);
             return self.repo.appendWith(arena, ref_name, spec.author, spec.expect, Builder{
@@ -194,7 +204,8 @@ pub fn Attachments(comptime B: type) type {
         ) Error!Oid {
             try self.ready(arena);
             const clean = try fmt.sanitizeName(arena, name);
-            const split = repo_mod.splitMessage(spec.message orelse "Rename attachment");
+            try self.checkMessage(spec.message);
+            const split = repo_mod.splitMessage(repo_mod.givenMessage(spec.message) orelse "Rename attachment");
             return self.repo.appendWith(arena, ref_name, spec.author, spec.expect, RenameBuilder{
                 .id = id,
                 .name = clean,
@@ -804,6 +815,11 @@ test "add, read, rename, remove" {
     }));
     try testing.expectError(error.EmptyAttachment, att.validate(.{ .name = "x", .data = "" }));
     try testing.expectError(error.NoAttachments, att.add(arena, ref, .{ .files = &.{} }));
+    try testing.expectError(error.EmptyText, att.add(arena, ref, .{
+        .files = &.{.{ .name = "a.png", .data = samples.png }},
+        .comment = " \n ",
+    }));
+
     const prefix = issue.attachments[0].id[0..6];
     try testing.expect(try Attachments(GitSim).find(arena, issue, prefix) == .one);
 }

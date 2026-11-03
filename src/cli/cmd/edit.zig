@@ -181,11 +181,6 @@ pub fn main(comptime B: type, ctx: *context.Context(B), argv: []const []const u8
     if (clears.contains(.estimate)) spec.estimate_minutes = .clear;
     if (x.workflow) |v| spec.workflow = v;
     if (clears.contains(.workflow)) spec.workflow = "";
-    if (spec.description != null and spec.message != null and
-        common.hasBlankLine(spec.message.?)) return common.fail(
-        ctx.err,
-        "error: with --description, -m is only the subject (no blank lines)\n",
-    );
     var names: std.ArrayList([]const u8) = .empty;
     if (!spec.isEmpty()) {
         const result = repo.edit(arena, ref.name, spec) catch |e|

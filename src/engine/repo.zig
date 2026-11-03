@@ -15,6 +15,7 @@ const uuid_fmt = @import("../format/uuid.zig");
 const core_fmt = @import("../format/core.zig");
 const attachment_fmt = @import("../format/attachment.zig");
 const fields_fmt = @import("../format/fields.zig");
+const settings_mod = @import("settings.zig");
 const issue_model = @import("../model/issue.zig");
 
 pub const Issue = issue_model.Issue;
@@ -266,6 +267,10 @@ pub fn Repo(comptime B: type) type {
         limits: Limits = .{},
         /// Besides `closed`. See `core.State.isDone`.
         done_states: []const []const u8 = &core_fmt.default_done_states,
+        /// What writes may set `workflow` to (`issue.workflowStates`, see
+        /// `settings`). Null when that setting is invalid: then writes that
+        /// set a workflow state fail with InvalidWorkflowStates.
+        workflow_states: ?[]const []const u8 = &fields_fmt.default_workflow,
         /// Set it to keep `refs` from listing the issues again within one
         /// command, like resolving a prefix and then a write's guards. A
         /// write clears it first, so every attempt after the first lists
@@ -294,6 +299,17 @@ pub fn Repo(comptime B: type) type {
             TooManyLabels,
             TooManyBlockers,
             NothingToEdit,
+            /// A title or a comment's text that is empty or only whitespace.
+            EmptyText,
+            /// A label with a comma (the separator) or a newline.
+            InvalidLabel,
+            /// Not one of `workflow_states`.
+            UnknownWorkflowState,
+            /// `workflow_states` is null: `issue.workflowStates` is invalid.
+            InvalidWorkflowStates,
+            /// `EditSpec.message` with a blank line, and a description: the
+            /// description is the body, so the message is only the subject.
+            MessageHasBody,
             /// A value the format or upstream doesn't allow, like an unknown
             /// priority or a reference that isn't a full UUID.
             InvalidValue,
@@ -664,6 +680,7 @@ pub fn Repo(comptime B: type) type {
         pub fn create(self: Self, arena: Allocator, spec: CreateSpec) Error!Created {
             try self.checkLimits();
             try self.checkText(spec.title, self.limits.max_title_bytes);
+            try checkNotBlank(spec.title);
             if (spec.body.len > self.limits.max_body_bytes) return error.TooLong;
             const normalized = try self.normalizeLabels(arena, spec.labels);
             var milestone_text = spec.milestone;
@@ -715,7 +732,7 @@ pub fn Repo(comptime B: type) type {
                 });
             }
             if (spec.workflow) |v| {
-                if (!fields_fmt.isSlug(v)) return error.InvalidValue;
+                try self.checkWorkflow(v);
                 try list.append(arena, .{ .key = "X-Workflow-State", .value = v });
             }
             if (spec.milestone_id) |mid| {
@@ -776,6 +793,7 @@ pub fn Repo(comptime B: type) type {
         ) Error!Oid {
             try self.checkLimits();
             if (spec.text.len > self.limits.max_body_bytes) return error.TooLong;
+            try checkNotBlank(spec.text);
             const split = splitMessage(spec.text);
             const message = try trailers.build(arena, split.subject, split.body, &.{});
             return self.appendCommit(arena, ref_name, spec.author, spec.expect, FixedMessage{
@@ -805,7 +823,7 @@ pub fn Repo(comptime B: type) type {
                 .closed => "Close issue",
                 .other => |s| try std.fmt.allocPrint(arena, "Change state to {s}", .{s}),
             };
-            const split = splitMessage(spec.message orelse default_subject);
+            const split = splitMessage(givenMessage(spec.message) orelse default_subject);
             const message = try trailers.build(arena, split.subject, split.body, list.items);
             return self.appendCommit(arena, ref_name, spec.author, spec.expect, StateBuilder{
                 .repo = self,
@@ -862,7 +880,7 @@ pub fn Repo(comptime B: type) type {
             spec: LifecycleSpec,
         ) Error!Oid {
             try self.checkLimits();
-            const subject = spec.message orelse if (deleted) "Delete issue" else "Restore issue";
+            const subject = givenMessage(spec.message) orelse if (deleted) "Delete issue" else "Restore issue";
             const split = splitMessage(subject);
             const message = try trailers.build(arena, split.subject, split.body, &.{
                 .{ .key = "X-Deleted", .value = if (deleted) "true" else "false" },
@@ -959,11 +977,12 @@ pub fn Repo(comptime B: type) type {
         ) Error!Oid {
             try self.checkLimits();
             if (text.len > self.limits.max_body_bytes) return error.TooLong;
+            if (event == .edit) try checkNotBlank(text);
             return self.appendCommit(arena, ref_name, spec.author, spec.expect, CommentEventBuilder{
                 .comment = comment_oid,
                 .event = event,
                 .text = text,
-                .subject = spec.message,
+                .subject = givenMessage(spec.message),
             });
         }
 
@@ -1010,7 +1029,12 @@ pub fn Repo(comptime B: type) type {
         ) Error!EditResult {
             try self.checkLimits();
             if (spec.isEmpty()) return error.NothingToEdit;
-            if (spec.title) |t| try self.checkText(t, self.limits.max_title_bytes);
+            if (spec.description != null) if (givenMessage(spec.message)) |m| if (splitMessage(m).body.len != 0)
+                return error.MessageHasBody;
+            if (spec.title) |t| {
+                try self.checkText(t, self.limits.max_title_bytes);
+                try checkNotBlank(t);
+            }
             for ([_]?[]const u8{ spec.assignee, spec.milestone }) |v| {
                 if (v) |value| try self.checkText(value, self.limits.max_trailer_value_bytes);
             }
@@ -1051,7 +1075,7 @@ pub fn Repo(comptime B: type) type {
                 try changes.append(arena, .estimate);
             }
             if (spec.workflow) |v| {
-                if (v.len > 0 and !fields_fmt.isSlug(v)) return error.InvalidValue;
+                if (v.len > 0) try self.checkWorkflow(v);
                 try changes.append(arena, .workflow);
             }
             if (spec.description) |d| {
@@ -1278,13 +1302,14 @@ pub fn Repo(comptime B: type) type {
                         .value = fields_fmt.Event.description_edit.text(),
                     });
                     const only = b.changes.len == 1;
-                    const subject = spec.message orelse if (only)
+                    const given = if (givenMessage(spec.message)) |m| splitMessage(m).subject else null;
+                    const subject = given orelse if (only)
                         "Edit description"
                     else
                         try defaultEditSubject(arena, b.changes);
                     return trailers.build(arena, subject, d, list.items);
                 }
-                const subject = spec.message orelse try defaultEditSubject(arena, b.changes);
+                const subject = givenMessage(spec.message) orelse try defaultEditSubject(arena, b.changes);
                 const split = splitMessage(subject);
                 return trailers.build(arena, split.subject, split.body, list.items);
             }
@@ -1790,7 +1815,7 @@ pub fn Repo(comptime B: type) type {
         ) Error![]const []const u8 {
             var out: std.ArrayList([]const u8) = .empty;
             for (raw) |l| {
-                labels_fmt.validate(l) catch return error.InvalidText;
+                labels_fmt.validate(l) catch return error.InvalidLabel;
                 const t = std.mem.trim(u8, l, " \t");
                 if (t.len == 0 or labels_fmt.contains(out.items, t)) continue;
                 try out.append(arena, t);
@@ -1803,6 +1828,10 @@ pub fn Repo(comptime B: type) type {
             _ = self;
             if (text.len > max) return error.TooLong;
             if (std.mem.findAny(u8, text, "\r\n") != null) return error.InvalidText;
+        }
+
+        fn checkWorkflow(self: Self, state: []const u8) Error!void {
+            return settings_mod.checkWorkflowState(self.workflow_states, state);
         }
     };
 }
@@ -1851,6 +1880,18 @@ fn defaultEditSubject(arena: Allocator, changes: []const Change) Allocator.Error
     var names: std.ArrayList([]const u8) = .empty;
     for (changes) |c| try names.append(arena, c.name());
     return std.fmt.allocPrint(arena, "Update {s}", .{try std.mem.join(arena, ", ", names.items)});
+}
+
+/// A commit message the caller gave, null when it is blank, like upstream
+/// takes an empty `-m`: the write's default subject stands in.
+pub fn givenMessage(message: ?[]const u8) ?[]const u8 {
+    const m = message orelse return null;
+    return if (std.mem.trim(u8, m, " \t\r\n").len == 0) null else m;
+}
+
+/// For text that must say something: titles, comments.
+pub fn checkNotBlank(text: []const u8) error{EmptyText}!void {
+    if (std.mem.trim(u8, text, " \t\r\n").len == 0) return error.EmptyText;
 }
 
 /// First paragraph is the subject, the rest the body, so `-m a -m b` gives
@@ -2007,6 +2048,13 @@ test "extension fields" {
         .{ .title = "x", .assignee = "a7f3b2c1-4e5d-4a8b-9c1e-2f3a4b5c6d7e" ++ " " },
         .{ .title = "x", .blocked_by = &.{"nope"} },
     }) |bad| try testing.expectError(error.InvalidValue, repo.create(arena, bad));
+    try testing.expectError(error.UnknownWorkflowState, repo.create(arena, .{ .title = "x", .workflow = "done" }));
+    // An invalid issue.workflowStates (Settings.apply): no state can be set.
+    var unset = repo;
+    unset.workflow_states = null;
+    try testing.expectError(error.InvalidWorkflowStates, unset.create(arena, .{ .title = "x", .workflow = "ready" }));
+    try testing.expectError(error.EmptyText, repo.create(arena, .{ .title = " " }));
+    try testing.expectError(error.InvalidLabel, repo.create(arena, .{ .title = "x", .labels = &.{"a,b"} }));
 }
 
 test "caller mistakes are errors, not panics" {
@@ -2020,6 +2068,20 @@ test "caller mistakes are errors, not panics" {
     const ref_name = try std.fmt.allocPrint(arena, "refs/issues/{s}", .{created.id.slice()});
 
     try testing.expectError(error.NothingToEdit, repo.edit(arena, ref_name, .{}));
+    try testing.expectError(error.MessageHasBody, repo.edit(arena, ref_name, .{
+        .description = "New text.",
+        .message = "Subject\n\nBody",
+    }));
+    // Without a body, the message is fine, and only its subject is written.
+    const tip = (try repo.edit(arena, ref_name, .{ .description = "Newer text.", .message = "Subject\n  " })).tip;
+    const written = (try sim.readObject(arena, tip)).?.data;
+    try testing.expect(std.mem.startsWith(u8, written[std.mem.find(u8, written, "\n\n").? + 2 ..], "Subject\n\nNewer text."));
+    // A blank message is no message.
+    const closed = try repo.setState(arena, ref_name, .{ .state = .closed, .message = " " });
+    const close_msg = (try sim.readObject(arena, closed)).?.data;
+    try testing.expect(std.mem.find(u8, close_msg, "\n\nClose issue") != null);
+    try testing.expectError(error.EmptyText, repo.edit(arena, ref_name, .{ .title = "" }));
+    try testing.expectError(error.EmptyText, repo.comment(arena, ref_name, .{ .text = " \n" }));
     for ([_][]const u8{ "refs/heads/main", "refs/issues/", "refs/issues/a..b", "x" }) |bad| {
         try testing.expectError(error.InvalidIssueRef, repo.comment(arena, bad, .{ .text = "hi" }));
         try testing.expectError(

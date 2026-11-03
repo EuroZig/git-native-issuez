@@ -145,15 +145,6 @@ fn syncError(comptime B: type, ctx: *context.Context(B), e: anyerror, remote: []
         ) catch {},
         else => return common.repoFailed(B, ctx, e),
     }
-    if (@hasDecl(B, "lastStderr")) {
-        if (ctx.backend) |backend| {
-            const detail = std.mem.trim(u8, backend.lastStderr(), " \t\r\n");
-            var lines = std.mem.splitScalar(u8, detail, '\n');
-            while (lines.next()) |line| if (line.len > 0) ctx.err.print(
-                "       git: {s}\n",
-                .{line},
-            ) catch {};
-        } else |_| {}
-    }
+    common.printGitDetail(B, ctx, e);
     return common.exit_error;
 }

@@ -1,10 +1,13 @@
-//!   zig build                      git-issue
+//!   zig build                      git-issue, full: with the MCP server
+//!   zig build -Dminimal            git-issue, CLI only (-Dmcp=false)
 //!   zig build test                 unit, backend, simulator/oracle and fuzz smoke tests
 //!   zig build simulator            git-issue-sim
 //!   zig build -Dfuzz               also install git-issue-fuzz
+//!   zig build release              both flavors for every release target, in zig-out/release/
 //!   zig build test-interop         tests against upstream (fetched lazily)
 //!   zig build test-upstream-suite  upstream's t/*.sh against our binary
 //!   zig build test-perf            `ls` over 10 000 issues
+//!   zig build e2e                  the MCP server against the official SDK client (Node.js)
 //!   zig build ci [-Dseed=N]        what CI runs
 //!   zig build examples             library examples (examples/*.zig)
 //!   zig build example-<name>       run one (quickstart, sync, attachments, real-repo -- <path> ls)
@@ -16,41 +19,59 @@ const entry_points = @import("src/cli/entry_points.zig");
 pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
     const optimize = b.standardOptimizeOption(.{});
+    // Projects depending on the library need neither the MCP server nor
+    // its dependency.
+    const minimal = b.option(
+        bool,
+        "minimal",
+        "CLI only: no MCP server (-Dmcp=false)",
+    ) orelse false;
+    const full = isRootPackage(b) and !minimal;
+    const mcp = b.option(
+        bool,
+        "mcp",
+        "Include the MCP server (default: true, false with -Dminimal or as a dependency)",
+    ) orelse full;
     const fuzz = b.option(bool, "fuzz", "Install the fuzzer") orelse false;
-
-    const zon = b.createModule(.{ .root_source_file = b.path("build.zig.zon") });
 
     const issuez = b.addModule("issuez", .{
         .root_source_file = b.path("src/root.zig"),
         .target = target,
         .optimize = optimize,
     });
+    const cli: Cli = .init(b, target, optimize, issuez);
+    const oracle = cli.oracle;
+    const extras = cli.parts(.{ .mcp = mcp });
 
-    const oracle = b.createModule(.{
-        .root_source_file = b.path("src/oracle/root.zig"),
-        .target = target,
-        .optimize = optimize,
-        .imports = &.{.{ .name = "issuez", .module = issuez }},
-    });
-
-    const cli = Cli{ .b = b, .target = target, .issuez = issuez, .oracle = oracle, .zon = zon };
-
-    const exe = cli.exe("git-issue", "src/cli/main.zig", optimize);
+    const exe = cli.exe("git-issue", "src/cli/main.zig", optimize, extras);
     b.installArtifact(exe);
     installEntryPoints(b, exe);
     installCompletions(b, exe);
     installManPages(b, exe);
+
+    const release_step = b.step(
+        "release",
+        "Archives of both flavors for every release target, and SHA256SUMS",
+    );
+    // The full flavor's lazy dependencies are only fetched for a full build.
+    if (full) {
+        addRelease(b, release_step);
+    } else {
+        const fail = b.addFail("zig build release needs the full build: drop -Dminimal");
+        release_step.dependOn(&fail.step);
+    }
 
     const run_step = b.step("run", "Run git-issue");
     const run_exe = b.addRunArtifact(exe);
     if (b.args) |args| run_exe.addArgs(args);
     run_step.dependOn(&run_exe.step);
 
-    const sim = cli.exe("git-issue-sim", "src/cli/main_sim.zig", optimize);
+    // These never include the MCP server.
+    const sim = cli.exe("git-issue-sim", "src/cli/main_sim.zig", optimize, .{});
     const sim_step = b.step("simulator", "Build git-issue-sim");
     sim_step.dependOn(&b.addInstallArtifact(sim, .{}).step);
 
-    const fuzz_exe = cli.exe("git-issue-fuzz", "src/cli/main_fuzz.zig", optimize);
+    const fuzz_exe = cli.exe("git-issue-fuzz", "src/cli/main_fuzz.zig", optimize, .{});
     if (fuzz) b.installArtifact(fuzz_exe);
 
     const test_step = b.step("test", "Run unit, backend, simulator/oracle and fuzz smoke tests");
@@ -58,11 +79,44 @@ pub fn build(b: *std.Build) void {
     const unit_roots = [_]struct { name: []const u8, module: *std.Build.Module }{
         .{ .name = "issuez", .module = issuez },
         .{ .name = "oracle", .module = oracle },
-        .{ .name = "cli", .module = cli.module("src/cli/main.zig", optimize) },
+        .{ .name = "cli", .module = cli.module("src/cli/main.zig", optimize, extras) },
     };
     for (unit_roots) |u| {
         const t = b.addTest(.{ .name = u.name, .root_module = u.module });
         test_step.dependOn(&b.addRunArtifact(t).step);
+    }
+    if (extras.mcp) |m| {
+        const t = b.addTest(.{ .name = "mcp", .root_module = m });
+        test_step.dependOn(&b.addRunArtifact(t).step);
+    }
+
+    // Drives `git-issue mcp` with the official MCP TypeScript SDK client
+    // (test/mcp_e2e/). Needs Node.js and npm. The test project is copied
+    // into the cache and installed there, so `npm ci` is cached until one of
+    // its files changes and the source tree stays clean.
+    const e2e_step = b.step("e2e", "Run the MCP server's end-to-end tests (needs Node.js and npm)");
+    if (extras.mcp != null) {
+        const files = b.addWriteFiles();
+        _ = files.addCopyFile(b.path("test/mcp_e2e/package.json"), "package.json");
+        _ = files.addCopyFile(b.path("test/mcp_e2e/package-lock.json"), "package-lock.json");
+        const script = files.addCopyFile(b.path("test/mcp_e2e/mcp.test.mjs"), "mcp.test.mjs");
+
+        // From PATH when the step runs, so builds without Node.js work.
+        const npm_ci = b.addSystemCommand(&.{ "npm", "ci", "--no-audit", "--no-fund" });
+        npm_ci.setCwd(files.getDirectory());
+        // Capturing the output makes the step cacheable.
+        _ = npm_ci.captureStdOut(.{});
+
+        const run_e2e = b.addSystemCommand(&.{"node"});
+        run_e2e.setName("e2e git-issue mcp");
+        run_e2e.addFileArg(script);
+        run_e2e.addArtifactArg(exe);
+        run_e2e.addArg(@import("build.zig.zon").version);
+        run_e2e.has_side_effects = true;
+        run_e2e.step.dependOn(&npm_ci.step);
+        e2e_step.dependOn(&run_e2e.step);
+    } else {
+        e2e_step.dependOn(&b.addFail("zig build e2e needs the MCP server: drop -Dminimal").step);
     }
 
     for ([_][]const u8{ "test/backend_git.zig", "test/trailers_git.zig" }) |root| {
@@ -105,7 +159,7 @@ pub fn build(b: *std.Build) void {
 
     // Budget 2 s, on a ReleaseSafe build whatever -Doptimize says: that is
     // what users run. Most of the time is spent in git.
-    const perf_exe = cli.exe("git-issue", "src/cli/main.zig", .ReleaseSafe);
+    const perf_exe = cli.exe("git-issue", "src/cli/main.zig", .ReleaseSafe, .{});
     const perf_runner = b.addExecutable(.{
         .name = "perf-smoke",
         .root_module = b.createModule(.{
@@ -128,6 +182,7 @@ pub fn build(b: *std.Build) void {
     {
         const seed = b.fmt("{d}", .{b.option(u64, "seed", "Seed of the ci runs") orelse 20261018});
         ci_step.dependOn(test_step);
+        if (extras.mcp != null) ci_step.dependOn(e2e_step);
 
         const long_fuzz = b.addRunArtifact(fuzz_exe);
         long_fuzz.addArgs(&.{ "--seed", seed, "--iterations", "5000" });
@@ -296,6 +351,154 @@ pub fn build(b: *std.Build) void {
     }
 }
 
+/// In the order the release page lists them: by name.
+const release_targets = [_]std.Target.Query{
+    .{ .cpu_arch = .aarch64, .os_tag = .linux, .abi = .musl },
+    .{ .cpu_arch = .aarch64, .os_tag = .macos },
+    .{ .cpu_arch = .x86_64, .os_tag = .linux, .abi = .musl },
+    .{ .cpu_arch = .x86_64, .os_tag = .macos },
+    .{ .cpu_arch = .x86_64, .os_tag = .windows },
+};
+
+const Flavor = struct { name: []const u8, full: bool };
+
+const release_flavors = [_]Flavor{
+    .{ .name = "full", .full = true },
+    .{ .name = "minimal", .full = false },
+};
+
+/// `git-native-issuez-<version>-<flavor>-<arch>-<os>`, one per flavor and
+/// target, cross-compiled (ReleaseSafe, stripped): `bin/` with the
+/// `git-issue-<command>` entry points (not on Windows), the shell completions and man pages
+/// (from a build that runs here), and LICENSE, README.md and CHANGELOG.md
+/// in `share/doc/git-native-issuez/` (at the top on Windows). A `.zip` for
+/// Windows, `.tar.gz` otherwise, all in `zig-out/release/` with their
+/// `SHA256SUMS`. GitHub lists release assets by name, so the full flavor
+/// comes first. Needs `sh`, `tar` and `zip`.
+fn addRelease(b: *std.Build, step: *std.Build.Step) void {
+    const version = @import("build.zig.zon").version;
+    const sums = b.addSystemCommand(&.{ "sh", "-c", sums_script, "sh" });
+    const sums_file = sums.addOutputFileArg("SHA256SUMS");
+    step.dependOn(&b.addInstallFileWithDir(sums_file, release_dir, "SHA256SUMS").step);
+
+    for (release_flavors) |flavor| {
+        var exes: [release_targets.len]*std.Build.Step.Compile = undefined;
+        var host_exe: ?*std.Build.Step.Compile = null;
+        for (release_targets, &exes) |query, *exe| {
+            exe.* = releaseExe(b, b.resolveTargetQuery(query), flavor);
+            if (host_exe == null and runsOnHost(b, exe.*)) host_exe = exe.*;
+        }
+        // Completions and man pages are the same for every target.
+        const gen = host_exe orelse releaseExe(b, b.graph.host, flavor);
+        const scripts = completionScripts(b, gen);
+        const pages = manPages(b, gen);
+
+        for (exes) |exe| {
+            const t = exe.rootModuleTarget();
+            const windows = t.os.tag == .windows;
+            const name = b.fmt("git-native-issuez-{s}-{s}-{t}-{t}", .{
+                version, flavor.name, t.cpu.arch, t.os.tag,
+            });
+            const archive_name = b.fmt("{s}.{s}", .{ name, if (windows) "zip" else "tar.gz" });
+
+            const pack = b.addSystemCommand(&.{ "sh", "-c", pack_script, "sh" });
+            // Keeps macOS's tar from adding ._ files with extended attributes.
+            pack.setEnvironmentVariable("COPYFILE_DISABLE", "1");
+            const archive = pack.addOutputFileArg(archive_name);
+            _ = pack.addOutputDirectoryArg("stage");
+            pack.addArg(name);
+            const bin = if (windows) "bin/git-issue.exe" else "bin/git-issue";
+            pack.addArgs(&.{ "x", bin });
+            pack.addFileArg(exe.getEmittedBin());
+            // Zip has no symlinks, and a copy per command would make the
+            // archive ten times larger: Windows gets `git issue <command>`.
+            if (!windows) for (entry_points.names) |entry| {
+                pack.addArgs(&.{ "l", b.fmt("bin/git-issue-{s}", .{entry}), "git-issue" });
+            };
+            // Under share/ like the rest, so unpacking into a prefix
+            // doesn't put them at its top. Windows has no share/.
+            const doc_dir = if (windows) "" else "share/doc/git-native-issuez/";
+            for ([_][]const u8{ "LICENSE", "README.md", "CHANGELOG.md" }) |doc| {
+                pack.addArgs(&.{ "f", b.fmt("{s}{s}", .{ doc_dir, doc }) });
+                pack.addFileArg(b.path(doc));
+            }
+            if (!windows) {
+                for (completionFiles(b)) |f| {
+                    pack.addArgs(&.{ "f", f.path });
+                    pack.addFileArg(scripts.of(f.shell));
+                }
+                pack.addArgs(&.{ "d", man_dir });
+                pack.addDirectoryArg(pages);
+            }
+
+            sums.addFileArg(archive);
+            step.dependOn(&b.addInstallFileWithDir(archive, release_dir, archive_name).step);
+        }
+    }
+}
+
+const release_dir: std.Build.InstallDir = .{ .custom = "release" };
+
+fn releaseExe(
+    b: *std.Build,
+    target: std.Build.ResolvedTarget,
+    flavor: Flavor,
+) *std.Build.Step.Compile {
+    const issuez = b.createModule(.{
+        .root_source_file = b.path("src/root.zig"),
+        .target = target,
+        .optimize = .ReleaseSafe,
+    });
+    const cli: Cli = .init(b, target, .ReleaseSafe, issuez);
+    const exe = cli.exe("git-issue", "src/cli/main.zig", .ReleaseSafe, cli.parts(.{
+        .mcp = flavor.full,
+    }));
+    // Debug info would make the Linux binaries five times larger; macOS
+    // builds go without it anyway. Stack traces show addresses instead.
+    exe.root_module.strip = true;
+    return exe;
+}
+
+/// `sh -c pack_script sh <archive> <stage dir> <name> [<kind> <path> <source>]...`
+/// puts each source at `<name>/<path>` in the stage directory, then
+/// archives `<name>` by the archive's extension. Kinds: `f` a file, `x`
+/// an executable, `d` a directory's contents, `l` a symlink to `<source>`.
+const pack_script =
+    \\set -eu
+    \\archive="$(cd "$(dirname "$1")" && pwd)/$(basename "$1")"
+    \\stage=$2 name=$3
+    \\shift 3
+    \\rm -rf "${stage:?}/$name"
+    \\while [ $# -gt 0 ]; do
+    \\  dest="$stage/$name/$2"
+    \\  mkdir -p "$(dirname "$dest")"
+    \\  case $1 in
+    \\    f) cp "$3" "$dest" && chmod 644 "$dest" ;;
+    \\    x) cp "$3" "$dest" && chmod 755 "$dest" ;;
+    \\    d) mkdir -p "$dest" && cp -R "$3/." "$dest" ;;
+    \\    l) ln -s "$3" "$dest" ;;
+    \\  esac
+    \\  shift 3
+    \\done
+    \\cd "$stage"
+    \\rm -f "$archive"
+    \\case $archive in
+    \\  *.zip) zip -qrX "$archive" "$name" ;;
+    \\  *) tar -czf "$archive" "$name" ;;
+    \\esac
+;
+
+/// `sh -c sums_script sh <output> <file>...`: `sha256sum`'s format, by
+/// file name.
+const sums_script =
+    \\set -eu
+    \\out=$1
+    \\shift
+    \\if command -v sha256sum >/dev/null; then sum="sha256sum"; else sum="shasum -a 256"; fi
+    \\: > "$out"
+    \\for f; do (cd "$(dirname "$f")" && $sum "$(basename "$f")") >> "$out"; done
+;
+
 /// Relative symlinks to `git-issue`, copies on Windows.
 fn installEntryPoints(b: *std.Build, exe: *std.Build.Step.Compile) void {
     if (exe.rootModuleTarget().os.tag == .windows) {
@@ -335,55 +538,76 @@ fn makeEntryPointLinks(step: *std.Build.Step, options: std.Build.Step.MakeOption
 /// Skipped for cross builds, where the binary can't run to print them.
 fn installCompletions(b: *std.Build, exe: *std.Build.Step.Compile) void {
     if (!runsOnHost(b, exe)) return;
-    const Install = struct { shell: []const u8, dir: []const u8, file: []const u8 };
-    // bash-completion and fish look scripts up by command name, so every
-    // entry point gets a copy. zsh's `#compdef` line covers them all.
-    var installs: std.ArrayList(Install) = .empty;
-    const bash_dir = "share/bash-completion/completions";
-    const fish_dir = "share/fish/vendor_completions.d";
-    installs.appendSlice(b.allocator, &.{
-        .{ .shell = "bash", .dir = bash_dir, .file = "git-issue" },
-        .{ .shell = "zsh", .dir = "share/zsh/site-functions", .file = "_git-issue" },
-        .{ .shell = "fish", .dir = fish_dir, .file = "git-issue.fish" },
-    }) catch @panic("OOM");
-    for (entry_points.names) |name| installs.appendSlice(b.allocator, &.{
-        .{ .shell = "bash", .dir = bash_dir, .file = b.fmt("git-issue-{s}", .{name}) },
-        .{ .shell = "fish", .dir = fish_dir, .file = b.fmt("git-issue-{s}.fish", .{name}) },
-    }) catch @panic("OOM");
-
-    var scripts: [3]?std.Build.LazyPath = @splat(null);
-    const shells = [_][]const u8{ "bash", "zsh", "fish" };
-    for (installs.items) |i| {
-        const index = for (shells, 0..) |s, k| {
-            if (std.mem.eql(u8, s, i.shell)) break k;
-        } else unreachable;
-        const script = scripts[index] orelse blk: {
-            const gen = b.addRunArtifact(exe);
-            gen.addArgs(&.{ "completion", i.shell });
-            gen.expectExitCode(0);
-            scripts[index] = gen.captureStdOut(.{});
-            break :blk scripts[index].?;
-        };
-        b.getInstallStep().dependOn(&b.addInstallFileWithDir(
-            script,
-            .prefix,
-            b.fmt("{s}/{s}", .{ i.dir, i.file }),
-        ).step);
-    }
+    const scripts = completionScripts(b, exe);
+    for (completionFiles(b)) |f| b.getInstallStep().dependOn(&b.addInstallFileWithDir(
+        scripts.of(f.shell),
+        .prefix,
+        f.path,
+    ).step);
 }
 
 /// Native builds only, like the completions.
 fn installManPages(b: *std.Build, exe: *std.Build.Step.Compile) void {
     if (!runsOnHost(b, exe)) return;
+    b.getInstallStep().dependOn(&b.addInstallDirectory(.{
+        .source_dir = manPages(b, exe),
+        .install_dir = .prefix,
+        .install_subdir = man_dir,
+    }).step);
+}
+
+const Shell = enum { bash, zsh, fish };
+
+/// A completion script under the install prefix.
+const CompletionFile = struct { shell: Shell, path: []const u8 };
+
+/// bash-completion and fish look scripts up by command name, so every
+/// entry point gets a copy. zsh's `#compdef` line covers them all.
+fn completionFiles(b: *std.Build) []const CompletionFile {
+    var files: std.ArrayList(CompletionFile) = .empty;
+    const bash_dir = "share/bash-completion/completions";
+    const fish_dir = "share/fish/vendor_completions.d";
+    files.appendSlice(b.allocator, &.{
+        .{ .shell = .bash, .path = bash_dir ++ "/git-issue" },
+        .{ .shell = .zsh, .path = "share/zsh/site-functions/_git-issue" },
+        .{ .shell = .fish, .path = fish_dir ++ "/git-issue.fish" },
+    }) catch @panic("OOM");
+    for (entry_points.names) |name| files.appendSlice(b.allocator, &.{
+        .{ .shell = .bash, .path = b.fmt("{s}/git-issue-{s}", .{ bash_dir, name }) },
+        .{ .shell = .fish, .path = b.fmt("{s}/git-issue-{s}.fish", .{ fish_dir, name }) },
+    }) catch @panic("OOM");
+    return files.items;
+}
+
+const CompletionScripts = struct {
+    scripts: [3]std.Build.LazyPath,
+
+    fn of(c: CompletionScripts, shell: Shell) std.Build.LazyPath {
+        return c.scripts[@intFromEnum(shell)];
+    }
+};
+
+/// What `exe completion <shell>` prints. `exe` must run on the host.
+fn completionScripts(b: *std.Build, exe: *std.Build.Step.Compile) CompletionScripts {
+    var out: CompletionScripts = undefined;
+    for (std.enums.values(Shell), &out.scripts) |shell, *script| {
+        const gen = b.addRunArtifact(exe);
+        gen.addArgs(&.{ "completion", @tagName(shell) });
+        gen.expectExitCode(0);
+        script.* = gen.captureStdOut(.{});
+    }
+    return out;
+}
+
+const man_dir = "share/man/man1";
+
+/// The man pages `exe` writes. `exe` must run on the host.
+fn manPages(b: *std.Build, exe: *std.Build.Step.Compile) std.Build.LazyPath {
     const gen = b.addRunArtifact(exe);
     gen.addArg("__manpages");
     const pages = gen.addOutputDirectoryArg("man1");
     gen.expectExitCode(0);
-    b.getInstallStep().dependOn(&b.addInstallDirectory(.{
-        .source_dir = pages,
-        .install_dir = .prefix,
-        .install_subdir = "share/man/man1",
-    }).step);
+    return pages;
 }
 
 fn runsOnHost(b: *std.Build, exe: *std.Build.Step.Compile) bool {
@@ -408,20 +632,82 @@ fn isRootPackage(b: *std.Build) bool {
     return b.pkg_hash.len == 0;
 }
 
+/// The optional parts of `git-issue`. Null leaves one out.
+const Extras = struct {
+    mcp: ?*std.Build.Module = null,
+};
+
+/// The modules `git-issue` is built from, for one target.
 const Cli = struct {
     b: *std.Build,
     target: std.Build.ResolvedTarget,
+    optimize: std.builtin.OptimizeMode,
     issuez: *std.Build.Module,
     oracle: *std.Build.Module,
     zon: *std.Build.Module,
+    mcp_help: *std.Build.Module,
+
+    fn init(
+        b: *std.Build,
+        target: std.Build.ResolvedTarget,
+        optimize: std.builtin.OptimizeMode,
+        issuez: *std.Build.Module,
+    ) Cli {
+        return .{
+            .b = b,
+            .target = target,
+            .optimize = optimize,
+            .issuez = issuez,
+            .oracle = b.createModule(.{
+                .root_source_file = b.path("src/oracle/root.zig"),
+                .target = target,
+                .optimize = optimize,
+                .imports = &.{.{ .name = "issuez", .module = issuez }},
+            }),
+            .zon = b.createModule(.{ .root_source_file = b.path("build.zig.zon") }),
+            .mcp_help = b.createModule(.{ .root_source_file = b.path("src/mcp/help.zig") }),
+        };
+    }
+
+    fn dependencyArgs(cli: Cli) struct {
+        target: std.Build.ResolvedTarget,
+        optimize: std.builtin.OptimizeMode,
+    } {
+        return .{ .target = cli.target, .optimize = cli.optimize };
+    }
+
+    /// The optional parts asked for, each null until its lazy dependency
+    /// is fetched.
+    fn parts(cli: Cli, want: struct { mcp: bool }) Extras {
+        const b = cli.b;
+        const mcp_module: ?*std.Build.Module = if (!want.mcp) null else blk: {
+            const blitzmcp = b.lazyDependency("blitzmcp", cli.dependencyArgs()) orelse
+                break :blk null;
+            break :blk b.createModule(.{
+                .root_source_file = b.path("src/mcp/main.zig"),
+                .target = cli.target,
+                .optimize = cli.optimize,
+                .imports = &.{
+                    .{ .name = "issuez", .module = cli.issuez },
+                    .{ .name = "blitzmcp", .module = blitzmcp.module("blitzmcp") },
+                    .{ .name = "build.zig.zon", .module = cli.zon },
+                    .{ .name = "mcp_help", .module = cli.mcp_help },
+                },
+            });
+        };
+        return .{ .mcp = mcp_module };
+    }
 
     fn module(
         cli: Cli,
         root: []const u8,
         optimize: std.builtin.OptimizeMode,
+        extras: Extras,
     ) *std.Build.Module {
         const b = cli.b;
-        return b.createModule(.{
+        const options = b.addOptions();
+        options.addOption(bool, "mcp", extras.mcp != null);
+        const m = b.createModule(.{
             .root_source_file = b.path(root),
             .target = cli.target,
             .optimize = optimize,
@@ -429,8 +715,12 @@ const Cli = struct {
                 .{ .name = "issuez", .module = cli.issuez },
                 .{ .name = "oracle", .module = cli.oracle },
                 .{ .name = "build.zig.zon", .module = cli.zon },
+                .{ .name = "build_options", .module = options.createModule() },
+                .{ .name = "mcp_help", .module = cli.mcp_help },
             },
         });
+        if (extras.mcp) |t| m.addImport("mcp", t);
+        return m;
     }
 
     fn exe(
@@ -438,10 +728,11 @@ const Cli = struct {
         name: []const u8,
         root: []const u8,
         optimize: std.builtin.OptimizeMode,
+        extras: Extras,
     ) *std.Build.Step.Compile {
         return cli.b.addExecutable(.{
             .name = name,
-            .root_module = cli.module(root, optimize),
+            .root_module = cli.module(root, optimize, extras),
         });
     }
 };

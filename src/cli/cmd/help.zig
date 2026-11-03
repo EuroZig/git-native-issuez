@@ -2,6 +2,7 @@
 
 const context = @import("../context.zig");
 const common = @import("../common.zig");
+const build_options = @import("build_options");
 
 pub const text =
     \\usage: git issue <command> [<args>]
@@ -32,6 +33,8 @@ pub const text =
     \\   status      Show unpushed, quarantined and conflicted issues
     \\   quarantine  Resolve a quarantined issue
     \\   completion  Print a shell completion script (bash, zsh, fish)
+++ (if (build_options.mcp) "\n   mcp         Serve the issues to coding agents (MCP, stdio)" else "") ++
+    \\
     \\
     \\Run 'git issue <command> --help' for details on a command.
     \\Provider import/export (GitHub, GitLab, ...): use upstream git-native-issue's
