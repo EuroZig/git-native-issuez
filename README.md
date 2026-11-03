@@ -247,8 +247,7 @@ It downloads the latest release for your machine, checks it against
 - To read it first, download it and run `sh install.sh`.
 - `update-git-native-issuez`, installed next to `git-issue`, updates with
   the same flavor and prefix; extra arguments (`--version`, `--no-verify`)
-  go to `install.sh`. It refuses an `install.sh` older than the one it came
-  from.
+  go to `install.sh`.
 - `--no-verify` skips the checksum check, for that run only.
 - `update-git-native-issuez --uninstall` (or
   `install.sh --uninstall --prefix <dir>`) removes everything it installed,

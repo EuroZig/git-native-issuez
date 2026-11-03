@@ -149,10 +149,10 @@ jobs:
             # Again over it, as an update does.
             sh install.sh --from zig-out/release --version "$VERSION" --flavor "$flavor" --prefix "$prefix"
             # Uninstalling removes all of it and nothing else.
-            touch "$prefix/bin/git-issue-import" "$prefix/share/man/man1/other.1"
+            touch "$prefix/bin/git-issue-import" "$prefix/share/man/man1/git-issue-import.1" "$prefix/share/man/man1/other.1"
             sh install.sh --uninstall --prefix "$prefix"
             left=$(cd "$prefix" && find . ! -type d | sort | tr '\n' ' ')
-            if [ "$left" != "./bin/git-issue-import ./share/man/man1/other.1 " ]; then
+            if [ "$left" != "./bin/git-issue-import ./share/man/man1/git-issue-import.1 ./share/man/man1/other.1 " ]; then
               echo "::error::--uninstall left or removed the wrong files: $left"
               exit 1
             fi
