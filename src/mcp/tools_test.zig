@@ -44,6 +44,49 @@ const Harness = struct {
         return response.object.get("result").?.object;
     }
 
+    /// The response to a request.
+    fn send(h: *Harness, method: []const u8, params: []const u8) !std.json.ObjectMap {
+        const id = h.next_id;
+        h.next_id += 1;
+        const msg = try std.fmt.allocPrint(
+            h.arena,
+            "{{\"jsonrpc\":\"2.0\",\"id\":{d},\"method\":\"{s}\",\"params\":{s}}}",
+            .{ id, method, params },
+        );
+        var reader: std.Io.Reader = .fixed("");
+        var out: std.Io.Writer.Allocating = .init(h.arena);
+        var stream: mcp.Transport.Stream = .init(&reader, &out.writer);
+        try h.server.handleMessage(testing.io, testing.allocator, &stream.transport, msg);
+        const response = try std.json.parseFromSliceLeaky(std.json.Value, h.arena, out.written(), .{});
+        return response.object;
+    }
+
+    /// The `result` of a request that must succeed.
+    fn request(h: *Harness, method: []const u8, params: []const u8) !std.json.Value {
+        const response = try h.send(method, params);
+        if (response.get("error")) |e| {
+            std.debug.print("{s} failed: {s}\n", .{ method, e.object.get("message").?.string });
+            return error.TestUnexpectedResult;
+        }
+        return response.get("result").?;
+    }
+
+    /// The `error` of a request that must fail.
+    fn requestError(h: *Harness, method: []const u8, params: []const u8) !std.json.ObjectMap {
+        return (try h.send(method, params)).get("error").?.object;
+    }
+
+    /// A resource's JSON, parsed.
+    fn readResource(h: *Harness, uri: []const u8) !std.json.Value {
+        const params = try std.fmt.allocPrint(h.arena, "{{\"uri\":\"{s}\"}}", .{uri});
+        const result = (try h.request("resources/read", params)).object;
+        const contents = result.get("contents").?.array.items;
+        try testing.expectEqual(@as(usize, 1), contents.len);
+        try testing.expectEqualStrings(uri, str(contents[0].object, "uri"));
+        try testing.expectEqualStrings("application/json", str(contents[0].object, "mimeType"));
+        return std.json.parseFromSliceLeaky(std.json.Value, h.arena, str(contents[0].object, "text"), .{});
+    }
+
     /// `structuredContent` of a call that must succeed.
     fn ok(h: *Harness, name: []const u8, arguments: []const u8) !std.json.ObjectMap {
         const result = try h.call(name, arguments);
@@ -236,6 +279,100 @@ test "milestones by name, as text and cleared" {
     _ = try h.ok("edit_issue", try std.fmt.allocPrint(arena, "{{\"id\":\"{s}\",\"milestone\":\"\"}}", .{id}));
     issue = (try h.ok("show_issue", show)).get("issue").?.object;
     try testing.expect(issue.get("milestone") == null or issue.get("milestone").? == .null);
+}
+
+test "resources: list, templates, read" {
+    var arena_state: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var world: GitSim.World = .{ .clones = &.{.{ .name = "local" }} };
+    var sim = try GitSim.init(arena, &world, 0);
+    var repos: SimRepos = .{ .sim = &sim };
+    var handler: tools.Handler(SimRepos) = .{ .repos = &repos };
+    var h: Harness = .{ .arena = arena, .server = .init(&handler) };
+    h.server.connection.markInitialized(.{
+        .protocolVersion = mcp.types.latest_protocol_version,
+        .capabilities = .{},
+        .clientInfo = .{ .name = "test", .version = "0" },
+    });
+    try testing.expect(Server.capabilities.resources != null);
+
+    const listed = (try h.request("resources/list", "{}")).object;
+    const uris = listed.get("resources").?.array.items;
+    try testing.expectEqual(@as(usize, 2), uris.len);
+    try testing.expectEqualStrings("git-issue://issues", str(uris[0].object, "uri"));
+    try testing.expectEqualStrings("git-issue://milestones", str(uris[1].object, "uri"));
+    const templates = (try h.request("resources/templates/list", "{}")).object;
+    try testing.expectEqualStrings(
+        "git-issue://issues/{id}",
+        str(templates.get("resourceTemplates").?.array.items[0].object, "uriTemplate"),
+    );
+
+    const created = try h.ok("create_issue", "{\"title\":\"Read me as a resource\"}");
+    const issues = try h.readResource("git-issue://issues");
+    try testing.expectEqual(@as(i64, 1), issues.object.get("total").?.integer);
+    const short = try std.fmt.allocPrint(arena, "git-issue://issues/{s}", .{str(created, "short_id")});
+    const one = try h.readResource(short);
+    try testing.expectEqualStrings("Read me as a resource", str(one.object.get("issue").?.object, "title"));
+    const milestones = try h.readResource("git-issue://milestones");
+    try testing.expectEqual(@as(usize, 0), milestones.object.get("milestones").?.array.items.len);
+
+    for ([_][]const u8{ "git-issue://issues/0000000", "git-issue://nope", "git-issue://issues/", "file:///x" }) |uri| {
+        const params = try std.fmt.allocPrint(arena, "{{\"uri\":\"{s}\"}}", .{uri});
+        const err = try h.requestError("resources/read", params);
+        try testing.expectEqual(@as(i64, -32002), err.get("code").?.integer);
+    }
+}
+
+test "subscriptions: which a change touches" {
+    const io = testing.io;
+    var arena_state: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var subs: tools.Subscriptions = .{};
+    try subs.add(io, "git-issue://issues");
+    try subs.add(io, "git-issue://issues/abc");
+    try subs.add(io, "git-issue://issues/def");
+    try subs.add(io, "git-issue://issues/abc");
+    try testing.expectEqual(@as(u8, 3), subs.count);
+
+    try testing.expectEqual(@as(usize, 0), (try subs.affected(io, arena, .{}, false)).len);
+    const one = try subs.affected(io, arena, .{ .issues = &.{"abc12345"} }, false);
+    try testing.expectEqual(@as(usize, 2), one.len);
+    try testing.expectEqualStrings("git-issue://issues", one[0]);
+    try testing.expectEqualStrings("git-issue://issues/abc", one[1]);
+    try testing.expectEqual(@as(usize, 3), (try subs.affected(io, arena, .{ .milestones = true }, false)).len);
+    try testing.expectEqual(@as(usize, 3), (try subs.affected(io, arena, .{}, true)).len);
+
+    subs.remove(io, "git-issue://issues");
+    subs.remove(io, "git-issue://nope");
+    const left = try subs.affected(io, arena, .{ .issues = &.{ "abc1", "def1" } }, false);
+    try testing.expectEqual(@as(usize, 2), left.len);
+}
+
+test "resources/subscribe and unsubscribe" {
+    var arena_state: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var world: GitSim.World = .{ .clones = &.{.{ .name = "local" }} };
+    var sim = try GitSim.init(arena, &world, 0);
+    var repos: SimRepos = .{ .sim = &sim };
+    var handler: tools.Handler(SimRepos) = .{ .repos = &repos };
+    var h: Harness = .{ .arena = arena, .server = .init(&handler) };
+    h.server.connection.markInitialized(.{
+        .protocolVersion = mcp.types.latest_protocol_version,
+        .capabilities = .{},
+        .clientInfo = .{ .name = "test", .version = "0" },
+    });
+    try testing.expect(Server.capabilities.resources.?.subscribe.?);
+
+    _ = try h.request("resources/subscribe", "{\"uri\":\"git-issue://issues\"}");
+    _ = try h.request("resources/subscribe", "{\"uri\":\"git-issue://issues/abc\"}");
+    try testing.expectEqual(@as(u8, 2), handler.subscriptions.count);
+    const err = try h.requestError("resources/subscribe", "{\"uri\":\"git-issue://nope\"}");
+    try testing.expectEqual(@as(i64, -32002), err.get("code").?.integer);
+    _ = try h.request("resources/unsubscribe", "{\"uri\":\"git-issue://issues\"}");
+    try testing.expectEqual(@as(u8, 1), handler.subscriptions.count);
 }
 
 test "tools/list" {

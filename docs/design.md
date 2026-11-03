@@ -5,8 +5,8 @@ How git-native-issuez is put together, and why.
 ## Principles
 
 1. **Format over tool.** The product is a git data format and a library that
-   implements it. The CLI and the MCP server are thin front ends over the
-   library, and so is any program that embeds it.
+   implements it. The CLI, the terminal UI and the MCP server are thin
+   front ends over the library, and so is any program that embeds it.
 2. **Git is the only source of truth.** All data lives in git objects
    reachable from refs.
 3. **Upstream compatibility is a hard constraint.** Everything written here
@@ -36,9 +36,11 @@ How git-native-issuez is put together, and why.
 Each layer only imports the layers below it.
 
 ```
-cli, mcp ──► engine ──► model ──► format
-          │
-          └──► backend (comptime parameter)
+cli, tui, mcp ──► engine ──► model ──► format
+               │
+               └──► backend (comptime parameter)
+
+tui, mcp ──► watch (live updates)
 ```
 
 | Layer     | Files                 | Does                                                                                                      |
@@ -48,7 +50,9 @@ cli, mcp ──► engine ──► model ──► format
 | `engine`  | `src/engine/`         | `Repo` (read, create, comment, edit, state, delete, check, guards), `Catalog`, `Attachments`, `Sync`, `query`, `projection`, `settings`, `errors` |
 | `backend` | `src/backend/`        | the contract, `GitProcess`, `GitSim`, git objects                                                         |
 | `cli`     | `src/cli/`            | argument parsing, output, exit codes                                                                      |
-| `mcp`     | `src/mcp/`            | the MCP server: tools over the engine, typed results                                                      |
+| `tui`     | `src/tui/`            | the terminal UI: list, board and detail view over the engine, on libvaxis                                 |
+| `mcp`     | `src/mcp/`            | the MCP server: tools and resources over the engine, typed results                                        |
+| `watch`   | `src/watch/`          | `RepoWatcher`: tells the TUI and the MCP server when the issues on disk changed, on nightwatch            |
 
 `format`, `model` and the projection are tested without git.
 
@@ -281,7 +285,54 @@ hold identical refs: the fuzzer checks exactly that.
   JSON-RPC on `GitSim`. `zig build e2e` (part of `zig build ci`) drives
   the real `git-issue mcp` over stdio on real git repositories with the
   official MCP TypeScript SDK client, which also checks every result
-  against the tool's output schema (`test/mcp_e2e/`).
+  against the tool's output schema (`test/e2e/`).
+- Resources: `git-issue://issues`, `git-issue://milestones` and
+  `git-issue://issues/{id}`, the server's repository as JSON in the tools'
+  result types. The first `resources/subscribe` starts a `RepoWatcher`
+  with a `GitProcess` of its own; on a change its thread diffs
+  `changes.RefState` and sends `notifications/resources/updated` for each
+  subscribed URI the change touched. stdout is a thread-safe transport, so
+  a notification never splits a response.
+
+## The terminal UI
+
+- `git issue tui`, and `git issue` alone at a terminal: a list (optionally
+  a tree of sub-issues), a kanban board by workflow state and a detail view,
+  on [libvaxis](https://github.com/rockorager/libvaxis). Part of the
+  default build; `-Dtui=false` or `-Dminimal` leave it out, and as a
+  dependency the package builds neither it nor libvaxis.
+- The store loads every issue into one snapshot, replaced whole by each
+  reload; views keep issue IDs, never pointers into it. Every write goes
+  through the same library calls as the CLI and checks the tip it showed,
+  so a change made meanwhile fails the write instead of being overwritten.
+- Input turns into actions on a state that knows nothing of the repository,
+  so the whole UI is tested on `GitSim`, driven by keys and clicks.
+- Live: a `RepoWatcher` posts to the event loop when anyone else writes.
+  The store reloads only if `changes.RefState` moved since its last
+  reload, which its own writes already did, and the status line says
+  which issue changed elsewhere. Selection, view and open dialogs stay.
+  Getting the terminal focus back runs the same check and rereads git
+  config; without a watcher, that and `ctrl+r` still reload.
+
+## Live updates
+
+- `src/watch/RepoWatcher.zig`, over
+  [nightwatch](https://github.com/neurocyte/nightwatch), a lazy dependency
+  of builds with the TUI or the MCP server. It watches the common git dir
+  but registers only `refs/`, the issue, milestone and attachment ref
+  directories and `reftable/`; objects, logs and other refs are never
+  registered. On macOS and the BSDs it uses directory-only kqueue watches:
+  git writes a ref as `<ref>.lock` renamed over `<ref>`, so directory
+  entries say everything, at one descriptor per directory.
+- A path tells that something may have changed, not what. Paths map to a
+  `Change` (refs or config), a lock counting as the file it locks. A thread
+  of its own coalesces bursts: the listener runs once events stop for
+  40 ms, and at least every 400 ms while they don't.
+- What changed comes from the library: `changes.RefState.read` lists the
+  three namespaces (one `listRefs` each) and `changes.diff` names the issues
+  created, changed or deleted, and whether milestones changed. Every write
+  moves its issue's ref, so nothing is missed. A program embedding the
+  library uses the same pair with whatever watcher it has.
 
 ## Simulator, oracle and fuzzer
 
@@ -373,8 +424,17 @@ run on `-Dseed`, a fresh one on every CI run, which finds new bugs.
   own `t/*.sh` against our binary. `test/upstream-expected.txt` lists the
   tests that have to pass, `test/upstream-allowlist.txt` the ones we fail on
   purpose, each with its reason.
+- `test/e2e/` (`zig build e2e`): `git-issue mcp` with the official MCP
+  SDK client, including two servers on one repository that hear of each
+  other's and the CLI's writes.
+- `test/live_tui.zig` (`zig build test-tui-e2e`, also in `zig build e2e`):
+  two `git-issue tui` on pseudo-terminals (`test/tui_e2e/tty_exec.zig`
+  makes the terminal the TUI's controlling one), read through a small
+  terminal emulator (`test/tui_e2e/Screen.zig`) so the test sees the
+  screens as text. The CLI, the other TUI and an agent through the MCP
+  server write, and both TUIs must show it with no key pressed.
 - `test/perf_smoke.zig` (`zig build test-perf`): `ls -a` over 10 000
-  issues within 1 s.
+  issues within 2 s.
 
 Upstream is GPL-2.0. It is a lazy dependency in `build.zig.zon`, fetched
 only by `test-interop` and `test-upstream-suite` in this package, never

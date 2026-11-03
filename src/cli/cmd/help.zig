@@ -33,10 +33,13 @@ pub const text =
     \\   status      Show unpushed, quarantined and conflicted issues
     \\   quarantine  Resolve a quarantined issue
     \\   completion  Print a shell completion script (bash, zsh, fish)
-++ (if (build_options.mcp) "\n   mcp         Serve the issues to coding agents (MCP, stdio)" else "") ++
+++ (if (build_options.tui) "\n   tui         Interactive terminal UI" else "") ++
+    (if (build_options.mcp) "\n   mcp         Serve the issues to coding agents (MCP, stdio)" else "") ++
     \\
     \\
     \\Run 'git issue <command> --help' for details on a command.
+++ (if (build_options.tui) "\nIn a terminal, 'git issue' alone opens the terminal UI." else "") ++
+    \\
     \\Provider import/export (GitHub, GitLab, ...): use upstream git-native-issue's
     \\git-issue-import / git-issue-export on the same repository.
     \\

@@ -15,8 +15,11 @@ showing, commenting on, editing, closing and searching issues, `fsck` and
 blockers, dates, estimates, workflow states), milestones, lifecycle
 events (editing and deleting comments, deleting and restoring issues) and
 image attachments, as extra trailers that upstream keeps and shows. Read
-commands print JSON with `--json`, `git issue mcp` serves the issues to
-coding agents, and the install includes shell completions and man pages.
+commands print JSON with `--json`, `git issue tui` is a terminal UI (a
+list, a kanban board and a detail view, all usable with the mouse),
+`git issue mcp` serves the issues to coding agents, and the install
+includes shell completions and man pages. The TUI and the MCP server
+update live when other processes write.
 
 > [!WARNING]
 > Generative AI was used to edit and/or produce large portions of this code.
@@ -32,7 +35,7 @@ machine, checks it against the release's `SHA256SUMS` and installs it into
 curl -fsSL https://raw.githubusercontent.com/EuroZig/git-native-issuez/main/install.sh | sh
 ```
 
-`sh -s -- --flavor minimal` picks the CLI-only flavor, `--version 0.1.0`
+`sh -s -- --flavor minimal` picks the CLI-only flavor, `--version 0.2.0`
 a release, `--prefix /usr/local` another place (`--help` lists them all).
 Only the copy into a prefix you can't write to runs with `sudo` (or
 `doas`), which asks for your password once; don't run the whole script
@@ -46,16 +49,16 @@ install alone and refuses a downgrade without `--allow-downgrade`.
 
 Each [release](https://github.com/EuroZig/git-native-issuez/releases) has
 archives for Linux and macOS (x86_64 and aarch64) and Windows (x86_64), in
-two flavors: `full`, the default with the MCP server, and `minimal`, the
-CLI only. The Linux and macOS archives also have the shell completions,
+two flavors: `full`, the default with the terminal UI and the MCP server,
+and `minimal`, the CLI only. The Linux and macOS archives also have the shell completions,
 man pages and docs under `share/`; the Windows archive has `git-issue.exe`
 only, so run `git issue <command>` there. `SHA256SUMS` lists the checksums. By
 hand, unpack one (`.tar.gz`, or `.zip` for Windows) into a prefix that has
 `bin/` on your `PATH`, such as `~/.local`:
 
 ```sh
-gh release download v0.1.0 --repo EuroZig/git-native-issuez --pattern '*-full-aarch64-macos.tar.gz'
-tar -xzf git-native-issuez-0.1.0-full-aarch64-macos.tar.gz --strip-components=1 -C ~/.local
+gh release download v0.2.0 --repo EuroZig/git-native-issuez --pattern '*-full-aarch64-macos.tar.gz'
+tar -xzf git-native-issuez-0.2.0-full-aarch64-macos.tar.gz --strip-components=1 -C ~/.local
 ```
 
 On macOS, an archive downloaded with a browser is quarantined and the
@@ -65,6 +68,24 @@ before unpacking.
 
 Or build it, with Zig 0.16.0: `zig build -Doptimize=ReleaseSafe --prefix ~/.local`
 (add `-Dminimal` for the CLI only).
+
+### Homebrew
+
+On macOS (13 or later) and Linux, Homebrew installs the latest release from
+the [EuroZig tap](https://github.com/EuroZig/homebrew-tap), with the man
+pages and the bash, zsh and fish completions:
+
+```sh
+brew tap eurozig/tap
+brew trust eurozig/tap
+brew install git-native-issuez
+```
+
+Homebrew only loads formulae from taps outside its own once you trust
+them; `brew trust` does that once for the tap, so `brew upgrade` keeps
+updating git-native-issuez with your other packages. A Homebrew without
+`brew trust` doesn't need that line. The formula installs the default
+flavor, with the terminal UI and the MCP server.
 
 ## Usage
 
@@ -87,6 +108,7 @@ git issue search -i safari
 git issue ls --json              # for scripts, see docs/json.md
 git issue fsck
 git issue sync origin            # merge the remote's issues, push ours
+git issue                        # at a terminal: the terminal UI (also git issue tui)
 ```
 
 Issue IDs can be shortened to any unique prefix.
@@ -118,6 +140,17 @@ two clones disagreed. Sync never force-pushes and never drops a version: a
 remote issue whose history was rewritten is quarantined until you decide
 (`git issue status`, `git issue quarantine`). Clones can sync with
 upstream's `git issue merge` and `git push` too.
+
+`git issue tui` (or plain `git issue` at a terminal) opens the terminal
+UI: a list, optionally as a tree of sub-issues, a kanban board by workflow
+state, and a detail view where every field is edited in place. `?` shows
+the keys; the mouse works everywhere. It follows what others write as it
+happens: `git issue` in another terminal, another TUI, an agent through
+`git issue mcp`, a sync.
+
+![The list: issues with their labels, priority, workflow state, assignee and due date, sorted by priority](docs/issuez-list.png)
+
+![The board: a column per workflow state, cards with priority, progress, labels and assignee](docs/issuez-board.png)
 
 `git issue <command> --help` describes each command. The same texts are
 installed as man pages (`man git-issue-create`; `git issue --help` opens
@@ -161,9 +194,10 @@ const issuez_dep = b.dependency("git_native_issuez", .{ .target = target, .optim
 exe.root_module.addImport("issuez", issuez_dep.module("issuez"));
 ```
 
-As a dependency the package builds only the library, so blitzmcp (the MCP
-server's dependency) is never fetched; pass `.mcp = true` to also get it in
-the `git-issue` build.
+As a dependency the package builds only the library, so libvaxis,
+blitzmcp and nightwatch (the TUI's and the MCP server's dependencies) are
+never fetched; pass `.tui = true` or `.mcp = true` to also get them in the
+`git-issue` build.
 
 ```zig
 const issuez = @import("issuez");
@@ -207,11 +241,13 @@ for (open) |issue| std.debug.print("{s} {s}\n", .{ issue.state.text(), issue.tit
 Requires Zig 0.16.0 and git 2.30 or newer.
 
 ```sh
-zig build                      # git-issue with the MCP server, the git-issue-<sub> links, completions, man pages
-zig build -Dminimal            # the same without the MCP server
+zig build                      # git-issue with the TUI and the MCP server, the git-issue-<sub> links, completions, man pages
+zig build -Dminimal            # the same without the TUI and the MCP server (or -Dtui=false / -Dmcp=false)
 zig build test                 # unit, backend, CLI, simulator and fuzz smoke tests, examples
 zig build test-interop         # both tools on shared repositories (fetches upstream)
-zig build e2e                  # `git issue mcp` against the official MCP SDK client (Node.js, npm)
+zig build e2e                  # `git issue mcp` against the official MCP SDK client (Node.js, npm),
+                               # and two TUIs on pseudo-terminals following each other's writes
+zig build test-tui-e2e         # only the TUIs' (Linux, macOS)
 zig build test-upstream-suite  # upstream's t/*.sh against our git-issue
 zig build test-perf            # `ls -a` over 10 000 issues within 2 s
 zig build ci -Dseed=N          # all of the above, plus long fuzz runs: what CI runs

@@ -37,6 +37,7 @@ pub const attachments = @import("engine/attachments.zig");
 pub const Attachments = attachments.Attachments;
 pub const settings = @import("engine/settings.zig");
 pub const errors = @import("engine/errors.zig");
+pub const changes = @import("engine/changes.zig");
 pub const Settings = settings.Settings;
 
 test {
@@ -61,4 +62,5 @@ test {
     _ = attachments;
     _ = settings;
     _ = errors;
+    _ = changes;
 }

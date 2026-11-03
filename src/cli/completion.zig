@@ -84,6 +84,9 @@ const command_helps = [_]struct { []const u8, []const u8 }{
     .{ "attach", @import("cmd/attach.zig").help },
     .{ "quarantine", @import("cmd/quarantine.zig").help },
     .{ "completion", help },
+    .{ "tui", "usage: git issue tui\n\nInteractive terminal UI: a list, a kanban board and a detail view.\n" ++
+        "Press ? inside for the keys; the mouse works everywhere.\n\n" ++
+        "Options:\n   -h, --help    Show this help\n" },
     .{ "mcp", @import("mcp_help").text },
 };
 

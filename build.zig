@@ -1,5 +1,6 @@
-//!   zig build                      git-issue, full: with the MCP server
-//!   zig build -Dminimal            git-issue, CLI only (-Dmcp=false)
+//!   zig build                      git-issue, full: TUI and MCP server
+//!   zig build -Dminimal            git-issue, CLI only (-Dtui=false -Dmcp=false)
+//!   zig build -Dtui=false          without the TUI; -Dmcp=false without the MCP server
 //!   zig build test                 unit, backend, simulator/oracle and fuzz smoke tests
 //!   zig build simulator            git-issue-sim
 //!   zig build -Dfuzz               also install git-issue-fuzz
@@ -7,7 +8,9 @@
 //!   zig build test-interop         tests against upstream (fetched lazily)
 //!   zig build test-upstream-suite  upstream's t/*.sh against our binary
 //!   zig build test-perf            `ls` over 10 000 issues
-//!   zig build e2e                  the MCP server against the official SDK client (Node.js)
+//!   zig build e2e                  the MCP server against the official SDK client (Node.js),
+//!                                  and the TUI's live updates on pseudo-terminals
+//!   zig build test-tui-e2e         only the TUI's
 //!   zig build ci [-Dseed=N]        what CI runs
 //!   zig build examples             library examples (examples/*.zig)
 //!   zig build example-<name>       run one (quickstart, sync, attachments, real-repo -- <path> ls)
@@ -19,14 +22,19 @@ const entry_points = @import("src/cli/entry_points.zig");
 pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
     const optimize = b.standardOptimizeOption(.{});
-    // Projects depending on the library need neither the MCP server nor
-    // its dependency.
+    // Projects depending on the library need neither the TUI nor the MCP
+    // server, nor their dependencies.
     const minimal = b.option(
         bool,
         "minimal",
-        "CLI only: no MCP server (-Dmcp=false)",
+        "CLI only: no terminal UI and no MCP server (-Dtui=false -Dmcp=false)",
     ) orelse false;
     const full = isRootPackage(b) and !minimal;
+    const tui = b.option(
+        bool,
+        "tui",
+        "Include the terminal UI (default: true, false with -Dminimal or as a dependency)",
+    ) orelse full;
     const mcp = b.option(
         bool,
         "mcp",
@@ -41,7 +49,7 @@ pub fn build(b: *std.Build) void {
     });
     const cli: Cli = .init(b, target, optimize, issuez);
     const oracle = cli.oracle;
-    const extras = cli.parts(.{ .mcp = mcp });
+    const extras = cli.parts(.{ .tui = tui, .mcp = mcp });
 
     const exe = cli.exe("git-issue", "src/cli/main.zig", optimize, extras);
     b.installArtifact(exe);
@@ -66,7 +74,7 @@ pub fn build(b: *std.Build) void {
     if (b.args) |args| run_exe.addArgs(args);
     run_step.dependOn(&run_exe.step);
 
-    // These never include the MCP server.
+    // These never include the TUI or the MCP server.
     const sim = cli.exe("git-issue-sim", "src/cli/main_sim.zig", optimize, .{});
     const sim_step = b.step("simulator", "Build git-issue-sim");
     sim_step.dependOn(&b.addInstallArtifact(sim, .{}).step);
@@ -85,21 +93,34 @@ pub fn build(b: *std.Build) void {
         const t = b.addTest(.{ .name = u.name, .root_module = u.module });
         test_step.dependOn(&b.addRunArtifact(t).step);
     }
+    if (extras.tui) |m| {
+        const t = b.addTest(.{ .name = "tui", .root_module = m });
+        const run_t = b.addRunArtifact(t);
+        test_step.dependOn(&run_t.step);
+        b.step("test-tui", "Run the TUI's tests").dependOn(&run_t.step);
+    }
     if (extras.mcp) |m| {
         const t = b.addTest(.{ .name = "mcp", .root_module = m });
         test_step.dependOn(&b.addRunArtifact(t).step);
     }
+    if (extras.watch) |m| {
+        const t = b.addTest(.{ .name = "watch", .root_module = m });
+        test_step.dependOn(&b.addRunArtifact(t).step);
+    }
 
     // Drives `git-issue mcp` with the official MCP TypeScript SDK client
-    // (test/mcp_e2e/). Needs Node.js and npm. The test project is copied
+    // (test/e2e/). Needs Node.js and npm. The test project is copied
     // into the cache and installed there, so `npm ci` is cached until one of
     // its files changes and the source tree stays clean.
-    const e2e_step = b.step("e2e", "Run the MCP server's end-to-end tests (needs Node.js and npm)");
+    const e2e_step = b.step(
+        "e2e",
+        "Run the MCP server's and the TUI's end-to-end tests (needs Node.js and npm)",
+    );
     if (extras.mcp != null) {
         const files = b.addWriteFiles();
-        _ = files.addCopyFile(b.path("test/mcp_e2e/package.json"), "package.json");
-        _ = files.addCopyFile(b.path("test/mcp_e2e/package-lock.json"), "package-lock.json");
-        const script = files.addCopyFile(b.path("test/mcp_e2e/mcp.test.mjs"), "mcp.test.mjs");
+        _ = files.addCopyFile(b.path("test/e2e/package.json"), "package.json");
+        _ = files.addCopyFile(b.path("test/e2e/package-lock.json"), "package-lock.json");
+        const script = files.addCopyFile(b.path("test/e2e/mcp.test.mjs"), "mcp.test.mjs");
 
         // From PATH when the step runs, so builds without Node.js work.
         const npm_ci = b.addSystemCommand(&.{ "npm", "ci", "--no-audit", "--no-fund" });
@@ -115,8 +136,63 @@ pub fn build(b: *std.Build) void {
         run_e2e.has_side_effects = true;
         run_e2e.step.dependOn(&npm_ci.step);
         e2e_step.dependOn(&run_e2e.step);
+
+        // Two servers on one repository, and the command line: live updates.
+        const live_mcp = b.addSystemCommand(&.{"node"});
+        live_mcp.setName("e2e live updates, git-issue mcp");
+        const live_script = b.path("test/e2e/live_mcp.test.mjs");
+        live_mcp.addFileArg(files.addCopyFile(live_script, "live_mcp.test.mjs"));
+        live_mcp.addArtifactArg(exe);
+        live_mcp.has_side_effects = true;
+        live_mcp.step.dependOn(&npm_ci.step);
+        e2e_step.dependOn(&live_mcp.step);
     } else {
         e2e_step.dependOn(&b.addFail("zig build e2e needs the MCP server: drop -Dminimal").step);
+    }
+
+    // Two TUIs on pseudo-terminals, the command line and an MCP server:
+    // live updates in the TUI (test/live_tui.zig). POSIX hosts only.
+    const tui_e2e_step = b.step(
+        "test-tui-e2e",
+        "Run the TUI's end-to-end tests on pseudo-terminals",
+    );
+    if (extras.tui != null and extras.mcp != null and b.graph.host.result.os.tag != .windows) {
+        if (b.lazyDependency("vaxis", .{ .target = b.graph.host, .optimize = .Debug })) |vaxis| {
+            const tty_exec = b.addExecutable(.{
+                .name = "tty-exec",
+                .root_module = b.createModule(.{
+                    .root_source_file = b.path("test/tui_e2e/tty_exec.zig"),
+                    .target = b.graph.host,
+                    .optimize = .Debug,
+                    .link_libc = true,
+                }),
+            });
+            const opts = b.addOptions();
+            opts.addOptionPath("git_issue_exe", exe.getEmittedBin());
+            opts.addOptionPath("tty_exec", tty_exec.getEmittedBin());
+            const t = b.addTest(.{
+                .name = "live_tui",
+                .root_module = b.createModule(.{
+                    .root_source_file = b.path("test/live_tui.zig"),
+                    .target = b.graph.host,
+                    .optimize = .Debug,
+                    .link_libc = true,
+                    .imports = &.{
+                        .{ .name = "paths", .module = opts.createModule() },
+                        .{ .name = "vaxis", .module = vaxis.module("vaxis") },
+                    },
+                }),
+            });
+            const run_t = b.addRunArtifact(t);
+            run_t.has_side_effects = true;
+            tui_e2e_step.dependOn(&run_t.step);
+            e2e_step.dependOn(&run_t.step);
+        }
+    } else {
+        const fail = b.addFail(
+            "zig build test-tui-e2e needs the TUI, the MCP server and a POSIX host",
+        );
+        tui_e2e_step.dependOn(&fail.step);
     }
 
     for ([_][]const u8{ "test/backend_git.zig", "test/trailers_git.zig" }) |root| {
@@ -451,6 +527,7 @@ fn releaseExe(
     });
     const cli: Cli = .init(b, target, .ReleaseSafe, issuez);
     const exe = cli.exe("git-issue", "src/cli/main.zig", .ReleaseSafe, cli.parts(.{
+        .tui = flavor.full,
         .mcp = flavor.full,
     }));
     // Debug info would make the Linux binaries five times larger; macOS
@@ -634,7 +711,10 @@ fn isRootPackage(b: *std.Build) bool {
 
 /// The optional parts of `git-issue`. Null leaves one out.
 const Extras = struct {
+    tui: ?*std.Build.Module = null,
     mcp: ?*std.Build.Module = null,
+    /// The repository watcher both use.
+    watch: ?*std.Build.Module = null,
 };
 
 /// The modules `git-issue` is built from, for one target.
@@ -678,8 +758,32 @@ const Cli = struct {
 
     /// The optional parts asked for, each null until its lazy dependency
     /// is fetched.
-    fn parts(cli: Cli, want: struct { mcp: bool }) Extras {
+    fn parts(cli: Cli, want: struct { tui: bool, mcp: bool }) Extras {
         const b = cli.b;
+        // Live updates, for both.
+        const watch_module: ?*std.Build.Module = if (!want.tui and !want.mcp) null else blk: {
+            const nightwatch = b.lazyDependency("nightwatch", cli.dependencyArgs()) orelse
+                break :blk null;
+            break :blk b.createModule(.{
+                .root_source_file = b.path("src/watch/RepoWatcher.zig"),
+                .target = cli.target,
+                .optimize = cli.optimize,
+                .imports = &.{.{ .name = "nightwatch", .module = nightwatch.module("nightwatch") }},
+            });
+        };
+        const tui_module: ?*std.Build.Module = if (!want.tui) null else blk: {
+            const vaxis = b.lazyDependency("vaxis", cli.dependencyArgs()) orelse break :blk null;
+            break :blk b.createModule(.{
+                .root_source_file = b.path("src/tui/main.zig"),
+                .target = cli.target,
+                .optimize = cli.optimize,
+                .imports = &.{
+                    .{ .name = "issuez", .module = cli.issuez },
+                    .{ .name = "vaxis", .module = vaxis.module("vaxis") },
+                    .{ .name = "RepoWatcher", .module = watch_module orelse break :blk null },
+                },
+            });
+        };
         const mcp_module: ?*std.Build.Module = if (!want.mcp) null else blk: {
             const blitzmcp = b.lazyDependency("blitzmcp", cli.dependencyArgs()) orelse
                 break :blk null;
@@ -692,10 +796,11 @@ const Cli = struct {
                     .{ .name = "blitzmcp", .module = blitzmcp.module("blitzmcp") },
                     .{ .name = "build.zig.zon", .module = cli.zon },
                     .{ .name = "mcp_help", .module = cli.mcp_help },
+                    .{ .name = "RepoWatcher", .module = watch_module orelse break :blk null },
                 },
             });
         };
-        return .{ .mcp = mcp_module };
+        return .{ .tui = tui_module, .mcp = mcp_module, .watch = watch_module };
     }
 
     fn module(
@@ -706,6 +811,7 @@ const Cli = struct {
     ) *std.Build.Module {
         const b = cli.b;
         const options = b.addOptions();
+        options.addOption(bool, "tui", extras.tui != null);
         options.addOption(bool, "mcp", extras.mcp != null);
         const m = b.createModule(.{
             .root_source_file = b.path(root),
@@ -719,6 +825,7 @@ const Cli = struct {
                 .{ .name = "mcp_help", .module = cli.mcp_help },
             },
         });
+        if (extras.tui) |t| m.addImport("tui", t);
         if (extras.mcp) |t| m.addImport("mcp", t);
         return m;
     }

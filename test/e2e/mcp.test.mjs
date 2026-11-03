@@ -114,7 +114,11 @@ test("initialize", () => {
     title: "git-native-issuez",
     version,
   });
-  assert.deepEqual(client.getServerCapabilities(), { logging: {}, tools: {} });
+  assert.deepEqual(client.getServerCapabilities(), {
+    logging: {},
+    resources: { subscribe: true },
+    tools: {},
+  });
   assert.match(client.getInstructions() ?? "", /refs\/issues/);
   assert.match(client.getInstructions() ?? "", /expect_version/);
 });

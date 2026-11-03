@@ -28,6 +28,7 @@ const cmd_quarantine = @import("cmd/quarantine.zig");
 const cmd_attach = @import("cmd/attach.zig");
 const completion = @import("completion.zig");
 const manpage = @import("manpage.zig");
+const tui = if (build_options.tui) @import("tui") else struct {};
 const mcp = if (build_options.mcp) @import("mcp") else struct {};
 
 pub const program = "git-issue";
@@ -53,6 +54,7 @@ pub const Command = enum {
     help,
     @"--help",
     @"-h",
+    tui,
     mcp,
     push,
     status,
@@ -68,6 +70,19 @@ pub const Command = enum {
     /// Writes the man pages at build time. Not in the usage.
     __manpages,
 };
+
+/// `git issue` alone: the TUI for a person at a terminal in a repository,
+/// else the usage, so scripts, pipes, agents and minimal builds see the
+/// commands.
+fn bare(comptime B: type, ctx: *context.Context(B)) u8 {
+    if (build_options.tui and B == @import("issuez").backend.GitProcess) {
+        const repo = if (ctx.backend) |_| true else |_| false;
+        const terminal = (std.Io.File.stdin().isTty(ctx.io) catch false) and
+            (std.Io.File.stdout().isTty(ctx.io) catch false);
+        if (repo and terminal) return tui.main(ctx.io, ctx.gpa, ctx.environ_map, ctx.out, ctx.err, &.{});
+    }
+    return cmd_help.usage(B, ctx);
+}
 
 pub const Invocation = struct {
     sub: ?[]const u8,
@@ -98,11 +113,15 @@ pub fn run(
     args: []const []const u8,
 ) u8 {
     const inv = resolve(argv0, args);
-    const sub = inv.sub orelse return cmd_help.usage(B, ctx);
+    const sub = inv.sub orelse return bare(B, ctx);
     const cmd = std.meta.stringToEnum(Command, sub) orelse return unknown(B, ctx, sub);
     return switch (cmd) {
         .version, .@"--version", .@"-v" => cmd_version.main(B, ctx, inv.args),
         .help, .@"--help", .@"-h" => cmd_help.usage(B, ctx),
+        .tui => if (build_options.tui)
+            tui.main(ctx.io, ctx.gpa, ctx.environ_map, ctx.out, ctx.err, inv.args)
+        else
+            unavailable(B, ctx, sub, "-Dtui=true"),
         .mcp => if (build_options.mcp)
             mcp.main(ctx.io, ctx.gpa, ctx.environ_map, ctx.out, ctx.err, inv.args)
         else

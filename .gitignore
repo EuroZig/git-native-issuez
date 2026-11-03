@@ -6,5 +6,7 @@ zig-pkg/
 build/
 build-*/
 docgen_tmp/
-# npm, for test/mcp_e2e/ (zig build e2e installs into the cache)
+# npm, for test/e2e/ (zig build e2e installs into the cache)
 node_modules/
+# macOS Finder metadata
+.DS_Store

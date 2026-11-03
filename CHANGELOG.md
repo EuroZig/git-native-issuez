@@ -8,6 +8,39 @@ versions may change the library API; the on-disk format only ever grows (see
 
 ## [Unreleased]
 
+## [0.2.0] - 2026-11-03
+
+### Added
+- The terminal UI, `git issue tui`, built on the library. A sortable,
+  filterable issue list, optionally as a tree of sub-issues; a kanban board
+  with a column per workflow state and done work last; and a detail view
+  where every field, the title and the description are edited in place,
+  comments are added, and sub-issues are created from their parent. The
+  filter takes words and `key:value` terms (`label:ui @ada p:high
+  is:blocked -label:wontfix`). The mouse works everywhere: clicking selects
+  and edits, double-clicking opens, column titles sort, cards drag between
+  board columns, and the wheel scrolls. Writes check the issue hasn't
+  changed since it was shown, and dialogs stay open when a write fails.
+- Live updates. The terminal UI shows what other processes write (`git
+  issue`, another TUI, an agent, a sync) as it happens, keeping the
+  selection and open dialogs, and says which issue changed elsewhere.
+- The MCP server serves the repository as resources (`git-issue://issues`,
+  `git-issue://milestones`, `git-issue://issues/{id}`) with subscriptions:
+  a client hears `notifications/resources/updated` when anyone changes
+  what it subscribed to.
+- `issuez.changes`: `RefState` and `diff`, what moved in a repository's
+  issues between two reads, for long-running front ends.
+- `git issue` without a command opens the terminal UI when run by a person
+  at a terminal in a repository. Elsewhere (a pipe, a script, outside a
+  repository, a minimal build) it still prints the usage.
+
+### Changed
+- The full build flavor, the default, now includes the terminal UI;
+  `-Dtui=false` leaves it out, and `-Dminimal` still builds the CLI only.
+  It adds two lazy dependencies, fetched only for builds with the TUI or
+  the MCP server: libvaxis (the TUI) and nightwatch (watching the
+  repository for live updates).
+
 ## [0.1.0] - 2026-11-03
 
 The first release; everything below is new.

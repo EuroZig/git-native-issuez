@@ -1,0 +1,677 @@
+//! One issue: its title, fields, description, sub-issues, relations and
+//! activity. Everything editable is an item: clicked, or selected with the
+//! arrows and opened with Enter.
+
+const std = @import("std");
+const assert = std.debug.assert;
+const Allocator = std.mem.Allocator;
+const vaxis = @import("vaxis");
+const issuez = @import("issuez");
+
+const ui = @import("ui.zig");
+const store = @import("store.zig");
+const text_mod = @import("text.zig");
+const modal = @import("modal.zig");
+const AppState = @import("State.zig");
+
+const Id = store.Id;
+const Snapshot = store.Snapshot;
+const Field = modal.Field;
+const K = vaxis.Key;
+const palette = ui.palette;
+const shortId = issuez.format.uuid.shortId;
+
+const max_stack = 32;
+/// What an empty field shows: an em dash.
+const unset = "\u{2014}";
+const none = std.math.maxInt(u32);
+
+pub const Item = union(enum) {
+    back,
+    title,
+    field: Field,
+    description,
+    comment,
+    add_child,
+    toggle,
+    /// Another issue, by snapshot index.
+    open: u32,
+};
+
+/// The focused item across reloads, which move items around. An issue
+/// shown twice, as a sub-issue that also blocks, is told apart by `nth`.
+pub const Focus = union(enum) {
+    /// The first content item.
+    none,
+    item: Item,
+    open: struct { id: Id, nth: u8 },
+};
+
+pub const State = struct {
+    /// Issues opened from one another, the current one last.
+    stack: [max_stack]Id = undefined,
+    depth: u8 = 0,
+    /// A position in `items`, kept on `focused` by every frame.
+    focus: u16 = 0,
+    focused: Focus = .none,
+    /// The first content row shown.
+    scroll: u32 = 0,
+    /// Scroll the focused item into view on the next frame.
+    follow: bool = false,
+    /// The last frame's. Items before `first` are the action bar's.
+    items: std.ArrayList(Item) = .empty,
+    first: u16 = 0,
+    content_rows: u32 = 0,
+    visible: u16 = 1,
+
+    pub fn deinit(d: *State, gpa: Allocator) void {
+        d.items.deinit(gpa);
+    }
+
+    pub fn clear(d: *State) void {
+        d.depth = 0;
+    }
+
+    pub fn push(d: *State, id: []const u8) void {
+        if (d.depth > 0 and d.stack[d.depth - 1].eql(id)) return;
+        if (d.depth == max_stack) {
+            std.mem.copyForwards(Id, d.stack[0 .. max_stack - 1], d.stack[1..]);
+            d.depth -= 1;
+        }
+        d.stack[d.depth] = .of(id);
+        d.depth += 1;
+        d.focus = 0;
+        d.focused = .none;
+        d.scroll = 0;
+    }
+
+    /// False when there is nothing to go back to.
+    pub fn pop(d: *State) bool {
+        if (d.depth <= 1) return false;
+        d.depth -= 1;
+        d.focus = 0;
+        d.focused = .none;
+        d.scroll = 0;
+        return true;
+    }
+
+    pub fn issue(d: *const State, snap: *const Snapshot) ?u32 {
+        if (d.depth == 0) return null;
+        return snap.find(d.stack[d.depth - 1].slice());
+    }
+
+    pub fn scrollBy(d: *State, delta: i32) void {
+        const max: i64 = @intCast(d.content_rows -| d.visible);
+        d.scroll = @intCast(std.math.clamp(@as(i64, d.scroll) + delta, 0, max));
+    }
+
+    /// Moves the focus to a position in the last frame's items.
+    pub fn focusOn(d: *State, snap: *const Snapshot, index: u16) void {
+        if (index >= d.items.items.len) return;
+        d.focus = index;
+        d.focused = d.keyAt(snap, index);
+    }
+
+    fn keyAt(d: *const State, snap: *const Snapshot, index: u16) Focus {
+        const items = d.items.items;
+        return switch (items[index]) {
+            .open => |k| blk: {
+                var nth: u8 = 0;
+                for (items[0..index]) |it| switch (it) {
+                    .open => |o| if (o == k) {
+                        nth +|= 1;
+                    },
+                    else => {},
+                };
+                break :blk .{ .open = .{ .id = .of(snap.issues[k].id), .nth = nth } };
+            },
+            else => |it| .{ .item = it },
+        };
+    }
+
+    fn focusItem(d: *State) ?Item {
+        if (d.focus >= d.items.items.len) return null;
+        return d.items.items[d.focus];
+    }
+};
+
+/// Content drawn on virtual rows, of which only those in view reach the
+/// screen.
+const Canvas = struct {
+    s: *AppState,
+    f: ui.Frame,
+    win: ui.Window,
+    scroll: u32,
+    y: u32 = 0,
+    /// Where the focused item was drawn.
+    focus_top: ?u32 = null,
+    focus_bottom: u32 = 0,
+    /// Whether an item matched `focused`.
+    found: bool = false,
+    /// Items so far showing the focused issue.
+    seen: u8 = 0,
+
+    /// The next row, if in view.
+    fn line(c: *Canvas) ?ui.Window {
+        defer c.y += 1;
+        if (c.y < c.scroll or c.y - c.scroll >= c.win.height) return null;
+        return c.win.child(.{ .y_off = @intCast(c.y - c.scroll), .height = 1 });
+    }
+
+    fn skip(c: *Canvas, n: u32) void {
+        c.y += n;
+    }
+
+    /// Starts an item; its rows follow until `end`.
+    fn begin(c: *Canvas, it: Item) Allocator.Error!Span {
+        const d = &c.s.detail;
+        const index: u16 = @intCast(d.items.items.len);
+        try d.items.append(c.s.gpa, it);
+        const focused = !c.found and c.isFocused(it);
+        if (focused) {
+            c.found = true;
+            d.focus = index;
+        }
+        return .{ .index = index, .top = c.y, .focused = focused };
+    }
+
+    fn isFocused(c: *Canvas, it: Item) bool {
+        const d = &c.s.detail;
+        switch (d.focused) {
+            .none => return false,
+            .item => |want| return std.meta.eql(want, it),
+            .open => |want| {
+                const k = switch (it) {
+                    .open => |k| k,
+                    else => return false,
+                };
+                if (!want.id.eql(c.s.snap.issues[k].id)) return false;
+                defer c.seen +|= 1;
+                return c.seen == want.nth;
+            },
+        }
+    }
+
+    fn end(c: *Canvas, span: Span) Allocator.Error!void {
+        if (span.focused) {
+            c.focus_top = span.top;
+            c.focus_bottom = c.y;
+        }
+        // Clickable over the rows in view.
+        const top = @max(span.top, c.scroll);
+        const bottom = @min(c.y, c.scroll + c.win.height);
+        if (bottom <= top) return;
+        const w = c.win.child(.{ .y_off = @intCast(top - c.scroll), .height = @intCast(bottom - top) });
+        try c.f.hit(w, .{ .item = span.index });
+    }
+
+    const Span = struct { index: u16, top: u32, focused: bool };
+};
+
+pub fn draw(s: *AppState, f: ui.Frame, win: ui.Window) Allocator.Error!void {
+    const d = &s.detail;
+    d.items.clearRetainingCapacity();
+    const i = d.issue(s.snap) orelse {
+        try d.items.append(s.gpa, .back);
+        d.first = 1;
+        _ = ui.text(win, 2, 1, "This issue isn't here (any more).", .{ .fg = palette.err });
+        _ = try ui.button(f, win, 2, 3, "‹ Back", .{ .item = 0 }, ui.buttonStyle(true));
+        return;
+    };
+    try drawActions(s, f, win.child(.{ .height = 1 }), i);
+    d.first = @intCast(d.items.items.len);
+
+    const content = win.child(.{ .y_off = 2, .x_off = 2, .width = win.width -| 4, .height = win.height -| 2 });
+    d.visible = @max(content.height, 1);
+    const hits_before = s.hits.items.items.len;
+    const items_before = d.items.items.len;
+    // Again when the focused item is gone, then when it is out of view.
+    for (0..3) |_| {
+        var c: Canvas = .{ .s = s, .f = f, .win = content, .scroll = d.scroll };
+        content.clear();
+        try drawContent(&c, i);
+        d.content_rows = c.y;
+        assert(d.items.items.len > d.first);
+        if (!c.found) {
+            // The item now where it was, or the first.
+            d.focus = std.math.clamp(d.focus, d.first, @as(u16, @intCast(d.items.items.len - 1)));
+            d.focused = d.keyAt(s.snap, d.focus);
+        } else {
+            if (!d.follow) break;
+            d.follow = false;
+            const top = c.focus_top orelse break;
+            const bottom = c.focus_bottom;
+            var scroll = d.scroll;
+            if (bottom > scroll + d.visible) scroll = bottom -| d.visible;
+            if (top < scroll) scroll = top;
+            if (scroll == d.scroll) break;
+            d.scroll = scroll;
+        }
+        s.hits.items.shrinkRetainingCapacity(hits_before);
+        d.items.shrinkRetainingCapacity(items_before);
+    }
+    d.follow = false;
+    d.scroll = @min(d.scroll, d.content_rows -| d.visible);
+}
+
+fn drawActions(s: *AppState, f: ui.Frame, bar: ui.Window, i: u32) Allocator.Error!void {
+    const d = &s.detail;
+    const done = s.snap.isDone(i);
+    bar.fill(.{ .style = .{ .bg = palette.panel_bg } });
+    const buttons = [_]struct { Item, []const u8 }{
+        .{ .back, "‹ Back" },
+        .{ .title, "✎ Title  t" },
+        .{ .description, "✎ Description  e" },
+        .{ .comment, "✉ Comment  c" },
+        .{ .add_child, "+ Sub-issue  a" },
+        .{ .toggle, if (done) "↺ Reopen  x" else "✓ Close  x" },
+    };
+    var x: u16 = 1;
+    for (buttons) |b| {
+        const index: u16 = @intCast(d.items.items.len);
+        try d.items.append(s.gpa, b[0]);
+        const active = b[0] == .add_child;
+        x += try ui.button(f, bar, x, 0, b[1], .{ .item = index }, ui.buttonStyle(active));
+        x += 1;
+    }
+}
+
+fn itemStyle(span: Canvas.Span) ui.Style {
+    return if (span.focused) .{ .bg = palette.select_bg } else .{};
+}
+
+fn drawContent(c: *Canvas, i: u32) Allocator.Error!void {
+    const s = c.s;
+    const f = c.f;
+    const snap = s.snap;
+    const issue = snap.issues[i];
+    const done = snap.isDone(i);
+    const w = c.win.width;
+
+    // Title.
+    {
+        const span = try c.begin(.title);
+        const rows = try text_mod.layout(f.arena, issue.title, w -| 2);
+        for (rows) |r| if (c.line()) |l| {
+            l.fill(.{ .style = itemStyle(span) });
+            _ = ui.text(l, 0, 0, issue.title[r.start..r.end], .{ .bold = true, .bg = itemStyle(span).bg });
+        };
+        try c.end(span);
+    }
+    if (c.line()) |l| {
+        var x: u16 = 0;
+        const badge_bg: vaxis.Color = if (done) palette.done else palette.open;
+        ui.word(l, &x, 0, f.fmt(" {s} ", .{issue.state.text()}), .{ .fg = .{ .index = 16 }, .bg = badge_bg, .bold = true });
+        if (snap.proj.workflow(i)) |wf| ui.word(l, &x, 0, wf, .{ .fg = palette.accent });
+        ui.word(l, &x, 0, f.fmt("#{s}", .{shortId(issue.id)}), .{ .fg = palette.id });
+        const updated = ui.ago(f, issue.updated);
+        ui.word(l, &x, 0, f.fmt("opened by {s} on {s}, updated {s}{s}", .{
+            issue.author.name,
+            ui.date(f, issue.created),
+            updated,
+            if (std.ascii.isDigit(updated[0]) and updated.len < 5) " ago" else "",
+        }), .{ .fg = palette.muted });
+        if (snap.proj.activelyBlocked(i)) ui.word(l, &x, 0, "⊘ blocked", .{ .fg = palette.err, .bold = true });
+        if (issue.deleted) ui.word(l, &x, 0, " deleted ", .{ .fg = .{ .index = 16 }, .bg = palette.err, .bold = true });
+    }
+    c.skip(1);
+
+    // Fields, in two columns when there is room.
+    try drawFields(c, i);
+    c.skip(1);
+
+    // Problems and conflicts.
+    for (snap.proj.problemsOf(i)) |p| if (c.line()) |l| {
+        _ = ui.text(l, 0, 0, f.fmt("⚠ {s}", .{p.describe(f.arena) catch ""}), .{ .fg = palette.err });
+    };
+    for (issue.conflicts) |cf| if (c.line()) |l| {
+        _ = ui.text(l, 0, 0, f.fmt("⚠ concurrent edits to {f}: kept '{s}', lost '{s}'", .{ cf.target, cf.value, cf.lost }), .{ .fg = palette.medium });
+    };
+    if (snap.proj.problemsOf(i).len > 0 or issue.conflicts.len > 0) c.skip(1);
+
+    // Description.
+    {
+        const span = try c.begin(.description);
+        try sectionHeader(c, span, "Description", "✎ edit  e");
+        if (std.mem.trim(u8, issue.description, " \n").len == 0) {
+            if (c.line()) |l| {
+                l.fill(.{ .style = itemStyle(span) });
+                _ = ui.text(l, 2, 0, "No description. Click or press e to write one.", .{ .fg = palette.faint, .italic = true, .bg = itemStyle(span).bg });
+            }
+        } else try paragraph(c, issue.description, 2, .{});
+        try c.end(span);
+    }
+    c.skip(1);
+
+    // Sub-issues.
+    {
+        const kids = try sortedChildren(f.arena, snap, i);
+        const span = try c.begin(.add_child);
+        const title = if (snap.proj.progress(i)) |p|
+            f.fmt("Sub-issues  {d}/{d} done", .{ p.closed, p.total })
+        else
+            f.fmt("Sub-issues  {d}", .{kids.len});
+        try sectionHeader(c, span, title, "+ add sub-issue  a");
+        if (kids.len == 0) if (c.line()) |l| {
+            l.fill(.{ .style = itemStyle(span) });
+            _ = ui.text(l, 2, 0, "None yet. Click or press a to break this issue down.", .{ .fg = palette.faint, .italic = true, .bg = itemStyle(span).bg });
+        };
+        try c.end(span);
+        if (snap.proj.progress(i)) |p| if (c.line()) |l| progressBar(l, p);
+        for (kids) |k| try issueLine(c, k, "");
+    }
+    c.skip(1);
+
+    // Relations.
+    const blockers = snap.proj.blockers[i];
+    const blocks = snap.proj.blocks[i];
+    const parent = snap.proj.parent[i];
+    if (parent != none or blockers.len > 0 or blocks.len > 0) {
+        if (c.line()) |l| _ = ui.text(l, 0, 0, "Relations", .{ .fg = palette.accent, .bold = true });
+        if (parent != none) try issueLine(c, parent, "parent     ");
+        for (blockers) |b| try issueLine(c, b, "blocked by ");
+        for (blocks) |b| try issueLine(c, b, "blocks     ");
+        c.skip(1);
+    }
+
+    // Activity.
+    {
+        const span = try c.begin(.comment);
+        var n: u32 = 0;
+        for (issue.comments) |cm| {
+            if (!cm.deleted) n += 1;
+        }
+        try sectionHeader(c, span, f.fmt("Activity  {d}", .{n}), "✉ comment  c");
+        try c.end(span);
+        for (issue.comments) |cm| {
+            if (cm.deleted) continue;
+            const when = ui.ago(f, cm.author.time);
+            if (cm.kind == .update) {
+                if (c.line()) |l| {
+                    var x: u16 = 2;
+                    ui.word(l, &x, 0, "·", .{ .fg = palette.faint });
+                    ui.word(l, &x, 0, cm.author.name, .{ .fg = palette.muted });
+                    ui.word(l, &x, 0, cm.subject, .{ .fg = palette.muted });
+                    ui.word(l, &x, 0, when, .{ .fg = palette.faint });
+                }
+                continue;
+            }
+            c.skip(1);
+            if (c.line()) |l| {
+                var x: u16 = 2;
+                ui.word(l, &x, 0, cm.author.name, .{ .bold = true });
+                ui.word(l, &x, 0, when, .{ .fg = palette.muted });
+                if (cm.edited) ui.word(l, &x, 0, "(edited)", .{ .fg = palette.faint });
+                if (cm.state_change) |st| ui.word(l, &x, 0, f.fmt("→ {s}", .{st.text()}), .{ .fg = palette.done });
+            }
+            const body = try std.mem.join(f.arena, "\n", cm.body);
+            const shown = if (std.mem.trim(u8, body, " \n").len == 0) cm.subject else body;
+            try paragraph(c, std.mem.trimEnd(u8, shown, "\n"), 4, .{});
+        }
+    }
+    c.skip(1);
+}
+
+fn sectionHeader(c: *Canvas, span: Canvas.Span, title: []const u8, action: []const u8) Allocator.Error!void {
+    const l = c.line() orelse return;
+    l.fill(.{ .style = itemStyle(span) });
+    const bg = itemStyle(span).bg;
+    var x = ui.text(l, 0, 0, title, .{ .fg = palette.accent, .bold = true, .bg = bg });
+    x += 1;
+    const aw = l.gwidth(action) + 2;
+    const rule_end = l.width -| aw;
+    while (x < rule_end) : (x += 1) _ = ui.text(l, x, 0, "─", .{ .fg = palette.faint, .bg = bg });
+    _ = ui.text(l, rule_end + 1, 0, action, .{ .fg = if (span.focused) palette.accent else palette.muted, .bg = bg });
+}
+
+fn paragraph(c: *Canvas, body: []const u8, indent: u16, style: ui.Style) Allocator.Error!void {
+    const rows = try text_mod.layout(c.f.arena, body, c.win.width -| indent -| 1);
+    for (rows) |r| if (c.line()) |l| {
+        _ = ui.text(l, indent, 0, text_mod.expandTabs(c.f.arena, body[r.start..r.end]), style);
+    };
+}
+
+fn progressBar(l: ui.Window, p: issuez.projection.Progress) void {
+    const w: u16 = @min(l.width -| 4, 40);
+    const filled: u16 = if (p.total == 0) 0 else @intCast(@as(u32, w) * p.closed / p.total);
+    var x: u16 = 0;
+    while (x < w) : (x += 1) {
+        _ = ui.text(l, 2 + x, 0, if (x < filled) "━" else "─", .{ .fg = if (x < filled) palette.done else palette.faint });
+    }
+}
+
+fn issueLine(c: *Canvas, k: u32, prefix: []const u8) Allocator.Error!void {
+    const snap = c.s.snap;
+    const issue = snap.issues[k];
+    const done = snap.isDone(k);
+    const span = try c.begin(.{ .open = k });
+    if (c.line()) |l| {
+        const bg = itemStyle(span).bg;
+        l.fill(.{ .style = itemStyle(span) });
+        var x: u16 = 2;
+        if (prefix.len > 0) ui.word(l, &x, 0, prefix, .{ .fg = palette.muted, .bg = bg });
+        ui.word(l, &x, 0, if (issue.deleted) "✗" else if (done) "✓" else if (snap.proj.activelyBlocked(k)) "⊘" else "●", .{
+            .fg = if (issue.deleted) palette.err else if (done) palette.done else palette.open,
+            .bg = bg,
+        });
+        ui.word(l, &x, 0, shortId(issue.id), .{ .fg = palette.id, .bg = bg });
+        const state = if (done) issue.state.text() else snap.proj.workflow(k) orelse issue.state.text();
+        const right = c.f.fmt("{s}  {s}", .{ issue.field("Priority") orelse "", state });
+        const rw = l.gwidth(right);
+        const title_win = l.child(.{ .width = l.width -| rw -| 2 });
+        _ = ui.text(title_win, x, 0, issue.title, .{
+            .fg = if (done or issue.deleted) palette.muted else .default,
+            .bg = bg,
+            .bold = span.focused,
+            .strikethrough = issue.deleted,
+        });
+        if (snap.proj.progress(k)) |p| {
+            const tw = l.gwidth(issue.title);
+            _ = ui.text(title_win, x + tw + 1, 0, c.f.fmt("{d}/{d}", .{ p.closed, p.total }), .{ .fg = palette.muted, .bg = bg });
+        }
+        _ = ui.text(l, l.width -| rw, 0, right, .{ .fg = palette.muted, .bg = bg });
+    }
+    try c.end(span);
+}
+
+fn sortedChildren(arena: Allocator, snap: *const Snapshot, i: u32) Allocator.Error![]const u32 {
+    var out: std.ArrayList(u32) = .empty;
+    for (snap.proj.children[i]) |k| if (!snap.issues[k].deleted) try out.append(arena, k);
+    std.mem.sort(u32, out.items, snap, struct {
+        fn lt(sn: *const Snapshot, a: u32, b: u32) bool {
+            const da = sn.isDone(a);
+            const db = sn.isDone(b);
+            if (da != db) return !da;
+            return sn.issues[a].created < sn.issues[b].created;
+        }
+    }.lt);
+    return out.items;
+}
+
+const field_order = [_]Field{ .state, .workflow, .priority, .assignee, .labels, .milestone, .parent, .blocked_by, .start, .due, .estimate };
+
+fn drawFields(c: *Canvas, i: u32) Allocator.Error!void {
+    const two = c.win.width >= 90;
+    const col_w: u16 = if (two) c.win.width / 2 else c.win.width;
+    var n: usize = 0;
+    while (n < field_order.len) {
+        const per_row: usize = if (two) 2 else 1;
+        // Both fields of a row are items on the same line.
+        const y = c.y;
+        var spans: [2]Canvas.Span = undefined;
+        var m: usize = 0;
+        while (m < per_row and n + m < field_order.len) : (m += 1) {
+            spans[m] = try c.begin(.{ .field = field_order[n + m] });
+        }
+        const l = c.line();
+        for (spans[0..m], 0..) |span, k| {
+            const field = field_order[n + k];
+            const x: u16 = @intCast(k * col_w);
+            if (l) |row| {
+                const cell = row.child(.{ .x_off = x, .width = col_w -| 1 });
+                if (span.focused) cell.fill(.{ .style = .{ .bg = palette.select_bg } });
+                drawField(c, cell, i, field, span.focused);
+            }
+            if (span.focused) {
+                c.focus_top = y;
+                c.focus_bottom = y + 1;
+            }
+            if (l) |row| try c.f.hit(row.child(.{ .x_off = x, .width = col_w -| 1 }), .{ .item = span.index });
+        }
+        n += m;
+    }
+}
+
+fn drawField(c: *Canvas, cell: ui.Window, i: u32, field: Field, focused: bool) void {
+    const f = c.f;
+    const snap = c.s.snap;
+    const issue = snap.issues[i];
+    const bg: vaxis.Color = if (focused) palette.select_bg else .default;
+    _ = ui.text(cell, 0, 0, field.label(), .{ .fg = palette.muted, .bg = bg });
+    const v = cell.child(.{ .x_off = 12 });
+    const empty: ui.Style = .{ .fg = palette.faint, .bg = bg };
+    const plain: ui.Style = .{ .bg = bg };
+    switch (field) {
+        .state => _ = ui.text(v, 0, 0, issue.state.text(), .{ .fg = if (snap.isDone(i)) palette.done else palette.open, .bg = bg, .bold = true }),
+        .workflow => {
+            if (snap.proj.workflow(i)) |wf| {
+                const x = ui.text(v, 0, 0, wf, .{ .fg = palette.accent, .bg = bg });
+                if (issue.ext.workflow == null) _ = ui.text(v, x + 1, 0, "(default)", empty);
+            } else _ = ui.text(v, 0, 0, unset, empty);
+        },
+        .priority => {
+            const p = issue.field("Priority");
+            _ = ui.text(v, 0, 0, p orelse unset, if (p != null) .{ .fg = ui.priorityColor(p), .bg = bg, .bold = true } else empty);
+        },
+        .assignee => _ = ui.text(v, 0, 0, issue.field("Assignee") orelse unset, if (issue.field("Assignee") != null) plain else empty),
+        .labels => {
+            if (issue.labels.len == 0) {
+                _ = ui.text(v, 0, 0, unset, empty);
+                return;
+            }
+            var x: u16 = 0;
+            for (issue.labels) |lab| {
+                x += ui.text(v, x, 0, f.fmt(" {s} ", .{lab}), .{ .fg = .{ .index = 16 }, .bg = palette.label });
+                x += 1;
+            }
+        },
+        .milestone => {
+            const m = snap.milestoneName(i);
+            const x = ui.text(v, 0, 0, m orelse unset, if (m != null) plain else empty);
+            if (m != null and issue.ext.milestone_id == null and snap.proj.milestone[i] != null) {
+                _ = ui.text(v, x + 1, 0, "(inherited)", empty);
+            }
+        },
+        .parent => {
+            const p = snap.proj.parent[i];
+            if (p == none) {
+                _ = ui.text(v, 0, 0, unset, empty);
+            } else {
+                const x = ui.text(v, 0, 0, shortId(snap.issues[p].id), .{ .fg = palette.id, .bg = bg });
+                _ = ui.text(v, x + 1, 0, snap.issues[p].title, plain);
+            }
+        },
+        .blocked_by => {
+            const bs = snap.proj.blockers[i];
+            if (bs.len == 0) {
+                _ = ui.text(v, 0, 0, unset, empty);
+                return;
+            }
+            var x: u16 = 0;
+            for (bs) |b| {
+                const st: ui.Style = .{ .fg = if (snap.proj.isActive(b)) palette.err else palette.muted, .bg = bg, .strikethrough = !snap.proj.isActive(b) };
+                x += ui.text(v, x, 0, shortId(snap.issues[b].id), st);
+                x += 1;
+            }
+        },
+        .start => dateValue(f, v, issue.ext.start_date, empty, plain),
+        .due => dateValue(f, v, issue.ext.due_date, empty, plain),
+        .estimate => if (issue.ext.estimate_minutes) |m| {
+            _ = ui.text(v, 0, 0, ui.duration(f, m), plain);
+        } else {
+            _ = ui.text(v, 0, 0, unset, empty);
+        },
+    }
+}
+
+fn dateValue(f: ui.Frame, v: ui.Window, d: ?issuez.format.fields.Date, empty: ui.Style, plain: ui.Style) void {
+    if (d) |date| {
+        _ = ui.text(v, 0, 0, f.fmt("{f}", .{date}), plain);
+    } else _ = ui.text(v, 0, 0, unset, empty);
+}
+
+pub fn key(s: *AppState, k: vaxis.Key) Allocator.Error!AppState.Action {
+    const d = &s.detail;
+    const i = d.issue(s.snap) orelse {
+        if (k.matches(K.escape, .{}) or k.matches(K.backspace, .{}) or k.matches(K.enter, .{})) s.back();
+        return .none;
+    };
+    const count: u16 = @intCast(d.items.items.len);
+    if (k.matches(K.escape, .{}) or k.matches(K.backspace, .{}) or k.matches(K.left, .{}) or k.matches('h', .{})) {
+        s.back();
+    } else if (k.matches(K.down, .{}) or k.matches('j', .{}) or k.matches(K.tab, .{})) {
+        if (d.focus + 1 < count) d.focusOn(s.snap, d.focus + 1);
+        d.follow = true;
+    } else if (k.matches(K.up, .{}) or k.matches('k', .{}) or k.matches(K.tab, .{ .shift = true })) {
+        if (d.focus > d.first) d.focusOn(s.snap, d.focus - 1);
+        d.follow = true;
+    } else if (k.matches(K.page_down, .{}) or k.matches('d', .{ .ctrl = true })) {
+        d.scrollBy(@intCast(d.visible / 2));
+    } else if (k.matches(K.page_up, .{}) or k.matches('u', .{ .ctrl = true })) {
+        d.scrollBy(-@as(i32, @intCast(d.visible / 2)));
+    } else if (k.matches(K.home, .{}) or k.matches('g', .{})) {
+        d.focusOn(s.snap, d.first);
+        d.scroll = 0;
+    } else if (k.matches(K.end, .{}) or k.matches('G', .{})) {
+        d.focusOn(s.snap, count -| 1);
+        d.follow = true;
+    } else if (k.matches(K.enter, .{}) or k.matches(K.space, .{}) or k.matches(K.right, .{})) {
+        if (d.focusItem()) |it| return activate(s, i, it);
+    } else if (k.matches('t', .{})) {
+        return activate(s, i, .title);
+    } else if (k.matches('e', .{})) {
+        return activate(s, i, .description);
+    } else if (k.matches('c', .{})) {
+        return activate(s, i, .comment);
+    } else if (k.matches('a', .{})) {
+        return activate(s, i, .add_child);
+    } else if (k.matches('x', .{})) {
+        return activate(s, i, .toggle);
+    } else if (k.matches('o', .{})) {
+        if (s.snap.proj.parent[i] != none) s.openIssue(s.snap.issues[s.snap.proj.parent[i]].id);
+    } else {
+        const shortcuts = [_]struct { u21, Field }{
+            .{ 's', .state },  .{ 'w', .workflow },  .{ 'p', .priority }, .{ 'u', .assignee },
+            .{ 'l', .labels }, .{ 'm', .milestone }, .{ 'P', .parent },   .{ 'b', .blocked_by },
+            .{ 'S', .start },  .{ 'd', .due },       .{ 'E', .estimate },
+        };
+        for (shortcuts) |sc| if (k.matches(sc[0], .{})) return activate(s, i, .{ .field = sc[1] });
+    }
+    return .none;
+}
+
+pub fn click(s: *AppState, index: u16) AppState.Action {
+    const d = &s.detail;
+    if (index >= d.items.items.len) return .none;
+    const it = d.items.items[index];
+    if (index >= d.first) d.focusOn(s.snap, index);
+    const i = d.issue(s.snap) orelse {
+        s.back();
+        return .none;
+    };
+    return activate(s, i, it);
+}
+
+fn activate(s: *AppState, i: u32, it: Item) AppState.Action {
+    switch (it) {
+        .back => s.back(),
+        .title => modal.editTitle(s, i),
+        .field => |field| modal.editField(s, i, field),
+        .description => modal.editDescription(s, i),
+        .comment => modal.addComment(s, i),
+        .add_child => s.newIssue(i),
+        .toggle => return s.toggleAction(i),
+        .open => |k| s.openIssue(s.snap.issues[k].id),
+    }
+    return .none;
+}

@@ -1,14 +1,28 @@
 .{
     .name = .git_native_issuez,
-    .version = "0.1.0",
+    .version = "0.2.0",
     .minimum_zig_version = "0.16.0",
     .fingerprint = 0x7bba8a1d2cbb8815,
     .dependencies = .{
+        // TUI. Pinned to the last libvaxis main commit before its Zig 0.17
+        // bump; builds on Zig 0.16.0. Only fetched when -Dtui=true (default).
+        .vaxis = .{
+            .url = "git+https://github.com/rockorager/libvaxis#5b0c724e6434de3a259e790e94954d110688ce5f",
+            .hash = "vaxis-0.6.0-BWNV_FcJDQAY-hi2JHq9u7MWVRxQOg0S7V0YBnvfHtmf",
+            .lazy = true,
+        },
         // MCP server (`git issue mcp`). The zig-0.16.0 branch of blitzmcp;
         // only fetched when -Dmcp=true (default).
         .blitzmcp = .{
             .url = "git+https://github.com/StaffinityAI/blitzmcp#ff5b14ce91e8249d88bc8f9ce6107bde780bbb8b",
             .hash = "blitzmcp-0.1.0-R76_bY8zBAA-QeYgAbjXUDut0vftxy0wSUIS_vwbGPB7",
+            .lazy = true,
+        },
+        // Live updates in the TUI and the MCP server: watches the refs.
+        // The zig-0.16 branch of nightwatch; only fetched when either is built.
+        .nightwatch = .{
+            .url = "git+https://github.com/neurocyte/nightwatch#4cef501981369bdc09ab66f19837b957db6c14f0",
+            .hash = "nightwatch-1.0.0-uXzeH2MLAwAij-fvvYoxhHpdaxWOL59lZXRaQ28Ng5KC",
             .lazy = true,
         },
         // Upstream git-native-issue (GPL-2.0), the interop test oracle.

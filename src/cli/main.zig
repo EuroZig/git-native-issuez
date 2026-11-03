@@ -8,6 +8,12 @@ const fatal = @import("fatal.zig");
 
 const GitProcess = issuez.backend.GitProcess;
 
+pub const std_options: std.Options = .{
+    // libvaxis logs debug output (e.g. on every resize) that must not leak
+    // into a user's terminal.
+    .log_scope_levels = &.{.{ .scope = .vaxis, .level = .warn }},
+};
+
 var stdout_buffer: [16 * 1024]u8 = undefined;
 var stderr_buffer: [4 * 1024]u8 = undefined;
 

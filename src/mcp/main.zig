@@ -6,8 +6,10 @@ const issuez = @import("issuez");
 const mcp = @import("blitzmcp");
 pub const tools = @import("tools.zig");
 const install = @import("install.zig");
+const RepoWatcher = @import("RepoWatcher");
 
 const GitProcess = issuez.backend.GitProcess;
+const changes = issuez.changes;
 
 /// In help.zig, which builds without the MCP server have too.
 pub const help = @import("mcp_help").text;
@@ -28,6 +30,11 @@ const ProcessRepos = struct {
     git: ?GitProcess = null,
     /// By the `repo` path as given, oldest first. Owns keys and values.
     others: std.StringArrayHashMapUnmanaged(*GitProcess) = .empty,
+    /// Where notifications go; null leaves subscriptions unwatched.
+    /// Written from the watcher's thread too, so thread-safe for writes.
+    transport: ?*mcp.Transport = null,
+    /// Watches the server's repository from the first subscription on.
+    live: ?*Live = null,
 
     pub const Backend = GitProcess;
 
@@ -65,6 +72,22 @@ const ProcessRepos = struct {
 
     pub fn close(_: *ProcessRepos, _: *GitProcess) void {}
 
+    /// For `resources/subscribe`: starts watching the server's repository.
+    pub fn watch(r: *ProcessRepos, ctx: *mcp.Context, subscriptions: *tools.Subscriptions) !void {
+        if (r.live != null) return;
+        const transport = r.transport orelse return;
+        const live = try r.gpa.create(Live);
+        errdefer r.gpa.destroy(live);
+        // Its own process: the watcher's thread reads the refs with it.
+        var git = try r.openPath(ctx, r.path, true);
+        errdefer git.close();
+        live.start(r.io, r.gpa, git, transport, subscriptions) catch |e| return switch (e) {
+            error.OutOfMemory => e,
+            else => ctx.fail(e, "can't watch the repository for changes: {t}", .{e}),
+        };
+        r.live = live;
+    }
+
     fn openPath(r: *ProcessRepos, ctx: *mcp.Context, path: []const u8, default: bool) !GitProcess {
         return GitProcess.open(r.io, r.gpa, .{ .path = path, .environ_map = r.environ_map }) catch |e| switch (e) {
             error.NotARepository => ctx.fail(e, "not a git repository: {s}{s}", .{
@@ -85,13 +108,97 @@ const ProcessRepos = struct {
     }
 
     fn deinit(r: *ProcessRepos) void {
+        if (r.live) |live| {
+            live.stop();
+            r.gpa.destroy(live);
+        }
         if (r.git) |*git| git.close();
         while (r.others.count() > 0) r.closeOther(r.others.count() - 1);
         r.others.deinit(r.gpa);
     }
 };
 
+/// Tells the client which subscribed resources others changed (or this
+/// server did), with `notifications/resources/updated`: a RepoWatcher on
+/// the repository, and the refs read again on its thread to see what
+/// moved.
+const Live = struct {
+    io: std.Io,
+    gpa: std.mem.Allocator,
+    git: GitProcess,
+    transport: *mcp.Transport,
+    subscriptions: *tools.Subscriptions,
+    /// As last read, owned.
+    refs: changes.RefState,
+    watcher: RepoWatcher,
+
+    /// In place. Owns `git` from here on, also on failure.
+    fn start(
+        live: *Live,
+        io: std.Io,
+        gpa: std.mem.Allocator,
+        git: GitProcess,
+        transport: *mcp.Transport,
+        subscriptions: *tools.Subscriptions,
+    ) !void {
+        live.* = .{
+            .io = io,
+            .gpa = gpa,
+            .git = git,
+            .transport = transport,
+            .subscriptions = subscriptions,
+            .refs = .{},
+            .watcher = undefined,
+        };
+        errdefer live.git.close();
+        var arena_state: std.heap.ArenaAllocator = .init(gpa);
+        defer arena_state.deinit();
+        live.refs = try (try changes.RefState.read(arena_state.allocator(), &live.git)).clone(gpa);
+        errdefer live.refs.deinit(gpa);
+        try live.watcher.init(io, gpa, live.git.common_dir.?, .{ .context = live, .changed = changed }, .{});
+    }
+
+    fn stop(live: *Live) void {
+        live.watcher.deinit();
+        live.refs.deinit(live.gpa);
+        live.git.close();
+        live.* = undefined;
+    }
+
+    /// On the watcher's thread.
+    fn changed(context: *anyopaque, change: RepoWatcher.Change) void {
+        const live: *Live = @ptrCast(@alignCast(context));
+        live.notify(change.config) catch |e| std.log.scoped(.mcp).warn("watching the repository: {t}", .{e});
+    }
+
+    fn notify(live: *Live, settings: bool) !void {
+        var arena_state: std.heap.ArenaAllocator = .init(live.gpa);
+        defer arena_state.deinit();
+        const arena = arena_state.allocator();
+        const now = try changes.RefState.read(arena, &live.git);
+        const d = try changes.diff(arena, live.refs, now);
+        if (d.empty() and !settings) return;
+        // Before the client hears of it, so a read it makes then and a
+        // change after it are told apart.
+        const uris = try live.subscriptions.affected(live.io, arena, d, settings);
+        var next = try now.clone(live.gpa);
+        std.mem.swap(changes.RefState, &live.refs, &next);
+        next.deinit(live.gpa);
+        for (uris) |uri| try live.transport.writeNotification(
+            live.io,
+            arena,
+            "notifications/resources/updated",
+            mcp.types.ResourceUpdatedNotificationParams,
+            .{ .uri = uri },
+            .{ .emit_null_optional_fields = false },
+        );
+    }
+};
+
 const Server = tools.Server(ProcessRepos, version);
+
+/// Responses from the server, notifications from the watcher's thread.
+const SafeTransport = mcp.Transport.ThreadSafe(.{ .thread_safe_read = false, .thread_safe_write = true });
 
 pub fn main(
     io: std.Io,
@@ -125,13 +232,20 @@ pub fn main(
         }
     }
 
-    var repos: ProcessRepos = .{ .io = io, .gpa = gpa, .environ_map = environ_map, .path = path };
+    var read_buffer: [64 * 1024]u8 = undefined;
+    var stdio: mcp.Transport.Stdio = .init(&read_buffer, .stdin(), .stdout());
+    var transport: SafeTransport = .init(&stdio.transport);
+    var repos: ProcessRepos = .{
+        .io = io,
+        .gpa = gpa,
+        .environ_map = environ_map,
+        .path = path,
+        .transport = &transport.transport,
+    };
     defer repos.deinit();
     var handler: tools.Handler(ProcessRepos) = .{ .repos = &repos };
     var server: Server = .init(&handler);
-    var read_buffer: [64 * 1024]u8 = undefined;
-    var stdio: mcp.Transport.Stdio = .init(&read_buffer, .stdin(), .stdout());
-    server.run(io, gpa, &stdio.transport) catch |e| {
+    server.run(io, gpa, &transport.transport) catch |e| {
         err.print("git-issue: mcp server stopped: {t}\n", .{e}) catch {};
         return 1;
     };
@@ -285,4 +399,71 @@ test "repositories: outside one, named by repo, made since" {
     // The server's repository, made since, is found on the next call.
     try testGitInit(arena, &env, dir);
     try testing.expectEqual(@as(i64, 0), try testTotal(try testCall(arena, &server, "list_issues", "{}")));
+}
+
+test "a subscription hears of changes, its own and others'" {
+    var arena_state: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const io = testing.io;
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const cwd = try std.process.currentPathAlloc(io, arena);
+    const dir = try std.fmt.allocPrint(arena, "{s}/.zig-cache/tmp/{s}", .{ cwd, tmp.sub_path });
+    var env = try testing.environ.createMap(arena);
+    try env.put("GIT_CONFIG_NOSYSTEM", "1");
+    try env.put("GIT_CONFIG_GLOBAL", "/dev/null");
+    try env.put("GIT_AUTHOR_NAME", "Ada");
+    try env.put("GIT_AUTHOR_EMAIL", "ada@example.invalid");
+    try env.put("GIT_COMMITTER_NAME", "Ada");
+    try env.put("GIT_COMMITTER_EMAIL", "ada@example.invalid");
+    try env.put("GIT_CEILING_DIRECTORIES", std.fs.path.dirname(dir).?);
+    try testGitInit(arena, &env, dir);
+
+    // What the server writes, notifications included.
+    var out: std.Io.Writer.Allocating = .init(testing.allocator);
+    defer out.deinit();
+    var reader: std.Io.Reader = .fixed("");
+    var stream: mcp.Transport.Stream = .init(&reader, &out.writer);
+    var transport: SafeTransport = .init(&stream.transport);
+
+    var repos: ProcessRepos = .{
+        .io = io,
+        .gpa = testing.allocator,
+        .environ_map = &env,
+        .path = dir,
+        .transport = &transport.transport,
+    };
+    defer repos.deinit();
+    var handler: tools.Handler(ProcessRepos) = .{ .repos = &repos };
+    var server: Server = .init(&handler);
+    server.connection.markInitialized(.{
+        .protocolVersion = mcp.types.latest_protocol_version,
+        .capabilities = .{},
+        .clientInfo = .{ .name = "test", .version = "0" },
+    });
+
+    const subscribe =
+        \\{"jsonrpc":"2.0","id":1,"method":"resources/subscribe","params":{"uri":"git-issue://issues"}}
+    ;
+    try server.handleMessage(io, testing.allocator, &transport.transport, subscribe);
+    try testing.expect(repos.live != null);
+
+    // Another process writes.
+    var other = try GitProcess.open(io, testing.allocator, .{ .path = dir, .environ_map = &env });
+    defer other.close();
+    _ = try issuez.Repo(GitProcess).init(&other).create(arena, .{ .title = "Elsewhere" });
+
+    const updated =
+        \\{"jsonrpc":"2.0","method":"notifications/resources/updated","params":{"uri":"git-issue://issues"}}
+    ;
+    var waited: u32 = 0;
+    while (true) : (waited += 1) {
+        transport.out_mutex.lockUncancelable(io);
+        const seen = std.mem.find(u8, out.written(), updated) != null;
+        transport.out_mutex.unlock(io);
+        if (seen) break;
+        if (waited == 500) return error.Timeout;
+        try io.sleep(.fromMilliseconds(10), .awake);
+    }
 }

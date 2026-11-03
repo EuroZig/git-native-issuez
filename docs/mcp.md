@@ -97,6 +97,32 @@ Errors (an ambiguous prefix, closing an issue with open sub-issues, an
 unknown workflow state, ...) come back as tool errors with a message saying
 what to do.
 
+## Resources and live updates
+
+The server's repository (`--repo`, else the current directory) is also
+served as resources, JSON in the tools' result types:
+
+| URI | Same as |
+| --- | --- |
+| `git-issue://issues` | `list_issues` without arguments: the issues that aren't done, at most 100 |
+| `git-issue://milestones` | `list_milestones` without arguments: the open milestones |
+| `git-issue://issues/{id}` | `show_issue`; `id` is the UUID or a unique prefix (a template) |
+
+A URI that names nothing, an unknown issue included, is a
+resource-not-found error (-32002). Repositories named by `repo` have no
+resources.
+
+`resources/subscribe` takes any of them. The first subscription starts
+watching the repository's git dir (only the issue refs, `packed-refs`,
+`reftable/` and `config`), and from then on the server sends
+`notifications/resources/updated` for each subscribed URI that a change
+touched, whoever made it: `git issue`, another server, a TUI, a sync, this
+server's own tools. The lists change with any issue or milestone; an issue
+with its own changes, any milestone change and a change to git config.
+What an issue shows of other issues (a parent's progress, `blocked`) isn't
+followed. Notifications come once things have been quiet for 40 ms, at
+least every 400 ms during a burst. Up to 128 subscriptions.
+
 ## Not in the server
 
 Sync with remotes (`git issue sync <remote>`), attachments, milestone

@@ -17,17 +17,22 @@ approach before you put in the work.
   is skipped without its tool.
 - For the MCP server's end-to-end tests (`zig build e2e`, part of
   `zig build ci`): Node.js 20 or newer and npm. They drive `git-issue mcp`
-  with the official MCP TypeScript SDK client (`test/mcp_e2e/`).
+  with the official MCP TypeScript SDK client (`test/e2e/`). The TUI's,
+  also in `zig build e2e` and alone as `zig build test-tui-e2e`, need
+  nothing but Linux or macOS: two TUIs on pseudo-terminals
+  (`test/live_tui.zig`).
 
 ```sh
-zig build test                 # the quick check
+zig build test                 # the quick check, TUI included
+zig build test -Dtui=false     # the same without the TUI
 zig build ci                   # what CI runs: also interop, upstream's suite, perf
                                # and long fuzz runs (-Dseed=N for other cases)
 ```
 
-A change is ready when `zig build ci` passes. A failed CI run reproduces
-with `zig build ci -Dseed=<run id>`; the run id is in the job's command
-line. When the fuzzer fails, it also prints a replay command for that case
+A change is ready when `zig build ci` and `zig build test -Dtui=false`
+pass. A failed CI run reproduces with `zig build ci -Dseed=<run id>`; the
+run id is in the job's command line. When the fuzzer fails, it also prints
+a replay command for that case
 (`zig build -Dfuzz && zig-out/bin/git-issue-fuzz --seed N --iterations 1`).
 
 ## Rules that keep the project working

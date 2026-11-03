@@ -156,3 +156,42 @@ jobs:
           gh release create "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" --verify-tag
           --title "v$VERSION" --notes-file notes.md
           zig-out/release/*.tar.gz zig-out/release/*.zip zig-out/release/SHA256SUMS
+
+  # Points the Homebrew tap at the new release. Pushes straight to the tap's
+  # main with a deploy key, after the formula installs and passes its test on
+  # Linux.
+  homebrew:
+    needs: [check, release]
+    if: ${{ !contains(needs.check.outputs.version, '-') }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    env:
+      VERSION: ${{ needs.check.outputs.version }}
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          repository: EuroZig/homebrew-tap
+          ssh-key: ${{ secrets.TAP_DEPLOY_KEY }}
+
+      - name: Update the formula
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release download "v$VERSION" --repo "$GITHUB_REPOSITORY" -p SHA256SUMS -D "$RUNNER_TEMP"
+          scripts/update-formula.sh "$VERSION" "$RUNNER_TEMP/SHA256SUMS"
+          git diff
+          git -c user.name=github-actions -c user.email=github-actions@users.noreply.github.com \
+            commit -am "git-native-issuez $VERSION"
+
+      # `brew tap` clones the commit above, so this tests what gets pushed.
+      - name: Test the formula
+        run: |
+          eval "$(/home/linuxbrew/.linuxbrew/bin/brew shellenv)"
+          brew tap eurozig/tap "$GITHUB_WORKSPACE"
+          brew trust eurozig/tap
+          brew audit --strict --online eurozig/tap/git-native-issuez
+          brew install eurozig/tap/git-native-issuez
+          brew test eurozig/tap/git-native-issuez
+
+      - name: Push
+        run: git push

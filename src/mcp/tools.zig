@@ -36,7 +36,9 @@ pub const instructions =
     \\here: run `git issue sync <remote>`. Every tool takes an optional repo,
     \\an absolute path to the repository; without it, the server's repository
     \\(the directory the client started it in). Pass repo when working in
-    \\another repository than that one.
+    \\another repository than that one. The server's repository is also
+    \\served as resources (git-issue://issues, git-issue://milestones,
+    \\git-issue://issues/{id}); subscribe to hear when others change them.
 ;
 
 // Results. The field names follow `git issue --json` (docs/json.md).
@@ -375,6 +377,130 @@ pub const StateArgs = struct {
     };
 };
 
+// Resources: the server's repository, as JSON in the tools' result types.
+
+pub const uri_scheme = "git-issue://";
+/// The issues that aren't done: `list_issues` without arguments.
+pub const issues_uri = uri_scheme ++ "issues";
+/// The open milestones: `list_milestones` without arguments.
+pub const milestones_uri = uri_scheme ++ "milestones";
+/// One issue, by ID or unique prefix: `show_issue`.
+pub const issue_uri_prefix = issues_uri ++ "/";
+
+pub const resources = [_]mcp.types.Resource{
+    .{
+        .uri = issues_uri,
+        .name = "issues",
+        .title = "Open issues",
+        .description = "The issues that aren't done, newest first, at most 100 (list_issues without arguments).",
+        .mimeType = "application/json",
+    },
+    .{
+        .uri = milestones_uri,
+        .name = "milestones",
+        .title = "Open milestones",
+        .description = "The open milestones with their progress (list_milestones without arguments).",
+        .mimeType = "application/json",
+    },
+};
+
+pub const resource_templates = [_]mcp.types.ResourceTemplate{.{
+    .uriTemplate = issue_uri_prefix ++ "{id}",
+    .name = "issue",
+    .title = "An issue",
+    .description = "An issue with its description and comments (show_issue); id is the UUID or a unique prefix.",
+    .mimeType = "application/json",
+}};
+
+pub const ResourceUri = union(enum) {
+    issues,
+    milestones,
+    /// The ID or prefix.
+    issue: []const u8,
+
+    pub fn parse(uri: []const u8) ?ResourceUri {
+        if (std.mem.eql(u8, uri, issues_uri)) return .issues;
+        if (std.mem.eql(u8, uri, milestones_uri)) return .milestones;
+        if (!std.mem.startsWith(u8, uri, issue_uri_prefix)) return null;
+        const id = uri[issue_uri_prefix.len..];
+        if (id.len == 0 or std.mem.findScalar(u8, id, '/') != null) return null;
+        return .{ .issue = id };
+    }
+};
+
+/// The resources a client subscribed to. The server adds and removes; a
+/// watcher's thread asks which a change touched.
+pub const Subscriptions = struct {
+    mutex: std.Io.Mutex = .init,
+    uris: [max][max_uri_len]u8 = undefined,
+    lens: [max]u8 = undefined,
+    count: u8 = 0,
+
+    pub const max = 128;
+    /// An issue's URI with a full SHA-256-length ID fits.
+    pub const max_uri_len = 160;
+
+    pub const Error = error{ TooManySubscriptions, UriTooLong };
+
+    pub fn add(s: *Subscriptions, io: std.Io, uri: []const u8) Error!void {
+        if (uri.len > max_uri_len) return error.UriTooLong;
+        s.mutex.lockUncancelable(io);
+        defer s.mutex.unlock(io);
+        if (s.find(uri) != null) return;
+        if (s.count == max) return error.TooManySubscriptions;
+        @memcpy(s.uris[s.count][0..uri.len], uri);
+        s.lens[s.count] = @intCast(uri.len);
+        s.count += 1;
+    }
+
+    pub fn remove(s: *Subscriptions, io: std.Io, uri: []const u8) void {
+        s.mutex.lockUncancelable(io);
+        defer s.mutex.unlock(io);
+        const i = s.find(uri) orelse return;
+        s.count -= 1;
+        s.uris[i] = s.uris[s.count];
+        s.lens[i] = s.lens[s.count];
+    }
+
+    fn find(s: *const Subscriptions, uri: []const u8) ?usize {
+        for (0..s.count) |i| if (std.mem.eql(u8, s.at(i), uri)) return i;
+        return null;
+    }
+
+    fn at(s: *const Subscriptions, i: usize) []const u8 {
+        return s.uris[i][0..s.lens[i]];
+    }
+
+    /// The subscribed URIs whose content may have changed, in `arena`:
+    /// `d` is what moved in the refs, `settings` that git config changed.
+    /// The lists change with any issue or milestone. An issue's resource
+    /// changes with the issue, the milestones and the settings; what it
+    /// shows of other issues (progress, blocked) isn't followed.
+    pub fn affected(
+        s: *Subscriptions,
+        io: std.Io,
+        arena: Allocator,
+        d: issuez.changes.Diff,
+        settings: bool,
+    ) Allocator.Error![]const []const u8 {
+        s.mutex.lockUncancelable(io);
+        defer s.mutex.unlock(io);
+        var out: std.ArrayList([]const u8) = .empty;
+        if (d.empty() and !settings) return out.items;
+        for (0..s.count) |i| {
+            const u = s.at(i);
+            const hit = switch (ResourceUri.parse(u) orelse continue) {
+                .issues, .milestones => true,
+                .issue => |prefix| settings or d.milestones or for (d.issues) |id| {
+                    if (std.mem.startsWith(u8, id, prefix)) break true;
+                } else false,
+            };
+            if (hit) try out.append(arena, try arena.dupe(u8, u));
+        }
+        return out.items;
+    }
+};
+
 pub fn Handler(comptime Repos: type) type {
     const B = Repos.Backend;
     const Repo = issuez.Repo(B);
@@ -382,6 +508,7 @@ pub fn Handler(comptime Repos: type) type {
 
     return struct {
         repos: *Repos,
+        subscriptions: Subscriptions = .{},
 
         const Self = @This();
 
@@ -659,6 +786,64 @@ pub fn Handler(comptime Repos: type) type {
             for (result.changes, changes) |c, *out| out.* = c.name();
             const hex = result.tip.hex();
             return .{ .id = ref.id(), .version = try arena.dupe(u8, hex.slice()), .changes = changes };
+        }
+
+        pub fn @"resources/list"() mcp.types.ListResourcesResult {
+            return .{ .resources = &resources };
+        }
+
+        pub fn @"resources/templates/list"() mcp.types.ListResourceTemplatesResult {
+            return .{ .resourceTemplates = &resource_templates };
+        }
+
+        pub fn @"resources/read"(
+            h: *Self,
+            ctx: *mcp.Context,
+            params: mcp.types.ReadResourceRequestParams,
+        ) !mcp.types.ReadResourceResult {
+            const uri = ResourceUri.parse(params.uri) orelse
+                return ctx.fail(error.ResourceNotFound, "no resource '{s}'", .{params.uri});
+            const json = switch (uri) {
+                .issues => try resourceJson(ctx, try h.listIssues(ctx, .{})),
+                .milestones => try resourceJson(ctx, try h.listMilestones(ctx, .{})),
+                .issue => |id| try resourceJson(ctx, h.showIssue(ctx, .{ .id = id }) catch |e| switch (e) {
+                    error.IssueNotFound => return ctx.fail(error.ResourceNotFound, "no issue '{s}'", .{id}),
+                    else => return e,
+                }),
+            };
+            const contents = try ctx.arena.alloc(mcp.types.ResourceContents, 1);
+            contents[0] = .{ .text = .{ .uri = params.uri, .mimeType = "application/json", .text = json } };
+            return .{ .contents = contents };
+        }
+
+        /// `Repos` may have `fn watch(self, *mcp.Context, *Subscriptions) !void`,
+        /// to start telling the client about changes on the first one.
+        pub fn @"resources/subscribe"(
+            h: *Self,
+            ctx: *mcp.Context,
+            params: mcp.types.SubscribeRequestParams,
+        ) !mcp.types.EmptyResult {
+            if (ResourceUri.parse(params.uri) == null)
+                return ctx.fail(error.ResourceNotFound, "no resource '{s}'", .{params.uri});
+            if (@hasDecl(Repos, "watch")) try h.repos.watch(ctx, &h.subscriptions);
+            h.subscriptions.add(ctx.io, params.uri) catch |e| return switch (e) {
+                error.TooManySubscriptions => ctx.fail(e, "at most {d} subscriptions", .{Subscriptions.max}),
+                error.UriTooLong => ctx.fail(error.ResourceNotFound, "no resource '{s}'", .{params.uri}),
+            };
+            return .{};
+        }
+
+        pub fn @"resources/unsubscribe"(
+            h: *Self,
+            ctx: *mcp.Context,
+            params: mcp.types.UnsubscribeRequestParams,
+        ) mcp.types.EmptyResult {
+            h.subscriptions.remove(ctx.io, params.uri);
+            return .{};
+        }
+
+        fn resourceJson(ctx: *mcp.Context, value: anytype) ![]const u8 {
+            return std.json.Stringify.valueAlloc(ctx.arena, value, .{ .emit_null_optional_fields = false });
         }
 
         pub fn setIssueState(h: *Self, ctx: *mcp.Context, args: StateArgs) !StateChanged {
