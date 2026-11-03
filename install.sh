@@ -174,10 +174,10 @@ if [ -x "$prefix/bin/git-issue" ]; then
         current_flavor=minimal
     fi
 fi
-if [ -n "$current" ] && [ "$force" -eq 0 ]; then
+if [ -n "$current" ]; then
     case "$(version_cmp "$version" "$current")" in
     same)
-        if [ "$flavor" = "$current_flavor" ]; then
+        if [ "$flavor" = "$current_flavor" ] && [ "$force" -eq 0 ]; then
             echo "git-native-issuez $version ($flavor) is already installed in $prefix"
             echo "(--force installs it again)"
             exit 0
@@ -296,7 +296,7 @@ if [ -z "\$fetched" ] || [ "\$fetched" -lt "\$installer_version" ]; then
     echo "installed with (\${fetched:-no version} < \$installer_version); refusing to run it" >&2
     exit 1
 fi
-exec sh "\$tmp/install.sh" --flavor $(shquote "$flavor") --prefix $(shquote "$prefix") "\$@"
+sh "\$tmp/install.sh" --flavor $(shquote "$flavor") --prefix $(shquote "$prefix") "\$@"
 EOF
 chmod 755 "$tmp/updater"
 
