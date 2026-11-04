@@ -1710,7 +1710,9 @@ pub fn Repo(comptime B: type) type {
                 }
             };
 
-            if (p.closed and p.state_changed) if (p.id) |id| {
+            // A closed issue coming back may have gained open work while
+            // deleted: deleted ancestors don't stop it.
+            if (p.closed and (p.state_changed or p.restored)) if (p.id) |id| {
                 try g.bumpGuard(id);
                 var height: u32 = 0;
                 for (try g.descendants(id, &height)) |d| {
@@ -2510,6 +2512,16 @@ test "lifecycle" {
     try testing.expect(issue.deleted);
     _ = try repo.setDeleted(arena, ref, false, .{});
     try testing.expect(!(try latest(repo, arena, &sim, ref)).deleted);
+
+    // A closed parent gains open work while deleted (deleted ancestors
+    // don't stop a reopen): it can't come back until that work is closed.
+    const child_ref = try refNameOf(arena, child.id.slice());
+    _ = try repo.setState(arena, ref, .{ .state = .closed });
+    _ = try repo.setDeleted(arena, ref, true, .{});
+    _ = try repo.setDeleted(arena, child_ref, false, .{});
+    try testing.expectError(error.OpenDescendants, repo.setDeleted(arena, ref, false, .{}));
+    _ = try repo.setState(arena, child_ref, .{ .state = .closed });
+    _ = try repo.setDeleted(arena, ref, false, .{});
 }
 
 test "guards under concurrent change" {

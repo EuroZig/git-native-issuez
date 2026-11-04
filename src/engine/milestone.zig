@@ -709,7 +709,8 @@ test "milestone guards: retired, inherited work, damaged issues" {
     _ = try cat.edit(arena, m2, .{ .status = .open });
     _ = try repo.setState(arena, try refOf(arena, open.id.slice()), .{ .state = .closed });
 
-    // Restoring a closed issue brings the open work below it along.
+    // Restoring a closed issue would bring the open work below it along:
+    // refused, the issue would be closed over open work.
     const root = try repo.create(arena, .{ .title = "Root", .milestone_id = m1 });
     const mid = try repo.create(arena, .{
         .title = "Mid",
@@ -731,7 +732,7 @@ test "milestone guards: retired, inherited work, damaged issues" {
     _ = try repo.setDeleted(arena, try refOf(arena, leaf.id.slice()), false, .{});
     _ = try repo.setState(arena, try refOf(arena, leaf.id.slice()), .{ .state = .open });
     try testing.expectError(
-        error.MilestoneCompleted,
+        error.OpenDescendants,
         repo.setDeleted(arena, try refOf(arena, mid.id.slice()), false, .{}),
     );
 

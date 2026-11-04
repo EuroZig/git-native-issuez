@@ -20,6 +20,7 @@ const std = @import("std");
 const entry_points = @import("src/cli/entry_points.zig");
 
 pub fn build(b: *std.Build) void {
+    if (isRootPackage(b)) forgetOuterRepository(b);
     const target = b.standardTargetOptions(.{});
     const optimize = b.standardOptimizeOption(.{});
     // Projects depending on the library need neither the TUI nor the MCP
@@ -121,6 +122,7 @@ pub fn build(b: *std.Build) void {
         _ = files.addCopyFile(b.path("test/e2e/package.json"), "package.json");
         _ = files.addCopyFile(b.path("test/e2e/package-lock.json"), "package-lock.json");
         const script = files.addCopyFile(b.path("test/e2e/mcp.test.mjs"), "mcp.test.mjs");
+        _ = files.addCopyFile(b.path("test/e2e/live_client.mjs"), "live_client.mjs");
 
         // From PATH when the step runs, so builds without Node.js work.
         const npm_ci = b.addSystemCommand(&.{ "npm", "ci", "--no-audit", "--no-fund" });
@@ -146,6 +148,16 @@ pub fn build(b: *std.Build) void {
         live_mcp.has_side_effects = true;
         live_mcp.step.dependOn(&npm_ci.step);
         e2e_step.dependOn(&live_mcp.step);
+
+        // A server in each of two linked worktrees, writing at once.
+        const worktrees_mcp = b.addSystemCommand(&.{"node"});
+        worktrees_mcp.setName("e2e live updates across worktrees, git-issue mcp");
+        const worktrees_script = b.path("test/e2e/worktrees_mcp.test.mjs");
+        worktrees_mcp.addFileArg(files.addCopyFile(worktrees_script, "worktrees_mcp.test.mjs"));
+        worktrees_mcp.addArtifactArg(exe);
+        worktrees_mcp.has_side_effects = true;
+        worktrees_mcp.step.dependOn(&npm_ci.step);
+        e2e_step.dependOn(&worktrees_mcp.step);
     } else {
         e2e_step.dependOn(&b.addFail("zig build e2e needs the MCP server: drop -Dminimal").step);
     }
@@ -705,6 +717,21 @@ fn readSnapshot(b: *std.Build, path: []const u8) []const u8 {
 }
 
 /// True when building this repository rather than using it as a dependency.
+/// Git's repository-local variables (`git rev-parse --local-env-vars`),
+/// which a git hook gets: `git commit -a` sets GIT_INDEX_FILE, a
+/// worktree's hook GIT_DIR. Inherited, they'd point the tests' git at this
+/// repository instead of their own. Gone from the environment every step
+/// runs in.
+fn forgetOuterRepository(b: *std.Build) void {
+    for ([_][]const u8{
+        "GIT_ALTERNATE_OBJECT_DIRECTORIES", "GIT_CONFIG",             "GIT_CONFIG_PARAMETERS",
+        "GIT_CONFIG_COUNT",                 "GIT_OBJECT_DIRECTORY",   "GIT_DIR",
+        "GIT_WORK_TREE",                    "GIT_IMPLICIT_WORK_TREE", "GIT_GRAFT_FILE",
+        "GIT_INDEX_FILE",                   "GIT_NO_REPLACE_OBJECTS", "GIT_REPLACE_REF_BASE",
+        "GIT_PREFIX",                       "GIT_SHALLOW_FILE",       "GIT_COMMON_DIR",
+    }) |name| _ = b.graph.environ_map.swapRemove(name);
+}
+
 fn isRootPackage(b: *std.Build) bool {
     return b.pkg_hash.len == 0;
 }

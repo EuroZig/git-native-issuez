@@ -15,6 +15,11 @@ versions may change the library API; the on-disk format only ever grows (see
   prefix), the downgrade and reinstall guards, and the wget and openssl
   fallbacks (it needs `curl`, and `sha256sum` or `shasum`).
 
+### Fixed
+- Restoring a closed issue is refused while open work sits below it
+  (`OpenDescendants`), as closing it is. Work reopened under it while it
+  was deleted left it closed over open sub-issues.
+
 ## [0.2.0] - 2026-11-03
 
 ### Added

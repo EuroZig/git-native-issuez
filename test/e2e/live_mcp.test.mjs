@@ -14,9 +14,7 @@ import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 
-import { Client } from "@modelcontextprotocol/sdk/client/index.js";
-import { StdioClientTransport } from "@modelcontextprotocol/sdk/client/stdio.js";
-import { ResourceUpdatedNotificationSchema } from "@modelcontextprotocol/sdk/types.js";
+import { connect as connectTo, issuesUri, milestonesUri, issueUri } from "./live_client.mjs";
 
 const [exe] = process.argv.slice(2);
 if (!exe) {
@@ -39,87 +37,13 @@ const env = {
 };
 const repo = join(root, "repo");
 
-const issuesUri = "git-issue://issues";
-const milestonesUri = "git-issue://milestones";
-const issueUri = (id) => `git-issue://issues/${id}`;
-
-/** How long a notification may take: the watcher waits for quiet first. */
-const timeoutMs = 5000;
-/** How long to wait to be sure one doesn't come. */
-const quietMs = 600;
-
 function cli(...args) {
   return execFileSync(gitIssue, args, { cwd: repo, env, encoding: "utf8" });
 }
 
-/** A client of its own `git-issue mcp`, recording resource updates. */
-async function connect(name) {
-  const transport = new StdioClientTransport({
-    command: gitIssue,
-    args: ["mcp"],
-    cwd: repo,
-    env,
-    stderr: "inherit",
-  });
-  const client = new Client({ name, version: "0.0.0" });
-  /** @type {string[]} */
-  const updates = [];
-  /** @type {(() => void)[]} */
-  const waiting = [];
-  client.setNotificationHandler(ResourceUpdatedNotificationSchema, (n) => {
-    updates.push(n.params.uri);
-    for (const wake of waiting.splice(0)) wake();
-  });
-  await client.connect(transport);
-
-  return {
-    client,
-    updates,
-    /** Waits for an update of `uri`, and forgets every update up to it. */
-    async updated(uri, why) {
-      const deadline = Date.now() + timeoutMs;
-      for (;;) {
-        const at = updates.indexOf(uri);
-        if (at >= 0) {
-          updates.splice(0, at + 1);
-          return;
-        }
-        const left = deadline - Date.now();
-        if (left <= 0) assert.fail(`${name}: no update of ${uri} after ${why}; got [${updates}]`);
-        await new Promise((wake) => {
-          waiting.push(wake);
-          setTimeout(wake, left);
-        });
-      }
-    },
-    /** Asserts that no update of `uri` comes for a while. */
-    async notUpdated(uri, why) {
-      await new Promise((r) => setTimeout(r, quietMs));
-      assert.ok(!updates.includes(uri), `${name}: ${uri} updated after ${why}`);
-    },
-    clear() {
-      updates.length = 0;
-    },
-    /** Waits for an update of `uri`, then for quiet, and forgets them all. */
-    async settled(uri, why) {
-      await this.updated(uri, why);
-      await new Promise((r) => setTimeout(r, quietMs));
-      updates.length = 0;
-    },
-    /** A resource's JSON. */
-    async read(uri) {
-      const { contents } = await client.readResource({ uri });
-      assert.equal(contents.length, 1);
-      assert.equal(contents[0].mimeType, "application/json");
-      return JSON.parse(contents[0].text);
-    },
-    /** `structuredContent` of a tool call that must succeed. */
-    async call(tool, args = {}) {
-      const result = await client.callTool({ name: tool, arguments: args });
-      assert.notEqual(result.isError, true, `${tool} failed: ${result.content?.[0]?.text}`);
-      return result.structuredContent;
-    },
-  };
+/** A client of its own `git-issue mcp` in the repository. */
+function connect(name) {
+  return connectTo({ gitIssue, cwd: repo, env, name });
 }
 
 /** @type {Awaited<ReturnType<typeof connect>>} */

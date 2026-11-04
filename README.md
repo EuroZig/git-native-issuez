@@ -142,8 +142,12 @@ issue refs, so what they import works here as it is. git-native-issuez
 doesn't install the `git-issue-import`, `git-issue-export` or
 `git-issue-sync` entry points, so with both on `PATH` the hyphenated names
 run upstream's; `git issue import` runs this one, which refuses and points
-there. Both install a `git-issue`: `git issue` runs whichever comes first on
-`PATH`, so put this one's directory first.
+there. Both install a `git-issue` and its `git-issue-<command>` entry points:
+`git issue` runs whichever comes first on `PATH`, so put this one's directory
+first. Installed into the same prefix (`~/.local`, say), the one installed
+last overwrites the other's. Install upstream first, then this one; if
+upstream came second, run `update-git-native-issuez` (or `install.sh`)
+again. Upstream's bridges keep working, since this one doesn't install them.
 
 ```sh
 git-issue-import github:owner/repo --state all   # all issues, with comments
