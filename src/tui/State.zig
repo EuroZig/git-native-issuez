@@ -15,6 +15,11 @@ const text_mod = @import("text.zig");
 const list_view = @import("list_view.zig");
 const board_view = @import("board_view.zig");
 const detail_view = @import("detail_view.zig");
+const milestones_view = @import("milestones_view.zig");
+const milestone_view = @import("milestone_view.zig");
+const milestone_filter = @import("milestone_filter.zig");
+const timeline_view = @import("timeline_view.zig");
+const sync_job = @import("sync_job.zig");
 const modal_mod = @import("modal.zig");
 
 const State = @This();
@@ -43,19 +48,86 @@ pub const Action = union(enum) {
     create: store.CreateInput,
     edit: struct { id: Id, spec: issuez.engine.EditSpec },
     milestone: struct { id: Id, name: []const u8 },
+    milestone_link: struct { id: Id, link: store.MilestoneLink },
     state: struct { id: Id, state: []const u8 },
     comment: struct { id: Id, text: []const u8 },
     /// Close an open issue, reopen a done one.
     toggle: Id,
     /// To a board column: a workflow state, or done.
     move: struct { id: Id, column: []const u8, done: bool },
+    create_milestone: store.MilestoneInput,
+    edit_milestone: struct { id: Id, edit: store.MilestoneEdit },
+    /// The milestone view, for a catalog milestone.
+    show_milestone: struct { id: Id, open_only: bool = false },
+    /// Several issues to a milestone, all or none. `unmark`: the marks
+    /// they came from, cleared once moved.
+    move_issues: struct { ids: []const Id, link: store.MilestoneLink, unmark: []const Id = &.{} },
+    /// Several issues under one parent, all or none.
+    adopt: struct { parent: Id, ids: []const Id },
+    /// `create`, keeping the quick-add prompt open for the next one.
+    quick_create: store.CreateInput,
+    /// Into the timeline's draft.
+    stage: @import("timeline_draft.zig").Op,
+    /// Writes the timeline's draft, all or none.
+    apply_draft,
+    /// Applies or discards the draft, then goes on to `then`.
+    leave_timeline: struct { apply: bool, then: timeline_view.edit.Leave },
+    /// With the remote, in the background.
+    sync: sync_job.Kind,
+    open_sync_panel,
+    /// A quarantined issue or milestone, by full ID.
+    resolve: struct { id: Id, how: issuez.sync.Resolution },
+    /// The remote syncs go to; in the modal arena.
+    choose_remote: []const u8,
+};
+
+/// Where syncing stands, for the badge and the panel.
+pub const SyncUi = struct {
+    running: ?sync_job.Kind = null,
+    auto: bool = false,
+    phase: ?issuez.sync.Phase = null,
+    last: ?sync_job.Summary = null,
+    /// Unix seconds the last one finished.
+    last_at: i64 = 0,
+    /// The last one failed and nobody looked yet: the badge is red.
+    failed: bool = false,
+    /// The last automatic one started, unix seconds.
+    auto_at: i64 = 0,
+    /// The last fetch that worked: when, and from where.
+    fetched_at: i64 = 0,
+    fetched_buf: [256]u8 = undefined,
+    fetched_len: u16 = 0,
+    /// The remote of the one running.
+    remote_buf: [256]u8 = undefined,
+    remote_len: u16 = 0,
+
+    pub fn fetchedFrom(u: *const SyncUi) []const u8 {
+        return u.fetched_buf[0..u.fetched_len];
+    }
+
+    pub fn setFetched(u: *SyncUi, remote: []const u8, at: i64) void {
+        u.fetched_len = @intCast(@min(remote.len, u.fetched_buf.len));
+        @memcpy(u.fetched_buf[0..u.fetched_len], remote[0..u.fetched_len]);
+        u.fetched_at = at;
+    }
+
+    pub fn runningRemote(u: *const SyncUi) []const u8 {
+        return u.remote_buf[0..u.remote_len];
+    }
+
+    pub fn setRunningRemote(u: *SyncUi, name: []const u8) void {
+        u.remote_len = @intCast(@min(name.len, u.remote_buf.len));
+        @memcpy(u.remote_buf[0..u.remote_len], name[0..u.remote_len]);
+    }
 };
 
 gpa: Allocator,
 snap: *const Snapshot,
 view: ui.View = .list,
-/// Where the detail view goes back to.
-home: ui.View = .list,
+/// The views to go back to, the last one first: from an issue to the
+/// milestone it was opened from, to the milestones.
+nav: [max_nav]ui.View = undefined,
+nav_len: u8 = 0,
 /// Without the text, which is `search`'s: see `currentQuery`.
 query: filter.Query = .{},
 search: TextArea = .init(false),
@@ -63,6 +135,30 @@ search_focused: bool = false,
 list: list_view.State = .{},
 board: board_view.State = .{},
 detail: detail_view.State = .{},
+milestones: milestones_view.State = .{},
+/// The milestones view's query, without the text, which is `ms_search`'s.
+ms_query: milestone_filter.Query = .{},
+ms_search: TextArea = .init(false),
+milestone: milestone_view.State = .{},
+/// The milestone view's issue query, in tree mode first: milestones
+/// follow the tree. Its text is `mv_search`'s.
+mv_query: filter.Query = .{ .tree = true },
+mv_search: TextArea = .init(false),
+timeline: timeline_view.State = .{},
+/// The timeline's issue query, by start date; its text is `tl_search`'s.
+tl_query: filter.Query = .{ .tree = true, .key = .start },
+tl_search: TextArea = .init(false),
+/// For dates typed as `+3d` and for what is late: the date of the last
+/// frame drawn, where the user is.
+today: issuez.format.fields.Date = .{ .year = 1970, .month = 1, .day = 1 },
+/// Seconds the local clock is ahead of UTC, set before each frame: it
+/// changes with summer time.
+utc_offset_s: i32 = 0,
+sync: SyncUi = .{},
+/// Unix seconds of the last frame drawn.
+now_s: i64 = 0,
+/// A second q or ctrl+c quits while a sync runs.
+quit_armed: bool = false,
 modal: ?Modal = null,
 /// The issue the open modal edits, at the tip it showed when it opened:
 /// what its write expects, so a change made meanwhile isn't overwritten.
@@ -101,6 +197,7 @@ pub const Drag = struct {
 };
 
 pub const double_click_ms = 400;
+const max_nav = 8;
 
 pub fn init(gpa: Allocator, snap: *const Snapshot) State {
     return .{
@@ -115,6 +212,11 @@ pub fn init(gpa: Allocator, snap: *const Snapshot) State {
 pub fn deinit(s: *State) void {
     s.closeModal();
     s.search.deinit(s.gpa);
+    s.ms_search.deinit(s.gpa);
+    s.mv_search.deinit(s.gpa);
+    s.tl_search.deinit(s.gpa);
+    s.timeline.deinit(s.gpa);
+    s.milestone.deinit(s.gpa);
     s.hits.deinit(s.gpa);
     s.detail.deinit(s.gpa);
     s.modal_arena.deinit();
@@ -202,7 +304,8 @@ pub fn modalStale(s: *const State) bool {
 /// After the user was told the issue changed: the next save is meant to
 /// replace what is there now.
 pub fn rebaseModal(s: *State) void {
-    if (s.modal_tip) |*t| t.tip = s.tipOf(t.id.slice()) else return;
+    if (s.modal == null) return;
+    if (s.modal_tip) |*t| t.tip = s.tipOf(t.id.slice());
     modal_mod.rebase(s);
 }
 
@@ -212,9 +315,25 @@ pub fn modalArena(s: *State) Allocator {
 
 // Navigation.
 
+fn push(s: *State, v: ui.View) void {
+    if (s.nav_len == max_nav) {
+        std.mem.copyForwards(ui.View, s.nav[0 .. max_nav - 1], s.nav[1..max_nav]);
+        s.nav_len -= 1;
+    }
+    s.nav[s.nav_len] = v;
+    s.nav_len += 1;
+}
+
+fn pop(s: *State) ?ui.View {
+    if (s.nav_len == 0) return null;
+    s.nav_len -= 1;
+    return s.nav[s.nav_len];
+}
+
 pub fn openIssue(s: *State, id: []const u8) void {
+    if (!timeline_view.edit.mayLeave(s, .{ .issue = .of(id) })) return;
     if (s.view != .detail) {
-        s.home = s.view;
+        s.push(s.view);
         s.detail.clear();
     }
     s.detail.push(id);
@@ -222,14 +341,68 @@ pub fn openIssue(s: *State, id: []const u8) void {
     s.search_focused = false;
 }
 
-pub fn back(s: *State) void {
-    if (s.view != .detail) return;
-    if (!s.detail.pop()) s.view = s.home;
+/// One milestone's view, or the issues in none.
+pub fn openMilestone(s: *State, scope: filter.MilestoneScope) void {
+    if (!timeline_view.edit.mayLeave(s, .{ .milestone = scope })) return;
+    if (s.view != .milestone) s.push(s.view);
+    milestone_view.open(s, scope);
+    s.view = .milestone;
+    s.search_focused = false;
 }
 
+/// The timeline, at a milestone's group.
+pub fn openTimeline(s: *State, scope: filter.MilestoneScope) void {
+    s.switchView(.timeline);
+    timeline_view.showGroup(s, scope);
+}
+
+/// A milestones view row: a milestone, or none past the catalog.
+pub fn openMilestoneRow(s: *State, n: u32) void {
+    if (n >= s.snap.milestones.len) return s.openMilestone(.none);
+    s.openMilestone(.{ .id = .of(s.snap.milestones[n].id) });
+}
+
+pub fn back(s: *State) void {
+    switch (s.view) {
+        .detail => if (s.detail.pop()) return,
+        .milestone => milestone_view.leave(s),
+        else => return,
+    }
+    s.view = s.pop() orelse if (s.view == .milestone) .milestones else .list;
+    s.search_focused = false;
+}
+
+/// Quits, asking once while a sync runs: quitting stops it.
+pub fn quitUnlessSyncing(s: *State) Action {
+    const kind = s.sync.running orelse return .quit;
+    if (s.quit_armed) return .quit;
+    s.quit_armed = true;
+    s.fail("a {s} with {s} is running: q again quits and stops it", .{ kind.label(), s.sync.runningRemote() });
+    return .none;
+}
+
+/// What the timeline's draft would change, now: a frame may not have
+/// counted it, as on a terminal too small.
+fn timelineChanges(s: *State) usize {
+    const t = &s.timeline;
+    if (!t.editing) return 0;
+    const plan = t.draft.plan(s.input_arena.allocator(), s.snap) catch return t.draft.len;
+    return plan.count();
+}
+
+/// To a tab, unless the timeline's draft holds the user back.
+pub fn goTo(s: *State, v: ui.View) void {
+    if (v == s.view) return;
+    if (!timeline_view.edit.mayLeave(s, .{ .view = v })) return;
+    s.switchView(v);
+}
+
+/// To a tab: what was open behind it is forgotten.
 pub fn switchView(s: *State, v: ui.View) void {
-    assert(v != .detail);
+    assert(v != .detail and v != .milestone);
+    milestone_view.leave(s);
     s.view = v;
+    s.nav_len = 0;
     s.search_focused = false;
 }
 
@@ -238,8 +411,41 @@ pub fn current(s: *const State) ?u32 {
     return switch (s.view) {
         .list => s.list.selectedIssue(),
         .board => s.board.selectedIssue(),
+        .milestones => null,
+        .timeline => s.timeline.selectedIssue(),
+        .milestone => s.milestone.panes[s.milestone.pane].selectedIssue(),
         .detail => s.detail.issue(s.snap),
     };
+}
+
+/// The issue query of the view: the milestone view has its own.
+pub fn issueQuery(s: *State) *filter.Query {
+    return switch (s.view) {
+        .milestone => &s.mv_query,
+        .timeline => &s.tl_query,
+        else => &s.query,
+    };
+}
+
+/// The filter text box of the view.
+pub fn searchBox(s: *State) *TextArea {
+    return switch (s.view) {
+        .milestones => &s.ms_search,
+        .milestone => &s.mv_search,
+        .timeline => &s.tl_search,
+        else => &s.search,
+    };
+}
+
+pub fn currentMilestoneQuery(s: *const State) milestone_filter.Query {
+    var q = s.ms_query;
+    q.text = s.ms_search.text();
+    return q;
+}
+
+/// Formatted into the input arena: for one input's dialogs.
+pub fn fmtInput(s: *State, comptime format: []const u8, args: anytype) []const u8 {
+    return std.fmt.allocPrint(s.input_arena.allocator(), format, args) catch "…";
 }
 
 /// After a create: show the new issue where the user is.
@@ -248,6 +454,9 @@ pub fn select(s: *State, id: Id) void {
     s.list.follow = true;
     s.board.selected_id = id;
     s.board.follow = true;
+    const pane = &s.milestone.panes[s.milestone.pane];
+    pane.selected_id = id;
+    pane.follow = true;
 }
 
 /// The create form, with a parent for a sub-issue.
@@ -256,8 +465,18 @@ pub fn newIssue(s: *State, parent: ?u32) void {
     s.openModal(.{ .form = m });
 }
 
-/// The query with the filter text as typed.
+/// The view's issue query with the filter text as typed.
 pub fn currentQuery(s: *const State) filter.Query {
+    if (s.view == .milestone) {
+        var q = s.mv_query;
+        q.text = s.mv_search.text();
+        return q;
+    }
+    if (s.view == .timeline) {
+        var q = s.tl_query;
+        q.text = s.tl_search.text();
+        return q;
+    }
     var q = s.query;
     q.text = s.search.text();
     return q;
@@ -269,6 +488,13 @@ fn filterChanged(s: *State) void {
     s.list.selected = 0;
     s.list.follow = true;
     s.board.follow = true;
+    s.milestones.selected = 0;
+    s.milestones.follow = true;
+    s.timeline.follow = true;
+    for (&s.milestone.panes) |*p| {
+        p.selected = 0;
+        p.follow = true;
+    }
 }
 
 // Drawing.
@@ -277,6 +503,8 @@ pub fn draw(s: *State, win: ui.Window, now_s: i64) Allocator.Error!void {
     _ = s.frame_arena.reset(.retain_capacity);
     s.hits.reset();
     const f: ui.Frame = .{ .gpa = s.gpa, .arena = s.frame_arena.allocator(), .hits = &s.hits, .now = now_s };
+    s.today = .fromUnixLocal(now_s, s.utc_offset_s);
+    s.now_s = now_s;
     win.clear();
     win.hideCursor();
     s.too_small = win.width < 20 or win.height < 6;
@@ -284,16 +512,16 @@ pub fn draw(s: *State, win: ui.Window, now_s: i64) Allocator.Error!void {
         // Nothing shown: the rows and columns were in the frame arena.
         s.list.rows = &.{};
         s.board.columns = &.{};
+        s.milestones.rows = &.{};
+        s.timeline.rows = &.{};
+        for (&s.milestone.panes) |*p| p.rows = &.{};
         _ = ui.text(win, 0, 0, "Terminal too small", .{ .fg = ui.palette.err });
         return;
     }
+    // The view first: the top bar shows what it found, like the
+    // timeline's pending changes.
+    try s.drawView(f, win.child(.{ .y_off = 1, .height = win.height - 2 }));
     try s.drawTopBar(f, win.child(.{ .height = 1 }));
-    const body = win.child(.{ .y_off = 1, .height = win.height - 2 });
-    switch (s.view) {
-        .list => try list_view.draw(s, f, body),
-        .board => try board_view.draw(s, f, body),
-        .detail => try detail_view.draw(s, f, body),
-    }
     s.drawStatusBar(f, win.child(.{ .y_off = @intCast(win.height - 1), .height = 1 }));
     if (s.modal) |*m| {
         s.hits.modal();
@@ -301,17 +529,34 @@ pub fn draw(s: *State, win: ui.Window, now_s: i64) Allocator.Error!void {
     }
 }
 
+/// The body of the current view.
+pub fn drawView(s: *State, f: ui.Frame, body: ui.Window) Allocator.Error!void {
+    switch (s.view) {
+        .list => try list_view.draw(s, f, body),
+        .board => try board_view.draw(s, f, body),
+        .milestones => try milestones_view.draw(s, f, body),
+        .timeline => try timeline_view.draw(s, f, body),
+        .milestone => try milestone_view.draw(s, f, body),
+        .detail => try detail_view.draw(s, f, body),
+    }
+}
+
 fn drawTopBar(s: *State, f: ui.Frame, bar: ui.Window) Allocator.Error!void {
+    if (s.view == .timeline and s.timeline.editing) return s.drawEditBanner(f, bar);
     const bg: ui.Style = .{ .bg = ui.palette.bar_bg };
     bar.fill(.{ .style = bg });
     var col: u16 = 0;
     col += ui.text(bar, 1, 0, "◆ issues", .{ .fg = ui.palette.accent, .bg = ui.palette.bar_bg, .bold = true });
     col += 3;
-    const tabs = [_]struct { ui.View, []const u8 }{ .{ .list, "List" }, .{ .board, "Board" } };
+    const tabs = [_]struct { ui.View, []const u8 }{ .{ .list, "List" }, .{ .board, "Board" }, .{ .milestones, "Milestones" }, .{ .timeline, "Timeline" } };
     for (tabs, 1..) |t, n| {
-        const active = s.view == t[0];
+        const active = s.view == t[0] or (t[0] == .milestones and s.view == .milestone);
         col += try ui.button(f, bar, col, 0, f.fmt("{d} {s}", .{ n, t[1] }), .{ .tab = t[0] }, ui.buttonStyle(active));
         col += 1;
+    }
+    if (s.view == .milestone) {
+        const name = milestone_view.scopeName(s.snap, s.milestone.scope);
+        col += try ui.button(f, bar, col, 0, f.fmt("◆ {s}", .{name}), .{ .command = .back }, ui.buttonStyle(true));
     }
     if (s.view == .detail) {
         if (s.detail.issue(s.snap)) |i| {
@@ -327,22 +572,99 @@ fn drawTopBar(s: *State, f: ui.Frame, bar: ui.Window) Allocator.Error!void {
         if (s.snap.isDone(@intCast(i))) done += 1 else open += 1;
     }
     const counts = f.fmt("{d} open · {d} done", .{ open, done });
+    const badge = s.syncBadge(f);
     // Right side buttons.
     const buttons = [_]struct { []const u8, ui.Command }{
-        .{ "+ New", .new_issue },
+        .{ if (s.view == .milestones) "+ Milestone" else "+ New", if (s.view == .milestones) .new_milestone else .new_issue },
         .{ "⟳", .reload },
         .{ "?", .help },
         .{ "✕", .quit },
     };
     var right: u16 = 0;
     for (buttons) |b| right += bar.gwidth(b[0]) + 3;
+    right += bar.gwidth(badge.text) + 3;
     if (bar.width > right + col + 2) {
         var x = bar.width - right;
         const cw = bar.gwidth(counts);
         if (x > col + cw + 2) _ = ui.text(bar, x - cw - 2, 0, counts, .{ .fg = ui.palette.muted, .bg = ui.palette.bar_bg });
+        x += try ui.button(f, bar, x, 0, badge.text, .{ .command = .sync_panel }, badge.style);
+        x += 1;
         for (buttons) |b| {
-            const st = if (b[1] == .new_issue) ui.buttonStyle(true) else ui.buttonStyle(false);
+            const st = if (b[1] == .new_issue or b[1] == .new_milestone) ui.buttonStyle(true) else ui.buttonStyle(false);
             x += try ui.button(f, bar, x, 0, b[0], .{ .command = b[1] }, st);
+            x += 1;
+        }
+    }
+}
+
+/// `⇅ origin ↑3 !1 ✕2`: what isn't pushed, is quarantined or in
+/// conflict; the phase while syncing; red after a failure, or when the
+/// remote couldn't be read.
+fn syncBadge(s: *State, f: ui.Frame) struct { text: []const u8, style: ui.Style } {
+    const r = &s.snap.remote;
+    const failed: ui.Style = .{ .fg = .{ .index = 231 }, .bg = ui.palette.err, .bold = true };
+    if (s.sync.running) |_| {
+        const what = if (s.sync.phase) |p| switch (p) {
+            .fetching => "fetching",
+            .merging => "merging",
+            .pushing => "pushing",
+        } else "starting";
+        return .{ .text = f.fmt("⇅ {s} {s}…", .{ s.sync.runningRemote(), what }), .style = .{ .fg = ui.palette.accent, .bg = ui.palette.bar_bg, .bold = true } };
+    }
+    const name = r.name orelse {
+        if (r.problem.len > 0) return .{ .text = "⇅ remote ⚠", .style = failed };
+        return .{ .text = "⇅ no remote", .style = .{ .fg = ui.palette.faint, .bg = ui.palette.bar_bg } };
+    };
+    var conflicts: usize = 0;
+    for (s.snap.issues) |issue| {
+        if (!issue.deleted and issue.conflicts.len > 0) conflicts += 1;
+    }
+    const up = r.unpushed.count();
+    const q = r.quarantined.count();
+    if (s.sync.failed or r.problem.len > 0) return .{ .text = f.fmt("⇅ {s} ⚠", .{name}), .style = failed };
+    if (up == 0 and q == 0 and conflicts == 0) return .{ .text = f.fmt("⇅ {s} ✓", .{name}), .style = .{ .fg = ui.palette.ok, .bg = ui.palette.bar_bg } };
+    var buf: std.ArrayList(u8) = .empty;
+    buf.print(f.arena, "⇅ {s}", .{name}) catch {};
+    if (up > 0) buf.print(f.arena, " ↑{d}", .{up}) catch {};
+    if (q > 0) buf.print(f.arena, " !{d}", .{q}) catch {};
+    if (conflicts > 0) buf.print(f.arena, " ✕{d}", .{conflicts}) catch {};
+    const trouble = q > 0 or conflicts > 0;
+    return .{ .text = buf.items, .style = .{ .fg = if (trouble) ui.palette.medium else .{ .index = 252 }, .bg = ui.palette.button_bg, .bold = trouble } };
+}
+
+/// Edit mode can't be missed: the bar turns amber and says what is
+/// pending, with the ways out.
+fn drawEditBanner(s: *State, f: ui.Frame, bar: ui.Window) Allocator.Error!void {
+    const t = &s.timeline;
+    const st: ui.Style = .{ .fg = .{ .index = 16 }, .bg = ui.palette.medium, .bold = true };
+    bar.fill(.{ .style = st });
+    var col: u16 = 1;
+    col += ui.text(bar, col, 0, "✎ EDIT MODE", st);
+    col += 2;
+    const n = t.changes();
+    const what = if (n == 0) "no changes yet" else f.fmt("{d} {s} not applied", .{ n, if (n == 1) "change" else "changes" });
+    col += ui.text(bar, col, 0, what, .{ .fg = .{ .index = 16 }, .bg = ui.palette.medium });
+    if (t.plan) |p| if (p.stale.len > 0) {
+        col += 2;
+        col += ui.text(bar, col, 0, f.fmt("! {d} changed elsewhere", .{p.stale.len}), .{ .fg = .{ .index = 160 }, .bg = ui.palette.medium, .bold = true });
+    };
+    if (t.linking) |id| {
+        col += 2;
+        col += ui.text(bar, col, 0, f.fmt("linking #{s}: pick its blocker", .{issuez.format.uuid.shortId(id.slice())}), .{ .fg = .{ .index = 16 }, .bg = ui.palette.medium, .italic = true });
+    }
+    const buttons = [_]struct { []const u8, ui.TimelineCommand, bool }{
+        .{ "Apply  ctrl+s", .apply, true },
+        .{ "Discard  esc", .discard, false },
+        .{ "↶ Undo  u", .undo, false },
+        .{ "↷ Redo  U", .redo, false },
+    };
+    var w: u16 = 0;
+    for (buttons) |b| w += bar.gwidth(b[0]) + 3;
+    if (bar.width > col + w + 2) {
+        var x = bar.width - w;
+        for (buttons) |b| {
+            const style: ui.Style = if (b[2]) .{ .fg = .{ .index = 231 }, .bg = .{ .index = 28 }, .bold = true } else .{ .fg = .{ .index = 16 }, .bg = .{ .index = 179 } };
+            x += try ui.button(f, bar, x, 0, b[0], .{ .tl_command = b[1] }, style);
             x += 1;
         }
     }
@@ -359,7 +681,16 @@ fn drawStatusBar(s: *State, f: ui.Frame, bar: ui.Window) void {
     const hint: []const u8 = if (s.modal) |m| m.hint() else switch (s.view) {
         .list => "↑↓ move  ⏎ open  n new  a sub-issue  x close/reopen  / filter  s sort  t tree  f scope  2 board  ? help  q quit",
         .board => "←→ column  ↑↓ card  ⏎ open  < > move card  n new  x close/reopen  / filter  s sort  1 list  ? help",
-        .detail => "↑↓ select  ⏎ edit/open  e description  c comment  a sub-issue  x close/reopen  t title  esc back  ? help",
+        .milestones => "↑↓ move  ⏎ open  n new  e edit  r rename  d due  c complete  R retire  o reopen  / filter  s sort  f scope  w progress  ? help",
+        .timeline => if (s.timeline.editing)
+            "←→ move  shift week  < > due  { } start  ( ) scroll  d s e type  ⏎ schedule  m milestone  b/B blocker  u U undo  ctrl+s apply  esc leave"
+        else
+            "↑↓ row  ←→ scroll  z Z zoom  . today  [ ] group  space fold  ⏎ open  D deps  v grouping  E edit  / filter",
+        .milestone => if (s.milestone.split)
+            "+ add existing  m move to…  space mark  > < move across  tab pane  p pick pane  [ ] prev/next  n new  v single  esc back"
+        else
+            "↑↓ move  + add existing  m move to…  space mark  [ ] prev/next milestone  n new  N quick add  v split  ⏎ open  esc back",
+        .detail => "↑↓ select  ⏎ edit/open  e description  c comment  a sub-issue  A add existing  x close/reopen  t title  esc back  ? help",
     };
     _ = ui.text(bar, 1, 0, hint, .{ .fg = ui.palette.muted, .bg = ui.palette.bar_bg });
 }
@@ -379,7 +710,10 @@ pub fn handle(s: *State, input: Input, now_ms: i64) Allocator.Error!Action {
         },
         .key => |k| {
             s.clearStatus();
-            return s.handleKey(k);
+            const had_confirm = s.modal != null and s.modal.? == .confirm;
+            const action = try s.handleKey(k);
+            modal_mod.noteOpener(s, had_confirm, k);
+            return action;
         },
         .mouse => |m| return s.handleMouse(m, now_ms),
     }
@@ -387,49 +721,92 @@ pub fn handle(s: *State, input: Input, now_ms: i64) Allocator.Error!Action {
 
 fn handleKey(s: *State, k: vaxis.Key) Allocator.Error!Action {
     if (k.matches('c', .{ .ctrl = true })) {
-        if (s.modal) |*m| if (!s.discard_armed and m.unsaved()) {
+        // One warning for all that would be lost.
+        const text = if (s.modal) |*m| m.unsaved() else false;
+        const changes = s.timelineChanges();
+        if ((text or changes > 0) and !s.discard_armed) {
             s.discard_armed = true;
-            s.fail("unsaved text: ctrl+c again quits without it, ctrl+s saves", .{});
+            if (text and changes > 0) {
+                s.fail("unsaved text and {d} timeline changes not applied: ctrl+c again quits without them", .{changes});
+            } else if (text) {
+                s.fail("unsaved text: ctrl+c again quits without it, ctrl+s saves", .{});
+            } else {
+                s.fail("{d} timeline changes aren't applied: ctrl+c again quits without them, ctrl+s applies", .{changes});
+            }
             return .none;
-        };
-        return .quit;
+        }
+        return s.quitUnlessSyncing();
     }
-    if (s.too_small) return if (k.matches('q', .{})) .quit else .none;
+    if (s.too_small) {
+        if (!k.matches('q', .{})) return .none;
+        // No room to ask: what would be lost holds it back.
+        if (s.timelineChanges() > 0 or (if (s.modal) |*m| m.unsaved() else false)) {
+            s.fail("unsaved changes: make the terminal larger to keep or drop them", .{});
+            return .none;
+        }
+        return s.quitUnlessSyncing();
+    }
     if (s.modal != null) return modal_mod.key(s, k);
     if (s.search_focused) return s.searchKey(k);
     // Pasted text isn't commands.
     if (s.pasting) return .none;
 
     // Shared keys.
+    // Keys other than ctrl+c disarm it.
+    s.discard_armed = false;
+    const armed = s.quit_armed;
+    s.quit_armed = false;
+    // Edit mode's keys first: `s` is a start date there, not the sort,
+    // and nothing is written before it is applied.
+    if (s.view == .timeline and s.timeline.editing) {
+        if (try timeline_view.edit.key(s, k)) |act| return act;
+    }
     if (k.matches('q', .{})) {
-        if (s.view == .detail) {
+        if (s.view == .detail or s.view == .milestone) {
             s.back();
             return .none;
         }
-        return .quit;
+        if (!timeline_view.edit.mayLeave(s, .quit)) return .none;
+        s.quit_armed = armed;
+        return s.quitUnlessSyncing();
     }
+    if (k.matches('y', .{})) return .{ .sync = .sync };
+    if (k.matches('Y', .{})) return .open_sync_panel;
     if (k.matches('?', .{}) or k.matches(K.f1, .{})) {
-        s.openModal(.{ .help = 0 });
+        s.openModal(.{ .help = .{} });
         return .none;
     }
     if (k.matches('r', .{ .ctrl = true }) or k.matches(K.f5, .{})) return .reload;
-    if (k.matches('1', .{})) {
-        s.switchView(.list);
+    const tabs = [_]struct { u21, ui.View }{ .{ '1', .list }, .{ '2', .board }, .{ '3', .milestones }, .{ '4', .timeline } };
+    for (tabs) |t| if (k.matches(t[0], .{})) {
+        s.goTo(t[1]);
         return .none;
-    }
-    if (k.matches('2', .{})) {
-        s.switchView(.board);
-        return .none;
-    }
+    };
     if (s.view != .detail) {
         if (k.matches('/', .{})) {
             s.search_focused = true;
             return .none;
         }
-        if (k.matches(K.tab, .{})) {
-            s.switchView(if (s.view == .list) .board else .list);
+        if (k.matches(K.escape, .{}) and s.searchBox().text().len > 0) {
+            s.searchBox().clear();
+            s.filterChanged();
             return .none;
         }
+        if (k.matches(K.tab, .{}) and s.view != .milestone) {
+            s.goTo(switch (s.view) {
+                .list => .board,
+                .board => .milestones,
+                .milestones => .timeline,
+                else => .list,
+            });
+            return .none;
+        }
+    }
+    // The issue tables' keys; not the timeline's edit mode: they sort,
+    // filter and create.
+    const timeline = s.view == .timeline and !s.timeline.editing;
+    if (s.view == .list or s.view == .board or s.view == .milestone or timeline) {
+        const q = s.issueQuery();
         if (k.matches('n', .{})) {
             s.newIssue(null);
             return .none;
@@ -439,11 +816,11 @@ fn handleKey(s: *State, k: vaxis.Key) Allocator.Error!Action {
             return .none;
         }
         if (k.matches('S', .{})) {
-            s.query.reverse = !s.query.reverse;
+            q.reverse = !q.reverse;
             return .none;
         }
         if (k.matches('f', .{})) {
-            s.query.scope = switch (s.query.scope) {
+            q.scope = switch (q.scope) {
                 .open => .done,
                 .done => .all,
                 .all => .open,
@@ -451,28 +828,27 @@ fn handleKey(s: *State, k: vaxis.Key) Allocator.Error!Action {
             s.filterChanged();
             return .none;
         }
-        if (k.matches(K.escape, .{}) and s.search.text().len > 0) {
-            s.search.clear();
-            s.filterChanged();
-            return .none;
-        }
     }
     return switch (s.view) {
         .list => list_view.key(s, k),
         .board => board_view.key(s, k),
+        .milestones => milestones_view.key(s, k),
+        .timeline => timeline_view.key(s, k),
+        .milestone => milestone_view.key(s, k),
         .detail => detail_view.key(s, k),
     };
 }
 
 fn searchKey(s: *State, k: vaxis.Key) Allocator.Error!Action {
+    const box = s.searchBox();
     if (s.pasting) {
-        try s.search.pasteKey(s.gpa, k);
+        try box.pasteKey(s.gpa, k);
         s.filterChanged();
         return .none;
     }
     if (k.matches(K.escape, .{})) {
-        if (s.search.text().len > 0) {
-            s.search.clear();
+        if (box.text().len > 0) {
+            box.clear();
             s.filterChanged();
         } else s.search_focused = false;
         return .none;
@@ -481,7 +857,7 @@ fn searchKey(s: *State, k: vaxis.Key) Allocator.Error!Action {
         s.search_focused = false;
         return .none;
     }
-    _ = try s.search.key(s.gpa, s.input_arena.allocator(), k);
+    _ = try box.key(s.gpa, s.input_arena.allocator(), k);
     s.filterChanged();
     return .none;
 }
@@ -489,12 +865,20 @@ fn searchKey(s: *State, k: vaxis.Key) Allocator.Error!Action {
 fn handleMouse(s: *State, m: vaxis.Mouse, now_ms: i64) Allocator.Error!Action {
     const found = s.hits.find(m.col, m.row);
     switch (m.button) {
-        .wheel_up, .wheel_down => {
+        .wheel_up, .wheel_down, .wheel_left, .wheel_right => {
             const delta: i32 = if (m.button == .wheel_up) -3 else 3;
             if (s.modal) |*md| return md.wheel(s, found, delta);
+            if (s.view == .timeline) {
+                timeline_view.wheel(s, m, delta);
+                return .none;
+            }
+            if (m.button == .wheel_left or m.button == .wheel_right) return .none;
             switch (s.view) {
                 .list => s.list.scrollBy(delta),
                 .board => board_view.wheel(s, found, delta),
+                .milestones => s.milestones.scrollBy(delta),
+                .timeline => {},
+                .milestone => milestone_view.wheel(s, found, delta),
                 .detail => s.detail.scrollBy(delta),
             }
             return .none;
@@ -506,20 +890,31 @@ fn handleMouse(s: *State, m: vaxis.Mouse, now_ms: i64) Allocator.Error!Action {
     switch (m.type) {
         .press => {},
         .drag, .motion => {
+            if (s.view == .timeline and (s.timeline.bar_drag != null or s.timeline.row_drag != null)) {
+                timeline_view.edit.dragTo(s, found);
+                return .none;
+            }
             if (s.drag) |*d| {
                 d.moved = true;
                 d.over = if (found) |h| switch (h.target) {
                     .column => |c| c,
                     .card => |c| c.column,
+                    .mrow => |c| c.column,
+                    .mpane => |p| p,
                     else => null,
                 } else null;
             }
             return .none;
         },
         .release => {
+            if (s.timeline.bar_drag != null or s.timeline.row_drag != null) {
+                timeline_view.edit.release(s);
+                return .none;
+            }
             const d = s.drag orelse return .none;
             s.drag = null;
             if (!d.moved) return .none;
+            if (s.view == .milestone) return milestone_view.drop(s, d);
             return board_view.drop(s, d);
         },
     }
@@ -537,29 +932,54 @@ fn handleMouse(s: *State, m: vaxis.Mouse, now_ms: i64) Allocator.Error!Action {
     if (s.modal) |*md| return md.click(s, h);
     if (s.search_focused and h.target != .search) s.search_focused = false;
 
+    const q = s.issueQuery();
     switch (h.target) {
-        .tab => |v| s.switchView(v),
+        .tab => |v| s.goTo(v),
         .command => |c| return s.command(c),
         .scope => |sc| {
-            s.query.scope = sc;
+            q.scope = sc;
             s.filterChanged();
         },
-        .tree => s.query.tree = !s.query.tree,
+        .tree => q.tree = !q.tree,
         .sort => |key| {
-            if (s.query.key == key) s.query.reverse = !s.query.reverse else {
-                s.query.key = key;
-                s.query.reverse = false;
+            if (q.key == key) q.reverse = !q.reverse else {
+                q.key = key;
+                q.reverse = false;
             }
         },
-        .sort_reverse => s.query.reverse = !s.query.reverse,
+        .sort_reverse => if (s.view == .milestones) {
+            s.ms_query.reverse = !s.ms_query.reverse;
+            s.milestones.follow = true;
+        } else {
+            q.reverse = !q.reverse;
+        },
         .search => {
             s.search_focused = true;
-            s.search.clickLine(h.x);
+            s.searchBox().clickLine(h.x);
         },
         .row => |r| return list_view.click(s, r, double),
         .card => |c| return board_view.click(s, c, double),
         .column => |c| board_view.clickColumn(s, c),
         .item => |i| return detail_view.click(s, i),
+        .ms_row => |r| return milestones_view.click(s, r, double),
+        .ms_scope => |sc| {
+            s.ms_query.scope = sc;
+            s.filterChanged();
+        },
+        .ms_sort => |key| {
+            const mq = &s.ms_query;
+            if (mq.key == key) mq.reverse = !mq.reverse else {
+                mq.key = key;
+                mq.reverse = false;
+            }
+            s.milestones.follow = true;
+        },
+        .mrow => |r| return milestone_view.click(s, r, double),
+        .mpane => |p| milestone_view.clickPane(s, p),
+        .tl_row => |r| return timeline_view.click(s, r, h.x, double),
+        .tl_header => timeline_view.clickHeader(s, h.x),
+        .tl_zoom => |z| timeline_view.setZoom(s, z),
+        .tl_command => |c| timeline_view.command(s, c),
         .modal, .backdrop => {},
     }
     return .none;
@@ -567,12 +987,19 @@ fn handleMouse(s: *State, m: vaxis.Mouse, now_ms: i64) Allocator.Error!Action {
 
 pub fn command(s: *State, c: ui.Command) Action {
     switch (c) {
-        .new_issue => s.newIssue(null),
+        .new_issue => if (s.view == .milestones) modal_mod.newMilestone(s) else s.newIssue(null),
+        .new_milestone => modal_mod.newMilestone(s),
         .reload => return .reload,
-        .help => s.openModal(.{ .help = 0 }),
-        .sort => modal_mod.openSort(s),
-        .quit => return .quit,
+        .help => s.openModal(.{ .help = .{} }),
+        .sort => if (s.view == .milestones) modal_mod.openMilestoneSort(s) else modal_mod.openSort(s),
+        .quit => return if (timeline_view.edit.mayLeave(s, .quit)) s.quitUnlessSyncing() else .none,
+        .sync_panel => return .open_sync_panel,
         .back => s.back(),
+        .ms_edit => if (milestone_view.milestoneOf(s.snap, s.milestone.focusedScope())) |n| modal_mod.editMilestone(s, n),
+        .ms_complete => if (milestone_view.milestoneOf(s.snap, s.milestone.focusedScope())) |n| milestones_view.confirmComplete(s, n),
+        .pick_pane => milestone_view.openPaneMenu(s),
+        .ms_add => milestone_view.openAddPicker(s),
+        .ms_move => milestone_view.openMoveMenu(s),
     }
     return .none;
 }

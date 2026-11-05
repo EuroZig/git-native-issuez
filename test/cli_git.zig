@@ -1036,3 +1036,41 @@ test "json output" {
     try testing.expectEqual(@as(u8, 1), refused.code);
     try testing.expect(std.mem.startsWith(u8, refused.stderr, "error: issue.workflowStates"));
 }
+
+test "dates relative to today, in the local time zone" {
+    var sb = try Sandbox.init(.{});
+    defer sb.deinit();
+    const arena = sb.arena();
+    // Fourteen hours ahead of UTC: the local date is often not UTC's.
+    try sb.env.put("TZ", "XXX-14");
+    const in = struct {
+        /// The local date `days` from now, as YYYY-MM-DD.
+        fn f(a: std.mem.Allocator, days: i64) ![]const u8 {
+            const now = std.Io.Timestamp.now(testing.io, .real).toSeconds();
+            const local: u64 = @intCast(now + 14 * 3600 + days * std.time.s_per_day);
+            const day = (std.time.epoch.EpochSeconds{ .secs = local }).getEpochDay();
+            const yd = day.calculateYearDay();
+            const md = yd.calculateMonthDay();
+            return std.fmt.allocPrint(a, "{d:0>4}-{d:0>2}-{d:0>2}", .{ yd.year, md.month.numeric(), md.day_index + 1 });
+        }
+    }.f;
+
+    const before = try in(arena, 3);
+    try expectSuccess(try gitIssue(&sb, &.{ "create", "Soon", "--due", "+3d", "--start", "today" }));
+    const ls = try gitIssue(&sb, &.{ "ls", "--json" });
+    try expectSuccess(ls);
+    const issue = (try std.json.parseFromSliceLeaky(std.json.Value, arena, ls.stdout, .{})).array.items[0].object;
+    const due = issue.get("due").?.string;
+    // Unless midnight passed in between.
+    if (!std.mem.eql(u8, due, before)) try testing.expectEqualStrings(try in(arena, 3), due);
+    try testing.expectEqual(@as(usize, 10), issue.get("start").?.string.len);
+
+    try expectFailure(try gitIssue(&sb, &.{ "create", "Later", "--due", "soon" }), 1, "error: --due must be a date as YYYY-MM-DD, or like today, +3d, fri, eom, not 'soon'\n");
+    const tomorrow = try in(arena, 1);
+    try expectSuccess(try gitIssue(&sb, &.{ "milestone", "create", "v1", "--due", "tomorrow" }));
+    const shown = try gitIssue(&sb, &.{ "milestone", "ls", "--json" });
+    try expectSuccess(shown);
+    const ms = (try std.json.parseFromSliceLeaky(std.json.Value, arena, shown.stdout, .{})).array.items[0].object;
+    const ms_due = ms.get("due").?.string;
+    if (!std.mem.eql(u8, ms_due, tomorrow)) try testing.expectEqualStrings(try in(arena, 1), ms_due);
+}

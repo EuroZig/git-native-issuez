@@ -27,7 +27,7 @@ pub const help =
     \\
     \\Options:
     \\   --name <name>         New name (edit)
-    \\   --due <date>          Due date, YYYY-MM-DD (create, edit)
+    \\   --due <date>          Due date: YYYY-MM-DD, today, +3d, fri, eom (create, edit)
     \\   --no-due              Clear the due date (edit)
     \\   --description <text>  The description (create), or replace it (edit)
     \\   -m, --message <text>  Description (create) or commit message
@@ -84,11 +84,6 @@ pub fn main(comptime B: type, ctx: *context.Context(B), argv: []const []const u8
             return common.unknownOption(ctx.err, "milestone", arg);
         }
     }
-    if (due) |d| if (d.len > 0 and issuez.format.fields.Date.parse(d) == null) {
-        ctx.err.print("error: --due must be a date as YYYY-MM-DD, not '{s}'\n", .{d}) catch {};
-        return common.exit_error;
-    };
-
     if (as_json and sub != .ls and sub != .show)
         return common.missing(ctx.err, "milestone", "--json goes with ls and show");
     if (all and sub != .ls) return common.missing(ctx.err, "milestone", "--all goes with ls");
@@ -105,6 +100,13 @@ pub fn main(comptime B: type, ctx: *context.Context(B), argv: []const []const u8
     if (sub == .create and description != null and message != null)
         return common.missing(ctx.err, "milestone", "give the description once");
     const repo = common.openRepo(B, ctx) orelse return common.exit_fatal;
+    // After opening: `eow` counts git config issue.workDays.
+    if (due) |d| if (d.len > 0) {
+        due = (ctx.date(d) catch return common.exit_error) orelse {
+            ctx.err.print("error: --due must be a date as YYYY-MM-DD, or like today, +3d, fri, eom, not '{s}'\n", .{d}) catch {};
+            return common.exit_error;
+        };
+    };
     const cat = issuez.Catalog(B).of(repo);
     const w = ctx.out;
 

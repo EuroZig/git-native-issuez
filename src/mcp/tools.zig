@@ -275,8 +275,8 @@ pub const CreateArgs = struct {
         .milestone_mode = milestone_mode_description,
         .parent = "The parent issue (ID or unique prefix).",
         .blocked_by = "Issues that block this one (IDs or unique prefixes).",
-        .start = "Start date, YYYY-MM-DD.",
-        .due = "Due date, YYYY-MM-DD.",
+        .start = "Start date: YYYY-MM-DD, or relative to today in the user's time zone: today, tomorrow, +3d, -1w, +2m, fri, eom, eow.",
+        .due = "Due date: YYYY-MM-DD, or relative to today in the user's time zone: today, tomorrow, +3d, -1w, +2m, fri, eom, eow.",
         .estimate = "Minutes, or a duration like 2h, 90m, 1h30m.",
         .workflow = "A workflow state from git config issue.workflowStates (default backlog, ready, in-progress, review).",
         .repo = repo_description,
@@ -345,8 +345,8 @@ pub const EditArgs = struct {
         .parent = "The parent issue (ID or unique prefix). Empty clears it.",
         .add_blocked_by = "Issues that now block this one.",
         .remove_blocked_by = "Blockers to remove.",
-        .start = "Start date, YYYY-MM-DD. Empty clears it.",
-        .due = "Due date, YYYY-MM-DD. Empty clears it.",
+        .start = "Start date: YYYY-MM-DD, or relative to today in the user's time zone (today, +3d, fri, eom). Empty clears it.",
+        .due = "Due date: YYYY-MM-DD, or relative to today in the user's time zone (today, +3d, fri, eom). Empty clears it.",
         .estimate = "Minutes, or a duration like 2h, 90m, 1h30m. Empty clears it.",
         .workflow = "A workflow state from git config issue.workflowStates. Empty clears it.",
         .message = "The commit subject. Default: what changed.",
@@ -524,6 +524,10 @@ pub fn Handler(comptime Repos: type) type {
     return struct {
         repos: *Repos,
         subscriptions: Subscriptions = .{},
+        /// Where relative dates (`+3d`, `fri`) count from: the local date
+        /// in `zone`, at `now_s` if set (tests), else now.
+        zone: issuez.local_time.Zone = .utc,
+        now_s: ?i64 = null,
 
         const Self = @This();
 
@@ -568,6 +572,18 @@ pub fn Handler(comptime Repos: type) type {
 
         fn close(h: *Self, s: Session) void {
             h.repos.close(s.backend);
+        }
+
+        /// A date as given (`2026-12-01`, `today`, `+3d`, `fri`, `eom`), as
+        /// git stores it; empty stays empty, for clearing.
+        fn date(h: *Self, ctx: *mcp.Context, s: Session, field: []const u8, value: ?[]const u8) !?[]const u8 {
+            const v = value orelse return null;
+            const today = h.zone.today(h.now_s orelse issuez.local_time.nowS(ctx.io));
+            return try issuez.format.dates.resolve(ctx.arena, v, today, s.settings.work_days) orelse ctx.fail(
+                error.InvalidValue,
+                "{s} must be a date as YYYY-MM-DD, or like today, +3d, fri, eom, not '{s}'",
+                .{ field, v },
+            );
         }
 
         pub fn listIssues(h: *Self, ctx: *mcp.Context, args: ListArgs) !IssueList {
@@ -717,8 +733,8 @@ pub fn Handler(comptime Repos: type) type {
                 .milestone_mode = ms.mode,
                 .parent = if (args.parent) |p| (try resolveIssue(ctx, s, p)).id() else null,
                 .blocked_by = blockers.items,
-                .start_date = args.start,
-                .due_date = args.due,
+                .start_date = try h.date(ctx, s, "start", args.start),
+                .due_date = try h.date(ctx, s, "due", args.due),
                 .estimate_minutes = if (args.estimate) |e| try duration(ctx, e) else null,
                 .workflow = args.workflow,
             }) catch |e| return s.fail(ctx, e);
@@ -758,8 +774,8 @@ pub fn Handler(comptime Repos: type) type {
                 .add_labels = args.add_labels,
                 .remove_labels = args.remove_labels,
                 .assignee = args.assignee,
-                .start_date = args.start,
-                .due_date = args.due,
+                .start_date = try h.date(ctx, s, "start", args.start),
+                .due_date = try h.date(ctx, s, "due", args.due),
                 .workflow = args.workflow,
                 .message = args.message,
                 .expect = try expectVersion(ctx, s.backend, args.expect_version),

@@ -19,8 +19,21 @@ pub fn Context(comptime B: type) type {
         backend: B.Error!*B,
         /// What `openRepo` read from git config. Null before.
         settings: ?@import("issuez").Settings = null,
+        /// What relative dates (`+3d`, `fri`) count from. Null: the local
+        /// date now, read when first needed.
+        today: ?@import("issuez").format.fields.Date = null,
 
         const Self = @This();
+
+        /// A date as typed (`2026-12-01`, `today`, `+3d`, `fri`, `eom`),
+        /// as git stores it; empty stays empty. Null when it isn't one.
+        pub fn date(ctx: *Self, text: []const u8) std.mem.Allocator.Error!?[]const u8 {
+            const issuez = @import("issuez");
+            const today = ctx.today orelse issuez.local_time.today(ctx.io, ctx.gpa, ctx.environ_map);
+            ctx.today = today;
+            const work_days: issuez.format.fields.WorkDays = if (ctx.settings) |s| s.work_days else .all;
+            return issuez.format.dates.resolve(ctx.arena, text, today, work_days);
+        }
 
         /// A file named on the command line. A backend with files of its
         /// own (the simulator's world) serves them instead of the disk.

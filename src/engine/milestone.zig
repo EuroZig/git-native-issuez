@@ -376,6 +376,74 @@ pub fn Catalog(comptime B: type) type {
             return self.repo.appendMilestone(arena, name, spec.author, spec.expect, fixed);
         }
 
+        /// A milestone's new due date, for `editBatch`.
+        pub const DueEdit = struct {
+            id: []const u8,
+            /// Empty clears it.
+            due: []const u8,
+            expect: ?Oid = null,
+            author: ?repo_mod.Signature = null,
+        };
+
+        /// What `editBatch` wrote.
+        pub const BatchResult = struct {
+            issues: []R.EditResult,
+            /// The milestones' new tips, in the order of the due edits.
+            milestones: []Oid,
+        };
+
+        /// Issue edits and milestones' due dates, in one ref transaction:
+        /// all of it or none. See `Repo.editBatch`.
+        pub fn editBatch(
+            self: Self,
+            arena: Allocator,
+            issue_edits: []const R.BatchEdit,
+            dues: []const DueEdit,
+        ) Error!BatchResult {
+            for (dues, 0..) |d, n| {
+                if (!uuid_fmt.isCanonical(d.id)) return error.ReferenceNotFound;
+                if (d.due.len > 0 and fields_fmt.Date.parse(d.due) == null) return error.InvalidValue;
+                for (dues[0..n]) |prev| if (std.mem.eql(u8, prev.id, d.id)) return error.DuplicateEdit;
+            }
+            const tips = try arena.alloc(Oid, dues.len);
+            const more: DueCommits = .{ .catalog = self, .dues = dues, .tips = tips };
+            const issues = try self.repo.editBatchWith(arena, issue_edits, more);
+            return .{ .issues = issues, .milestones = tips };
+        }
+
+        const DueCommits = struct {
+            catalog: Self,
+            dues: []const DueEdit,
+            /// Each attempt's new tips.
+            tips: []Oid,
+
+            pub fn ops(c: DueCommits, arena: Allocator, out: *std.ArrayList(@import("../backend/contract.zig").RefUpdate)) Error!void {
+                const repo = c.catalog.repo;
+                for (c.dues, c.tips) |d, *new| {
+                    const name = try repo_mod.milestoneRefName(arena, d.id);
+                    const tip = (try repo.backend.resolveRef(name)) orelse return error.ReferenceNotFound;
+                    if (d.expect) |want| if (!want.eql(tip)) return error.VersionMismatch;
+                    // Loaded like any write's, for the history limits.
+                    _ = try repo.load(arena, .{ .name = name, .tip = tip });
+                    const message = try trailers.build(arena, "Update due date", "", &.{.{ .key = "X-Due-Date", .value = d.due }});
+                    const who = try repo.identity(arena, d.author);
+                    new.* = try repo.writeCommit(arena, &.{tip}, who, message);
+                    try out.append(arena, .{ .name = name, .op = .{ .update = .{ .new = new.*, .old = tip } } });
+                }
+            }
+
+            pub fn moved(c: DueCommits) Error!bool {
+                const repo = c.catalog.repo;
+                var buf: [128]u8 = undefined;
+                for (c.dues) |d| if (d.expect) |want| {
+                    const name = std.fmt.bufPrint(&buf, "{s}{s}", .{ ref_prefix, d.id }) catch return true;
+                    const now = (try repo.backend.resolveRef(name)) orelse return error.ReferenceNotFound;
+                    if (!now.eql(want)) return true;
+                };
+                return false;
+            }
+        };
+
         /// Every non-deleted issue in the milestone has to be done, and
         /// each gets a verify line. Writes that add work pin the milestone
         /// ref and move its guard ref, see `repo.guard_ref_prefix`.
@@ -796,4 +864,65 @@ test "Catalog.choose" {
     _ = try cat.edit(arena, v1_id, .{ .status = .retired });
     try testing.expect((try cat.choose(arena, .{ .name = "v1" })).refused == .not_open);
     try testing.expect((try cat.choose(arena, .{ .id = "v1" })).refused == .retired_name);
+}
+
+test "editBatch: issues and due dates together" {
+    var arena_state: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var world: GitSim.World = .{ .seed = 52, .clones = &.{.{ .name = "a" }} };
+    var sim = try GitSim.init(arena, &world, 0);
+    const cat = Catalog(GitSim).init(&sim);
+    const v1 = try cat.create(arena, .{ .name = "v1", .due = "2026-12-01" });
+    const issue = try cat.repo.create(arena, .{ .title = "Work" });
+    const ref = try std.fmt.allocPrint(arena, "refs/issues/{s}", .{issue.id.slice()});
+
+    _ = try cat.editBatch(arena, &.{.{ .ref_name = ref, .spec = .{ .due_date = "2026-11-20" } }}, &.{
+        .{ .id = v1.id.slice(), .due = "2026-12-15", .expect = v1.tip },
+    });
+    const m = (try cat.find(arena, v1.id.slice())).?;
+    try testing.expectEqual(@as(u8, 15), m.due.?.day);
+    // Only a due date; a stale one writes nothing, the issue neither.
+    const before = (try sim.resolveRef(ref)).?;
+    try testing.expectError(error.VersionMismatch, cat.editBatch(arena, &.{.{ .ref_name = ref, .spec = .{ .due_date = "2026-11-21" } }}, &.{
+        .{ .id = v1.id.slice(), .due = "", .expect = v1.tip },
+    }));
+    try testing.expect(before.eql((try sim.resolveRef(ref)).?));
+    const cleared = try cat.editBatch(arena, &.{}, &.{.{ .id = v1.id.slice(), .due = "" }});
+    try testing.expect((try cat.find(arena, v1.id.slice())).?.due == null);
+    try testing.expect(cleared.milestones[0].eql((try sim.resolveRef(try repo_mod.milestoneRefName(arena, v1.id.slice()))).?));
+
+    // Into the milestone and its new due date at once: the guard reads the
+    // milestone the batch updates, which checks it.
+    const moved = try cat.editBatch(arena, &.{.{ .ref_name = ref, .spec = .{ .milestone_id = v1.id.slice() } }}, &.{
+        .{ .id = v1.id.slice(), .due = "2027-01-15" },
+    });
+    try testing.expectEqual(@as(usize, 1), moved.issues.len);
+    const linked = try cat.repo.load(arena, .{ .name = ref, .tip = moved.issues[0].tip });
+    try testing.expectEqualStrings(v1.id.slice(), linked.ext.milestone_id.?);
+    const m_after = (try cat.find(arena, v1.id.slice())).?;
+    try testing.expect(m_after.tip.eql(moved.milestones[0]));
+    try testing.expectEqual(@as(u16, 2027), m_after.due.?.year);
+
+    // A milestone that is gone: not found, whether or not expected.
+    const gone = "0f0f0f0f-0f0f-4f0f-8f0f-0f0f0f0f0f0f";
+    try testing.expectError(error.ReferenceNotFound, cat.editBatch(arena, &.{}, &.{.{ .id = gone, .due = "" }}));
+    try testing.expectError(error.DuplicateEdit, cat.editBatch(arena, &.{}, &.{
+        .{ .id = v1.id.slice(), .due = "" },
+        .{ .id = v1.id.slice(), .due = "" },
+    }));
+}
+
+test "editBatch: a milestone deleted after a conflict is not found" {
+    var arena_state: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var world: GitSim.World = .{ .seed = 53, .clones = &.{.{ .name = "a" }} };
+    var sim = try GitSim.init(arena, &world, 0);
+    const cat = Catalog(GitSim).init(&sim);
+    const v1 = try cat.create(arena, .{ .name = "v1" });
+    const name = try repo_mod.milestoneRefName(arena, v1.id.slice());
+    try sim.updateRefs(&.{.{ .name = name, .op = .{ .delete = v1.tip } }});
+    const more: Catalog(GitSim).DueCommits = .{ .catalog = cat, .dues = &.{.{ .id = v1.id.slice(), .due = "", .expect = v1.tip }}, .tips = &.{} };
+    try testing.expectError(error.ReferenceNotFound, more.moved());
 }

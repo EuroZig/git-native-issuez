@@ -10,8 +10,8 @@ command. It reads and writes the format of
 - **More than format 1:** parent issues, blockers, dates, estimates,
   workflow states, milestones and image attachments, as extra trailers that
   upstream keeps and shows.
-- **A terminal UI:** a list, a kanban board and a detail view, usable with
-  the mouse, updating live when anyone else writes.
+- **A terminal UI:** a list, a kanban board, milestones and an editable
+  timeline, usable with the mouse, updating live when anyone else writes.
 - **For coding agents:** `git issue mcp`, a Model Context Protocol server.
 - **For scripts:** `--json` on every read command, man pages and shell
   completions.
@@ -102,16 +102,33 @@ See [docs/attachments.md](docs/attachments.md).
 
 ### Terminal UI
 
-`git issue tui`, or plain `git issue` at a terminal:
+`git issue tui`, or plain `git issue` at a terminal: a list (optionally a
+tree of sub-issues), a kanban board by workflow state and a detail view
+where every field is edited in place. `?` shows the keys; the mouse works
+everywhere. The list is sortable and filterable
+(`label:ui @ada p:high is:blocked -label:wontfix`). It updates live when
+the CLI, another TUI or an agent writes.
 
-- a list, optionally as a tree of sub-issues, sortable and filterable
-  (`label:ui @ada p:high is:blocked -label:wontfix`);
-- a kanban board with a column per workflow state;
-- a detail view where every field is edited in place.
+Milestones (`3`) shows every milestone with its progress, due date and
+health, sorted and filtered as you like; `n` creates one. Enter opens its
+issues, where `m`, `[` `]`, marks and a second pane (`v`) move work
+between milestones, and `n` or `N` adds work to it. The timeline (`4`)
+draws milestones, issues and blockers over the days. In its edit mode
+(`E`) bars move and stretch with the keys or the mouse, nothing is written
+until `ctrl+s` applies every change at once, and the view can't be left
+with changes neither applied nor discarded. Schedules count working days
+when `git config issue.workDays "mon,tue,wed,thu,fri"` says which they
+are, and an estimate's day is `git config issue.hoursPerDay` hours
+(default 8).
 
-`?` shows the keys, and the mouse works everywhere. It follows what others
-write as it happens: `git issue` in another terminal, another TUI, an agent,
-a sync.
+The `⇅` badge in the top bar says what isn't pushed (`↑`), what the
+remote's history was refused for (`!`) and what is left in conflict
+(`✕`). `y` syncs (fetch, merge, push, as `git issue sync`) in the
+background; `Y` opens the sync panel, where quarantines are resolved and
+conflicts opened. `git config issue.remote` picks the remote, and `git
+config issue.autoSync 10` fetches and merges every 10 minutes (it never
+pushes on its own). git never prompts: it runs without a terminal, ssh in
+batch mode unless you set your own ssh command, so a key needs an agent.
 
 ### Coding agents (MCP)
 

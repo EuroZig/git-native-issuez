@@ -7,11 +7,14 @@ const assert = std.debug.assert;
 const Allocator = std.mem.Allocator;
 const vaxis = @import("vaxis");
 const filter = @import("filter.zig");
+const milestone_filter = @import("milestone_filter.zig");
+const timeline_view = @import("timeline_view.zig");
+const issuez = @import("issuez");
 
 pub const Window = vaxis.Window;
 pub const Style = vaxis.Style;
 
-pub const View = enum { list, board, detail };
+pub const View = enum { list, board, milestones, timeline, milestone, detail };
 
 /// What a click means. One union for every view, so the hit map is shared.
 pub const Target = union(enum) {
@@ -29,6 +32,20 @@ pub const Target = union(enum) {
     column: u16,
     /// A detail view item, by position in its items.
     item: u16,
+    /// A milestones view row, by position in its rows.
+    ms_row: u32,
+    ms_scope: milestone_filter.Scope,
+    ms_sort: milestone_filter.SortKey,
+    /// A row of a milestone view pane: `column` is the pane.
+    mrow: Card,
+    /// A milestone view pane's body, for drops.
+    mpane: u16,
+    /// A timeline row, by position in its rows.
+    tl_row: u32,
+    /// The timeline's dates: a click centers that day.
+    tl_header,
+    tl_zoom: timeline_view.Zoom,
+    tl_command: TimelineCommand,
     /// Modals.
     modal: ModalTarget,
     /// Anywhere outside the open modal.
@@ -41,7 +58,9 @@ pub const Target = union(enum) {
     }
 };
 
-pub const Command = enum { new_issue, reload, help, sort, quit, back };
+pub const Command = enum { new_issue, new_milestone, reload, help, sort, quit, back, ms_edit, ms_complete, ms_add, ms_move, pick_pane, sync_panel };
+
+pub const TimelineCommand = enum { earlier, later, today, deps, grouping, edit, apply, discard, undo, redo };
 
 pub const ModalTarget = union(enum) {
     ok,
@@ -148,6 +167,10 @@ pub const palette = struct {
     pub const button_bg: vaxis.Color = .{ .index = 240 };
     pub const muted: vaxis.Color = .{ .index = 245 };
     pub const faint: vaxis.Color = .{ .index = 241 };
+    /// Marked rows.
+    pub const mark_bg: vaxis.Color = .{ .index = 22 };
+    /// The empty part of a progress bar.
+    pub const faint_bg: vaxis.Color = .{ .index = 238 };
     pub const open: vaxis.Color = .{ .index = 114 };
     pub const done: vaxis.Color = .{ .index = 140 };
     pub const err: vaxis.Color = .{ .index = 203 };
@@ -159,6 +182,59 @@ pub const palette = struct {
     pub const label: vaxis.Color = .{ .index = 180 };
     pub const id: vaxis.Color = .{ .index = 109 };
 };
+
+pub fn healthColor(h: issuez.schedule.Health) vaxis.Color {
+    return switch (h) {
+        .on_track => palette.ok,
+        .at_risk => palette.medium,
+        .overdue => palette.err,
+        .done => palette.done,
+        .no_date => palette.muted,
+        .retired => palette.faint,
+    };
+}
+
+pub fn healthGlyph(h: issuez.schedule.Health) []const u8 {
+    return switch (h) {
+        .on_track => "●",
+        .at_risk => "▲",
+        .overdue => "✕",
+        .done => "✓",
+        .no_date => "○",
+        .retired => "–",
+    };
+}
+
+const eighths = [_][]const u8{ "", "▏", "▎", "▍", "▌", "▋", "▊", "▉" };
+
+/// A bar of `width` cells: `done` of `total` solid, then `active` lighter,
+/// then the rest faint, in eighths of a cell.
+pub fn progressBar(win: Window, col: u16, row: u16, width: u16, done: u32, active: u32, total: u32, bg: vaxis.Color) void {
+    if (width == 0 or row >= win.height) return;
+    const cells: u64 = width;
+    const done_8: u64 = if (total == 0) 0 else @as(u64, done) * cells * 8 / total;
+    const active_8: u64 = if (total == 0) 0 else @as(u64, done + active) * cells * 8 / total;
+    var x: u16 = 0;
+    while (x < width) : (x += 1) {
+        const lo: u64 = @as(u64, x) * 8;
+        const cell = win.child(.{ .x_off = col + x, .y_off = row, .width = 1, .height = 1 });
+        if (done_8 >= lo + 8) {
+            _ = text(cell, 0, 0, "█", .{ .fg = palette.ok, .bg = bg });
+        } else if (active_8 >= lo + 8) {
+            // Partly done, the rest in progress: the done part shows.
+            const part = done_8 -| lo;
+            if (part > 0) {
+                _ = text(cell, 0, 0, eighths[@intCast(part)], .{ .fg = palette.ok, .bg = palette.low });
+            } else _ = text(cell, 0, 0, "█", .{ .fg = palette.low, .bg = bg });
+        } else if (done_8 > lo) {
+            _ = text(cell, 0, 0, eighths[@intCast(done_8 - lo)], .{ .fg = palette.ok, .bg = palette.faint_bg });
+        } else if (active_8 > lo) {
+            _ = text(cell, 0, 0, eighths[@intCast(active_8 - lo)], .{ .fg = palette.low, .bg = palette.faint_bg });
+        } else {
+            _ = text(cell, 0, 0, " ", .{ .bg = palette.faint_bg });
+        }
+    }
+}
 
 pub fn priorityColor(p: ?[]const u8) vaxis.Color {
     const v = p orelse return palette.faint;

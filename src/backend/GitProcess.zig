@@ -37,6 +37,8 @@ common_dir: ?[]u8 = null,
 tmp_dir: ?[]u8 = null,
 /// git-lfs's object directory, resolved on first use.
 git_lfs_dir: ?[]u8 = null,
+/// See `OpenOptions.no_terminal`.
+no_terminal: bool = false,
 /// Whether `git lfs version` runs, checked once.
 git_lfs: ?bool = null,
 /// stderr of the last failed command, for error messages.
@@ -76,6 +78,11 @@ pub const OpenOptions = struct {
     path: []const u8,
     environ_map: *const std.process.Environ.Map,
     timeouts: Timeouts = .{},
+    /// git runs in a session of its own, without a controlling terminal,
+    /// so nothing it starts (ssh, a credential helper) can prompt on the
+    /// terminal or read from it: for a program that owns the terminal,
+    /// like a TUI. On Windows git gets no console.
+    no_terminal: bool = false,
 };
 
 /// The longest a call may take, start to finish, before git is stopped and
@@ -118,6 +125,7 @@ pub fn open(io: Io, gpa: Allocator, options: OpenOptions) Error!GitProcess {
         .repo_path = repo_path,
         .format = .sha1,
         .timeouts = options.timeouts,
+        .no_terminal = options.no_terminal,
         .cat_file = null,
         .last_stderr = undefined,
         .last_stderr_len = 0,
@@ -906,7 +914,7 @@ fn runWithin(
     const io = gp.io;
     const by = gp.deadline(limit);
     var child = try gp.spawn(argv, stdin != null);
-    defer child.kill(io);
+    defer gp.stop(&child);
 
     if (stdin) |data| {
         var rest = data;
@@ -935,9 +943,9 @@ fn runPair(
 ) Error![2]RunResult {
     const by = gp.deadline(gp.timeouts.command);
     var first = try gp.spawn(a, false);
-    defer first.kill(gp.io);
+    defer gp.stop(&first);
     var second = try gp.spawn(b, false);
-    defer second.kill(gp.io);
+    defer gp.stop(&second);
     return .{ try gp.collect(arena, &first, by), try gp.collect(arena, &second, by) };
 }
 
@@ -966,6 +974,7 @@ fn spawn(gp: *GitProcess, argv: []const []const u8, stdin: bool) Error!std.proce
     assert(argv.len > 0 and std.mem.eql(u8, argv[0], "git"));
     // `lastStderr` belongs to the latest command.
     gp.last_stderr_len = 0;
+    if (builtin.os.tag != .windows and gp.no_terminal) return gp.spawnDetached(argv, stdin);
     return std.process.spawn(gp.io, .{
         .argv = argv,
         .cwd = .{ .path = gp.repo_path },
@@ -973,11 +982,102 @@ fn spawn(gp: *GitProcess, argv: []const []const u8, stdin: bool) Error!std.proce
         .stdin = if (stdin) .pipe else .ignore,
         .stdout = .pipe,
         .stderr = .pipe,
+        .create_no_window = gp.no_terminal,
     }) catch |err| switch (err) {
         error.OutOfMemory => return error.OutOfMemory,
         error.Canceled => return error.Canceled,
         else => return error.GitSpawnFailed,
     };
+}
+
+/// Stops a command from `spawn` unless it is over. A detached one leads a
+/// process group of its own, and what it started (ssh) stops with it.
+fn stop(gp: *GitProcess, child: *std.process.Child) void {
+    if (builtin.os.tag != .windows and gp.no_terminal) {
+        if (child.id) |pid| _ = std.posix.system.kill(-pid, .TERM);
+    }
+    child.kill(gp.io);
+}
+
+/// `spawn` in a new session (`setsid`): std's spawn can't. Everything is
+/// allocated before the fork, as the child may only make system calls:
+/// another thread may hold the allocator's lock.
+fn spawnDetached(gp: *GitProcess, argv: []const []const u8, stdin: bool) Error!std.process.Child {
+    const sys = std.posix.system;
+    const errno = std.posix.errno;
+    var arena_state: std.heap.ArenaAllocator = .init(gp.gpa);
+    defer arena_state.deinit();
+    const a = arena_state.allocator();
+    const argv_z = try a.allocSentinel(?[*:0]const u8, argv.len, null);
+    for (argv, argv_z) |arg, *z| z.* = (try a.dupeZ(u8, arg)).ptr;
+    const env = try gp.env.createPosixBlock(a, .{});
+    const cwd = try a.dupeZ(u8, gp.repo_path);
+    // Where `git` may be, in PATH order.
+    var programs: std.ArrayList([*:0]const u8) = .empty;
+    var dirs = std.mem.tokenizeScalar(u8, gp.env.get("PATH") orelse "/usr/bin:/bin", ':');
+    while (dirs.next()) |dir| try programs.append(a, try std.fmt.allocPrintSentinel(a, "{s}/{s}", .{ dir, argv[0] }, 0));
+
+    const pipe = struct {
+        fn make() Error![2]std.posix.fd_t {
+            return Io.Threaded.pipe2(.{ .CLOEXEC = true }) catch error.GitSpawnFailed;
+        }
+        fn close(fds: [2]std.posix.fd_t) void {
+            _ = sys.close(fds[0]);
+            _ = sys.close(fds[1]);
+        }
+    };
+    const null_in = Io.Dir.openFileAbsolute(gp.io, "/dev/null", .{}) catch return error.GitSpawnFailed;
+    defer null_in.close(gp.io);
+    const in: ?[2]std.posix.fd_t = if (stdin) try pipe.make() else null;
+    errdefer if (in) |p| pipe.close(p);
+    const out = try pipe.make();
+    errdefer pipe.close(out);
+    const err = try pipe.make();
+    errdefer pipe.close(err);
+    // Written to by the child only when exec fails.
+    const report = try pipe.make();
+    defer _ = sys.close(report[0]);
+
+    const forked = sys.fork();
+    if (errno(forked) != .SUCCESS) {
+        _ = sys.close(report[1]);
+        return error.GitSpawnFailed;
+    }
+    if (forked == 0) {
+        _ = sys.setsid();
+        const stdin_fd = if (in) |p| p[0] else null_in.handle;
+        if (errno(sys.dup2(stdin_fd, 0)) == .SUCCESS and errno(sys.dup2(out[1], 1)) == .SUCCESS and
+            errno(sys.dup2(err[1], 2)) == .SUCCESS and errno(sys.chdir(cwd)) == .SUCCESS)
+        {
+            for (programs.items) |program| _ = sys.execve(program, argv_z.ptr, env.slice.ptr);
+        }
+        _ = sys.write(report[1], "x", 1);
+        if (builtin.link_libc) std.c._exit(127) else std.os.linux.exit_group(127);
+    }
+    _ = sys.close(report[1]);
+    if (in) |p| _ = sys.close(p[0]);
+    _ = sys.close(out[1]);
+    _ = sys.close(err[1]);
+    var child: std.process.Child = .{
+        .id = @intCast(forked),
+        .thread_handle = {},
+        .stdin = if (in) |p| .{ .handle = p[1], .flags = .{ .nonblocking = false } } else null,
+        .stdout = .{ .handle = out[0], .flags = .{ .nonblocking = false } },
+        .stderr = .{ .handle = err[0], .flags = .{ .nonblocking = false } },
+        .request_resource_usage_statistics = false,
+    };
+    // EOF: exec worked, and closed the child's end.
+    var byte: [1]u8 = undefined;
+    while (true) {
+        const n = sys.read(report[0], &byte, 1);
+        switch (errno(n)) {
+            .SUCCESS => if (n == 0) return child else break,
+            .INTR => continue,
+            else => break,
+        }
+    }
+    _ = child.wait(gp.io) catch {};
+    return error.GitSpawnFailed;
 }
 
 /// Reads a started command's output to the end and waits for it.

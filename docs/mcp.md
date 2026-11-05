@@ -69,7 +69,7 @@ To try it, run `npx @modelcontextprotocol/inspector git issue mcp`.
 | `show_issue` | One issue with its description and its updates, each a `comment` or an `update` (`kind`; deleted comments left out) |
 | `search_issues` | Issues whose title, fields, description or comments contain a text, with the matching lines; a limit (default 50) and the total |
 | `list_milestones` | The milestone catalog with each milestone's progress |
-| `create_issue` | A new issue, with labels, assignee, priority, milestone, parent, blockers, dates, estimate and workflow state |
+| `create_issue` | A new issue, with labels, assignee, priority, milestone, parent, blockers, dates, estimate and workflow state; dates are `YYYY-MM-DD` or relative to today in the user's time zone (`today`, `+3d`, `fri`, `eom`) |
 | `comment_issue` | A comment on an issue |
 | `edit_issue` | Title, description and fields in one commit; an empty value clears a field |
 | `set_issue_state` | Close, reopen or set another state, with reason, fixing commit and release |

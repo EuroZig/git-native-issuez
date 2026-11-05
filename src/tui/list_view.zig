@@ -39,7 +39,7 @@ pub const State = struct {
         l.scroll = @intCast(std.math.clamp(@as(i64, l.scroll) + delta, 0, max));
     }
 
-    fn moveTo(l: *State, snap: *const Snapshot, row: i64) void {
+    pub fn moveTo(l: *State, snap: *const Snapshot, row: i64) void {
         if (l.rows.len == 0) return;
         l.selected = @intCast(std.math.clamp(row, 0, @as(i64, @intCast(l.rows.len - 1))));
         l.selected_id = .of(snap.issues[l.rows[l.selected].issue].id);
@@ -69,8 +69,11 @@ const Layout = struct {
     }
 };
 
-/// The filter text, scope, tree and sort controls, shared with the board.
-pub fn drawFilterBar(s: *AppState, f: ui.Frame, bar: ui.Window, tree: bool) Allocator.Error!void {
+/// The filter text, scope, tree and sort controls of the view's issue
+/// query, shared with the board and the milestone view. Returns the
+/// columns used.
+pub fn drawFilterBar(s: *AppState, f: ui.Frame, bar: ui.Window, tree: bool) Allocator.Error!u16 {
+    const q = s.issueQuery();
     const bg: ui.Style = .{ .bg = palette.panel_bg };
     bar.fill(.{ .style = bg });
     var col: u16 = 1;
@@ -78,31 +81,56 @@ pub fn drawFilterBar(s: *AppState, f: ui.Frame, bar: ui.Window, tree: bool) Allo
     col += ui.text(bar, col, 0, "/ ", search_icon);
     const box_w: u16 = @min(@max(bar.width / 3, 20), 48);
     const box = bar.child(.{ .x_off = col, .width = box_w, .height = 1 });
-    try s.search.draw(f.arena, box, .{ .bg = palette.input_bg }, s.search_focused, "filter: words, label:x, @who, p:high, is:blocked");
+    try s.searchBox().draw(f.arena, box, .{ .bg = palette.input_bg }, s.search_focused, "filter: words, label:x, @who, p:high, is:blocked");
     try f.hit(box, .search);
     col += box_w + 2;
 
     for ([_]filter.Scope{ .open, .done, .all }) |sc| {
-        col += try ui.button(f, bar, col, 0, sc.label(), .{ .scope = sc }, ui.buttonStyle(s.query.scope == sc));
+        col += try ui.button(f, bar, col, 0, sc.label(), .{ .scope = sc }, ui.buttonStyle(q.scope == sc));
     }
     col += 2;
     if (tree) {
-        col += try ui.button(f, bar, col, 0, if (s.query.tree) "▾ Tree" else "▸ Tree", .tree, ui.buttonStyle(s.query.tree));
+        col += try ui.button(f, bar, col, 0, if (q.tree) "▾ Tree" else "▸ Tree", .tree, ui.buttonStyle(q.tree));
         col += 2;
     }
     col += ui.text(bar, col, 0, "Sort ", .{ .fg = palette.muted, .bg = palette.panel_bg });
-    const sort_label = switch (s.query.key) {
+    const sort_label = switch (q.key) {
         inline else => |k| @tagName(k) ++ " ▾",
     };
     col += try ui.button(f, bar, col, 0, sort_label, .{ .command = .sort }, ui.buttonStyle(false));
-    col += try ui.button(f, bar, col, 0, if (s.query.reverse) "↑" else "↓", .sort_reverse, ui.buttonStyle(false));
+    col += try ui.button(f, bar, col, 0, if (q.reverse) "↑" else "↓", .sort_reverse, ui.buttonStyle(false));
+    return col;
 }
 
 pub fn draw(s: *AppState, f: ui.Frame, win: ui.Window) Allocator.Error!void {
-    const l = &s.list;
+    _ = try drawFilterBar(s, f, win.child(.{ .height = 1 }), true);
+    const rows = try filter.rows(f.arena, s.snap, s.currentQuery());
+    try drawTable(s, f, win.child(.{ .y_off = 1, .height = win.height -| 1 }), .{ .l = &s.list, .rows = rows, .query = s.query });
+}
+
+/// One issue table: the list, or a pane of the milestone view.
+pub const Table = struct {
+    l: *State,
+    rows: []const filter.Row,
+    /// For the header's sort marks.
+    query: filter.Query,
+    /// A pane of the milestone view: its rows' targets are `.mrow`.
+    pane: ?u16 = null,
+    /// Issues shown with a mark.
+    marks: []const Id = &.{},
+    /// Without the focus the selection shows dimmer.
+    focused: bool = true,
+    /// What it says without rows; null: the list's messages.
+    empty: ?[]const u8 = null,
+    /// Draws a drop target's highlight.
+    drop: bool = false,
+};
+
+/// The header and the rows, keeping the selection on its issue.
+pub fn drawTable(s: *AppState, f: ui.Frame, win: ui.Window, t: Table) Allocator.Error!void {
+    const l = t.l;
     const snap = s.snap;
-    try drawFilterBar(s, f, win.child(.{ .height = 1 }), true);
-    l.rows = try filter.rows(f.arena, snap, s.currentQuery());
+    l.rows = t.rows;
 
     // Keep the selection on its issue.
     if (l.selected_id) |*id| {
@@ -114,11 +142,12 @@ pub fn draw(s: *AppState, f: ui.Frame, win: ui.Window) Allocator.Error!void {
     if (l.selected >= l.rows.len) l.selected = @intCast(l.rows.len -| 1);
     if (l.rows.len > 0) l.selected_id = .of(snap.issues[l.rows[l.selected].issue].id);
 
-    const head = win.child(.{ .y_off = 1, .height = 1 });
+    const head = win.child(.{ .height = 1 });
     const lay = Layout.of(win.width);
-    try drawHeader(s, f, head, lay);
+    try drawHeader(f, head, lay, t.query);
 
-    const body = win.child(.{ .y_off = 2, .height = win.height -| 2 });
+    const body = win.child(.{ .y_off = 1, .height = win.height -| 1 });
+    if (t.drop) body.fill(.{ .style = .{ .bg = palette.hover_bg } });
     l.visible = @max(body.height, 1);
     if (l.follow) {
         if (l.selected < l.scroll) l.scroll = l.selected;
@@ -127,12 +156,13 @@ pub fn draw(s: *AppState, f: ui.Frame, win: ui.Window) Allocator.Error!void {
     }
     l.scroll = @min(l.scroll, @as(u32, @intCast(l.rows.len -| l.visible)));
 
+    if (t.pane) |p| try f.hit(body, .{ .mpane = p });
     if (l.rows.len == 0) {
-        const msg = if (snap.issues.len == 0) "No issues yet." else "No issues match the filter.";
+        const msg = t.empty orelse if (snap.issues.len == 0) "No issues yet." else "No issues match the filter.";
         const mid = body.height / 2;
         const mw = body.gwidth(msg);
         _ = ui.text(body, (body.width -| mw) / 2, mid -| 1, msg, .{ .fg = palette.muted });
-        _ = try ui.button(f, body, (body.width -| 14) / 2, mid + 1, "+ New issue", .{ .command = .new_issue }, ui.buttonStyle(true));
+        if (t.pane == null) _ = try ui.button(f, body, (body.width -| 14) / 2, mid + 1, "+ New issue", .{ .command = .new_issue }, ui.buttonStyle(true));
         return;
     }
 
@@ -140,8 +170,13 @@ pub fn draw(s: *AppState, f: ui.Frame, win: ui.Window) Allocator.Error!void {
     while (y < body.height and l.scroll + y < l.rows.len) : (y += 1) {
         const index = l.scroll + y;
         const row_win = body.child(.{ .y_off = y, .height = 1 });
-        drawRow(s, f, row_win, lay, l.rows[index], index == l.selected);
-        try f.hit(row_win, .{ .row = index });
+        const r = l.rows[index];
+        const marked = for (t.marks) |*m| {
+            if (m.eql(snap.issues[r.issue].id)) break true;
+        } else false;
+        const dragged = if (s.drag) |d| d.moved and t.pane != null and d.card.column == t.pane.? and d.card.index == index else false;
+        drawRow(s, f, row_win, lay, r, .{ .selected = index == l.selected, .focused = t.focused, .marked = marked, .dragged = dragged });
+        try f.hit(row_win, if (t.pane) |p| .{ .mrow = .{ .column = p, .index = index } } else .{ .row = index });
     }
     // Scroll position.
     if (l.rows.len > body.height and body.height > 0) {
@@ -151,7 +186,7 @@ pub fn draw(s: *AppState, f: ui.Frame, win: ui.Window) Allocator.Error!void {
     }
 }
 
-fn drawHeader(s: *AppState, f: ui.Frame, head: ui.Window, lay: Layout) Allocator.Error!void {
+fn drawHeader(f: ui.Frame, head: ui.Window, lay: Layout, q: filter.Query) Allocator.Error!void {
     const style: ui.Style = .{ .fg = palette.muted, .bold = true };
     head.fill(.{ .style = .{} });
     var x: u16 = 0;
@@ -179,22 +214,25 @@ fn drawHeader(s: *AppState, f: ui.Frame, head: ui.Window, lay: Layout) Allocator
             .updated => "Upd",
         };
         const cell = head.child(.{ .x_off = x, .width = w, .height = 1 });
-        var cx = ui.text(cell, 0, 0, name, if (sort_key != null and sort_key.? == s.query.key) .{ .fg = palette.accent, .bold = true } else style);
+        var cx = ui.text(cell, 0, 0, name, if (sort_key != null and sort_key.? == q.key) .{ .fg = palette.accent, .bold = true } else style);
         if (sort_key) |k| {
-            if (k == s.query.key) cx += ui.text(cell, cx, 0, if (s.query.reverse) " ↑" else " ↓", .{ .fg = palette.accent });
+            if (k == q.key) cx += ui.text(cell, cx, 0, if (q.reverse) " ↑" else " ↓", .{ .fg = palette.accent });
             try f.hit(cell, .{ .sort = k });
         }
         x += w;
     }
 }
 
-fn drawRow(s: *AppState, f: ui.Frame, win: ui.Window, lay: Layout, row: filter.Row, selected: bool) void {
+const RowLook = struct { selected: bool, focused: bool = true, marked: bool = false, dragged: bool = false };
+
+fn drawRow(s: *AppState, f: ui.Frame, win: ui.Window, lay: Layout, row: filter.Row, look: RowLook) void {
     const snap = s.snap;
     const i = row.issue;
     const issue = snap.issues[i];
     const done = snap.isDone(i);
-    const bg: vaxis.Color = if (selected) palette.select_bg else .default;
-    if (selected) win.fill(.{ .style = .{ .bg = bg } });
+    const selected = look.selected;
+    const bg: vaxis.Color = if (look.dragged) palette.hover_bg else if (selected and look.focused) palette.select_bg else if (look.marked) palette.mark_bg else .default;
+    if (bg != .default) win.fill(.{ .style = .{ .bg = bg } });
     const dim = row.context;
 
     var x: u16 = 0;
@@ -209,8 +247,14 @@ fn drawRow(s: *AppState, f: ui.Frame, win: ui.Window, lay: Layout, row: filter.R
                 // Deleted: only as the context of a sub-issue in the tree.
                 const glyph: []const u8 = if (issue.deleted) "✗" else if (done) "✓" else if (blocked) "⊘" else "●";
                 const fg = if (issue.deleted) palette.err else if (done) palette.done else if (blocked) palette.err else palette.open;
-                _ = ui.text(cell, 0, 0, if (selected) "▌" else " ", .{ .fg = palette.accent, .bg = bg });
+                _ = ui.text(cell, 0, 0, if (look.marked) "✓" else if (selected) "▌" else " ", .{ .fg = if (look.marked) palette.ok else if (look.focused) palette.accent else palette.muted, .bg = bg });
                 _ = ui.text(win, 1, 0, glyph, .{ .fg = fg, .bg = bg, .dim = dim });
+                // Not pushed yet, or refused by the remote.
+                if (snap.remote.isQuarantined(issue.id)) {
+                    _ = ui.text(win, 2, 0, "!", .{ .fg = palette.err, .bg = bg, .bold = true });
+                } else if (snap.remote.isUnpushed(issue.id)) {
+                    _ = ui.text(win, 2, 0, "↑", .{ .fg = palette.faint, .bg = bg });
+                }
             },
             .id => _ = ui.text(cell, 0, 0, issuez.format.uuid.shortId(issue.id), .{ .fg = palette.id, .bg = bg, .dim = dim }),
             .title => {
@@ -223,13 +267,15 @@ fn drawRow(s: *AppState, f: ui.Frame, win: ui.Window, lay: Layout, row: filter.R
                 const ts: ui.Style = .{
                     .fg = if (done or dim) palette.muted else .default,
                     .bg = bg,
-                    .bold = selected and !dim,
+                    .bold = selected and look.focused and !dim,
                     .strikethrough = (done and issue.state == .closed) or issue.deleted,
                 };
                 tx += ui.text(cell, tx, 0, issue.title, ts);
                 if (snap.proj.progress(i)) |p| {
-                    _ = ui.text(cell, tx + 1, 0, f.fmt("{d}/{d}", .{ p.closed, p.total }), .{ .fg = palette.muted, .bg = bg });
+                    tx += 1;
+                    tx += ui.text(cell, tx, 0, f.fmt("{d}/{d}", .{ p.closed, p.total }), .{ .fg = palette.muted, .bg = bg });
                 }
+                if (row.inherited) _ = ui.text(cell, tx + 1, 0, "↳ inherited", .{ .fg = palette.faint, .bg = bg, .italic = true });
             },
             .labels => {
                 var lx: u16 = 0;
@@ -261,7 +307,11 @@ fn drawRow(s: *AppState, f: ui.Frame, win: ui.Window, lay: Layout, row: filter.R
 }
 
 pub fn key(s: *AppState, k: vaxis.Key) Allocator.Error!AppState.Action {
-    const l = &s.list;
+    return tableKey(s, &s.list, k) orelse .none;
+}
+
+/// Keys on an issue table; null when the key isn't one of them.
+pub fn tableKey(s: *AppState, l: *State, k: vaxis.Key) ?AppState.Action {
     const snap = s.snap;
     const sel: i64 = l.selected;
     const page: i64 = @max(l.visible, 2) - 1;
@@ -280,13 +330,14 @@ pub fn key(s: *AppState, k: vaxis.Key) Allocator.Error!AppState.Action {
     } else if (k.matches(K.enter, .{}) or k.matches(K.right, .{}) or k.matches('l', .{})) {
         if (l.selectedIssue()) |i| s.openIssue(snap.issues[i].id);
     } else if (k.matches('t', .{})) {
-        s.query.tree = !s.query.tree;
+        const q = s.issueQuery();
+        q.tree = !q.tree;
         l.follow = true;
     } else if (k.matches('a', .{})) {
         if (l.selectedIssue()) |i| s.newIssue(i);
     } else if (k.matches('x', .{})) {
         if (l.selectedIssue()) |i| return s.toggleAction(i);
-    }
+    } else return null;
     return .none;
 }
 

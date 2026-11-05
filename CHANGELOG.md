@@ -8,7 +8,78 @@ versions may change the library API; the on-disk format only ever grows (see
 
 ## [Unreleased]
 
+### Added
+- The terminal UI's milestones view (`3`): every milestone with a progress
+  bar, open, done and blocked counts, the due date and how far off it is,
+  and its health (on track, at risk, overdue). Sorted by due date, name,
+  progress, open work, health or creation, scoped to open, completed,
+  retired or all, filtered with `is:overdue`, `is:at-risk`, `is:empty`,
+  `due:<date` and words. Milestones are created, renamed, given a due date,
+  completed (after saying what is still open), retired and reopened there.
+- One milestone's issues, or those in none: moved to another milestone with
+  a menu, `[` and `]`, several at once with marks, or dragged between two
+  panes; created in it with the form or one title after another. Moving an
+  issue that inherits its milestone asks whether alone or with its parent.
+  `+` (or the "Add issues" button) brings existing issues in: a list of
+  everything elsewhere to search as you type, Tab marks several. `m` (or
+  "Move to…") moves the selected or marked issues out the same way.
+- An issue's detail view adds existing issues as sub-issues: `A` (or the
+  "+ Existing" button, or the row under the sub-issues) opens the same
+  list to search, Tab marks several, and they move under it in one write.
+  Its ancestors and current sub-issues aren't offered; `a` still creates
+  a new one.
+- The timeline (`4`): milestones, issues and blockers over the days, by
+  day, week or month, with what doesn't fit marked. Its edit mode stages
+  moves, new dates, estimates, milestones and blockers, by key or by
+  dragging, with undo; `ctrl+s` writes them all at once, and leaving the
+  view asks to apply or discard them. Changes made elsewhere meanwhile are
+  marked, to keep or drop.
+- Syncing from the TUI: a badge with what is unpushed, quarantined and in
+  conflict for the remote; `y` syncs in the background (fetch, merge,
+  push) with progress in the status line; `Y` opens a panel listing them,
+  resolving quarantines (`a` accepts the remote's version, `l` keeps
+  ours) and opening conflicting fields. `↑` and `!` mark issues in the
+  list, board and detail view, and `is:unpushed` / `is:quarantined`
+  filter them.
+  `git config issue.remote` picks the remote and `issue.autoSync`
+  fetches and merges every so many minutes, never pushing. git never
+  prompts on the TUI's terminal: it runs without one, ssh in batch mode
+  unless you set your own ssh command. With OpenSSH 8.4 or later, outside
+  Windows, syncs share one ssh connection for 5 minutes through a socket
+  in a private directory, so the fetch, the push and the next syncs pay
+  the handshake once; a push right after a fetch doesn't fetch again.
+  Quitting during a sync stops it.
+- Dates take `today`, `tomorrow`, `+3d`, `-1w`, `+2m`, `fri`, `eom` and
+  `eow` besides `YYYY-MM-DD`: in the TUI, which shows the date they mean
+  as they are typed, in `--start` and `--due` (issues and milestones), and
+  in the MCP tools' `start` and `due`. "Today" is the local date, from
+  `TZ` or `/etc/localtime`. What is written is always `YYYY-MM-DD`.
+- `git config issue.workDays` and `issue.hoursPerDay`: which days count in
+  a schedule, and how long an estimate's day is.
+- Library: sync progress phases, `Sync.unpushed` and `Sync.counts`,
+  `sync.defaultRemote` (`UnknownIssueRemote` when `issue.remote` names
+  no remote), and the `issue.autoSync` setting.
+- Library: `format.dates` parses dates as people type them, relative to
+  a given today (`dates.resolve` gives `YYYY-MM-DD`); `local_time` reads
+  the local time zone (`TZ`, `/etc/localtime`) without libc; `Date` has
+  `addMonths`, `endOfMonth` and `daysInMonth`.
+- Library: `GitProcess.OpenOptions.no_terminal` runs git without a
+  controlling terminal (a session of its own on POSIX, no console on
+  Windows); stopping such a call stops its whole process group.
+- Library: `Repo.editBatch` and `Catalog.editBatch` write several issues'
+  edits, and milestones' due dates, in one ref transaction, checking the
+  rules (parents, depth, blockers, milestones) on the issues as the batch
+  leaves them; `Catalog.editBatch` returns the milestones' new tips too.
+  `schedule` summarizes milestones, rates their health (in the caller's
+  time zone), and turns dates and estimates into timeline spans with
+  their warnings; `fields.Date` counts days and `fields.WorkDays` working
+  days.
+
 ### Changed
+- Library: `settings.parse(arena, done, workflow)` is now
+  `settings.parse(arena, raw)`, taking every raw `issue.*` value at once.
+- The TUI's milestone menu links by milestone ID, so two milestones of one
+  name are no longer refused, and offers inheriting from the parent.
 - `install.sh` is a quarter of its size: download, check against
   `SHA256SUMS`, unpack, and write `update-git-native-issuez`. `--uninstall`
   stays. Gone: the sudo handling (pipe it into `sudo sh` for a system

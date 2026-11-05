@@ -347,6 +347,8 @@ pub fn Repo(comptime B: type) type {
             InvalidIssueRef,
             /// The tip is no longer the `expect`ed one.
             VersionMismatch,
+            /// `editBatch` with two edits of one issue.
+            DuplicateEdit,
             /// Use `loadPage`.
             TooManyIssues,
             InvalidLimits,
@@ -1028,6 +1030,158 @@ pub fn Repo(comptime B: type) type {
             spec: EditSpec,
         ) Error!EditResult {
             try self.checkLimits();
+            const changes = try self.checkEdit(arena, spec);
+            const builder: EditBuilder = .{ .repo = self, .spec = spec, .changes = changes };
+            const tip = try self.appendCommit(arena, ref_name, spec.author, spec.expect, builder);
+            return .{ .tip = tip, .changes = changes };
+        }
+
+        pub const BatchEdit = struct { ref_name: []const u8, spec: EditSpec };
+
+        /// Several issues' edits, one commit each, written in one ref
+        /// transaction: all of them or, on any failure, none. Each edit is
+        /// checked like `edit`, its guards against the issues as the whole
+        /// batch leaves them: the batch's issues with their new commits,
+        /// every other one as it is. So edits can't make a parent or
+        /// blocker loop between them, nest too deep, or put open work
+        /// under a closed issue or in a completed milestone. Sub-issues are
+        /// found as they were before the batch, which errs towards refusing:
+        /// one the batch moves away still counts for depth and milestones.
+        /// With `expect` on an edit whose issue moved, `VersionMismatch` and
+        /// nothing written; without, a concurrent change retries the whole
+        /// batch.
+        pub fn editBatch(
+            self: Self,
+            arena: Allocator,
+            edits: []const BatchEdit,
+        ) Error![]EditResult {
+            return self.editBatchWith(arena, edits, NoMore{});
+        }
+
+        const NoMore = struct {
+            fn ops(_: NoMore, _: Allocator, _: *std.ArrayList(contract.RefUpdate)) Error!void {}
+            fn moved(_: NoMore) Error!bool {
+                return false;
+            }
+        };
+
+        /// The issues a batch edits, as it leaves them, by ID.
+        const Batched = std.StringHashMapUnmanaged(Issue);
+
+        /// `editBatch`, with more ref updates from `more` in the same
+        /// transaction, like the milestone catalog's: `more.ops(arena,
+        /// &ops)` appends them on every attempt, `more.moved()` says
+        /// whether a ref it expects moved after a conflict. A guard that
+        /// read a ref `more` updates needs it at the update's old tip.
+        pub fn editBatchWith(
+            self: Self,
+            arena: Allocator,
+            edits: []const BatchEdit,
+            more: anytype,
+        ) Error![]EditResult {
+            try self.checkLimits();
+            const out = try arena.alloc(EditResult, edits.len);
+            for (edits, 0..) |e, n| {
+                if (!std.mem.startsWith(u8, e.ref_name, issue_ref_prefix) or
+                    e.ref_name.len == issue_ref_prefix.len or
+                    !contract.isValidRefName(e.ref_name)) return error.InvalidIssueRef;
+                for (edits[0..n]) |prev| if (std.mem.eql(u8, prev.ref_name, e.ref_name)) return error.DuplicateEdit;
+                out[n].changes = try self.checkEdit(arena, e.spec);
+            }
+            const any_expect = for (edits) |e| {
+                if (e.spec.expect != null) break true;
+            } else false;
+
+            var attempt: u8 = 0;
+            while (attempt < self.limits.cas_retries) : (attempt += 1) {
+                var ops: std.ArrayList(contract.RefUpdate) = .empty;
+                // Every commit first, each on its tip read once, so that the
+                // guards see the batch's issues as it leaves them.
+                var batched: Batched = .empty;
+                const currents = try arena.alloc(Issue, edits.len);
+                for (edits, currents, 0..) |e, *current, n| {
+                    const tip = (try self.backend.resolveRef(e.ref_name)) orelse return error.IssueDisappeared;
+                    if (e.spec.expect) |want| if (!want.eql(tip)) return error.VersionMismatch;
+                    current.* = try self.load(arena, .{ .name = e.ref_name, .tip = tip });
+                    const builder: EditBuilder = .{ .repo = self, .spec = e.spec, .changes = out[n].changes };
+                    const message = try builder.message(arena, current.*);
+                    const who = try self.identity(arena, e.spec.author);
+                    const oid = try self.writeCommit(arena, &.{tip}, who, message);
+                    out[n].tip = oid;
+                    try ops.append(arena, .{ .name = e.ref_name, .op = .{ .update = .{ .new = oid, .old = tip } } });
+                    try batched.put(arena, current.id, try self.load(arena, .{ .name = e.ref_name, .tip = oid }));
+                }
+                var verify: std.ArrayList(contract.RefUpdate) = .empty;
+                var bumps: std.ArrayList(struct { name: []const u8, old: ?Oid }) = .empty;
+                var cache: ?Guarded.ParentCache = null;
+                for (edits, currents, 0..) |e, current, n| {
+                    const builder: EditBuilder = .{
+                        .repo = self,
+                        .spec = e.spec,
+                        .changes = out[n].changes,
+                        .batch = &batched,
+                    };
+                    const guarded = try builder.guard(arena, current);
+                    for (guarded.verify) |v| {
+                        const seen = for (verify.items) |x| {
+                            if (std.mem.eql(u8, x.name, v.name)) break true;
+                        } else false;
+                        if (!seen) try verify.append(arena, v);
+                    }
+                    // A guard ref moves once, to any of the new commits.
+                    for (guarded.bump) |b| {
+                        const seen = for (bumps.items) |x| {
+                            if (std.mem.eql(u8, x.name, b.name)) break true;
+                        } else false;
+                        if (!seen) try bumps.append(arena, .{ .name = b.name, .old = b.old });
+                    }
+                    if (guarded.parent_cache) |c| cache = c;
+                }
+                try more.ops(arena, &ops);
+                if (ops.items.len == 0) return out;
+                // A ref the batch updates is checked by its update, when a
+                // guard read it at the update's old tip. Read at another,
+                // it moved in between: the attempt is stale.
+                const updates = ops.items.len;
+                var stale = false;
+                for (verify.items) |v| {
+                    const same: ?bool = for (ops.items[0..updates]) |o| {
+                        if (std.mem.eql(u8, o.name, v.name))
+                            break o.op == .update and v.op.verify != null and o.op.update.old.eql(v.op.verify.?);
+                    } else null;
+                    if (same) |ok| {
+                        if (!ok) stale = true;
+                    } else try ops.append(arena, v);
+                }
+                for (bumps.items) |b| try ops.append(arena, .{ .name = b.name, .op = if (b.old) |old|
+                    .{ .update = .{ .new = out[0].tip, .old = old } }
+                else
+                    .{ .create = out[0].tip } });
+                self.forgetListing();
+                const conflict = stale or written: {
+                    self.backend.updateRefs(ops.items) catch |err| switch (err) {
+                        error.RefConflict => break :written true,
+                        else => |e| return e,
+                    };
+                    break :written false;
+                };
+                if (conflict) {
+                    if (any_expect) for (edits) |e| if (e.spec.expect) |want| {
+                        const now = (try self.backend.resolveRef(e.ref_name)) orelse
+                            return error.IssueDisappeared;
+                        if (!now.eql(want)) return error.VersionMismatch;
+                    };
+                    if (try more.moved()) return error.VersionMismatch;
+                    continue;
+                }
+                if (cache) |c| self.writeParentCache(c);
+                return out;
+            }
+            return error.ConcurrentModification;
+        }
+
+        /// What `edit` checks before writing; the changes for the subject.
+        fn checkEdit(self: Self, arena: Allocator, spec: EditSpec) Error![]const Change {
             if (spec.isEmpty()) return error.NothingToEdit;
             if (spec.description != null) if (givenMessage(spec.message)) |m| if (splitMessage(m).body.len != 0)
                 return error.MessageHasBody;
@@ -1082,9 +1236,7 @@ pub fn Repo(comptime B: type) type {
                 if (d.len > self.limits.max_body_bytes) return error.TooLong;
                 try changes.append(arena, .description);
             }
-            const builder: EditBuilder = .{ .repo = self, .spec = spec, .changes = changes.items };
-            const tip = try self.appendCommit(arena, ref_name, spec.author, spec.expect, builder);
-            return .{ .tip = tip, .changes = changes.items };
+            return changes.items;
         }
 
         fn appendCommit(
@@ -1207,6 +1359,8 @@ pub fn Repo(comptime B: type) type {
             repo: Self,
             spec: EditSpec,
             changes: []const Change,
+            /// In a batch, for the guards.
+            batch: ?*const Batched = null,
 
             pub fn message(b: EditBuilder, arena: Allocator, current: Issue) Error![]const u8 {
                 const spec = b.spec;
@@ -1357,6 +1511,7 @@ pub fn Repo(comptime B: type) type {
                     .milestone_id = id_after,
                     .milestone_mode = mode_after,
                     .milestone_changed = spec.milestone_id != null or spec.milestone_mode != null,
+                    .batch = b.batch,
                 });
             }
         };
@@ -1376,6 +1531,8 @@ pub fn Repo(comptime B: type) type {
             milestone_changed: bool,
             /// A deleted issue comes back.
             restored: bool = false,
+            /// The other issues a batch writes, as it leaves them.
+            batch: ?*const Batched = null,
         };
 
         /// Every issue a guard reads is loaded once and gets a verify line,
@@ -1385,8 +1542,10 @@ pub fn Repo(comptime B: type) type {
             repo: Self,
             arena: Allocator,
             /// The issue being written never gets a verify line: the update
-            /// itself checks its ref, and a ref can't appear twice.
+            /// itself checks its ref, and a ref can't appear twice. Nor do
+            /// the issues of its batch, which `get` reads from here.
             self_id: ?[]const u8,
+            batch: ?*const Batched = null,
             cache: std.StringHashMapUnmanaged(?Issue) = .empty,
             verify: std.ArrayList(contract.RefUpdate) = .empty,
             bump: std.ArrayList(Guarded.Bump) = .empty,
@@ -1399,6 +1558,7 @@ pub fn Repo(comptime B: type) type {
 
             fn get(g: *Guard, id: []const u8) Error!?Issue {
                 if (g.cache.get(id)) |hit| return hit;
+                if (g.batch) |b| if (b.get(id)) |issue| return issue;
                 g.scanned += 1;
                 if (g.scanned > g.repo.limits.max_guard_scan) return error.GuardScanTooLarge;
                 const name = try std.fmt.allocPrint(g.arena, "{s}{s}", .{ issue_ref_prefix, id });
@@ -1431,6 +1591,7 @@ pub fn Repo(comptime B: type) type {
 
             fn pin(g: *Guard, name: []const u8, id: []const u8, tip: Oid) Error!void {
                 if (g.self_id) |s| if (std.mem.eql(u8, s, id)) return;
+                if (g.batch) |b| if (std.mem.startsWith(u8, name, issue_ref_prefix) and b.contains(id)) return;
                 for (g.verify.items) |v| if (std.mem.eql(u8, v.name, name)) return;
                 try g.verify.append(g.arena, .{ .name = name, .op = .{ .verify = tip } });
             }
@@ -1510,7 +1671,8 @@ pub fn Repo(comptime B: type) type {
                 const index = &g.index.?;
                 var out: std.ArrayList(Issue) = .empty;
                 if (index.children.get(id)) |kids| for (kids.items) |r| {
-                    const issue = index.loaded.get(r.id()) orelse
+                    const batched = if (g.batch) |b| b.get(r.id()) else null;
+                    const issue = batched orelse index.loaded.get(r.id()) orelse
                         g.repo.load(g.arena, r) catch |err| switch (err) {
                         error.CorruptIssue,
                         error.HistoryTooLong,
@@ -1669,7 +1831,7 @@ pub fn Repo(comptime B: type) type {
 
         /// Returns verify lines for every issue it read.
         fn runGuards(self: Self, arena: Allocator, p: Proposal) Error!Guarded {
-            var g: Guard = .{ .repo = self, .arena = arena, .self_id = p.id };
+            var g: Guard = .{ .repo = self, .arena = arena, .self_id = p.id, .batch = p.batch };
             const eql = std.mem.eql;
 
             if (p.parent_changed) if (p.parent) |parent| {
@@ -2616,4 +2778,141 @@ test "CAS conflict rebuilds the commit" {
     try testing.expectEqualStrings("concurrent comment", issue.comments[0].subject);
     try testing.expectEqualStrings("Update labels", issue.comments[1].subject);
     try testing.expectEqual(@as(usize, 2), issue.labels.len);
+}
+
+test "editBatch: all or nothing" {
+    var arena_state: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var world: GitSim.World = .{ .seed = 7, .clones = &.{.{ .name = "a" }} };
+    var sim = try GitSim.init(arena, &world, 0);
+    const repo = Repo(GitSim).init(&sim);
+    const Catalog = @import("milestone.zig").Catalog(GitSim);
+    const cat = Catalog.of(repo);
+    const v1 = try cat.create(arena, .{ .name = "v1" });
+
+    const ref = struct {
+        fn f(a: Allocator, id: []const u8) []const u8 {
+            return std.fmt.allocPrint(a, "refs/issues/{s}", .{id}) catch unreachable;
+        }
+    }.f;
+    const a = try repo.create(arena, .{ .title = "A" });
+    const b = try repo.create(arena, .{ .title = "B" });
+    const c = try repo.create(arena, .{ .title = "C" });
+    const ra = ref(arena, a.id.slice());
+    const rb = ref(arena, b.id.slice());
+    const rc = ref(arena, c.id.slice());
+
+    // Two issues into one milestone: one guard ref, moved once.
+    const res = try repo.editBatch(arena, &.{
+        .{ .ref_name = ra, .spec = .{ .milestone_id = v1.id.slice(), .due_date = "2026-12-01" } },
+        .{ .ref_name = rb, .spec = .{ .milestone_id = v1.id.slice(), .start_date = "2026-11-10" } },
+    });
+    try testing.expectEqual(@as(usize, 2), res.len);
+    const la = try repo.load(arena, .{ .name = ra, .tip = res[0].tip });
+    try testing.expectEqualStrings(v1.id.slice(), la.ext.milestone_id.?);
+    try testing.expect(la.ext.due_date.?.eql(fields_fmt.Date.parse("2026-12-01").?));
+
+    // One stale expect: nothing written.
+    const tip_c = (try sim.resolveRef(rc)).?;
+    const tip_b = (try sim.resolveRef(rb)).?;
+    _ = try repo.edit(arena, rc, .{ .title = "C, renamed elsewhere" });
+    try testing.expectError(error.VersionMismatch, repo.editBatch(arena, &.{
+        .{ .ref_name = rb, .spec = .{ .due_date = "2027-01-01", .expect = tip_b } },
+        .{ .ref_name = rc, .spec = .{ .due_date = "2027-01-01", .expect = tip_c } },
+    }));
+    try testing.expect(tip_b.eql((try sim.resolveRef(rb)).?));
+
+    // A loop only the batch as a whole makes.
+    try testing.expectError(error.BlockerCycle, repo.editBatch(arena, &.{
+        .{ .ref_name = ra, .spec = .{ .add_blocked_by = &.{b.id.slice()} } },
+        .{ .ref_name = rb, .spec = .{ .add_blocked_by = &.{c.id.slice()} } },
+        .{ .ref_name = rc, .spec = .{ .add_blocked_by = &.{a.id.slice()} } },
+    }));
+    try testing.expectEqual(@as(usize, 0), (try repo.load(arena, .{ .name = ra, .tip = (try sim.resolveRef(ra)).? })).ext.blocked_by.len);
+    // Without the loop it goes through.
+    _ = try repo.editBatch(arena, &.{
+        .{ .ref_name = ra, .spec = .{ .add_blocked_by = &.{b.id.slice()} } },
+        .{ .ref_name = rb, .spec = .{ .add_blocked_by = &.{c.id.slice()} } },
+    });
+    try testing.expectError(error.DuplicateEdit, repo.editBatch(arena, &.{
+        .{ .ref_name = ra, .spec = .{ .title = "x" } },
+        .{ .ref_name = ra, .spec = .{ .title = "y" } },
+    }));
+    // A guard refusal anywhere refuses all.
+    _ = try cat.edit(arena, v1.id.slice(), .{ .status = .retired });
+    try testing.expectError(error.MilestoneRetired, repo.editBatch(arena, &.{
+        .{ .ref_name = ra, .spec = .{ .due_date = "2027-02-02" } },
+        .{ .ref_name = rc, .spec = .{ .milestone_id = v1.id.slice() } },
+    }));
+    try testing.expect((try repo.load(arena, .{ .name = ra, .tip = (try sim.resolveRef(ra)).? })).ext.due_date.?.year == 2026);
+}
+
+fn issueRef(arena: Allocator, id: anytype) ![]const u8 {
+    return std.fmt.allocPrint(arena, "refs/issues/{s}", .{id.slice()});
+}
+
+test "editBatch: parents, checked as the batch leaves them" {
+    var arena_state: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var world: GitSim.World = .{ .seed = 8, .clones = &.{.{ .name = "a" }} };
+    var sim = try GitSim.init(arena, &world, 0);
+    var repo = Repo(GitSim).init(&sim);
+    repo.limits.max_depth = 2;
+    var ids: [4][]const u8 = undefined;
+    var refs: [4][]const u8 = undefined;
+    for (&ids, &refs, 0..) |*id, *r, n| {
+        const created = try repo.create(arena, .{ .title = try std.fmt.allocPrint(arena, "{d}", .{n}) });
+        id.* = try arena.dupe(u8, created.id.slice());
+        r.* = try issueRef(arena, created.id);
+    }
+    // Each fine alone, a loop together.
+    try testing.expectError(error.ParentCycle, repo.editBatch(arena, &.{
+        .{ .ref_name = refs[0], .spec = .{ .parent = ids[1] } },
+        .{ .ref_name = refs[1], .spec = .{ .parent = ids[0] } },
+    }));
+    try testing.expectError(error.ParentCycle, repo.editBatch(arena, &.{
+        .{ .ref_name = refs[0], .spec = .{ .parent = ids[1] } },
+        .{ .ref_name = refs[1], .spec = .{ .parent = ids[2] } },
+        .{ .ref_name = refs[2], .spec = .{ .parent = ids[0] } },
+    }));
+    // Depth three, from edits that each make depth one.
+    try testing.expectError(error.TooDeep, repo.editBatch(arena, &.{
+        .{ .ref_name = refs[1], .spec = .{ .parent = ids[0] } },
+        .{ .ref_name = refs[2], .spec = .{ .parent = ids[1] } },
+        .{ .ref_name = refs[3], .spec = .{ .parent = ids[2] } },
+    }));
+    try testing.expect((try repo.load(arena, .{ .name = refs[1], .tip = (try sim.resolveRef(refs[1])).? })).ext.parent == null);
+    // Depth two is allowed.
+    const res = try repo.editBatch(arena, &.{
+        .{ .ref_name = refs[1], .spec = .{ .parent = ids[0] } },
+        .{ .ref_name = refs[2], .spec = .{ .parent = ids[1] } },
+    });
+    try testing.expectEqualStrings(ids[1], (try repo.load(arena, .{ .name = refs[2], .tip = res[1].tip })).ext.parent.?);
+    try testing.expectError(error.TooDeep, repo.edit(arena, refs[3], .{ .parent = ids[2] }));
+}
+
+test "editBatch: retries when an issue moves under it" {
+    var arena_state: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var world: GitSim.World = .{ .seed = 9, .clones = &.{.{ .name = "a" }} };
+    var sim = try GitSim.init(arena, &world, 0);
+    const a = try Repo(GitSim).init(&sim).create(arena, .{ .title = "A" });
+    const b = try Repo(GitSim).init(&sim).create(arena, .{ .title = "B" });
+    const ra = try issueRef(arena, a.id);
+    const rb = try issueRef(arena, b.id);
+    var racing: RacingSim = .{ .sim = &sim, .race = .{ .ref = ra, .message = "Meanwhile" } };
+    const repo = Repo(RacingSim).init(&racing);
+    // No expect: the comment that lands first is kept, the edits too.
+    const res = try repo.editBatch(arena, &.{
+        .{ .ref_name = ra, .spec = .{ .title = "A, renamed" } },
+        .{ .ref_name = rb, .spec = .{ .add_blocked_by = &.{a.id.slice()} } },
+    });
+    const la = try repo.load(arena, .{ .name = ra, .tip = (try sim.resolveRef(ra)).? });
+    try testing.expect(la.tip.eql(res[0].tip));
+    try testing.expectEqualStrings("A, renamed", la.title);
+    try testing.expectEqualStrings("Meanwhile", la.comments[0].subject);
+    try testing.expect(res[1].tip.eql((try sim.resolveRef(rb)).?));
 }

@@ -261,7 +261,11 @@ pub fn main(
         .transport = &transport.transport,
     };
     defer repos.deinit();
-    var handler: tools.Handler(ProcessRepos) = .{ .repos = &repos };
+    var handler: tools.Handler(ProcessRepos) = .{
+        .repos = &repos,
+        .zone = issuez.local_time.load(io, gpa, environ_map),
+    };
+    defer handler.zone.deinit(gpa);
     var server: Server = .init(&handler);
     server.run(io, gpa, &transport.transport) catch |e| {
         err.print("git-issue: mcp server stopped: {t}\n", .{e}) catch {};

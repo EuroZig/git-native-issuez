@@ -118,6 +118,19 @@ pub const fetched_namespaces = [_]Namespace{ .issues, .milestones, .attachments 
 /// to upload and no git-lfs.
 pub const PushOptions = struct {
     before_push: ?BeforePush = null,
+    progress: ?Progress = null,
+};
+
+/// Where a merge or push is, for a front end to show.
+pub const Phase = enum { fetching, merging, pushing };
+
+pub const Progress = struct {
+    context: *anyopaque,
+    phase: *const fn (context: *anyopaque, phase: Phase) void,
+
+    fn report(p: ?Progress, phase: Phase) void {
+        if (p) |x| x.phase(x.context, phase);
+    }
 };
 
 pub const BeforePush = struct {
@@ -157,6 +170,23 @@ pub const Status = struct {
     quarantined: []const Quarantined,
     /// Not pushed yet, quarantined ones excluded.
     pending: []const repo_mod.IssueRef,
+    /// The same, and milestones, with whether the remote ever had them.
+    unpushed: []const Unpushed = &.{},
+};
+
+pub const Unpushed = struct {
+    namespace: Namespace,
+    id: []const u8,
+    tip: Oid,
+    /// Never pushed to this remote.
+    new: bool,
+};
+
+/// What `Sync.counts` finds: from local refs only.
+pub const Counts = struct {
+    /// Issues and milestones not pushed yet.
+    unpushed: usize,
+    quarantined: usize,
 };
 
 pub const Resolution = enum {
@@ -174,6 +204,7 @@ pub const MergeOptions = struct {
     fetch: bool = true,
     /// Report only, change nothing.
     check: bool = false,
+    progress: ?Progress = null,
 };
 
 pub const MergeReport = struct {
@@ -283,8 +314,10 @@ pub fn Sync(comptime B: type) type {
             if (!contract.isValidRemoteName(remote)) return error.InvalidRemoteName;
             if (options.fetch) {
                 try self.ensureRemote(arena, remote);
+                Progress.report(options.progress, .fetching);
                 try self.fetchSeen(arena, remote);
             }
+            Progress.report(options.progress, .merging);
             // Nothing below writes a record before the last namespace is
             // read, so one read serves all of them.
             const records = try self.readRecords(arena, remote);
@@ -848,10 +881,13 @@ pub fn Sync(comptime B: type) type {
         /// From local state only, no fetch.
         pub fn status(self: Self, arena: Allocator, remote: []const u8) Error!Status {
             if (!contract.isValidRemoteName(remote)) return error.InvalidRemoteName;
+            // One read of the refs for all of it, so the parts agree.
+            const view = try self.readView(arena, remote);
             var quarantined: std.ArrayList(Quarantined) = .empty;
             for (namespaces) |ns| {
                 const prefix = try recordRef(arena, remote, .quarantined, ns, "");
-                for (try self.b().listRefs(arena, prefix)) |m| {
+                for (view.records) |m| {
+                    if (!std.mem.startsWith(u8, m.name, prefix)) continue;
                     const id = m.name[prefix.len..];
                     const local = try self.b().resolveRef(try localRef(arena, ns, id));
                     const kept_ref = try recordRef(arena, remote, .kept, ns, id);
@@ -867,9 +903,47 @@ pub fn Sync(comptime B: type) type {
                 }
             }
             var skipped: std.ArrayList([]const u8) = .empty;
+            const pending = try self.pendingIn(arena, &skipped, &view);
+            var issues: std.ArrayList(repo_mod.IssueRef) = .empty;
+            for (pending) |p| {
+                if (p.ns == .issues) try issues.append(arena, .{ .name = p.name, .tip = p.tip });
+            }
             return .{
                 .quarantined = quarantined.items,
-                .pending = try self.pendingRefs(arena, remote, &skipped),
+                .pending = issues.items,
+                .unpushed = try unpushedIn(arena, pending),
+            };
+        }
+
+        /// Issues and milestones not pushed to `remote` yet, quarantined
+        /// ones excluded. Local refs only.
+        pub fn unpushed(self: Self, arena: Allocator, remote: []const u8) Error![]const Unpushed {
+            if (!contract.isValidRemoteName(remote)) return error.InvalidRemoteName;
+            const view = try self.readView(arena, remote);
+            var skipped: std.ArrayList([]const u8) = .empty;
+            return unpushedIn(arena, try self.pendingIn(arena, &skipped, &view));
+        }
+
+        fn unpushedIn(arena: Allocator, pending: []const Pending) Error![]const Unpushed {
+            var out: std.ArrayList(Unpushed) = .empty;
+            for (pending) |p| {
+                if (p.ns == .attachments) continue;
+                try out.append(arena, .{ .namespace = p.ns, .id = p.id, .tip = p.tip, .new = p.record == null });
+            }
+            return out.items;
+        }
+
+        /// How much is unpushed and quarantined, without loading any
+        /// issue: for a badge after every reload.
+        pub fn counts(self: Self, arena: Allocator, remote: []const u8) Error!Counts {
+            if (!contract.isValidRemoteName(remote)) return error.InvalidRemoteName;
+            const view = try self.readView(arena, remote);
+            var skipped: std.ArrayList([]const u8) = .empty;
+            var quarantined: usize = 0;
+            for (namespaces) |ns| quarantined += view.quarantined[@intFromEnum(ns)].count();
+            return .{
+                .unpushed = (try unpushedIn(arena, try self.pendingIn(arena, &skipped, &view))).len,
+                .quarantined = quarantined,
             };
         }
 
@@ -1086,7 +1160,7 @@ pub fn Sync(comptime B: type) type {
             remote: []const u8,
             options: PushOptions,
         ) Error!SyncReport {
-            const merged = try self.merge(arena, remote, .{});
+            const merged = try self.merge(arena, remote, .{ .progress = options.progress });
             return .{ .merge = merged, .push = try self.pushFetched(arena, remote, options) };
         }
 
@@ -1119,7 +1193,9 @@ pub fn Sync(comptime B: type) type {
         ) Error!PushReport {
             if (!contract.isValidRemoteName(remote)) return error.InvalidRemoteName;
             if (fetch) try self.ensureRemote(arena, remote);
+            Progress.report(options.progress, if (fetch) .fetching else .pushing);
             var view = try self.refreshPushed(arena, remote, fetch);
+            if (fetch) Progress.report(options.progress, .pushing);
             // Pushed issues should carry their pointers. Issues that came in
             // through upstream have no derived ref yet.
             const att = attachments_mod.Attachments(B).fromRepo(self.repo);
@@ -1420,20 +1496,6 @@ pub fn Sync(comptime B: type) type {
             return with_derived.items;
         }
 
-        fn pendingRefs(
-            self: Self,
-            arena: Allocator,
-            remote: []const u8,
-            skipped: *std.ArrayList([]const u8),
-        ) Error![]repo_mod.IssueRef {
-            const view = try self.readView(arena, remote);
-            var out: std.ArrayList(repo_mod.IssueRef) = .empty;
-            for (try self.pendingIn(arena, skipped, &view)) |p| {
-                if (p.ns == .issues) try out.append(arena, .{ .name = p.name, .tip = p.tip });
-            }
-            return out.items;
-        }
-
         fn ensureRemote(self: Self, arena: Allocator, remote: []const u8) Error!void {
             for (try self.b().remoteNames(arena)) |r| if (std.mem.eql(u8, r, remote)) return;
             return error.UnknownRemote;
@@ -1530,6 +1592,29 @@ fn rootKeys(ns: Namespace) []const []const u8 {
         .milestones => &.{ "Name", "Format-Version" },
         .attachments => &.{},
     };
+}
+
+pub const remote_key = "issue.remote";
+
+/// The remote to sync with when none is named: the one `git config
+/// issue.remote` names, else the only one, else `origin`, else the first
+/// by name. Null without remotes. `UnknownIssueRemote` when
+/// `issue.remote` names no remote: a typo shouldn't send issues elsewhere.
+pub fn defaultRemote(arena: Allocator, backend: anytype) !?[]const u8 {
+    const names = try backend.remoteNames(arena);
+    if (try backend.configGet(arena, remote_key)) |want| {
+        if (!contract.isValidRemoteName(want)) return error.UnknownIssueRemote;
+        for (names) |n| if (std.mem.eql(u8, n, want)) return n;
+        return error.UnknownIssueRemote;
+    }
+    if (names.len == 0) return null;
+    if (names.len == 1) return names[0];
+    for (names) |n| if (std.mem.eql(u8, n, "origin")) return n;
+    var first = names[0];
+    for (names[1..]) |n| if (std.mem.lessThan(u8, n, first)) {
+        first = n;
+    };
+    return first;
 }
 
 /// `refs/issuez-sync/<remote>/<record>/<ns>/<id>`. An empty `id` gives
@@ -1986,6 +2071,9 @@ test "quarantine" {
     try testing.expectEqual(Reason.unrelated_history, st.quarantined[0].reason.?);
     try testing.expect(st.quarantined[0].remote_tip.eql(created.tip));
     try testing.expectEqual(@as(usize, 0), st.pending.len); // quarantined is not pending
+    const c = try bob.sync.counts(arena, "origin");
+    try testing.expectEqual(@as(usize, 1), c.quarantined);
+    try testing.expectEqual(@as(usize, 0), c.unpushed);
 
     // keep_local: still quarantined, since pushing would take a force push,
     // but no longer reported.
@@ -2332,4 +2420,70 @@ test "before_push and no git-lfs" {
     _ = try a.sync.repo.create(arena, .{ .title = "No images" });
     const plain = try a.sync.push(arena, "origin");
     try testing.expectEqual(@as(usize, 1), plain.pushed);
+}
+
+test "progress phases, counts and the default remote" {
+    var arena_state: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var world = testWorld();
+    const a = try onClone(arena, &world, 0);
+    const issue = try a.sync.repo.create(arena, .{ .title = "New here" });
+    const Catalog = @import("milestone.zig").Catalog(GitSim);
+    _ = try Catalog.init(a.sim).create(arena, .{ .name = "v1" });
+
+    var c = try a.sync.counts(arena, "origin");
+    try testing.expectEqual(@as(usize, 2), c.unpushed);
+    try testing.expectEqual(@as(usize, 0), c.quarantined);
+    const before = try a.sync.unpushed(arena, "origin");
+    try testing.expect(before[0].new and before[1].new);
+
+    const Seen = struct {
+        phases: [8]Phase = undefined,
+        n: usize = 0,
+        fn on(ctx: *anyopaque, p: Phase) void {
+            const self: *@This() = @ptrCast(@alignCast(ctx));
+            self.phases[self.n] = p;
+            self.n += 1;
+        }
+    };
+    var seen: Seen = .{};
+    _ = try a.sync.syncWith(arena, "origin", .{ .progress = .{ .context = &seen, .phase = Seen.on } });
+    try testing.expectEqualSlices(Phase, &.{ .fetching, .merging, .pushing }, seen.phases[0..seen.n]);
+    c = try a.sync.counts(arena, "origin");
+    try testing.expectEqual(@as(usize, 0), c.unpushed);
+    // Edited after a push: unpushed, but not new.
+    const ref = try std.fmt.allocPrint(arena, "refs/issues/{s}", .{issue.id.slice()});
+    _ = try a.sync.repo.edit(arena, ref, .{ .title = "Renamed" });
+    const after = try a.sync.unpushed(arena, "origin");
+    try testing.expectEqual(@as(usize, 1), after.len);
+    try testing.expect(!after[0].new);
+    try testing.expectEqual(@as(usize, 1), (try a.sync.status(arena, "origin")).unpushed.len);
+
+    try testing.expectEqualStrings("origin", (try defaultRemote(arena, a.sim)).?);
+}
+
+test "defaultRemote" {
+    var arena_state: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var world = testWorld();
+    const sim = (try onClone(arena, &world, 2)).sim;
+    try testing.expect(try defaultRemote(arena, sim) == null);
+    // Exactly one: that one, whatever its name.
+    try sim.configAdd("remote.upstream.url", "sim:alice");
+    try testing.expectEqualStrings("upstream", (try defaultRemote(arena, sim)).?);
+    // Several without origin: the first by name.
+    try sim.configAdd("remote.backup.url", "sim:bob");
+    try testing.expectEqualStrings("backup", (try defaultRemote(arena, sim)).?);
+    try sim.configAdd("remote.origin.url", "sim:alice");
+    try testing.expectEqualStrings("origin", (try defaultRemote(arena, sim)).?);
+    try sim.configAdd(remote_key, "upstream");
+    try testing.expectEqualStrings("upstream", (try defaultRemote(arena, sim)).?);
+    // A typo is an error, not another remote.
+    try sim.configAdd(remote_key, "upstrem");
+    try testing.expectError(error.UnknownIssueRemote, defaultRemote(arena, sim));
+    try sim.configAdd(remote_key, "-bad name");
+    try testing.expectError(error.UnknownIssueRemote, defaultRemote(arena, sim));
+    try testing.expect(@import("errors.zig").describe(error.UnknownIssueRemote) != null);
 }
