@@ -16,9 +16,11 @@ command. It reads and writes the format of
 - **For scripts:** `--json` on every read command, man pages and shell
   completions.
 
-![The list: issues with their labels, priority, workflow state, assignee and due date, sorted by priority](docs/issuez-list.png)
-
 ![The board: a column per workflow state, cards with priority, progress, labels and assignee](docs/issuez-board.png)
+
+![The timeline: issues grouped by milestone as bars over the weeks, with due dates, blockers and a warning where work ends after the due date](docs/issuez-gantt.png)
+
+![The list: issues with their labels, priority, workflow state, assignee and due date, sorted by priority](docs/issuez-list.png)
 
 > [!WARNING]
 > Generative AI was used to edit and/or produce large portions of this code.
@@ -151,34 +153,17 @@ other clients.
 
 ### Importing from GitHub, GitLab and others
 
-Import, export and two-way sync with GitHub, GitLab and Gitea/Forgejo, and
-import from Azure DevOps, are upstream's: install
+Import, export and sync with GitHub, GitLab and Gitea/Forgejo, and import
+from Azure DevOps, come from upstream: install
 [git-native-issue](https://github.com/remenoscodes/git-native-issue) next to
-this one and run its bridges in the same repository. Both tools share the
-issue refs, so what they import works here as it is. git-native-issuez
-doesn't install the `git-issue-import`, `git-issue-export` or
-`git-issue-sync` entry points, so with both on `PATH` the hyphenated names
-run upstream's; `git issue import` runs this one, which refuses and points
-there. Both install a `git-issue` and its `git-issue-<command>` entry points:
-`git issue` runs whichever comes first on `PATH`, so put this one's directory
-first. Installed into the same prefix (`~/.local`, say), the one installed
-last overwrites the other's. Install upstream first, then this one; if
-upstream came second, run `update-git-native-issuez` (or `install.sh`)
-again. Upstream's bridges keep working, since this one doesn't install them.
-
-```sh
-git-issue-import github:owner/repo --state all   # all issues, with comments
-git-issue-export github:owner/repo               # local issues back to GitHub
-git-issue-sync gitlab:group/project              # import, then export
-```
-
-Upstream's docs cover the providers, tokens and options:
-[Platform Bridges](https://github.com/remenoscodes/git-native-issue#platform-bridges),
-the [GitLab](https://github.com/remenoscodes/git-native-issue/blob/main/docs/gitlab-bridge.md)
-and [Gitea/Forgejo](https://github.com/remenoscodes/git-native-issue/blob/main/docs/gitea-bridge.md)
-bridges, and the
-[migration guide](https://github.com/remenoscodes/git-native-issue/blob/main/docs/migration-guide.md).
-The bridges aren't reimplemented here (contributions are welcome).
+this one and run its `git-issue-import`, `git-issue-export` and
+`git-issue-sync` in the same repository. Both share the issue refs, so
+imported issues work here as they are. Install upstream first: both install
+`git-issue` and its `git-issue-<command>` entry points, so upstream
+installed after this one into the same prefix overwrites ours (run
+`update-git-native-issuez` again to fix it). Upstream's
+[Platform Bridges](https://github.com/remenoscodes/git-native-issue#platform-bridges)
+cover providers, tokens and options.
 
 ## Using the library
 

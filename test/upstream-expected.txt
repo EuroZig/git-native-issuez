@@ -7,7 +7,10 @@
 # it isn't listed. Neither are tests whose name embeds a local value
 # ("git version >= 2.22 (2.54.0)"), or tests in files that skip
 # themselves without a logged-in gh (test-edge-cases.sh): they don't run on
-# CI.
+# CI. "permission error surfaces meaningful message" locks only the top of
+# .git/objects, so it skips itself when our object lands in a fanout
+# directory that already exists; cli_git's "an object git can't write"
+# tests the same thing.
 #
 # Every format-1 command (create, ls, show, comment, edit, state, search,
 # fsck, init) and merge (test-merge.sh).
@@ -39,7 +42,6 @@ test-environment.sh::works with minimal PATH
 test-environment.sh::read-only .git/refs/issues surfaces error
 test-environment.sh::UTF-8 content preserved in issue
 test-environment.sh::works under C/POSIX locale
-test-environment.sh::permission error surfaces meaningful message
 test-environment.sh::works from nested subdirectory
 test-environment.sh::works with invalid HOME
 test-environment.sh::long title (500 chars) preserved

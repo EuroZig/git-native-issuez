@@ -362,6 +362,30 @@ test "a push the remote refuses" {
     try testing.expect(std.mem.find(u8, pushed.stderr, "no issues here") != null);
 }
 
+test "an object git can't write" {
+    var sb = try Sandbox.init(.{});
+    defer sb.deinit();
+    // root writes regardless of permissions.
+    const uid = try sb.run(&.{ "id", "-u" });
+    try expectSuccess(uid);
+    if (std.mem.eql(u8, uid.stdout, "0\n")) return error.SkipZigTest;
+    try sb.git(&.{ "commit", "-q", "--allow-empty", "-m", "initial" });
+
+    // Every directory, not just the top one: upstream's test locks only
+    // .git/objects, so an object landing in a fanout directory the first
+    // commit made still gets written.
+    try expectSuccess(try sb.run(&.{ "chmod", "-R", "a-w", ".git/objects" }));
+    defer _ = sb.run(&.{ "chmod", "-R", "u+w", ".git/objects" }) catch {};
+
+    const created = try gitIssue(&sb, &.{ "create", "Not written" });
+    try testing.expectEqual(@as(u8, 1), created.code);
+    try testing.expect(std.mem.startsWith(u8, created.stderr, "error: a git command failed\n"));
+    try testing.expect(std.mem.find(u8, created.stderr, "git: error: insufficient permission") != null);
+    const refs = try sb.run(&.{ "git", "for-each-ref", "refs/issues" });
+    try expectSuccess(refs);
+    try testing.expectEqualStrings("", refs.stdout);
+}
+
 test "one remote per merge, push and sync" {
     var sb = try Sandbox.init(.{});
     defer sb.deinit();
