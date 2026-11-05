@@ -14,7 +14,7 @@ const changes = issuez.changes;
 /// In help.zig, which builds without the MCP server have too.
 pub const help = @import("mcp_help").text;
 
-const version: []const u8 = @import("build.zig.zon").version;
+const version: []const u8 = @import("version").version;
 
 /// The repository at `path`, and those that tool calls name with `repo`.
 /// Each is opened on the first call that needs it rather than at start: a

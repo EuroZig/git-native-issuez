@@ -8,6 +8,19 @@ versions may change the library API; the on-disk format only ever grows (see
 
 ## [Unreleased]
 
+### Added
+
+- `zig build link` symlinks a checkout's build (`git-issue`, its entry
+  points, completions and man pages) into `~/.local`, or `-Dlink-prefix`,
+  so each later `zig build` updates what runs. `zig build unlink` removes
+  those symlinks and nothing else.
+
+### Changed
+
+- Built from a git checkout, `git issue version` names the commit:
+  `0.3.0-12-ga3e21cfa` twelve commits after v0.3.0, with `-dirty` for
+  uncommitted changes. Release builds print just the version.
+
 ## [0.3.0] - 2026-11-05
 
 ### Added

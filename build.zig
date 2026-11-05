@@ -1,4 +1,5 @@
 //!   zig build                      git-issue, full: TUI and MCP server
+//!   zig build link                 symlink it into ~/.local (-Dlink-prefix), `unlink` undoes it
 //!   zig build -Dminimal            git-issue, CLI only (-Dtui=false -Dmcp=false)
 //!   zig build -Dtui=false          without the TUI; -Dmcp=false without the MCP server
 //!   zig build test                 unit, backend, simulator/oracle and fuzz smoke tests
@@ -18,6 +19,8 @@
 
 const std = @import("std");
 const entry_points = @import("src/cli/entry_points.zig");
+
+const zon_version: []const u8 = @import("build.zig.zon").version;
 
 pub fn build(b: *std.Build) void {
     if (isRootPackage(b)) forgetOuterRepository(b);
@@ -48,7 +51,8 @@ pub fn build(b: *std.Build) void {
         .target = target,
         .optimize = optimize,
     });
-    const cli: Cli = .init(b, target, optimize, issuez);
+    const version = describeVersion(b);
+    const cli: Cli = .init(b, target, optimize, issuez, version);
     const oracle = cli.oracle;
     const extras = cli.parts(.{ .tui = tui, .mcp = mcp });
 
@@ -57,6 +61,7 @@ pub fn build(b: *std.Build) void {
     installEntryPoints(b, exe);
     installCompletions(b, exe);
     installManPages(b, exe);
+    addLinkSteps(b, exe);
 
     const release_step = b.step(
         "release",
@@ -134,7 +139,7 @@ pub fn build(b: *std.Build) void {
         run_e2e.setName("e2e git-issue mcp");
         run_e2e.addFileArg(script);
         run_e2e.addArtifactArg(exe);
-        run_e2e.addArg(@import("build.zig.zon").version);
+        run_e2e.addArg(version);
         run_e2e.has_side_effects = true;
         run_e2e.step.dependOn(&npm_ci.step);
         e2e_step.dependOn(&run_e2e.step);
@@ -464,7 +469,7 @@ const release_flavors = [_]Flavor{
 /// `SHA256SUMS`. GitHub lists release assets by name, so the full flavor
 /// comes first. Needs `sh`, `tar` and `zip`.
 fn addRelease(b: *std.Build, step: *std.Build.Step) void {
-    const version = @import("build.zig.zon").version;
+    const version = zon_version;
     const sums = b.addSystemCommand(&.{ "sh", "-c", sums_script, "sh" });
     const sums_file = sums.addOutputFileArg("SHA256SUMS");
     step.dependOn(&b.addInstallFileWithDir(sums_file, release_dir, "SHA256SUMS").step);
@@ -537,7 +542,8 @@ fn releaseExe(
         .target = target,
         .optimize = .ReleaseSafe,
     });
-    const cli: Cli = .init(b, target, .ReleaseSafe, issuez);
+    // The tag's version: release.yml checks it is build.zig.zon's.
+    const cli: Cli = .init(b, target, .ReleaseSafe, issuez, zon_version);
     const exe = cli.exe("git-issue", "src/cli/main.zig", .ReleaseSafe, cli.parts(.{
         .tui = flavor.full,
         .mcp = flavor.full,
@@ -645,6 +651,127 @@ fn installManPages(b: *std.Build, exe: *std.Build.Step.Compile) void {
     }).step);
 }
 
+/// `build.zig.zon`'s version, from git when building a checkout: just it
+/// on the `v<version>` tag, `0.3.0-12-ga3e21cfa` twelve commits after the
+/// tag, `0.3.0-ga3e21cfa` before there is one, each with `-dirty` for
+/// uncommitted changes. Unchanged without git or a repository (an unpacked
+/// source archive, a dependency).
+fn describeVersion(b: *std.Build) []const u8 {
+    if (!isRootPackage(b) or !hasPath(b, ".git")) return zon_version;
+    const root = b.build_root.path orelse ".";
+    const tag = "v" ++ zon_version;
+    var code: u8 = undefined;
+    if (b.runAllowFail(&.{
+        "git", "-C", root, "describe", "--tags", "--long", "--dirty", "--abbrev=8", "--match", tag,
+    }, &code, .ignore)) |out| {
+        // v0.3.0-12-ga3e21cfa, or -0- on the tag itself.
+        const rest = std.mem.trimEnd(u8, out, "\n")[tag.len..];
+        if (std.mem.startsWith(u8, rest, "-0-g") and !std.mem.endsWith(u8, rest, "-dirty"))
+            return zon_version;
+        return b.fmt("{s}{s}", .{ zon_version, rest });
+    } else |_| {}
+    // No such tag (a shallow clone, or the version isn't tagged yet).
+    const commit = b.runAllowFail(&.{
+        "git", "-C", root, "describe", "--always", "--dirty", "--abbrev=8", "--exclude=*",
+    }, &code, .ignore) catch return zon_version;
+    return b.fmt("{s}-g{s}", .{ zon_version, std.mem.trimEnd(u8, commit, "\n") });
+}
+
+/// `zig build link` symlinks what `zig build` installs (git-issue, its
+/// entry points, completions and man pages) into `-Dlink-prefix`, so the
+/// next `zig build` updates what runs. A file already there is replaced.
+/// `zig build unlink` removes the symlinks that point into this install
+/// prefix and nothing else.
+fn addLinkSteps(b: *std.Build, exe: *std.Build.Step.Compile) void {
+    const prefix = b.option(
+        []const u8,
+        "link-prefix",
+        "Where `zig build link` puts its symlinks (default: ~/.local)",
+    ) orelse if (b.graph.environ_map.get("HOME")) |home| b.pathJoin(&.{ home, ".local" }) else null;
+    const link_step = b.step("link", "Install, then symlink it into -Dlink-prefix (default: ~/.local)");
+    const unlink_step = b.step("unlink", "Remove the symlinks `zig build link` made");
+    const problem: ?[]const u8 = if (exe.rootModuleTarget().os.tag == .windows)
+        "zig build link has no Windows support: use zig build -p <prefix>"
+    else if (!runsOnHost(b, exe))
+        "zig build link needs a native build: drop -Dtarget"
+    else if (prefix == null)
+        "zig build link needs -Dlink-prefix: HOME is not set"
+    else
+        null;
+    if (problem) |p| {
+        link_step.dependOn(&b.addFail(p).step);
+        unlink_step.dependOn(&b.addFail(p).step);
+        return;
+    }
+    for ([_]struct { step: *std.Build.Step, remove: bool }{
+        .{ .step = link_step, .remove = false },
+        .{ .step = unlink_step, .remove = true },
+    }) |s| {
+        const links = b.allocator.create(Links) catch @panic("OOM");
+        links.* = .{
+            .step = .init(.{
+                .id = .custom,
+                .name = if (s.remove) "unlink from link prefix" else "link into link prefix",
+                .owner = b,
+                .makeFn = Links.make,
+            }),
+            .prefix = b.pathResolve(&.{ b.graph.cache.cwd, prefix.? }),
+            .remove = s.remove,
+        };
+        if (!s.remove) links.step.dependOn(b.getInstallStep());
+        s.step.dependOn(&links.step);
+    }
+}
+
+const Links = struct {
+    step: std.Build.Step,
+    prefix: []const u8,
+    remove: bool,
+
+    fn make(step: *std.Build.Step, options: std.Build.Step.MakeOptions) !void {
+        _ = options;
+        const links: *Links = @fieldParentPtr("step", step);
+        const b = step.owner;
+        const io = b.graph.io;
+        const cwd = std.Io.Dir.cwd();
+        const installed = b.pathResolve(&.{ b.graph.cache.cwd, b.install_path });
+        if (std.mem.eql(u8, installed, links.prefix))
+            return step.fail("-Dlink-prefix is the install prefix ({s})", .{installed});
+
+        var paths: std.ArrayList([]const u8) = .empty;
+        try paths.append(b.allocator, "bin/git-issue");
+        for (entry_points.names) |name|
+            try paths.append(b.allocator, b.fmt("bin/git-issue-{s}", .{name}));
+        for (completionFiles(b)) |f| try paths.append(b.allocator, f.path);
+        // The pages the install made, or for unlink those in the link prefix.
+        const pages_root = if (links.remove) links.prefix else installed;
+        if (cwd.openDir(io, b.pathJoin(&.{ pages_root, man_dir }), .{ .iterate = true })) |dir| {
+            var d = dir;
+            defer d.close(io);
+            var it = d.iterate();
+            while (try it.next(io)) |entry| if (std.mem.startsWith(u8, entry.name, "git-issue"))
+                try paths.append(b.allocator, b.fmt("{s}/{s}", .{ man_dir, entry.name }));
+        } else |_| {}
+
+        for (paths.items) |rel| {
+            const target = b.pathJoin(&.{ installed, rel });
+            const link = b.pathJoin(&.{ links.prefix, rel });
+            if (links.remove) {
+                var buf: [std.fs.max_path_bytes]u8 = undefined;
+                const n = cwd.readLink(io, link, &buf) catch continue;
+                if (!std.mem.eql(u8, buf[0..n], target)) continue;
+                cwd.deleteFile(io, link) catch |err|
+                    return step.fail("unable to remove {s}: {t}", .{ link, err });
+                continue;
+            }
+            cwd.createDirPath(io, std.fs.path.dirname(link).?) catch |err|
+                return step.fail("unable to create the directory for {s}: {t}", .{ link, err });
+            cwd.symLinkAtomic(io, target, link, .{}) catch |err|
+                return step.fail("unable to symlink {s} -> {s}: {t}", .{ link, target, err });
+        }
+    }
+};
+
 const Shell = enum { bash, zsh, fish };
 
 /// A completion script under the install prefix.
@@ -751,7 +878,8 @@ const Cli = struct {
     optimize: std.builtin.OptimizeMode,
     issuez: *std.Build.Module,
     oracle: *std.Build.Module,
-    zon: *std.Build.Module,
+    /// `version`, what `git issue version` and the MCP server report.
+    version: *std.Build.Module,
     mcp_help: *std.Build.Module,
 
     fn init(
@@ -759,7 +887,10 @@ const Cli = struct {
         target: std.Build.ResolvedTarget,
         optimize: std.builtin.OptimizeMode,
         issuez: *std.Build.Module,
+        version: []const u8,
     ) Cli {
+        const version_options = b.addOptions();
+        version_options.addOption([]const u8, "version", version);
         return .{
             .b = b,
             .target = target,
@@ -771,7 +902,7 @@ const Cli = struct {
                 .optimize = optimize,
                 .imports = &.{.{ .name = "issuez", .module = issuez }},
             }),
-            .zon = b.createModule(.{ .root_source_file = b.path("build.zig.zon") }),
+            .version = version_options.createModule(),
             .mcp_help = b.createModule(.{ .root_source_file = b.path("src/mcp/help.zig") }),
         };
     }
@@ -821,7 +952,7 @@ const Cli = struct {
                 .imports = &.{
                     .{ .name = "issuez", .module = cli.issuez },
                     .{ .name = "blitzmcp", .module = blitzmcp.module("blitzmcp") },
-                    .{ .name = "build.zig.zon", .module = cli.zon },
+                    .{ .name = "version", .module = cli.version },
                     .{ .name = "mcp_help", .module = cli.mcp_help },
                     .{ .name = "RepoWatcher", .module = watch_module orelse break :blk null },
                 },
@@ -847,7 +978,7 @@ const Cli = struct {
             .imports = &.{
                 .{ .name = "issuez", .module = cli.issuez },
                 .{ .name = "oracle", .module = cli.oracle },
-                .{ .name = "build.zig.zon", .module = cli.zon },
+                .{ .name = "version", .module = cli.version },
                 .{ .name = "build_options", .module = options.createModule() },
                 .{ .name = "mcp_help", .module = cli.mcp_help },
             },

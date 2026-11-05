@@ -280,6 +280,7 @@ zig build -Doptimize=ReleaseSafe --prefix ~/.local   # add -Dminimal for the CLI
 
 ```sh
 zig build                      # git-issue with the TUI and the MCP server, links, completions, man pages
+zig build link                 # also symlink it into ~/.local (-Dlink-prefix=<dir>); unlink removes them
 zig build -Dminimal            # without the TUI and the MCP server (or -Dtui=false / -Dmcp=false)
 zig build test                 # unit, backend, CLI, simulator and fuzz smoke tests, examples
 zig build test-interop         # both tools on shared repositories (fetches upstream)

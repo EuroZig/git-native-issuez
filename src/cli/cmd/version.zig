@@ -5,7 +5,9 @@ const std = @import("std");
 const context = @import("../context.zig");
 const common = @import("../common.zig");
 
-pub const version: []const u8 = @import("build.zig.zon").version;
+/// `build.zig.zon`'s version, with `git describe`'s distance and commit
+/// unless built from its tag (`describeVersion` in build.zig).
+pub const version: []const u8 = @import("version").version;
 
 pub const help =
     \\usage: git issue version
