@@ -45,12 +45,12 @@ tui, mcp ──► watch (live updates)
 
 | Layer     | Files                 | Does                                                                                                      |
 | --------- | --------------------- | --------------------------------------------------------------------------------------------------------- |
-| `format`  | `src/format/`         | trailers exactly as git parses them, labels, UUIDs, hex, upstream's value rules, extension field grammars, attachment trailers and image types |
+| `format`  | `src/format/`         | trailers exactly as git parses them, labels, UUIDs, hex, upstream's value rules, extension field grammars, dates as typed (`dates`), attachment trailers and image types |
 | `model`   | `src/model/issue.zig` | one issue from its commit DAG: fields, comments, events, attachments, conflicts                           |
-| `engine`  | `src/engine/`         | `Repo` (read, create, comment, edit, state, delete, check, guards), `Catalog`, `Attachments`, `Sync`, `query`, `projection`, `settings`, `errors` |
+| `engine`  | `src/engine/`         | `Repo` (read, create, comment, edit, state, delete, check, guards), `Catalog`, `Attachments`, `Sync`, `query`, `projection`, `schedule`, `settings`, `errors`, `local_time` |
 | `backend` | `src/backend/`        | the contract, `GitProcess`, `GitSim`, git objects                                                         |
 | `cli`     | `src/cli/`            | argument parsing, output, exit codes                                                                      |
-| `tui`     | `src/tui/`            | the terminal UI: list, board and detail view over the engine, on libvaxis                                 |
+| `tui`     | `src/tui/`            | the terminal UI: list, board, detail, milestones and timeline over the engine, on libvaxis                |
 | `mcp`     | `src/mcp/`            | the MCP server: tools and resources over the engine, typed results                                        |
 | `watch`   | `src/watch/`          | `RepoWatcher`: tells the TUI and the MCP server when the issues on disk changed, on nightwatch            |
 
@@ -132,6 +132,26 @@ reference a milestone by UUID; which milestone an issue is in, through its
 parents, is a question for the projection. Completing a milestone reads
 every issue in it and pins each one with a `verify` line, the same way the
 issue guards do.
+
+`Repo.editBatch` applies several issues' edits in one ref transaction.
+`Catalog.editBatch` combines issue edits and milestone due dates in the
+same transaction. Both check expected versions and guards before moving
+any refs, so a timeline draft is applied together or refused together.
+The guards read the batch's issues as the batch leaves them, so parent
+loops, depth and milestone rules hold across edits of one batch.
+
+`engine/schedule.zig` summarizes milestone progress and health, and turns
+issue dates, estimates and blockers into timeline spans with warnings.
+`fields.Date` supplies date arithmetic; `fields.WorkDays` counts working
+days. Settings `issue.workDays` and `issue.hoursPerDay` control how an
+estimate becomes a span (all days and eight hours per day by default).
+
+`format/dates.zig` reads dates as people type them (`today`, `+3d`,
+`fri`, `eom`) relative to a given today, and `dates.resolve` turns them
+into `YYYY-MM-DD`, the only form ever written or read from a trailer. The
+TUI, the CLI's `--start` and `--due` and the MCP tools share it.
+`engine/local_time.zig` reads the local time zone (`TZ`, else
+`/etc/localtime`, UTC on Windows) without libc, for what today is.
 
 ## Attachments
 
@@ -297,9 +317,10 @@ hold identical refs: the fuzzer checks exactly that.
 ## The terminal UI
 
 - `git issue tui`, and `git issue` alone at a terminal: a list (optionally
-  a tree of sub-issues), a kanban board by workflow state and a detail view,
-  on [libvaxis](https://github.com/rockorager/libvaxis). Part of the
-  default build; `-Dtui=false` or `-Dminimal` leave it out, and as a
+  a tree of sub-issues), a kanban board by workflow state, a detail view,
+  milestones and a timeline, on
+  [libvaxis](https://github.com/rockorager/libvaxis). Part of the default
+  build; `-Dtui=false` or `-Dminimal` leave it out, and as a
   dependency the package builds neither it nor libvaxis.
 - The store loads every issue into one snapshot, replaced whole by each
   reload; views keep issue IDs, never pointers into it. Every write goes
@@ -315,6 +336,33 @@ hold identical refs: the fuzzer checks exactly that.
   so and writes nothing; saving again replaces what is there now.
   Getting the terminal focus back runs the same check and rereads git
   config; without a watcher, that and `ctrl+r` still reload.
+- Milestone views show progress, health and due dates, and support creating,
+  completing, retiring and reopening milestones. Issues can be assigned or
+  moved with search, marks, keys or dragging between panes.
+- The timeline draws milestones, issues and blockers at day, week or month
+  scale. Its edit mode stages changes with undo; applying uses the batch
+  APIs above. Changes written elsewhere are marked for the user to keep
+  or drop before applying the draft.
+- `sync_job.zig` runs fetch, merge and push off the event loop, reporting
+  phases through the library's sync progress callback. The badge and panel
+  show unpushed work, quarantines and conflicts, with actions to resolve
+  quarantines or open conflicting fields. `Sync.unpushed` and `Sync.counts`
+  read local refs for the indicators.
+- `sync.defaultRemote` uses `issue.remote`, otherwise the only remote,
+  `origin`, or the first remote by name. `issue.autoSync` enables periodic
+  fetch and merge, without pushing. The job runs as a concurrent Io task,
+  so quitting cancels it and kills its git. Its git runs without a
+  controlling terminal (`GitProcess.OpenOptions.no_terminal`, `setsid` on
+  POSIX) and with `SSH_ASKPASS_REQUIRE=never`, so nothing prompts on the
+  TUI's terminal, even with the user's own ssh command. Without one, ssh
+  gets batch mode and connect and keep-alive timeouts; with OpenSSH 8.4
+  or later outside Windows, connections are shared for five minutes
+  through a socket in a private 0700 directory (`$XDG_RUNTIME_DIR/issuez`
+  or `/tmp/issuez-<uid>`), and a push after a fresh fetch avoids fetching
+  again.
+- "Today" is the local date: the TUI asks `local_time` (in the engine)
+  for the UTC offset before every frame, and `schedule.health` takes the
+  same offset.
 
 ## Live updates
 

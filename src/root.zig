@@ -17,6 +17,7 @@ pub const format = struct {
     pub const hex = @import("format/hex.zig");
     pub const core = @import("format/core.zig");
     pub const fields = @import("format/fields.zig");
+    pub const dates = @import("format/dates.zig");
     pub const attachment = @import("format/attachment.zig");
     pub const time = @import("format/time.zig");
 };
@@ -38,6 +39,8 @@ pub const Attachments = attachments.Attachments;
 pub const settings = @import("engine/settings.zig");
 pub const errors = @import("engine/errors.zig");
 pub const changes = @import("engine/changes.zig");
+pub const local_time = @import("engine/local_time.zig");
+pub const schedule = @import("engine/schedule.zig");
 pub const Settings = settings.Settings;
 
 test {
@@ -51,6 +54,7 @@ test {
     _ = format.hex;
     _ = format.core;
     _ = format.fields;
+    _ = format.dates;
     _ = format.attachment;
     _ = format.time;
     _ = model.issue;
@@ -63,4 +67,6 @@ test {
     _ = settings;
     _ = errors;
     _ = changes;
+    _ = local_time;
+    _ = schedule;
 }

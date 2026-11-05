@@ -58,7 +58,7 @@ pub const State = struct {
 pub fn draw(s: *AppState, f: ui.Frame, win: ui.Window) Allocator.Error!void {
     const b = &s.board;
     const snap = s.snap;
-    try list_view.drawFilterBar(s, f, win.child(.{ .height = 1 }), false);
+    _ = try list_view.drawFilterBar(s, f, win.child(.{ .height = 1 }), false);
     var q = s.currentQuery();
     q.tree = false;
     b.columns = try capped(f.arena, try filter.board(f.arena, snap, q));
@@ -181,6 +181,9 @@ fn drawCard(s: *AppState, f: ui.Frame, win: ui.Window, i: u32, selected: bool, d
     // ID, priority, progress.
     var x: u16 = 0;
     x += ui.text(inner, x, 0, issuez.format.uuid.shortId(issue.id), .{ .fg = palette.id, .bg = bg });
+    if (s.snap.remote.isQuarantined(issue.id)) {
+        x += ui.text(inner, x, 0, "!", .{ .fg = palette.err, .bg = bg, .bold = true });
+    } else if (s.snap.remote.isUnpushed(issue.id)) x += ui.text(inner, x, 0, "↑", .{ .fg = palette.faint, .bg = bg });
     x += 1;
     if (issue.field("Priority")) |p| {
         x += ui.text(inner, x, 0, p, .{ .fg = ui.priorityColor(p), .bg = bg });

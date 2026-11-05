@@ -9,13 +9,14 @@
 //! label. Keys: `label:`/`l:`, `assignee:`/`a:`/`@`, `priority:`/`p:`,
 //! `state:`/`s:`, `workflow:`/`w:`, `milestone:`/`m:`, `parent:` (ID
 //! prefix), and `is:` with `blocked`, `child`, `root`, `parent`,
-//! `unassigned`, `conflict`, `problem`.
+//! `unassigned`, `conflict`, `problem`, `unpushed`, `quarantined`.
 
 const std = @import("std");
 const assert = std.debug.assert;
 const Allocator = std.mem.Allocator;
 const issuez = @import("issuez");
 const Snapshot = @import("store.zig").Snapshot;
+const Id = @import("store.zig").Id;
 
 const Issue = issuez.engine.Issue;
 const labels_fmt = issuez.format.labels;
@@ -42,6 +43,7 @@ pub const SortKey = enum {
     title,
     state,
     due,
+    start,
     id,
 
     pub fn label(k: SortKey) []const u8 {
@@ -57,6 +59,7 @@ pub const SortKey = enum {
             .title => "A to Z",
             .state => "open first, by workflow",
             .due => "earliest first",
+            .start => "earliest first",
             .id => "by ID",
         };
     }
@@ -71,10 +74,61 @@ pub const Query = struct {
     reverse: bool = false,
     /// The list shows sub-issues under their parents.
     tree: bool = false,
+    /// Only the issues of one milestone, by effective milestone.
+    milestone: ?MilestoneScope = null,
+    /// Effective milestones to use instead of the projection's: a draft's.
+    effective: ?[]const ?[]const u8 = null,
 };
 
+pub const MilestoneScope = union(enum) {
+    id: Id,
+    /// Issues with no effective milestone.
+    none,
+
+    pub fn eql(a: MilestoneScope, b: MilestoneScope) bool {
+        return switch (a) {
+            .none => b == .none,
+            .id => |x| b == .id and x.eql(b.id.slice()),
+        };
+    }
+
+    pub fn holds(m: MilestoneScope, snap: *const Snapshot, i: u32) bool {
+        return m.holdsIn(snap.proj.milestone, i);
+    }
+
+    pub fn holdsIn(m: MilestoneScope, effective: []const ?[]const u8, i: u32) bool {
+        const eff = effective[i];
+        return switch (m) {
+            .none => eff == null,
+            .id => |id| if (eff) |e| id.eql(e) else false,
+        };
+    }
+};
+
+/// No milestone link of its own: it has its parent's, if any.
+pub fn followsParent(snap: *const Snapshot, i: u32) bool {
+    const ext = snap.issues[i].ext;
+    return fields_fmt.MilestoneMode.of(ext.milestone_mode, ext.milestone_id != null, snap.proj.parent[i] != none) == .inherit;
+}
+
+/// Its milestone is its parent's: no link of its own.
+pub fn inherits(snap: *const Snapshot, i: u32) bool {
+    return followsParent(snap, i) and snap.proj.milestone[i] != null;
+}
+
+fn shown(snap: *const Snapshot, i: u32, q: Query, terms: []const Term) bool {
+    if (q.milestone) |m| if (!m.holdsIn(q.effective orelse snap.proj.milestone, i)) return false;
+    return matches(snap, i, q.scope, terms);
+}
+
 /// A list row. `context` rows don't match but have a descendant that does.
-pub const Row = struct { issue: u32, depth: u8 = 0, context: bool = false };
+pub const Row = struct {
+    issue: u32,
+    depth: u8 = 0,
+    context: bool = false,
+    /// In the query's milestone through its parent, not by its own link.
+    inherited: bool = false,
+};
 
 const none = std.math.maxInt(u32);
 /// Deeper than this is drawn at this depth.
@@ -166,6 +220,8 @@ fn isMatches(snap: *const Snapshot, i: u32, v: []const u8) bool {
     if (eq(v, "unassigned")) return snap.issues[i].field("Assignee") == null or snap.issues[i].field("Assignee").?.len == 0;
     if (eq(v, "conflict")) return snap.issues[i].conflicts.len > 0;
     if (eq(v, "problem")) return snap.proj.problemsOf(i).len > 0;
+    if (eq(v, "unpushed")) return snap.remote.isUnpushed(snap.issues[i].id);
+    if (eq(v, "quarantined")) return snap.remote.isQuarantined(snap.issues[i].id);
     if (eq(v, "open")) return !snap.isDone(i);
     if (eq(v, "done") or eq(v, "closed")) return snap.isDone(i);
     return false;
@@ -203,7 +259,8 @@ const Order = struct {
             .state => std.math.order(@intFromBool(o.snap.isDone(a)), @intFromBool(o.snap.isDone(b)))
                 .differ() orelse o.workflowOrder(a, b).differ() orelse
                 std.mem.order(u8, x.state.text(), y.state.text()),
-            .due => dueOrder(x, y),
+            .due => dateOrder(x.ext.due_date, y.ext.due_date),
+            .start => dateOrder(x.ext.start_date orelse x.ext.due_date, y.ext.start_date orelse y.ext.due_date),
             .id => std.mem.order(u8, x.id, y.id),
         };
         // Ties: the most recently touched first.
@@ -246,10 +303,8 @@ const Order = struct {
         return std.math.order(a.len, b.len);
     }
 
-    /// Earliest first; without a due date last.
-    fn dueOrder(x: Issue, y: Issue) std.math.Order {
-        const a = x.ext.due_date;
-        const b = y.ext.due_date;
+    /// Earliest first; without a date last.
+    fn dateOrder(a: ?fields_fmt.Date, b: ?fields_fmt.Date) std.math.Order {
         if (a != null and b != null) return a.?.order(b.?);
         if (a == null and b == null) return .eq;
         return if (a != null) .lt else .gt;
@@ -268,10 +323,10 @@ pub fn rows(arena: Allocator, snap: *const Snapshot, q: Query) Allocator.Error![
     var out: std.ArrayList(Row) = .empty;
     if (!q.tree) {
         var hits: std.ArrayList(u32) = .empty;
-        for (0..n) |i| if (matches(snap, @intCast(i), q.scope, terms)) try hits.append(arena, @intCast(i));
+        for (0..n) |i| if (shown(snap, @intCast(i), q, terms)) try hits.append(arena, @intCast(i));
         sort(snap, hits.items, q);
         try out.ensureTotalCapacity(arena, hits.items.len);
-        for (hits.items) |i| out.appendAssumeCapacity(.{ .issue = i });
+        for (hits.items) |i| out.appendAssumeCapacity(.{ .issue = i, .inherited = q.milestone != null and inherits(snap, i) });
         return out.items;
     }
 
@@ -280,7 +335,7 @@ pub fn rows(arena: Allocator, snap: *const Snapshot, q: Query) Allocator.Error![
     @memset(keep, .no);
     for (0..n) |idx| {
         const i: u32 = @intCast(idx);
-        if (!matches(snap, i, q.scope, terms)) continue;
+        if (!shown(snap, i, q, terms)) continue;
         keep[i] = .hit;
         var p = snap.proj.parent[i];
         var guard: u32 = 0;
@@ -303,7 +358,13 @@ pub fn rows(arena: Allocator, snap: *const Snapshot, q: Query) Allocator.Error![
     }
     while (stack.pop()) |f| {
         assert(keep[f.issue] != .no);
-        try out.append(arena, .{ .issue = f.issue, .depth = f.depth, .context = keep[f.issue] == .context });
+        try out.append(arena, .{
+            .issue = f.issue,
+            .depth = f.depth,
+            .context = keep[f.issue] == .context,
+            // A context row isn't in the milestone, by inheriting or not.
+            .inherited = q.milestone != null and keep[f.issue] == .hit and inherits(snap, f.issue),
+        });
         level.clearRetainingCapacity();
         for (snap.proj.children[f.issue]) |c| if (keep[c] != .no) try level.append(arena, c);
         sort(snap, level.items, q);
@@ -340,7 +401,7 @@ pub fn board(arena: Allocator, snap: *const Snapshot, q: Query) Allocator.Error!
 
     for (0..snap.issues.len) |idx| {
         const i: u32 = @intCast(idx);
-        if (!matches(snap, i, q.scope, terms)) continue;
+        if (!shown(snap, i, q, terms)) continue;
         if (snap.isDone(i)) {
             try done.append(arena, i);
             continue;

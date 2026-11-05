@@ -33,6 +33,8 @@ pub const Item = union(enum) {
     description,
     comment,
     add_child,
+    /// Existing issues as sub-issues.
+    add_existing,
     toggle,
     /// Another issue, by snapshot index.
     open: u32,
@@ -264,6 +266,7 @@ fn drawActions(s: *AppState, f: ui.Frame, bar: ui.Window, i: u32) Allocator.Erro
         .{ .description, "✎ Description  e" },
         .{ .comment, "✉ Comment  c" },
         .{ .add_child, "+ Sub-issue  a" },
+        .{ .add_existing, "+ Existing  A" },
         .{ .toggle, if (done) "↺ Reopen  x" else "✓ Close  x" },
     };
     var x: u16 = 1;
@@ -320,6 +323,17 @@ fn drawContent(c: *Canvas, i: u32) Allocator.Error!void {
     try drawFields(c, i);
     c.skip(1);
 
+    // Where it stands with the remote.
+    if (snap.remote.name) |remote| {
+        if (snap.remote.isQuarantined(issue.id)) {
+            if (c.line()) |l| _ = ui.text(l, 0, 0, f.fmt("! {s} refused the remote's version: Y shows why and what to do", .{remote}), .{ .fg = palette.err });
+            c.skip(1);
+        } else if (snap.remote.unpushed.get(issue.id)) |new| {
+            if (c.line()) |l| _ = ui.text(l, 0, 0, f.fmt("↑ {s} on {s} yet: y syncs", .{ if (new) "not" else "these changes aren't", remote }), .{ .fg = palette.muted });
+            c.skip(1);
+        }
+    }
+
     // Problems and conflicts.
     for (snap.proj.problemsOf(i)) |p| if (c.line()) |l| {
         _ = ui.text(l, 0, 0, f.fmt("⚠ {s}", .{p.describe(f.arena) catch ""}), .{ .fg = palette.err });
@@ -351,7 +365,7 @@ fn drawContent(c: *Canvas, i: u32) Allocator.Error!void {
             f.fmt("Sub-issues  {d}/{d} done", .{ p.closed, p.total })
         else
             f.fmt("Sub-issues  {d}", .{kids.len});
-        try sectionHeader(c, span, title, "+ add sub-issue  a");
+        try sectionHeader(c, span, title, "+ new sub-issue  a");
         if (kids.len == 0) if (c.line()) |l| {
             l.fill(.{ .style = itemStyle(span) });
             _ = ui.text(l, 2, 0, "None yet. Click or press a to break this issue down.", .{ .fg = palette.faint, .italic = true, .bg = itemStyle(span).bg });
@@ -359,6 +373,12 @@ fn drawContent(c: *Canvas, i: u32) Allocator.Error!void {
         try c.end(span);
         if (snap.proj.progress(i)) |p| if (c.line()) |l| progressBar(l, p);
         for (kids) |k| try issueLine(c, k, "");
+        const existing = try c.begin(.add_existing);
+        if (c.line()) |l| {
+            l.fill(.{ .style = itemStyle(existing) });
+            _ = ui.text(l, 2, 0, "+ add existing issues  A", .{ .fg = if (existing.focused) palette.accent else palette.muted, .bg = itemStyle(existing).bg });
+        }
+        try c.end(existing);
     }
     c.skip(1);
 
@@ -635,6 +655,8 @@ pub fn key(s: *AppState, k: vaxis.Key) Allocator.Error!AppState.Action {
         return activate(s, i, .comment);
     } else if (k.matches('a', .{})) {
         return activate(s, i, .add_child);
+    } else if (k.matches('A', .{}) or k.matches('+', .{})) {
+        return activate(s, i, .add_existing);
     } else if (k.matches('x', .{})) {
         return activate(s, i, .toggle);
     } else if (k.matches('o', .{})) {
@@ -670,8 +692,64 @@ fn activate(s: *AppState, i: u32, it: Item) AppState.Action {
         .description => modal.editDescription(s, i),
         .comment => modal.addComment(s, i),
         .add_child => s.newIssue(i),
+        .add_existing => openAdoptPicker(s, i),
         .toggle => return s.toggleAction(i),
         .open => |k| s.openIssue(s.snap.issues[k].id),
     }
     return .none;
+}
+
+/// Existing issues to make sub-issues of `i`: any but `i`, its
+/// ancestors, which would loop, and its sub-issues already.
+pub fn openAdoptPicker(s: *AppState, i: u32) void {
+    const snap = s.snap;
+    s.closeModal();
+    const a = s.modalArena();
+    var order: std.ArrayList(u32) = .empty;
+    for (snap.issues, 0..) |issue, n| {
+        const k: u32 = @intCast(n);
+        if (issue.deleted or k == i or snap.proj.parent[k] == i or isAncestor(snap, k, i)) continue;
+        order.append(a, k) catch {};
+    }
+    // Open first, then the most recently touched.
+    std.mem.sort(u32, order.items, snap, struct {
+        fn lt(sn: *const Snapshot, x: u32, y: u32) bool {
+            const dx = sn.isDone(x);
+            const dy = sn.isDone(y);
+            if (dx != dy) return !dx;
+            return sn.issues[x].updated > sn.issues[y].updated;
+        }
+    }.lt);
+    const items = a.alloc(modal.Picker.Item, order.items.len) catch return s.fail("out of memory", .{});
+    for (order.items, items) |k, *it| {
+        const issue = snap.issues[k];
+        const p = snap.proj.parent[k];
+        it.* = .{
+            .label = std.fmt.allocPrint(a, "#{s} {s}", .{ shortId(issue.id), issue.title }) catch "",
+            .detail = if (p == none) "" else std.fmt.allocPrint(a, "sub-issue of #{s}", .{shortId(snap.issues[p].id)}) catch "",
+            .value = a.dupe(u8, issue.id) catch "",
+            .done = snap.isDone(k),
+        };
+    }
+    if (items.len == 0) return s.info("no other issue can be a sub-issue of #{s}", .{shortId(snap.issues[i].id)});
+    const title = std.fmt.allocPrint(a, "Add sub-issues to #{s}", .{shortId(snap.issues[i].id)}) catch "Add sub-issues";
+    s.openModal(.{ .picker = .{ .title = title, .items = items, .multi = true, .purpose = .{ .adopt = .of(snap.issues[i].id) }, .verb = "Add" } });
+}
+
+/// Whether `k` is `i`'s parent, its parent's, and so on.
+fn isAncestor(snap: *const Snapshot, k: u32, i: u32) bool {
+    var at = snap.proj.parent[i];
+    var steps: usize = 0;
+    // Bounded: a parent cycle in the data would loop.
+    while (at != none and steps < snap.issues.len) : (steps += 1) {
+        if (at == k) return true;
+        at = snap.proj.parent[at];
+    }
+    return false;
+}
+
+/// Puts the focus on one of the issue's fields, for the next frame.
+pub fn focusField(s: *AppState, field: Field) void {
+    s.detail.focused = .{ .item = .{ .field = field } };
+    s.detail.follow = true;
 }

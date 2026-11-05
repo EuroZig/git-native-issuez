@@ -37,6 +37,11 @@ const Tui = struct {
     exited: bool = false,
 
     fn start(t: *Tui, sb: *Sandbox, name: []const u8) !void {
+        return t.startWith(sb, name, .inherit);
+    }
+
+    /// With its stderr, where leaks show, at `stderr`.
+    fn startWith(t: *Tui, sb: *Sandbox, name: []const u8, stderr: std.process.SpawnOptions.StdIo) !void {
         const flags: c.O = .{ .ACCMODE = .RDWR, .NOCTTY = true };
         const master = posix_openpt(@bitCast(flags));
         if (master < 0) return error.OpenPtyFailed;
@@ -61,7 +66,7 @@ const Tui = struct {
                 .environ_map = &sb.env,
                 .stdin = .ignore,
                 .stdout = .ignore,
-                .stderr = .inherit,
+                .stderr = stderr,
             }),
             .screen = try .init(testing.allocator, rows, cols),
         };
@@ -256,6 +261,193 @@ test "two TUIs follow what the command line, each other and an agent write" {
     for (both) |t| try expectShows(&both, t, "Created by an agent", "the agent's create_issue");
 
     for (both) |t| try testing.expectEqual(@as(u8, 0), try t.quit(&both));
+}
+
+/// Today in UTC, plus `days`, as `YYYY-MM-DD`.
+fn dayFromToday(buf: []u8, days: i64) []const u8 {
+    const t = std.Io.Timestamp.now(io, .real);
+    const secs: u64 = @intCast(@divFloor(t.nanoseconds, std.time.ns_per_s) + days * std.time.s_per_day);
+    const yd = (std.time.epoch.EpochSeconds{ .secs = secs }).getEpochDay().calculateYearDay();
+    const md = yd.calculateMonthDay();
+    return std.fmt.bufPrint(buf, "{d:0>4}-{d:0>2}-{d:0>2}", .{ yd.year, md.month.numeric(), md.day_index + 1 }) catch unreachable;
+}
+
+test "the timeline's draft sees a change made elsewhere, and applies over it when asked" {
+    var sb = try Sandbox.init(.{});
+    defer sb.deinit();
+    var b1: [16]u8 = undefined;
+    var b2: [16]u8 = undefined;
+    var b3: [16]u8 = undefined;
+    const created = try gitIssue(&sb, &.{ "create", "Design", "--start", dayFromToday(&b1, 0), "--due", dayFromToday(&b2, 4) });
+    const short = std.mem.trimEnd(u8, created["Created issue ".len..], "\n");
+
+    var tui: Tui = undefined;
+    try tui.start(&sb, "tui");
+    defer tui.deinit();
+    const all = [_]*Tui{&tui};
+    try expectShows(&all, &tui, "Design", "starting");
+    try tui.type("4");
+    try expectShows(&all, &tui, "(no milestone)", "4");
+    try tui.type("jE");
+    try expectShows(&all, &tui, "EDIT MODE", "E");
+    try tui.type("l");
+    try expectShows(&all, &tui, "1 change not applied", "l");
+
+    // Someone renames it meanwhile: the draft says so, with no key pressed.
+    _ = try gitIssue(&sb, &.{ "edit", short, "--title", "Design, renamed" });
+    try expectShows(&all, &tui, "! 1 changed elsewhere", "git issue edit");
+    try tui.type("\x13"); // ctrl+s
+    try expectShows(&all, &tui, "r keeps your change", "ctrl+s on a stale draft");
+    try tui.type("r\x13");
+    try expectShows(&all, &tui, "Apply 1 change?", "r, ctrl+s");
+    try tui.type("\r");
+    try expectShows(&all, &tui, "applied 1 change", "Apply");
+
+    const shown = try gitIssue(&sb, &.{ "show", short });
+    try testing.expect(std.mem.find(u8, shown, "Design, renamed") != null);
+    const want = try std.fmt.allocPrint(sb.arena(), "Start:   {s}", .{dayFromToday(&b3, 1)});
+    try testing.expect(std.mem.find(u8, shown, want) != null);
+    try testing.expectEqual(@as(u8, 0), try tui.quit(&all));
+}
+
+/// An executable shell script at `path`.
+fn writeScript(sb: *Sandbox, path: []const u8, script: []const u8) !void {
+    try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = path, .data = script });
+    try expectSuccess(try sb.run(&.{ "chmod", "+x", path }));
+}
+
+/// ssh without the developer's ~/.ssh/config, first in PATH: ssh reads
+/// the config from the home directory of the user, whatever HOME says.
+fn isolateSsh(sb: *Sandbox) !void {
+    const a = sb.arena();
+    const found = try sb.run(&.{ "sh", "-c", "command -v ssh" });
+    try expectSuccess(found);
+    const bin = try std.fmt.allocPrint(a, "{s}-bin", .{sb.repo});
+    try std.Io.Dir.cwd().createDir(io, bin, .default_dir);
+    try writeScript(sb, try std.fmt.allocPrint(a, "{s}/ssh", .{bin}), try std.fmt.allocPrint(
+        a,
+        "#!/bin/sh\nexec '{s}' -F /dev/null \"$@\"\n",
+        .{std.mem.trimEnd(u8, found.stdout, "\n")},
+    ));
+    try sb.env.put("PATH", try std.fmt.allocPrint(a, "{s}:{s}", .{ bin, sb.env.get("PATH") orelse "/usr/bin:/bin" }));
+}
+
+test "y syncs with a real remote; a dead one fails without a prompt" {
+    var sb = try Sandbox.init(.{});
+    defer sb.deinit();
+    try isolateSsh(&sb);
+    const a = sb.arena();
+    const hub = try std.fmt.allocPrint(a, "{s}-hub.git", .{sb.repo});
+    const bob = try std.fmt.allocPrint(a, "{s}-bob", .{sb.repo});
+    try sb.git(&.{ "init", "-q", "--bare", hub });
+    try sb.git(&.{ "remote", "add", "origin", hub });
+    try sb.git(&.{ "clone", "-q", hub, bob });
+    const exe = try sb.exe(paths.git_issue_exe);
+    _ = try gitIssue(&sb, &.{ "create", "Made here" });
+    try expectSuccess(try sb.runIn(bob, &.{ exe, "create", "Made by Bob" }));
+    try expectSuccess(try sb.runIn(bob, &.{ exe, "sync", "origin" }));
+
+    var tui: Tui = undefined;
+    try tui.start(&sb, "tui");
+    defer tui.deinit();
+    const all = [_]*Tui{&tui};
+    try expectShows(&all, &tui, "⇅ origin ↑1", "starting");
+    try tui.type("y");
+    try expectShows(&all, &tui, "synced with origin: 1 in, 1 out", "y");
+    try expectShows(&all, &tui, "Made by Bob", "y");
+    try expectShows(&all, &tui, "⇅ origin ✓", "y");
+
+    try expectSuccess(try sb.runIn(bob, &.{ exe, "merge", "origin" }));
+    const listed = try sb.runIn(bob, &.{ exe, "ls" });
+    try testing.expect(std.mem.find(u8, listed.stdout, "Made here") != null);
+
+    // A CLI push moves only sync records: the badge still updates live.
+    _ = try gitIssue(&sb, &.{ "create", "Pushed from the CLI" });
+    try expectShows(&all, &tui, "⇅ origin ↑1", "an external create");
+    _ = try gitIssue(&sb, &.{ "push", "origin" });
+    try expectShows(&all, &tui, "⇅ origin ✓", "an external push");
+
+    // A remote nobody answers on: it fails, says why, and asks nothing.
+    try sb.git(&.{ "remote", "add", "dead", "ssh://nobody@127.0.0.1:1/x.git" });
+    try sb.git(&.{ "config", "issue.remote", "dead" });
+    try tui.type("\x12"); // ctrl+r: reread it all, the remote too
+    try expectShows(&all, &tui, "⇅ dead", "issue.remote");
+    try tui.type("y");
+    try expectShows(&all, &tui, "sync with dead failed", "y on a dead remote");
+    try expectShows(&all, &tui, "⇅ dead ⚠", "the failure");
+    try testing.expectEqual(@as(u8, 0), try tui.quit(&all));
+}
+
+test "quitting while a sync runs stops it; the user's own ssh runs without the terminal" {
+    var sb = try Sandbox.init(.{});
+    defer sb.deinit();
+    const a = sb.arena();
+    const dir = try std.fmt.allocPrint(a, "{s}-ssh", .{sb.repo});
+    try std.Io.Dir.cwd().createDir(io, dir, .default_dir);
+    // An ssh that says where it runs, then hangs like a host that never
+    // answers.
+    const ssh = try std.fmt.allocPrint(a, "{s}/my-ssh", .{dir});
+    try writeScript(&sb, ssh, try std.fmt.allocPrint(a,
+        \\#!/bin/sh
+        \\if (exec </dev/tty) 2>/dev/null; then echo tty; else echo none; fi > '{0s}/tty'
+        \\echo "$SSH_ASKPASS_REQUIRE" > '{0s}/askpass'
+        \\echo "$@" > '{0s}/args'
+        \\echo $$ > '{0s}/pid.tmp' && mv '{0s}/pid.tmp' '{0s}/pid'
+        \\exec sleep 60
+        \\
+    , .{dir}));
+    try sb.git(&.{ "remote", "add", "origin", "ssh://git@example.invalid/x.git" });
+    try sb.git(&.{ "config", "core.sshCommand", ssh });
+    // No probing of what kind of ssh it is: that would hang too.
+    try sb.git(&.{ "config", "ssh.variant", "ssh" });
+    _ = try gitIssue(&sb, &.{ "create", "Made here" });
+
+    const log_path = try std.fmt.allocPrint(a, "{s}/stderr", .{dir});
+    const log = try std.Io.Dir.cwd().createFile(io, log_path, .{});
+    defer log.close(io);
+    var tui: Tui = undefined;
+    try tui.startWith(&sb, "tui", .{ .file = log });
+    defer tui.deinit();
+    const all = [_]*Tui{&tui};
+    try expectShows(&all, &tui, "⇅ origin ↑1", "starting");
+    try tui.type("y");
+    try expectShows(&all, &tui, "origin fetching…", "y");
+    const pid_path = try std.fmt.allocPrint(a, "{s}/pid", .{dir});
+    const deadline = now() + timeout_ms;
+    while (true) {
+        std.Io.Dir.cwd().access(io, pid_path, .{}) catch {
+            if (now() > deadline) return failScreen(&tui, "never ran", "my-ssh", "y");
+            try pump(&all, 25);
+            continue;
+        };
+        break;
+    }
+    const read = struct {
+        fn f(al: std.mem.Allocator, d: []const u8, name: []const u8) ![]const u8 {
+            const path = try std.fmt.allocPrint(al, "{s}/{s}", .{ d, name });
+            const text = try std.Io.Dir.cwd().readFileAlloc(io, path, al, .limited(4096));
+            return std.mem.trimEnd(u8, text, "\n");
+        }
+    }.f;
+    // Theirs, as they set it, with no terminal to prompt on.
+    try testing.expectEqualStrings("none", try read(a, dir, "tty"));
+    try testing.expectEqualStrings("never", try read(a, dir, "askpass"));
+    try testing.expect(std.mem.find(u8, try read(a, dir, "args"), "BatchMode") == null);
+    const pid = try std.fmt.parseInt(c.pid_t, try read(a, dir, "pid"), 10);
+
+    try tui.type("q");
+    try expectShows(&all, &tui, "q again quits and stops it", "q while syncing");
+    try testing.expectEqual(@as(u8, 0), try tui.quit(&all));
+    // The ssh is gone with the git that ran it.
+    const gone_by = now() + timeout_ms;
+    while (c.kill(pid, @enumFromInt(0)) == 0) {
+        if (now() > gone_by) return error.SshStillRunning;
+        try io.sleep(.fromMilliseconds(25), .awake);
+    }
+    // Nothing leaked: the debug allocator would say so on stderr.
+    const errors = try std.Io.Dir.cwd().readFileAlloc(io, log_path, a, .limited(64 * 1024));
+    if (errors.len > 0) std.debug.print("tui stderr:\n{s}\n", .{errors});
+    try testing.expect(std.mem.find(u8, errors, "leak") == null);
 }
 
 test {

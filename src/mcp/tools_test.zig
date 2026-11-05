@@ -120,7 +120,12 @@ test "create, list, show, comment, edit and close" {
     };
     var sim = try GitSim.init(arena, &world, 0);
     var repos: SimRepos = .{ .sim = &sim };
-    var handler: tools.Handler(SimRepos) = .{ .repos = &repos };
+    var handler: tools.Handler(SimRepos) = .{
+        .repos = &repos,
+        // 2026-11-04 23:30 UTC: already the 5th an hour east.
+        .zone = .{ .initial = 3600 },
+        .now_s = 1_793_835_000,
+    };
     var h: Harness = .{ .arena = arena, .server = .init(&handler) };
     h.server.connection.markInitialized(.{
         .protocolVersion = mcp.types.latest_protocol_version,
@@ -133,12 +138,17 @@ test "create, list, show, comment, edit and close" {
     );
     const parent_id = str(parent, "id");
     const child_args = try std.fmt.allocPrint(arena,
-        \\{{"title":"Write the changelog","description":"Every change since 0.1.","parent":"{s}","estimate":"1h30m","workflow":"ready"}}
+        \\{{"title":"Write the changelog","description":"Every change since 0.1.","parent":"{s}","estimate":"1h30m","workflow":"ready","start":"+2d","due":"eow"}}
     , .{str(parent, "short_id")});
     const child = try h.ok("create_issue", child_args);
     const child_id = str(child, "id");
 
     // The parent has an open sub-issue, so it can't be closed yet.
+    try testing.expectEqualStrings(
+        "due must be a date as YYYY-MM-DD, or like today, +3d, fri, eom, not 'soon'",
+        try h.failed("create_issue", "{\"title\":\"Later\",\"due\":\"soon\"}"),
+    );
+
     const close_parent = try std.fmt.allocPrint(arena, "{{\"id\":\"{s}\",\"state\":\"closed\"}}", .{parent_id});
     try testing.expectEqualStrings(
         "the issue has open sub-issues; close them first",
@@ -152,6 +162,9 @@ test "create, list, show, comment, edit and close" {
     try testing.expectEqualStrings(child_id, str(first, "id"));
     try testing.expectEqualStrings(parent_id, str(first, "parent"));
     try testing.expectEqual(@as(i64, 90), first.get("estimate_minutes").?.integer);
+    // Relative to the local date, the 5th (a Thursday; the week ends on Sunday).
+    try testing.expectEqualStrings("2026-11-07", str(first, "start"));
+    try testing.expectEqualStrings("2026-11-08", str(first, "due"));
     const second = listed.get("issues").?.array.items[1].object;
     try testing.expectEqualStrings("high", str(second, "priority"));
     try testing.expectEqualStrings("2026-12-01", str(second, "due"));

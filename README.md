@@ -10,15 +10,17 @@ command. It reads and writes the format of
 - **More than format 1:** parent issues, blockers, dates, estimates,
   workflow states, milestones and image attachments, as extra trailers that
   upstream keeps and shows.
-- **A terminal UI:** a list, a kanban board and a detail view, usable with
-  the mouse, updating live when anyone else writes.
+- **A terminal UI:** a list, a kanban board, milestones and an editable
+  timeline, usable with the mouse, updating live when anyone else writes.
 - **For coding agents:** `git issue mcp`, a Model Context Protocol server.
 - **For scripts:** `--json` on every read command, man pages and shell
   completions.
 
-![The list: issues with their labels, priority, workflow state, assignee and due date, sorted by priority](docs/issuez-list.png)
-
 ![The board: a column per workflow state, cards with priority, progress, labels and assignee](docs/issuez-board.png)
+
+![The timeline: issues grouped by milestone as bars over the weeks, with due dates, blockers and a warning where work ends after the due date](docs/issuez-gantt.png)
+
+![The list: issues with their labels, priority, workflow state, assignee and due date, sorted by priority](docs/issuez-list.png)
 
 > [!WARNING]
 > Generative AI was used to edit and/or produce large portions of this code.
@@ -102,16 +104,33 @@ See [docs/attachments.md](docs/attachments.md).
 
 ### Terminal UI
 
-`git issue tui`, or plain `git issue` at a terminal:
+`git issue tui`, or plain `git issue` at a terminal: a list (optionally a
+tree of sub-issues), a kanban board by workflow state and a detail view
+where every field is edited in place. `?` shows the keys; the mouse works
+everywhere. The list is sortable and filterable
+(`label:ui @ada p:high is:blocked -label:wontfix`). It updates live when
+the CLI, another TUI or an agent writes.
 
-- a list, optionally as a tree of sub-issues, sortable and filterable
-  (`label:ui @ada p:high is:blocked -label:wontfix`);
-- a kanban board with a column per workflow state;
-- a detail view where every field is edited in place.
+Milestones (`3`) shows every milestone with its progress, due date and
+health, sorted and filtered as you like; `n` creates one. Enter opens its
+issues, where `m`, `[` `]`, marks and a second pane (`v`) move work
+between milestones, and `n` or `N` adds work to it. The timeline (`4`)
+draws milestones, issues and blockers over the days. In its edit mode
+(`E`) bars move and stretch with the keys or the mouse, nothing is written
+until `ctrl+s` applies every change at once, and the view can't be left
+with changes neither applied nor discarded. Schedules count working days
+when `git config issue.workDays "mon,tue,wed,thu,fri"` says which they
+are, and an estimate's day is `git config issue.hoursPerDay` hours
+(default 8).
 
-`?` shows the keys, and the mouse works everywhere. It follows what others
-write as it happens: `git issue` in another terminal, another TUI, an agent,
-a sync.
+The `⇅` badge in the top bar says what isn't pushed (`↑`), what the
+remote's history was refused for (`!`) and what is left in conflict
+(`✕`). `y` syncs (fetch, merge, push, as `git issue sync`) in the
+background; `Y` opens the sync panel, where quarantines are resolved and
+conflicts opened. `git config issue.remote` picks the remote, and `git
+config issue.autoSync 10` fetches and merges every 10 minutes (it never
+pushes on its own). git never prompts: it runs without a terminal, ssh in
+batch mode unless you set your own ssh command, so a key needs an agent.
 
 ### Coding agents (MCP)
 
@@ -134,34 +153,17 @@ other clients.
 
 ### Importing from GitHub, GitLab and others
 
-Import, export and two-way sync with GitHub, GitLab and Gitea/Forgejo, and
-import from Azure DevOps, are upstream's: install
+Import, export and sync with GitHub, GitLab and Gitea/Forgejo, and import
+from Azure DevOps, come from upstream: install
 [git-native-issue](https://github.com/remenoscodes/git-native-issue) next to
-this one and run its bridges in the same repository. Both tools share the
-issue refs, so what they import works here as it is. git-native-issuez
-doesn't install the `git-issue-import`, `git-issue-export` or
-`git-issue-sync` entry points, so with both on `PATH` the hyphenated names
-run upstream's; `git issue import` runs this one, which refuses and points
-there. Both install a `git-issue` and its `git-issue-<command>` entry points:
-`git issue` runs whichever comes first on `PATH`, so put this one's directory
-first. Installed into the same prefix (`~/.local`, say), the one installed
-last overwrites the other's. Install upstream first, then this one; if
-upstream came second, run `update-git-native-issuez` (or `install.sh`)
-again. Upstream's bridges keep working, since this one doesn't install them.
-
-```sh
-git-issue-import github:owner/repo --state all   # all issues, with comments
-git-issue-export github:owner/repo               # local issues back to GitHub
-git-issue-sync gitlab:group/project              # import, then export
-```
-
-Upstream's docs cover the providers, tokens and options:
-[Platform Bridges](https://github.com/remenoscodes/git-native-issue#platform-bridges),
-the [GitLab](https://github.com/remenoscodes/git-native-issue/blob/main/docs/gitlab-bridge.md)
-and [Gitea/Forgejo](https://github.com/remenoscodes/git-native-issue/blob/main/docs/gitea-bridge.md)
-bridges, and the
-[migration guide](https://github.com/remenoscodes/git-native-issue/blob/main/docs/migration-guide.md).
-The bridges aren't reimplemented here (contributions are welcome).
+this one and run its `git-issue-import`, `git-issue-export` and
+`git-issue-sync` in the same repository. Both share the issue refs, so
+imported issues work here as they are. Install upstream first: both install
+`git-issue` and its `git-issue-<command>` entry points, so upstream
+installed after this one into the same prefix overwrites ours (run
+`update-git-native-issuez` again to fix it). Upstream's
+[Platform Bridges](https://github.com/remenoscodes/git-native-issue#platform-bridges)
+cover providers, tokens and options.
 
 ## Using the library
 
@@ -230,8 +232,8 @@ docs under `share/`. The Windows archive has `git-issue.exe` only: run
 one by hand, unpack it into a prefix with `bin/` on your `PATH`:
 
 ```sh
-gh release download v0.2.0 --repo EuroZig/git-native-issuez --pattern '*-full-aarch64-macos.tar.gz'
-tar -xzf git-native-issuez-0.2.0-full-aarch64-macos.tar.gz --strip-components=1 -C ~/.local
+gh release download v0.3.0 --repo EuroZig/git-native-issuez --pattern '*-full-aarch64-macos.tar.gz'
+tar -xzf git-native-issuez-0.3.0-full-aarch64-macos.tar.gz --strip-components=1 -C ~/.local
 ```
 
 On macOS, an archive downloaded with a browser is quarantined and
@@ -243,7 +245,7 @@ On macOS, an archive downloaded with a browser is quarantined and
 It downloads the latest release for your machine, checks it against
 `SHA256SUMS` and unpacks it into `~/.local`.
 
-- Options go after `sh -s --`: `--flavor minimal`, `--version 0.2.0`,
+- Options go after `sh -s --`: `--flavor minimal`, `--version 0.3.0`,
   `--prefix /usr/local`. For a prefix you can't write to, pipe it into
   `sudo sh -s -- --prefix /usr/local`.
 - It doesn't touch your shell configuration: if `~/.local/bin` isn't on

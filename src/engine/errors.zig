@@ -68,6 +68,7 @@ pub fn describe(err: anyerror) ?[]const u8 {
         error.ActiveChildren => "the issue has sub-issues that aren't deleted; delete or move them first",
         error.ParentDeleted => "that parent is deleted; restore it first",
         error.CommentNotFound => "that isn't a comment of this issue",
+        error.DuplicateEdit => "the same issue or milestone is edited twice in one batch",
         // Milestones.
         error.MilestoneCompleted => "the milestone is completed; reopen it first",
         error.MilestoneRetired => "the milestone is retired; pick another one",
@@ -86,6 +87,7 @@ pub fn describe(err: anyerror) ?[]const u8 {
         // Sync.
         error.InvalidRemoteName => "not a valid remote name",
         error.UnknownRemote => "no such remote",
+        error.UnknownIssueRemote => "`git config issue.remote` names no remote; fix or unset it",
         error.PushRoundsExhausted => "the remote kept changing while pushing; try again",
         error.NotQuarantined => "the issue isn't quarantined",
         error.RemoteIssueInvalid => "the remote's issue fails the integrity checks; there is nothing valid to accept",

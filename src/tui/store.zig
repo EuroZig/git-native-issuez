@@ -45,6 +45,8 @@ pub const Snapshot = struct {
     settings: issuez.Settings = .{},
     /// The catalog, by due date then name.
     milestones: []const Milestone = &.{},
+    /// Against the remote syncs go to, from local refs.
+    remote: RemoteState = .{},
 
     pub fn find(s: *const Snapshot, id: []const u8) ?u32 {
         return s.proj.find(id);
@@ -81,11 +83,37 @@ pub const Snapshot = struct {
     pub const Resolved = union(enum) { none, many, one: u32 };
 
     /// The milestone's name, for an issue's effective milestone.
+    /// A catalog milestone's position in `milestones`.
+    pub fn findMilestone(s: *const Snapshot, id: []const u8) ?u32 {
+        for (s.milestones, 0..) |m, n| if (std.mem.eql(u8, m.id, id)) return @intCast(n);
+        return null;
+    }
+
     pub fn milestoneName(s: *const Snapshot, i: u32) ?[]const u8 {
         if (s.proj.milestone[i]) |mid| {
             for (s.milestones) |m| if (std.mem.eql(u8, m.id, mid)) return m.name;
         }
         return s.issues[i].field("Milestone");
+    }
+};
+
+pub const RemoteState = struct {
+    remotes: []const []const u8 = &.{},
+    /// The one syncs go to; null without remotes.
+    name: ?[]const u8 = null,
+    /// Not pushed yet, by ID: true when never pushed.
+    unpushed: std.StringHashMapUnmanaged(bool) = .empty,
+    quarantined: std.StringHashMapUnmanaged(void) = .empty,
+    /// Why the remote, or what isn't pushed or is quarantined, couldn't
+    /// be read; empty when all was.
+    problem: []const u8 = "",
+
+    pub fn isUnpushed(r: *const RemoteState, id: []const u8) bool {
+        return r.unpushed.contains(id);
+    }
+
+    pub fn isQuarantined(r: *const RemoteState, id: []const u8) bool {
+        return r.quarantined.contains(id);
     }
 };
 
@@ -98,6 +126,42 @@ pub const CreateInput = struct {
     priority: ?core.Priority = null,
     workflow: ?[]const u8 = null,
     parent: ?[]const u8 = null,
+    /// A catalog milestone's full ID.
+    milestone_id: ?[]const u8 = null,
+};
+
+/// One issue's part of `editBatch`: a full ID.
+pub const BatchItem = struct { id: []const u8, spec: issuez.engine.EditSpec };
+
+/// A milestone's due date in `applyPlan`; empty clears it.
+pub const DueItem = struct { id: []const u8, due: []const u8, expect: ?Oid = null };
+
+/// Where an issue's milestone comes from.
+pub const MilestoneLink = union(enum) {
+    /// A catalog milestone, by full ID.
+    id: []const u8,
+    /// None, and sub-issues that inherit get none either.
+    none,
+    /// The parent's.
+    inherit,
+};
+
+/// What a milestone edit changes; null leaves a part alone. `due` empty
+/// clears it.
+pub const MilestoneEdit = struct {
+    name: ?[]const u8 = null,
+    due: ?[]const u8 = null,
+    description: ?[]const u8 = null,
+    status: ?issuez.format.fields.MilestoneStatus = null,
+    /// Null: the tip the snapshot shows.
+    expect: ?Oid = null,
+};
+
+/// A new milestone. Strings are copied by the write.
+pub const MilestoneInput = struct {
+    name: []const u8,
+    due: ?[]const u8 = null,
+    description: []const u8 = "",
 };
 
 pub fn Store(comptime B: type) type {
@@ -117,8 +181,13 @@ pub fn Store(comptime B: type) type {
         generation: u32 = 0,
         /// The refs as the snapshot read them, in its arena.
         refs: issuez.changes.RefState = .{},
+        /// Sync records change the badge even when no issue tip moves.
+        sync_refs: issuez.changes.RefState = .{},
         /// Why the reload after a write that worked failed, until taken.
         reload_error: ?anyerror = null,
+        /// The remote picked for this session, over `sync.defaultRemote`.
+        remote_buf: [256]u8 = undefined,
+        remote_len: u16 = 0,
 
         pub fn init(gpa: Allocator, backend: *B) Self {
             return .{
@@ -170,6 +239,9 @@ pub fn Store(comptime B: type) type {
             // Before the issues: a write in between then shows as a change
             // next time, never the other way round.
             const refs = try issuez.changes.RefState.read(a, self.backend);
+            const sync_refs: issuez.changes.RefState = .{
+                .refs = try self.backend.listRefs(a, "refs/issuez-sync/"),
+            };
             const settings = try issuez.settings.read(a, self.backend);
             if (settings.invalid_done_state != null) return error.InvalidDoneStates;
             var r = Repo.init(self.backend);
@@ -182,11 +254,92 @@ pub fn Store(comptime B: type) type {
             const proj = try cat.project(a, issues, .{ .milestones = milestones });
             assert(proj.issues.len == issues.len);
 
+            const remote = self.readRemote(a);
+
             self.snap_arena.deinit();
             self.snap_arena = next;
-            self.snap = .{ .issues = issues, .proj = proj, .settings = settings, .milestones = milestones };
+            self.snap = .{ .issues = issues, .proj = proj, .settings = settings, .milestones = milestones, .remote = remote };
             self.refs = refs;
+            self.sync_refs = sync_refs;
             self.generation +%= 1;
+        }
+
+        /// What is unpushed and quarantined, for the remote syncs go to.
+        /// A failure here doesn't fail the reload: it's a hint, not the
+        /// data. What was read stays, and the problem says what wasn't.
+        fn readRemote(self: *Self, a: Allocator) RemoteState {
+            var out: RemoteState = .{};
+            out.remotes = self.backend.remoteNames(a) catch |e| return self.remoteProblem(a, out, "can't list the remotes", e);
+            if (out.remotes.len == 0) return out;
+            const chosen = self.remote_buf[0..self.remote_len];
+            out.name = for (out.remotes) |n| {
+                if (chosen.len > 0 and std.mem.eql(u8, n, chosen)) break n;
+            } else issuez.sync.defaultRemote(a, Known{ .backend = self.backend, .names = out.remotes }) catch |e|
+                return self.remoteProblem(a, out, "git config issue.remote", e);
+            const name = out.name orelse return out;
+            self.readCounts(a, name, &out) catch |e| {
+                out.unpushed = .empty;
+                out.quarantined = .empty;
+                return self.remoteProblem(a, out, "can't tell what isn't pushed", e);
+            };
+            return out;
+        }
+
+        fn readCounts(self: *Self, a: Allocator, name: []const u8, out: *RemoteState) !void {
+            const s = issuez.Sync(B).init(self.backend);
+            for (try s.unpushed(a, name)) |u| try out.unpushed.put(a, u.id, u.new);
+            for (issuez.sync.namespaces) |ns| {
+                const prefix = try issuez.sync.recordRef(a, name, .quarantined, ns, "");
+                for (try self.backend.listRefs(a, prefix)) |m| try out.quarantined.put(a, m.name[prefix.len..], {});
+            }
+        }
+
+        fn remoteProblem(self: *Self, a: Allocator, out: RemoteState, what: []const u8, err: anyerror) RemoteState {
+            var with = out;
+            var buf: [400]u8 = undefined;
+            with.problem = std.fmt.allocPrint(a, "{s}: {s}", .{ what, self.describe(err, &buf) }) catch what;
+            return with;
+        }
+
+        /// The backend for `sync.defaultRemote`, with the remotes read
+        /// already.
+        const Known = struct {
+            backend: *B,
+            names: []const []const u8,
+
+            pub fn remoteNames(k: Known, _: Allocator) error{}![]const []const u8 {
+                return k.names;
+            }
+
+            pub fn configGet(k: Known, a: Allocator, key: []const u8) !?[]const u8 {
+                return k.backend.configGet(a, key);
+            }
+        };
+
+        /// The remote's URL, for showing; empty when unknown.
+        pub fn remoteUrl(self: *Self, a: Allocator, name: []const u8) []const u8 {
+            const key = std.fmt.allocPrint(a, "remote.{s}.url", .{name}) catch return "";
+            return (self.backend.configGet(a, key) catch return "") orelse "";
+        }
+
+        /// Syncs go to `name` from now on, this session.
+        pub fn chooseRemote(self: *Self, name: []const u8) !void {
+            self.remote_len = @intCast(@min(name.len, self.remote_buf.len));
+            @memcpy(self.remote_buf[0..self.remote_len], name[0..self.remote_len]);
+            try self.reload();
+        }
+
+        /// What a sync panel shows, read now from local refs.
+        pub fn syncStatus(self: *Self, a: Allocator) !?issuez.sync.Status {
+            const name = self.snap.remote.name orelse return null;
+            return try issuez.Sync(B).init(self.backend).status(a, name);
+        }
+
+        /// A quarantined remote version: taken, or our own kept.
+        pub fn resolve(self: *Self, id: []const u8, how: issuez.sync.Resolution) !void {
+            const name = self.snap.remote.name orelse return error.UnknownRemote;
+            _ = try issuez.Sync(B).init(self.backend).resolve(self.begin(), name, id, how);
+            self.reloadAfterWrite();
         }
 
         /// What `reloadIfChanged` found.
@@ -198,14 +351,17 @@ pub fn Store(comptime B: type) type {
             milestones: bool = false,
         };
 
-        /// Reads the refs, and everything again if they moved since the
-        /// last reload or `settings` says git config may have changed.
+        /// Reads issue and sync refs, and everything again if they moved
+        /// since the last reload or git config may have changed.
         /// Null when it didn't reload.
         pub fn reloadIfChanged(self: *Self, settings: bool) !?Outside {
             const a = self.begin();
             const now = try issuez.changes.RefState.read(a, self.backend);
             const d = try issuez.changes.diff(a, self.refs, now);
-            if (d.empty() and !settings) return null;
+            const sync_refs: issuez.changes.RefState = .{
+                .refs = try self.backend.listRefs(a, "refs/issuez-sync/"),
+            };
+            if (d.empty() and self.sync_refs.eql(sync_refs) and !settings) return null;
             var out: Outside = .{ .issues = @intCast(d.issues.len), .milestones = d.milestones };
             if (d.issues.len > 0) out.first = .of(d.issues[0]);
             try self.reload();
@@ -256,6 +412,7 @@ pub fn Store(comptime B: type) type {
                 .priority = input.priority,
                 .workflow = input.workflow,
                 .parent = input.parent,
+                .milestone_id = input.milestone_id,
             });
             const id: Id = .of(created.id.slice());
             self.reloadAfterWrite();
@@ -294,6 +451,78 @@ pub fn Store(comptime B: type) type {
             self.reloadAfterWrite();
         }
 
+        /// Links the issue as `link` says, like `git issue edit
+        /// --milestone-id`, `--no-milestone` and `--milestone-mode inherit`.
+        pub fn setMilestoneLink(self: *Self, id: []const u8, link: MilestoneLink, expected: ?Oid) !void {
+            const a = self.begin();
+            var spec: issuez.engine.EditSpec = .{ .expect = self.expect(id, expected) };
+            switch (link) {
+                .id => |mid| spec.milestone_id = mid,
+                .none => spec.milestone_mode = .none,
+                .inherit => spec.milestone_mode = .inherit,
+            }
+            _ = try self.repo().edit(a, try refName(a, id), spec);
+            self.reloadAfterWrite();
+        }
+
+        /// Every edit or none. `spec.expect` null: what the snapshot shows.
+        pub fn editBatch(self: *Self, items: []const BatchItem) !void {
+            const a = self.begin();
+            const edits = try a.alloc(Repo.BatchEdit, items.len);
+            for (items, edits) |it, *e| {
+                var spec = it.spec;
+                spec.expect = self.expect(it.id, spec.expect);
+                if (spec.workflow) |w| if (w.len > 0) try self.snap.settings.checkWorkflow(w);
+                e.* = .{ .ref_name = try refName(a, it.id), .spec = spec };
+            }
+            _ = try self.repo().editBatch(a, edits);
+            self.reloadAfterWrite();
+        }
+
+        /// Issue edits and milestones' due dates, all or none.
+        pub fn applyPlan(self: *Self, items: []const BatchItem, dues: []const DueItem) !void {
+            const a = self.begin();
+            const edits = try a.alloc(Repo.BatchEdit, items.len);
+            for (items, edits) |it, *e| {
+                var spec = it.spec;
+                spec.expect = self.expect(it.id, spec.expect);
+                e.* = .{ .ref_name = try refName(a, it.id), .spec = spec };
+            }
+            const due_edits = try a.alloc(Catalog.DueEdit, dues.len);
+            for (dues, due_edits) |d, *e| e.* = .{ .id = d.id, .due = d.due, .expect = d.expect };
+            _ = try Catalog.of(self.repo()).editBatch(a, edits, due_edits);
+            self.reloadAfterWrite();
+        }
+
+        /// Returns the new milestone's ID.
+        pub fn createMilestone(self: *Self, input: MilestoneInput) !Id {
+            const a = self.begin();
+            const created = try Catalog.of(self.repo()).create(a, .{
+                .name = input.name,
+                .due = input.due,
+                .description = input.description,
+            });
+            const id: Id = .of(created.id.slice());
+            self.reloadAfterWrite();
+            return id;
+        }
+
+        pub fn editMilestone(self: *Self, id: []const u8, e: MilestoneEdit) !void {
+            const a = self.begin();
+            var expected = e.expect;
+            if (expected == null) {
+                if (self.snap.findMilestone(id)) |n| expected = self.snap.milestones[n].tip;
+            }
+            _ = try Catalog.of(self.repo()).edit(a, id, .{
+                .name = e.name,
+                .due = e.due,
+                .description = e.description,
+                .status = e.status,
+                .expect = expected,
+            });
+            self.reloadAfterWrite();
+        }
+
         /// `expected` null: what the snapshot shows.
         pub fn setState(self: *Self, id: []const u8, state: core.State, expected: ?Oid) !void {
             const a = self.begin();
@@ -328,7 +557,7 @@ pub fn Store(comptime B: type) type {
                     std.mem.join(self.begin(), ", ", self.snap.settings.workflow_states) catch "",
                 }) catch {},
                 error.VersionMismatch => w.writeAll(
-                    "the issue changed meanwhile; reloaded, try again",
+                    "it changed meanwhile; reloaded, try again",
                 ) catch {},
                 else => {
                     w.print("{f}", .{issuez.errors.Description{ .err = err, .limits = .{} }}) catch {};

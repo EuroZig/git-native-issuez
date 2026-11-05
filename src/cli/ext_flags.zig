@@ -11,8 +11,8 @@ const Allocator = std.mem.Allocator;
 pub const help_create =
     \\   --parent <issue-id>       Make it a child of another issue
     \\   --blocked-by <issue-id>   Blocked by another issue (repeatable)
-    \\   --start <date>            Start date, YYYY-MM-DD
-    \\   --due <date>              Due date, YYYY-MM-DD
+    \\   --start <date>            Start date: YYYY-MM-DD, today, +3d, fri, eom
+    \\   --due <date>              Due date: YYYY-MM-DD, today, +3d, fri, eom
     \\   --estimate <duration>     Minutes, or e.g. 2h, 90m, 1h30m
     \\   --workflow <state>        Workflow state (git config issue.workflowStates;
     \\                             default backlog, ready, in-progress, review)
@@ -143,14 +143,13 @@ pub const Flags = struct {
             .{ "--start", f.start, &out.start },
             .{ "--due", f.due, &out.due },
         }) |d| if (d[1]) |v| {
-            if (fields.Date.parse(v) == null) {
+            d[2].* = (ctx.date(v) catch return null) orelse {
                 ctx.err.print(
-                    "error: {s} must be a date as YYYY-MM-DD, not '{s}'\n",
+                    "error: {s} must be a date as YYYY-MM-DD, or like today, +3d, fri, eom, not '{s}'\n",
                     .{ d[0], v },
                 ) catch {};
                 return null;
-            }
-            d[2].* = v;
+            };
         };
         if (f.estimate) |e| out.estimate = fields.parseDuration(e) orelse {
             ctx.err.print(
