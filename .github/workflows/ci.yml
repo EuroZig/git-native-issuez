@@ -10,10 +10,10 @@ permissions:
 
 jobs:
   test:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v7
-      - uses: mlugg/setup-zig@v2
+      - uses: EuroZig/setup-zig@v3
         with:
           version: 0.16.0
 

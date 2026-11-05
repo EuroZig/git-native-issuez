@@ -57,7 +57,7 @@ jobs:
           sed -i -E "s#\]\(((docs|examples)/[^)]*|[A-Z]+\.md)\)#](https://github.com/$GITHUB_REPOSITORY/blob/$GITHUB_REF_NAME/\1)#g" notes.md
           cat notes.md
 
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: notes
           path: notes.md
@@ -80,7 +80,7 @@ jobs:
           - { name: aarch64-macos, runner: macos-15, apt: false, step: test }
     steps:
       - uses: actions/checkout@v7
-      - uses: mlugg/setup-zig@v2
+      - uses: EuroZig/setup-zig@v3
         with:
           version: ${{ env.ZIG_VERSION }}
 
@@ -102,11 +102,11 @@ jobs:
       VERSION: ${{ needs.check.outputs.version }}
     steps:
       - uses: actions/checkout@v7
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@v8
         with:
           name: notes
 
-      - uses: mlugg/setup-zig@v2
+      - uses: EuroZig/setup-zig@v3
         with:
           version: ${{ env.ZIG_VERSION }}
 
