@@ -416,7 +416,8 @@ pub fn App(comptime B: type) type {
             var panel: modal.SyncPanel = .{
                 .remote = a.dupe(u8, name) catch "",
                 .url = st.remoteUrl(a, name),
-                .problem = snap.remote.problem,
+                // The snapshot's arena goes with the next reload.
+                .problem = a.dupe(u8, snap.remote.problem) catch "",
                 .rows = rows.items,
             };
             panel.first();
@@ -466,12 +467,7 @@ pub fn App(comptime B: type) type {
                 timeline_edit.reset(t);
                 return s.info("nothing to apply", .{});
             }
-            if (plan.stale.len > 0) {
-                return s.fail("{d} changed elsewhere since you edited {s}: r keeps your change, X drops it", .{ plan.stale.len, if (plan.stale.len == 1) "it" else "them" });
-            }
-            if (plan.inverted.len > 0) {
-                return s.fail("#{s} would start after its due date: move one of them", .{shortId(plan.inverted[0].slice())});
-            }
+            if (timeline_edit.refuse(s, plan)) return;
             var items: std.ArrayList(store_mod.BatchItem) = .empty;
             var dues: std.ArrayList(store_mod.DueItem) = .empty;
             const date = struct {
@@ -562,8 +558,9 @@ pub fn App(comptime B: type) type {
             else
                 std.fmt.allocPrint(a, "{d} issues", .{items.items.len}) catch "";
             st.editBatch(items.items) catch |e| return self.failWith(e);
-            s.closeModal();
+            // `unmark` is in the modal arena too: before closing it.
             s.milestone.unmark(a, &st.snap, unmark) catch {};
+            s.closeModal();
             if (inheriting > 0) {
                 s.info("moved {s} to {s}, with {d} sub-issues that inherit{s}", .{ what, to, inheriting, gone_note });
             } else s.info("moved {s} to {s}{s}", .{ what, to, gone_note });
@@ -2022,6 +2019,28 @@ test "moving issues: the ones gone, and every sub-issue that follows" {
     try testing.expect(h.shows("1 issue is gone meanwhile: nothing to move"));
 }
 
+test "milestone view: moving marked issues unmarks them from the modal's IDs" {
+    var h: Harness = undefined;
+    try h.init();
+    defer h.deinit();
+    const st = &h.app.store;
+    const v1 = try st.createMilestone(.{ .name = "v1" });
+    const v2 = try st.createMilestone(.{ .name = "v2" });
+    const a = try st.create(.{ .title = "A", .milestone_id = v1.slice() });
+    const b = try st.create(.{ .title = "B", .milestone_id = v1.slice() });
+    try h.draw();
+    try h.app.state.milestone.marks.append(h.app.state.gpa, a);
+    try h.app.state.milestone.marks.append(h.app.state.gpa, b);
+    // The IDs past the modal arena's oldest node: closing it frees them.
+    const ma = h.app.state.modalArena();
+    _ = try ma.alloc(u8, 1 << 16);
+    _ = try ma.alloc(u8, 1 << 16);
+    const ids = try ma.dupe(store_mod.Id, &.{ a, b });
+    h.app.moveIssues(ids, .{ .id = v2.slice() }, ids);
+    try testing.expectEqual(@as(usize, 0), h.app.state.milestone.marks.items.len);
+    try testing.expectEqualStrings(v2.slice(), h.snap().proj.milestone[h.byTitle("A").?].?);
+}
+
 test "timeline: bars, groups, blockers, zoom" {
     var h: Harness = undefined;
     try h.init();
@@ -2323,6 +2342,19 @@ test "timeline edit mode: a row dragged onto another milestone's group" {
     const from = hit(&h, .issue, "Work");
     const to = hit(&h, .group, "v2");
     const press: vaxis.Mouse = .{ .col = @intCast(from.x + 6), .row = @intCast(from.y), .button = .left, .mods = .{}, .type = .press };
+    // Over v2, then off the rows to the top bar: letting go there cancels.
+    {
+        try h.input(.{ .mouse = press });
+        var off = press;
+        off.type = .drag;
+        off.row = @intCast(to.y);
+        try h.input(.{ .mouse = off });
+        off.row = 0;
+        try h.input(.{ .mouse = off });
+        off.type = .release;
+        try h.input(.{ .mouse = off });
+        try testing.expectEqual(@as(usize, 0), t.changes());
+    }
     try h.input(.{ .mouse = press });
     var drag = press;
     drag.type = .drag;
@@ -2424,6 +2456,73 @@ test "timeline: an issue shown in two groups, each row reachable" {
     try testing.expectEqual(@as(u32, 3), t.selected);
     try h.press('[', .{});
     try testing.expectEqual(@as(u32, 2), t.selected);
+}
+
+test "timeline edit mode: an issue deleted between the question and applying stops it" {
+    var h: Harness = undefined;
+    try h.init();
+    defer h.deinit();
+    const st = &h.app.store;
+    const a = try st.create(.{ .title = "A" });
+    const b = try st.create(.{ .title = "B" });
+    for ([_]store_mod.Id{ a, b }) |id| try st.edit(id.slice(), .{ .start_date = "2023-11-20", .due_date = "2023-11-24" });
+    try h.press('4', .{});
+    try h.press('E', .{});
+    for ([_]store_mod.Id{ a, b }) |id| {
+        h.app.state.timeline.selected_key = .{ .issue = .{ .id = id } };
+        try h.draw();
+        try h.press('l', .{});
+    }
+    try testing.expectEqual(@as(usize, 2), h.app.state.timeline.changes());
+    try h.press('s', .{ .ctrl = true });
+    try testing.expect(h.shows("Apply 2 changes?"));
+    // Deleted elsewhere while the question is open.
+    const repo = issuez.Repo(GitSim).init(&h.sim);
+    const ref = try std.fmt.allocPrint(h.arena_state.allocator(), "{s}{s}", .{ issuez.engine.issue_ref_prefix, b.slice() });
+    _ = try repo.setDeleted(h.arena_state.allocator(), ref, true, .{});
+    try st.reload();
+    try h.press(K.enter, .{});
+    try testing.expect(h.shows("deleted elsewhere"));
+    // Nothing written: A is as it was, and its change still staged.
+    const D = issuez.format.fields.Date;
+    try testing.expect(issuez.schedule.Dates.of(h.snap().issues[h.byTitle("A").?]).start.?.eql(D.parse("2023-11-20").?));
+    try testing.expectEqual(@as(usize, 1), h.app.state.timeline.changes());
+}
+
+test "timeline edit mode: a bar changed elsewhere while held is staged stale" {
+    var h: Harness = undefined;
+    try h.init();
+    defer h.deinit();
+    const st = &h.app.store;
+    const D = issuez.format.fields.Date;
+    const v1 = try st.createMilestone(.{ .name = "v1", .due = "2023-11-30" });
+    const build = try st.create(.{ .title = "Build", .milestone_id = v1.slice() });
+    try st.edit(build.slice(), .{ .start_date = "2023-11-20", .due_date = "2023-11-24" });
+    try h.press('4', .{});
+    const t = &h.app.state.timeline;
+    try h.press('j', .{});
+    try h.press('E', .{});
+    const y = for (h.app.state.hits.items.items) |x| {
+        if (x.target == .tl_row and x.target.tl_row == t.selected) break x.y;
+    } else unreachable;
+    const at = @as(i32, t.chart_x) + t.x(D.parse("2023-11-22").?.toDays());
+    var m: vaxis.Mouse = .{ .col = @intCast(at), .row = @intCast(y), .button = .left, .mods = .{}, .type = .press };
+    try h.input(.{ .mouse = m });
+    // Someone moves Build's due date while it is held.
+    try st.edit(build.slice(), .{ .due_date = "2023-11-28" });
+    try h.draw();
+    m.type = .drag;
+    m.col = @intCast(@as(i32, t.chart_x) + t.x(D.parse("2023-11-24").?.toDays()));
+    try h.input(.{ .mouse = m });
+    m.type = .release;
+    try h.input(.{ .mouse = m });
+    try testing.expectEqual(@as(usize, 1), t.changes());
+    try h.draw();
+    // Applying asks first rather than overwriting their date.
+    try h.press('s', .{ .ctrl = true });
+    try testing.expect(h.shows("r keeps your change"));
+    const written = issuez.schedule.Dates.of(h.snap().issues[h.byTitle("Build").?]);
+    try testing.expect(written.due.?.eql(D.parse("2023-11-28").?));
 }
 
 test "timeline edit mode: drags across a reload and after leaving" {
@@ -3223,6 +3322,21 @@ test "sync: a remote that couldn't be read says why" {
     try testing.expect(h.shows("⇅ remote ⚠"));
     try h.press('y', .{});
     try testing.expect(h.shows("git config issue.remote: no such remote"));
+}
+
+test "sync panel: the remote's problem outlives the snapshot it came from" {
+    var h: Harness = undefined;
+    try h.initRemote();
+    defer h.deinit();
+    var problem = "can't tell what isn't pushed".*;
+    h.app.store.snap.remote = .{ .name = "origin", .remotes = &.{"origin"}, .problem = &problem };
+    try h.press('Y', .{});
+    try testing.expect(h.app.state.modal.? == .sync_panel);
+    // As a reload freeing the old snapshot's arena would.
+    @memset(&problem, 'x');
+    h.app.store.snap.remote = .{ .name = "origin", .remotes = &.{"origin"} };
+    try h.draw();
+    try testing.expect(h.shows("can't tell what isn't pushed"));
 }
 
 test "sync: leaving the timeline to quit asks first while one runs" {

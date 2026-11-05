@@ -372,12 +372,12 @@ pub const Modal = union(enum) {
             .choice => |c| switch (m.*) {
                 .menu => |*mn| {
                     if (c >= mn.options.len) return .none;
-                    mn.selected = c;
+                    mn.selected = @intCast(c);
                     return submit(s);
                 },
                 .confirm => |*cf| {
                     if (c >= cf.choices.len) return .none;
-                    cf.selected = c;
+                    cf.selected = @intCast(c);
                     return submit(s);
                 },
                 .sync_panel => |*p| {
@@ -1355,7 +1355,7 @@ fn drawSyncPanel(s: *AppState, f: ui.Frame, win: ui.Window, p: *SyncPanel) Alloc
                 _ = ui.text(row, 3 + lw + 2, 0, c.what, .{ .fg = palette.medium, .bg = rbg });
             },
         }
-        try f.hit(row, .{ .modal = .{ .choice = @intCast(@min(n, std.math.maxInt(u16))) } });
+        try f.hit(row, .{ .modal = .{ .choice = @intCast(n) } });
     }
     // Actions.
     const bar = inner.height -| 1;
@@ -1437,7 +1437,7 @@ fn drawPicker(f: ui.Frame, win: ui.Window, p: *Picker) Allocator.Error!void {
             const dx = @max(3 + lw + 2, row.width -| (dw + 1));
             _ = ui.text(row, dx, 0, it.detail, .{ .fg = palette.muted, .bg = rbg });
         }
-        try f.hit(row, .{ .modal = .{ .choice = @intCast(@min(n, std.math.maxInt(u16))) } });
+        try f.hit(row, .{ .modal = .{ .choice = @intCast(n) } });
     }
     if (shown.len == 0) _ = ui.text(inner, 3, 1, "nothing matches", .{ .fg = palette.muted, .bg = bg, .italic = true });
     const marked = p.marked();

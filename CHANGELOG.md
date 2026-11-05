@@ -8,6 +8,8 @@ versions may change the library API; the on-disk format only ever grows (see
 
 ## [Unreleased]
 
+## [0.3.0] - 2026-11-05
+
 ### Added
 - The terminal UI's milestones view (`3`): every milestone with a progress
   bar, open, done and blocked counts, the due date and how far off it is,

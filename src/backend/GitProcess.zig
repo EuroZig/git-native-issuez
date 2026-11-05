@@ -1028,12 +1028,14 @@ fn spawnDetached(gp: *GitProcess, argv: []const []const u8, stdin: bool) Error!s
     };
     const null_in = Io.Dir.openFileAbsolute(gp.io, "/dev/null", .{}) catch return error.GitSpawnFailed;
     defer null_in.close(gp.io);
+    // Once forked, the fds are the child's or `child`'s to close.
+    var forked_ok = false;
     const in: ?[2]std.posix.fd_t = if (stdin) try pipe.make() else null;
-    errdefer if (in) |p| pipe.close(p);
+    errdefer if (!forked_ok) if (in) |p| pipe.close(p);
     const out = try pipe.make();
-    errdefer pipe.close(out);
+    errdefer if (!forked_ok) pipe.close(out);
     const err = try pipe.make();
-    errdefer pipe.close(err);
+    errdefer if (!forked_ok) pipe.close(err);
     // Written to by the child only when exec fails.
     const report = try pipe.make();
     defer _ = sys.close(report[0]);
@@ -1054,6 +1056,7 @@ fn spawnDetached(gp: *GitProcess, argv: []const []const u8, stdin: bool) Error!s
         _ = sys.write(report[1], "x", 1);
         if (builtin.link_libc) std.c._exit(127) else std.os.linux.exit_group(127);
     }
+    forked_ok = true;
     _ = sys.close(report[1]);
     if (in) |p| _ = sys.close(p[0]);
     _ = sys.close(out[1]);
@@ -1076,7 +1079,8 @@ fn spawnDetached(gp: *GitProcess, argv: []const []const u8, stdin: bool) Error!s
             else => break,
         }
     }
-    _ = child.wait(gp.io) catch {};
+    // Reaps it, even when canceled, and closes our ends of the pipes.
+    child.kill(gp.io);
     return error.GitSpawnFailed;
 }
 

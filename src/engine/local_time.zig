@@ -79,6 +79,9 @@ pub fn load(io: std.Io, gpa: Allocator, environ_map: *const std.process.Environ.
 }
 
 fn loadFile(io: std.Io, gpa: Allocator, path: []const u8) ?Zone {
+    // A FIFO or a terminal would block the read.
+    const st = std.Io.Dir.cwd().statFile(io, path, .{}) catch return null;
+    if (st.kind != .file) return null;
     const bytes = std.Io.Dir.cwd().readFileAlloc(io, path, gpa, .limited(1 << 20)) catch return null;
     defer gpa.free(bytes);
     return parseTzif(gpa, bytes) catch null;
@@ -86,6 +89,7 @@ fn loadFile(io: std.Io, gpa: Allocator, path: []const u8) ?Zone {
 
 /// A TZif file's transitions and its rule.
 pub fn parseTzif(gpa: Allocator, bytes: []const u8) !Zone {
+    try checkTzif(bytes);
     var reader: std.Io.Reader = .fixed(bytes);
     var tz = try std.Tz.parse(gpa, &reader);
     defer tz.deinit();
@@ -100,6 +104,40 @@ pub fn parseTzif(gpa: Allocator, bytes: []const u8) !Zone {
         .initial = initial,
         .rule = if (tz.footer) |f| Rule.parse(f) else null,
     };
+}
+
+/// What `std.Tz.parse` would overflow on instead of refusing: counts past
+/// the end of the file, and leap seconds too far out or too large.
+fn checkTzif(bytes: []const u8) error{Malformed}!void {
+    const header_len = 44;
+    const Counts = struct { isut: u64, isstd: u64, leap: u64, time: u64, type: u64, char: u64 };
+    const at = struct {
+        fn counts(b: []const u8, h: usize) ?Counts {
+            if (b.len < h + header_len) return null;
+            var c: [6]u64 = undefined;
+            for (&c, 0..) |*n, k| n.* = std.mem.readInt(u32, b[h + 20 + 4 * k ..][0..4], .big);
+            return .{ .isut = c[0], .isstd = c[1], .leap = c[2], .time = c[3], .type = c[4], .char = c[5] };
+        }
+    };
+    // Each block: its header, then times of 4 bytes (version 1) or 8.
+    var h: usize = 0;
+    for ([_]u64{ 4, 8 }) |time_len| {
+        // Too short for a header: `std.Tz.parse` refuses it.
+        const c = at.counts(bytes, h) orelse return;
+        const leaps_at = h + header_len + c.time * (time_len + 1) + c.type * 6 + c.char;
+        const end = leaps_at + c.leap * (time_len + 4) + c.isstd + c.isut;
+        if (end > bytes.len) return error.Malformed;
+        for (0..@intCast(c.leap)) |k| {
+            const r = bytes[@intCast(leaps_at + k * (time_len + 4))..];
+            const occur: i64 = if (time_len == 4) std.mem.readInt(i32, r[0..4], .big) else std.mem.readInt(i64, r[0..8], .big);
+            const corr = std.mem.readInt(i32, r[@intCast(time_len)..][0..4], .big);
+            if (occur > std.math.maxInt(i48) - 2419199) return error.Malformed;
+            if (corr > std.math.maxInt(i16) or corr < std.math.minInt(i16)) return error.Malformed;
+        }
+        // Version 1 holds only the first block.
+        if (bytes[h + 4] == 0) return;
+        h = @intCast(end);
+    }
 }
 
 /// A POSIX TZ rule: `CET-1CEST,M3.5.0,M10.5.0/3`. Offsets are stored as
@@ -350,4 +388,74 @@ test "parseTzif: a version 2 file" {
     try t.expectEqual(@as(i32, 0), z.offsetAt(999));
     try t.expectEqual(@as(i32, 3600), z.offsetAt(1000));
     try t.expectEqual(@as(i32, 3600), z.offsetAt(utcAt("2026-07-01", 0, 0)));
+}
+
+test "parseTzif: malformed counts and leap seconds are refused, not overflowed" {
+    const t = std.testing;
+    const gpa = t.allocator;
+    const header = struct {
+        fn f(b: *std.ArrayList(u8), version: u8, counts: [6]u32) !void {
+            try b.appendSlice(t.allocator, "TZif");
+            try b.append(t.allocator, version);
+            try b.appendNTimes(t.allocator, 0, 15);
+            for (counts) |n| {
+                var be: [4]u8 = undefined;
+                std.mem.writeInt(u32, &be, n, .big);
+                try b.appendSlice(t.allocator, &be);
+            }
+        }
+    }.f;
+    // Counts that would overflow std's u32 sum.
+    {
+        var buf: std.ArrayList(u8) = .empty;
+        defer buf.deinit(gpa);
+        try header(&buf, '2', .{ 0, 0, 0, 0xffff_ffff, 1, 4 });
+        try t.expectError(error.Malformed, parseTzif(gpa, buf.items));
+    }
+    // A leap second's correction that std's `corr + 1` would overflow.
+    {
+        var buf: std.ArrayList(u8) = .empty;
+        defer buf.deinit(gpa);
+        try header(&buf, 0, .{ 0, 0, 2, 0, 1, 4 });
+        try buf.appendSlice(gpa, &.{ 0, 0, 0, 0, 0, 0 });
+        try buf.appendSlice(gpa, "UTC\x00");
+        for ([_][2]i32{ .{ 0, 1 }, .{ 3_000_000, std.math.maxInt(i32) } }) |r| for (r) |n| {
+            var be: [4]u8 = undefined;
+            std.mem.writeInt(i32, &be, n, .big);
+            try buf.appendSlice(gpa, &be);
+        };
+        try t.expectError(error.Malformed, parseTzif(gpa, buf.items));
+    }
+    // And an occurrence that the next record's check would overflow.
+    {
+        var buf: std.ArrayList(u8) = .empty;
+        defer buf.deinit(gpa);
+        try header(&buf, '2', .{ 0, 0, 0, 0, 1, 4 });
+        try buf.appendSlice(gpa, &.{ 0, 0, 0, 0, 0, 0 });
+        try buf.appendSlice(gpa, "UTC\x00");
+        try header(&buf, '2', .{ 0, 0, 2, 0, 1, 4 });
+        try buf.appendSlice(gpa, &.{ 0, 0, 0, 0, 0, 0 });
+        try buf.appendSlice(gpa, "UTC\x00");
+        for ([_]struct { i64, i32 }{ .{ std.math.maxInt(i48), 1 }, .{ std.math.maxInt(i48), 2 } }) |r| {
+            var be8: [8]u8 = undefined;
+            std.mem.writeInt(i64, &be8, r[0], .big);
+            try buf.appendSlice(gpa, &be8);
+            var be4: [4]u8 = undefined;
+            std.mem.writeInt(i32, &be4, r[1], .big);
+            try buf.appendSlice(gpa, &be4);
+        }
+        try buf.appendSlice(gpa, "\nUTC0\n");
+        try t.expectError(error.Malformed, parseTzif(gpa, buf.items));
+    }
+}
+
+test "load: a TZ that isn't a regular file is UTC, without blocking" {
+    if (@import("builtin").os.tag == .windows) return error.SkipZigTest;
+    var env: std.process.Environ.Map = .init(std.testing.allocator);
+    defer env.deinit();
+    // Read, a terminal would wait for a line.
+    try env.put("TZ", "/dev/tty");
+    const z = load(std.testing.io, std.testing.allocator, &env);
+    try std.testing.expectEqual(@as(usize, 0), z.transitions.len);
+    try std.testing.expect(z.rule == null);
 }

@@ -133,7 +133,11 @@ const SyncWorker = struct {
         if (@import("builtin").os.tag == .windows) return null;
         if (w.ssh_checked) return w.control;
         w.ssh_checked = true;
-        const version = std.process.run(a, w.io, .{ .argv = &.{ "ssh", "-V" } }) catch return null;
+        const version = std.process.run(a, w.io, .{ .argv = &.{ "ssh", "-V" } }) catch |e| {
+            // Quitting: the sync's git must see it too.
+            if (e == error.Canceled) w.io.recancel();
+            return null;
+        };
         if (!sync_job.sshSharesSafely(version.stderr)) return null;
         w.control = sync_job.controlDir(w.io, &w.control_buf, w.environ_map.get("XDG_RUNTIME_DIR"), sync_job.currentUid());
         return w.control;
@@ -146,10 +150,11 @@ const SyncWorker = struct {
     }
 
     /// Blocks while the queue is full: the loop always drains it, until
-    /// quitting, which cancels the wait.
+    /// quitting, which cancels the wait. The cancel is delivered once:
+    /// re-armed, so the sync's next git call stops too.
     fn post(w: *SyncWorker, e: Event) void {
         if (w.stopping.load(.acquire)) return;
-        w.loop.postEvent(e) catch {};
+        w.loop.postEvent(e) catch |err| if (err == error.Canceled) w.io.recancel();
     }
 
     /// After `sync_done`: the task is over.

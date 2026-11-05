@@ -125,6 +125,12 @@ pub fn controlDir(io: std.Io, buf: []u8, runtime_dir: ?[]const u8, uid: u32) ?[:
     else
         std.fmt.bufPrintSentinel(buf, "/tmp/issuez-{d}", .{uid}, 0) catch return null;
     if (dir.len + socket_suffix + 1 > max_socket_path or !std.fs.path.isAbsolute(dir)) return null;
+    // It goes unquoted into `GIT_SSH_COMMAND`, which a shell runs, and
+    // into ssh's `ControlPath`, which expands `%` and splits on spaces.
+    for (dir) |c| switch (c) {
+        'a'...'z', 'A'...'Z', '0'...'9', '/', '.', '_', '-' => {},
+        else => return null,
+    };
     std.Io.Dir.cwd().createDir(io, dir, @enumFromInt(0o700)) catch |e| switch (e) {
         error.PathAlreadyExists => {},
         else => return null,
@@ -277,6 +283,13 @@ test controlDir {
     try std.testing.expect(controlDir(io, &buf, root, uid) == null);
     // Too long for a socket.
     try std.testing.expect(controlDir(io, &buf, "/" ++ "x" ** 60, uid) == null);
+    // What a shell or ssh would read as more than a path, though private.
+    for ([_][]const u8{ "a b", "a;id", "$(id)", "a%h", "'q" }) |name| {
+        try tmp.createDir(io, name, @enumFromInt(0o700));
+        var bad_buf: [128]u8 = undefined;
+        const bad = try std.fmt.bufPrint(&bad_buf, "{s}/{s}", .{ root, name });
+        try std.testing.expect(controlDir(io, &buf, bad, uid) == null);
+    }
 }
 
 test sshSharesSafely {

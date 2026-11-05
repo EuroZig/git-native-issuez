@@ -142,6 +142,29 @@ test "open" {
     );
 }
 
+test "open without a terminal: no git on PATH fails, leaving no fd open" {
+    if (@import("builtin").os.tag == .windows) return error.SkipZigTest;
+    const gpa = testing.allocator;
+    var repo = try Repo.init(gpa, &.{});
+    defer repo.deinit(gpa);
+    var env = try repo.env.clone(gpa);
+    defer env.deinit();
+    try env.put("PATH", "/nonexistent/issuez-test");
+    const probe = struct {
+        fn fd() !std.posix.fd_t {
+            const f = try std.Io.Dir.openFileAbsolute(io, "/dev/null", .{});
+            defer f.close(io);
+            return f.handle;
+        }
+    };
+    const before = try probe.fd();
+    for (0..3) |_| try testing.expectError(
+        error.GitSpawnFailed,
+        GitProcess.open(io, gpa, .{ .path = repo.path, .environ_map = &env, .no_terminal = true }),
+    );
+    try testing.expectEqual(before, try probe.fd());
+}
+
 test "cat-file session" {
     const gpa = testing.allocator;
     var repo = try Repo.init(gpa, &.{});

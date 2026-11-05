@@ -247,8 +247,8 @@ docs under `share/`. The Windows archive has `git-issue.exe` only: run
 one by hand, unpack it into a prefix with `bin/` on your `PATH`:
 
 ```sh
-gh release download v0.2.0 --repo EuroZig/git-native-issuez --pattern '*-full-aarch64-macos.tar.gz'
-tar -xzf git-native-issuez-0.2.0-full-aarch64-macos.tar.gz --strip-components=1 -C ~/.local
+gh release download v0.3.0 --repo EuroZig/git-native-issuez --pattern '*-full-aarch64-macos.tar.gz'
+tar -xzf git-native-issuez-0.3.0-full-aarch64-macos.tar.gz --strip-components=1 -C ~/.local
 ```
 
 On macOS, an archive downloaded with a browser is quarantined and
@@ -260,7 +260,7 @@ On macOS, an archive downloaded with a browser is quarantined and
 It downloads the latest release for your machine, checks it against
 `SHA256SUMS` and unpacks it into `~/.local`.
 
-- Options go after `sh -s --`: `--flavor minimal`, `--version 0.2.0`,
+- Options go after `sh -s --`: `--flavor minimal`, `--version 0.3.0`,
   `--prefix /usr/local`. For a prefix you can't write to, pipe it into
   `sudo sh -s -- --prefix /usr/local`.
 - It doesn't touch your shell configuration: if `~/.local/bin` isn't on

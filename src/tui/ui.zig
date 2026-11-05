@@ -66,7 +66,7 @@ pub const ModalTarget = union(enum) {
     ok,
     cancel,
     /// A menu entry.
-    choice: u16,
+    choice: u32,
     /// A form field, to focus it.
     field: u8,
     /// One of a form field's options.

@@ -13,6 +13,11 @@ const WorkDays = fields.WorkDays;
 
 pub const hint = "YYYY-MM-DD, today, tomorrow, +3d, +2w, fri, eom; empty clears";
 
+/// `d` when it is after `today`: null when clamping kept it from being.
+fn after(today: Date, d: Date) ?Date {
+    return if (d.order(today) == .gt) d else null;
+}
+
 /// Null when it isn't a date. `text` is trimmed. `today` is the user's
 /// local date; `eow` is the week's last day in `work_days`.
 pub fn parse(text_in: []const u8, today: Date, work_days: WorkDays) ?Date {
@@ -21,7 +26,8 @@ pub fn parse(text_in: []const u8, today: Date, work_days: WorkDays) ?Date {
     if (Date.parse(text)) |d| return d;
     const eq = std.ascii.eqlIgnoreCase;
     if (eq(text, "today") or eq(text, "now")) return today;
-    if (eq(text, "tomorrow") or eq(text, "tmr")) return today.addDays(1);
+    // Past 9999-12-31 the days clamp: no "next" one is left there.
+    if (eq(text, "tomorrow") or eq(text, "tmr")) return after(today, today.addDays(1));
     if (eq(text, "yesterday")) return today.addDays(-1);
     if (eq(text, "eom")) return today.endOfMonth();
     if (eq(text, "eow")) {
@@ -30,7 +36,7 @@ pub fn parse(text_in: []const u8, today: Date, work_days: WorkDays) ?Date {
         const sunday = today.addDays(6 - @as(i32, @intFromEnum(today.weekday())));
         const this_week = lastWorkDay(sunday, work_days);
         if (this_week.order(today) != .lt) return this_week;
-        return lastWorkDay(sunday.addDays(7), work_days);
+        return after(today, lastWorkDay(sunday.addDays(7), work_days));
     }
     if (text[0] == '+' or text[0] == '-') {
         if (text.len < 3) return null;
@@ -55,7 +61,7 @@ pub fn parse(text_in: []const u8, today: Date, work_days: WorkDays) ?Date {
         const from: i32 = @intFromEnum(today.weekday());
         const to: i32 = @intFromEnum(w);
         const ahead = @mod(to - from + 6, 7) + 1;
-        return today.addDays(ahead);
+        return after(today, today.addDays(ahead));
     }
     return null;
 }
@@ -143,6 +149,16 @@ test "parse: signs and sizes that don't fit are not dates" {
     }
     try t.expect(parse("+100000d", today, .all) != null);
     try t.expect(parse("-100000y", today, .all) == null); // before year 1
+}
+
+test "parse: no day after 9999-12-31" {
+    const t = std.testing;
+    const last = Date.parse("9999-12-31").?;
+    for ([_][]const u8{ "tomorrow", "fri", "mon" }) |text| try t.expect(parse(text, last, .weekdays) == null);
+    // A Friday: the week's last working day is today, unless only Monday
+    // works, whose next week isn't there.
+    try t.expect(parse("eow", last, .weekdays).?.eql(last));
+    try t.expect(parse("eow", last, (WorkDays{ .bits = 0 }).with(.mon)) == null);
 }
 
 test "parse: eow is the week's last working day" {

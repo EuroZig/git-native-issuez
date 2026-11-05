@@ -229,6 +229,11 @@ pub const Draft = struct {
         /// Issues whose dates the draft changes, starting after their due
         /// date once applied over what is there now.
         inverted: []const Id,
+        /// Issues the draft makes wait on an issue, or moves into a
+        /// milestone, that is gone or closed elsewhere since.
+        dangling: []const Id = &.{},
+        /// Issues the draft makes wait on themselves, through blockers.
+        loops: []const Id = &.{},
 
         pub fn count(p: Plan) usize {
             return p.issues.len + p.milestones.len;
@@ -265,7 +270,76 @@ pub const Draft = struct {
                 if (!tipEql(b.tip, m.tip)) try stale.append(arena, b.id);
             } else try gone.append(arena, b.id);
         }
-        return .{ .issues = issues.items, .milestones = milestones.items, .stale = stale.items, .gone = gone.items, .inverted = inverted.items };
+        var dangling: std.ArrayList(Id) = .empty;
+        for (issues.items) |c| {
+            const blocker_gone = for (c.add) |b| {
+                const i = snap.find(b.slice()) orelse break true;
+                if (snap.issues[i].deleted) break true;
+            } else false;
+            const milestone_gone = if (c.link) |l| switch (l) {
+                .id => |m| if (snap.findMilestone(m.slice())) |n| snap.milestones[n].status != .open else true,
+                else => false,
+            } else false;
+            if (blocker_gone or milestone_gone) try dangling.append(arena, c.id);
+        }
+        return .{
+            .issues = issues.items,
+            .milestones = milestones.items,
+            .stale = stale.items,
+            .gone = gone.items,
+            .inverted = inverted.items,
+            .dangling = dangling.items,
+            .loops = try loops(arena, snap, issues.items),
+        };
+    }
+
+    /// The changed issues that would wait on themselves: blockers as the
+    /// snapshot has them, with the changes' added and removed.
+    fn loops(arena: Allocator, snap: *const Snapshot, changes: []const IssueChange) Allocator.Error![]const Id {
+        const Graph = struct {
+            snap: *const Snapshot,
+            changes: []const IssueChange,
+
+            fn blockers(g: @This(), arena_: Allocator, i: u32) Allocator.Error![]const []const u8 {
+                const current = g.snap.issues[i].ext.blocked_by;
+                const c = for (g.changes) |*c| {
+                    if (c.id.eql(g.snap.issues[i].id)) break c;
+                } else return current;
+                if (c.add.len == 0 and c.remove.len == 0) return current;
+                var out: std.ArrayList([]const u8) = .empty;
+                for (current) |b| {
+                    const removed = for (c.remove) |r| {
+                        if (r.eql(b)) break true;
+                    } else false;
+                    if (!removed) try out.append(arena_, b);
+                }
+                for (c.add) |*b| try out.append(arena_, b.slice());
+                return out.items;
+            }
+        };
+        const g: Graph = .{ .snap = snap, .changes = changes };
+        var out: std.ArrayList(Id) = .empty;
+        const seen = try arena.alloc(bool, snap.issues.len);
+        var stack: std.ArrayList(u32) = .empty;
+        // Only an added blocker can close a loop.
+        for (changes) |c| {
+            if (c.add.len == 0) continue;
+            const start = snap.find(c.id.slice()) orelse continue;
+            @memset(seen, false);
+            stack.clearRetainingCapacity();
+            try stack.append(arena, start);
+            const looped = search: while (stack.pop()) |i| {
+                for (try g.blockers(arena, i)) |b| {
+                    const j = snap.find(b) orelse continue;
+                    if (j == start) break :search true;
+                    if (seen[j]) continue;
+                    seen[j] = true;
+                    try stack.append(arena, j);
+                }
+            } else false;
+            if (looped) try out.append(arena, c.id);
+        }
+        return out.items;
     }
 
     /// After the user chose to keep their change: it now applies over
@@ -491,6 +565,59 @@ test "staged again after undoing all, an issue expects what is there now" {
     try st.edit(a.slice(), .{ .title = "A, renamed" });
     try d.push(testing.allocator, .{ .dates = .{ .id = a, .due = D("2026-11-04") } }, st.snap.issues[st.snap.find(a.slice()).?].tip);
     try testing.expectEqual(@as(usize, 0), (try d.plan(arena, &st.snap)).stale.len);
+}
+
+test "plan: what a draft points at gone or closed elsewhere, and blocker loops" {
+    var arena_state: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var world: GitSim.World = .{ .clones = &.{.{ .name = "local" }} };
+    var sim = try GitSim.init(arena, &world, 0);
+    var st: store.Store(GitSim) = .init(testing.allocator, &sim);
+    defer st.deinit();
+    try st.reload();
+    const a = try st.create(.{ .title = "A" });
+    const b = try st.create(.{ .title = "B" });
+    const c = try st.create(.{ .title = "C" });
+    // B waits on A already.
+    try st.edit(b.slice(), .{ .add_blocked_by = &.{a.slice()} });
+    const v1 = try st.createMilestone(.{ .name = "v1" });
+    const tip = struct {
+        fn of(sn: *const Snapshot, id: Id) ?Oid {
+            return sn.issues[sn.find(id.slice()).?].tip;
+        }
+    }.of;
+
+    var d: Draft = .{};
+    defer d.deinit(testing.allocator);
+    // A waits on C, and C on B: A → C → B → A.
+    try d.push(testing.allocator, .{ .add_blocker = .{ .id = a, .blocker = c } }, tip(&st.snap, a));
+    var p = try d.plan(arena, &st.snap);
+    try testing.expectEqual(@as(usize, 0), p.loops.len);
+    try d.push(testing.allocator, .{ .add_blocker = .{ .id = c, .blocker = b } }, tip(&st.snap, c));
+    p = try d.plan(arena, &st.snap);
+    try testing.expectEqual(@as(usize, 2), p.loops.len);
+    // Dropping C's changes ends it.
+    d.drop(c.slice());
+    p = try d.plan(arena, &st.snap);
+    try testing.expectEqual(@as(usize, 0), p.loops.len);
+    // So does removing the snapshot's B → A in the draft.
+    try d.push(testing.allocator, .{ .add_blocker = .{ .id = c, .blocker = b } }, tip(&st.snap, c));
+    try d.push(testing.allocator, .{ .remove_blocker = .{ .id = b, .blocker = a } }, tip(&st.snap, b));
+    p = try d.plan(arena, &st.snap);
+    try testing.expectEqual(@as(usize, 0), p.loops.len);
+
+    // A blocker that is gone, and a milestone retired since.
+    d.clear();
+    const gone: Id = .of("ffffffff-ffff-4fff-bfff-ffffffffffff");
+    try d.push(testing.allocator, .{ .add_blocker = .{ .id = a, .blocker = gone } }, tip(&st.snap, a));
+    try d.push(testing.allocator, .{ .milestone = .{ .id = b, .link = .{ .id = v1 } } }, tip(&st.snap, b));
+    p = try d.plan(arena, &st.snap);
+    try testing.expectEqual(@as(usize, 1), p.dangling.len);
+    try testing.expect(p.dangling[0].eql(a.slice()));
+    try st.editMilestone(v1.slice(), .{ .status = .retired });
+    p = try d.plan(arena, &st.snap);
+    try testing.expectEqual(@as(usize, 2), p.dangling.len);
 }
 
 test "effective milestones with a parent loop" {

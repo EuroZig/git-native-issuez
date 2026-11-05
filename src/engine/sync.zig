@@ -186,6 +186,7 @@ pub const Unpushed = struct {
 pub const Counts = struct {
     /// Issues and milestones not pushed yet.
     unpushed: usize,
+    /// Quarantines not answered by keeping the local version.
     quarantined: usize,
 };
 
@@ -940,7 +941,16 @@ pub fn Sync(comptime B: type) type {
             const view = try self.readView(arena, remote);
             var skipped: std.ArrayList([]const u8) = .empty;
             var quarantined: usize = 0;
-            for (namespaces) |ns| quarantined += view.quarantined[@intFromEnum(ns)].count();
+            for (namespaces) |ns| {
+                // Kept local (`resolve(.keep_local)`) for this remote tip:
+                // answered, as `status` and the CLI have it.
+                const kept = try mapUnder(arena, view.records, try recordRef(arena, remote, .kept, ns, ""));
+                var it = view.quarantined[@intFromEnum(ns)].iterator();
+                while (it.next()) |e| {
+                    if (kept.get(e.key_ptr.*)) |k| if (k.eql(e.value_ptr.*)) continue;
+                    quarantined += 1;
+                }
+            }
             return .{
                 .unpushed = (try unpushedIn(arena, try self.pendingIn(arena, &skipped, &view))).len,
                 .quarantined = quarantined,
@@ -2081,6 +2091,8 @@ test "quarantine" {
     const m2 = try bob.sync.merge(arena, "origin", .{});
     try testing.expect(m2.entries[0].kept_local);
     try testing.expect((try bob.sim.resolveRef(ref_name)).?.eql(bobs));
+    // Answered, so not counted for a badge either.
+    try testing.expectEqual(@as(usize, 0), (try bob.sync.counts(arena, "origin")).quarantined);
 
     // accept_remote: Alice's version wins and Bob's is kept in a ref.
     _ = try bob.sync.resolve(arena, "origin", id, .accept_remote);

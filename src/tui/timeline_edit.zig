@@ -95,6 +95,38 @@ pub fn confirmDiscard(s: *AppState, then: ?Leave) void {
     });
 }
 
+/// Why `plan` can't be applied as it is, said and selected; false when
+/// it can. Checked again on applying: what's elsewhere may change.
+pub fn refuse(s: *AppState, plan: draft_mod.Draft.Plan) bool {
+    if (plan.gone.len > 0) {
+        // Dropped with the next frame, as `buildOverlay` does.
+        for (plan.gone) |g| s.timeline.draft.drop(g.slice());
+        s.fail("{d} edited {s} deleted elsewhere: {s} changes are dropped, look again", .{ plan.gone.len, if (plan.gone.len == 1) "issue was" else "issues were", if (plan.gone.len == 1) "its" else "their" });
+        return true;
+    }
+    if (plan.stale.len > 0) {
+        selectId(s, plan.stale[0].slice());
+        s.fail("{d} changed elsewhere since you edited {s}: r keeps your change, X drops it", .{ plan.stale.len, if (plan.stale.len == 1) "it" else "them" });
+        return true;
+    }
+    if (plan.dangling.len > 0) {
+        selectId(s, plan.dangling[0].slice());
+        s.fail("#{s} waits on or moves into what is gone or closed elsewhere: X drops its changes", .{shortId(plan.dangling[0].slice())});
+        return true;
+    }
+    if (plan.loops.len > 0) {
+        selectId(s, plan.loops[0].slice());
+        s.fail("#{s} would wait on itself through its blockers: B unlinks one, X drops its changes", .{shortId(plan.loops[0].slice())});
+        return true;
+    }
+    if (plan.inverted.len > 0) {
+        selectId(s, plan.inverted[0].slice());
+        s.fail("#{s} would start after its due date: move one of them", .{shortId(plan.inverted[0].slice())});
+        return true;
+    }
+    return false;
+}
+
 /// What applying writes, then the question.
 pub fn confirmApply(s: *AppState) void {
     const t = &s.timeline;
@@ -102,14 +134,7 @@ pub fn confirmApply(s: *AppState) void {
     const a = s.input_arena.allocator();
     const plan = t.draft.plan(a, snap) catch return s.fail("out of memory", .{});
     if (plan.count() == 0) return s.info("nothing to apply", .{});
-    if (plan.stale.len > 0) {
-        selectId(s, plan.stale[0].slice());
-        return s.fail("{d} changed elsewhere since you edited {s}: r keeps your change, X drops it", .{ plan.stale.len, if (plan.stale.len == 1) "it" else "them" });
-    }
-    if (plan.inverted.len > 0) {
-        selectId(s, plan.inverted[0].slice());
-        return s.fail("#{s} would start after its due date: move one of them", .{shortId(plan.inverted[0].slice())});
-    }
+    if (refuse(s, plan)) return;
     var lines: std.ArrayList([]const u8) = .empty;
     const max_lines = 10;
     for (plan.issues, 0..) |c, n| {
@@ -187,9 +212,16 @@ pub fn redo(s: *AppState) void {
 /// Into the draft, expecting the tip shown now when first touched. False,
 /// with the failure shown, when it couldn't be.
 pub fn stage(s: *AppState, op: Op) bool {
-    const snap = s.snap;
-    const id = op.target().slice();
-    const tip = if (snap.find(id)) |i| snap.issues[i].tip else if (snap.findMilestone(id)) |n| snap.milestones[n].tip else null;
+    return stageOn(s, op, tipOf(s.snap, op.target().slice()));
+}
+
+/// The issue's or milestone's tip in `snap`.
+fn tipOf(snap: anytype, id: []const u8) ?issuez.engine.Oid {
+    return if (snap.find(id)) |i| snap.issues[i].tip else if (snap.findMilestone(id)) |n| snap.milestones[n].tip else null;
+}
+
+/// `stage`, for an op made from what `tip` showed.
+fn stageOn(s: *AppState, op: Op, tip: ?issuez.engine.Oid) bool {
     s.timeline.draft.push(s.gpa, op, tip) catch {
         s.fail("out of memory", .{});
         return false;
@@ -514,7 +546,7 @@ pub fn press(s: *AppState, row: u32, x: u16) void {
             const n = t.groups[r.group].milestone orelse return;
             const due = view.milestoneDue(s, n) orelse return;
             if (@abs(t.x(due.toDays()) - col) > 1) return;
-            t.bar_drag = .{ .target = .{ .milestone = .of(snap.milestones[n].id) }, .part = .end, .anchor = day, .start = null, .due = due, .written_start = null, .written_due = due };
+            t.bar_drag = .{ .target = .{ .milestone = .of(snap.milestones[n].id) }, .part = .end, .anchor = day, .start = null, .due = due, .written_start = null, .written_due = due, .tip = snap.milestones[n].tip };
         },
         .issue => {
             const i = r.issue;
@@ -537,6 +569,7 @@ pub fn press(s: *AppState, row: u32, x: u16) void {
                 .due = d.due orelse sp.end,
                 .written_start = d.start,
                 .written_due = d.due,
+                .tip = snap.issues[i].tip,
             };
         },
         else => {},
@@ -546,6 +579,8 @@ pub fn press(s: *AppState, row: u32, x: u16) void {
 pub fn dragTo(s: *AppState, found: ?ui.Hits.Found) void {
     const t = &s.timeline;
     if (t.row_drag) |*rd| {
+        // Off the rows, letting go cancels.
+        rd.over = null;
         const h = found orelse return;
         if (h.target == .tl_row and h.target.tl_row < t.rows.len) rd.over = t.groups[t.rows[h.target.tl_row].group].scope;
         return;
@@ -619,7 +654,7 @@ pub fn release(s: *AppState) void {
         .milestone => |id| snap.findMilestone(id.slice()) != null,
     };
     if (!there) return s.fail("it was deleted elsewhere meanwhile", .{});
-    _ = stage(s, p);
+    _ = stageOn(s, p, d.tip);
 }
 
 /// Whether letting go of `d` with preview `p` changes a date.

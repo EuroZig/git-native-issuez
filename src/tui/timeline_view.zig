@@ -190,6 +190,9 @@ pub const State = struct {
         /// What the issue has, or the draft.
         written_start: ?Date,
         written_due: ?Date,
+        /// Its tip when pressed: a write elsewhere before letting go
+        /// marks the move stale rather than overwriting it.
+        tip: ?issuez.engine.Oid = null,
         moved: bool = false,
         /// Days from the anchor, as last dragged.
         delta: i32 = 0,
