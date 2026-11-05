@@ -361,6 +361,12 @@ test "y syncs with a real remote; a dead one fails without a prompt" {
     const listed = try sb.runIn(bob, &.{ exe, "ls" });
     try testing.expect(std.mem.find(u8, listed.stdout, "Made here") != null);
 
+    // A CLI push moves only sync records: the badge still updates live.
+    _ = try gitIssue(&sb, &.{ "create", "Pushed from the CLI" });
+    try expectShows(&all, &tui, "⇅ origin ↑1", "an external create");
+    _ = try gitIssue(&sb, &.{ "push", "origin" });
+    try expectShows(&all, &tui, "⇅ origin ✓", "an external push");
+
     // A remote nobody answers on: it fails, says why, and asks nothing.
     try sb.git(&.{ "remote", "add", "dead", "ssh://nobody@127.0.0.1:1/x.git" });
     try sb.git(&.{ "config", "issue.remote", "dead" });

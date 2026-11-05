@@ -477,8 +477,10 @@ fn buildRows(s: *AppState, arena: Allocator, tree: []const ?Span, effective: ?[]
     if (t.grouping == .milestone) {
         var index: std.StringHashMapUnmanaged(u32) = .empty;
         for (snap.milestones) |m| {
-            if (m.status == .retired) continue;
-            if (m.status == .completed and q.scope == .open) continue;
+            // Keep a staged milestone reachable if its status changed elsewhere.
+            const staged = t.editing and t.draft.milestoneDue(m.id) != null;
+            if (!staged and m.status == .retired) continue;
+            if (!staged and m.status == .completed and q.scope == .open) continue;
             try index.put(arena, m.id, @intCast(scopes.items.len));
             try scopes.append(arena, .{ .id = .of(m.id) });
         }

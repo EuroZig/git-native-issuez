@@ -181,6 +181,8 @@ pub fn Store(comptime B: type) type {
         generation: u32 = 0,
         /// The refs as the snapshot read them, in its arena.
         refs: issuez.changes.RefState = .{},
+        /// Sync records change the badge even when no issue tip moves.
+        sync_refs: issuez.changes.RefState = .{},
         /// Why the reload after a write that worked failed, until taken.
         reload_error: ?anyerror = null,
         /// The remote picked for this session, over `sync.defaultRemote`.
@@ -237,6 +239,9 @@ pub fn Store(comptime B: type) type {
             // Before the issues: a write in between then shows as a change
             // next time, never the other way round.
             const refs = try issuez.changes.RefState.read(a, self.backend);
+            const sync_refs: issuez.changes.RefState = .{
+                .refs = try self.backend.listRefs(a, "refs/issuez-sync/"),
+            };
             const settings = try issuez.settings.read(a, self.backend);
             if (settings.invalid_done_state != null) return error.InvalidDoneStates;
             var r = Repo.init(self.backend);
@@ -255,6 +260,7 @@ pub fn Store(comptime B: type) type {
             self.snap_arena = next;
             self.snap = .{ .issues = issues, .proj = proj, .settings = settings, .milestones = milestones, .remote = remote };
             self.refs = refs;
+            self.sync_refs = sync_refs;
             self.generation +%= 1;
         }
 
@@ -345,14 +351,17 @@ pub fn Store(comptime B: type) type {
             milestones: bool = false,
         };
 
-        /// Reads the refs, and everything again if they moved since the
-        /// last reload or `settings` says git config may have changed.
+        /// Reads issue and sync refs, and everything again if they moved
+        /// since the last reload or git config may have changed.
         /// Null when it didn't reload.
         pub fn reloadIfChanged(self: *Self, settings: bool) !?Outside {
             const a = self.begin();
             const now = try issuez.changes.RefState.read(a, self.backend);
             const d = try issuez.changes.diff(a, self.refs, now);
-            if (d.empty() and !settings) return null;
+            const sync_refs: issuez.changes.RefState = .{
+                .refs = try self.backend.listRefs(a, "refs/issuez-sync/"),
+            };
+            if (d.empty() and self.sync_refs.eql(sync_refs) and !settings) return null;
             var out: Outside = .{ .issues = @intCast(d.issues.len), .milestones = d.milestones };
             if (d.issues.len > 0) out.first = .of(d.issues[0]);
             try self.reload();

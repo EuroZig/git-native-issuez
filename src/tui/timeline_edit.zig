@@ -169,6 +169,10 @@ fn selectId(s: *AppState, id: []const u8) void {
     if (s.snap.find(id) != null) {
         t.selected_key = .{ .issue = .{ .id = .of(id) } };
         t.follow = true;
+    } else if (s.snap.findMilestone(id) != null) {
+        t.grouping = .milestone;
+        t.selected_key = .{ .group = .{ .id = .of(id) } };
+        t.follow = true;
     }
 }
 
@@ -352,18 +356,19 @@ pub fn key(s: *AppState, k: vaxis.Key) Allocator.Error!?AppState.Action {
         if (i) |x| unblockMenu(s, x);
         return .none;
     }
-    if (k.matches('r', .{})) {
-        if (i) |x| {
-            const id = snap.issues[x].id;
+    if (k.matches('r', .{}) or k.matches('X', .{})) {
+        const id = if (i) |x| snap.issues[x].id else blk: {
+            const r = row orelse return .none;
+            if (r.kind != .group) return .none;
+            const m = t.groups[r.group].milestone orelse return .none;
+            break :blk snap.milestones[m].id;
+        };
+        if (k.matches('r', .{})) {
             t.draft.rebase(snap, id);
             s.info("#{s}: your change now applies over what changed elsewhere", .{shortId(id)});
-        }
-        return .none;
-    }
-    if (k.matches('X', .{})) {
-        if (i) |x| {
-            t.draft.drop(snap.issues[x].id);
-            s.info("#{s}: your changes dropped", .{shortId(snap.issues[x].id)});
+        } else {
+            t.draft.drop(id);
+            s.info("#{s}: your changes dropped", .{shortId(id)});
         }
         return .none;
     }

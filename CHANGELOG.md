@@ -87,6 +87,10 @@ versions may change the library API; the on-disk format only ever grows (see
   fallbacks (it needs `curl`, and `sha256sum` or `shasum`).
 
 ### Fixed
+- Timeline draft conflicts on milestones can be kept with `r` or dropped
+  with `X`; applying selects the stale milestone without losing other edits.
+- The TUI refreshes its sync badge and filters when the CLI or another TUI
+  changes sync records, including pushes that leave every issue tip alone.
 - Restoring a closed issue is refused while open work sits below it
   (`OpenDescendants`), as closing it is. Work reopened under it while it
   was deleted left it closed over open sub-issues.

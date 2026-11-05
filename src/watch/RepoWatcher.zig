@@ -187,9 +187,11 @@ fn relative(self: *const RepoWatcher, path: []const u8, buf: []u8) ?[]const u8 {
     return buf[0..rel.len];
 }
 
-/// Ref namespaces that hold issue state. The guard and cache refs are
-/// derived and never change what an issue shows.
-const watched_refs = [_][]const u8{ "refs/issues", "refs/milestones", "refs/attachments" };
+/// Ref namespaces that hold issue and sync state. Guard and cache refs
+/// never change what a front end shows.
+const watched_refs = [_][]const u8{
+    "refs/issues", "refs/milestones", "refs/attachments", "refs/issuez-sync",
+};
 
 /// Directories to register, by path under the git dir: the way down to
 /// the watched refs, and everything below them.
@@ -248,6 +250,8 @@ test classify {
     try testing.expectEqual(Change{ .refs = true }, classify("refs/issues"));
     try testing.expectEqual(Change{ .refs = true }, classify("refs/milestones/x"));
     try testing.expectEqual(Change{ .refs = true }, classify("refs/attachments/x/y"));
+    try testing.expectEqual(Change{ .refs = true }, classify("refs/issuez-sync/origin/pushed/issues/x"));
+    try testing.expectEqual(Change{ .refs = true }, classify("refs/issuez-sync/origin/quarantined/issues/x.lock"));
     try testing.expectEqual(Change{ .refs = true }, classify("packed-refs"));
     try testing.expectEqual(Change{ .refs = true }, classify("packed-refs.lock"));
     try testing.expectEqual(Change{ .refs = true }, classify("reftable/tables.list"));
@@ -260,6 +264,7 @@ test classify {
         "refs",
         "refs/heads/main",
         "refs/issuesx/a",
+        "refs/issuez-syncx/a",
         "refs/issuez-guard/x",
         "objects/ab/cdef",
         "logs/refs/issues/x",
@@ -270,7 +275,10 @@ test classify {
 }
 
 test watchesDir {
-    for ([_][]const u8{ "refs", "refs/issues", "refs/milestones/a", "reftable" }) |rel|
+    for ([_][]const u8{
+        "refs",     "refs/issues", "refs/milestones/a", "refs/issuez-sync/origin/pushed/issues",
+        "reftable",
+    }) |rel|
         try testing.expect(watchesDir(rel));
     for ([_][]const u8{ "", "objects", "refs/heads", "refs/tags", "refs/remotes/origin", "logs", "hooks", "issuez" }) |rel|
         try testing.expect(!watchesDir(rel));

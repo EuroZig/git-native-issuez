@@ -3241,3 +3241,71 @@ test "sync panel: X-Milestone-Mode conflicts open the milestone field" {
     const A = App(GitSim);
     try testing.expectEqual(modal.Field.milestone, A.fieldOf(.{ .field = "X-Milestone-Mode" }).?);
 }
+
+test "timeline: keep or drop a stale milestone without losing other draft edits" {
+    const Status = issuez.format.fields.MilestoneStatus;
+    for ([_]Status{ .open, .completed, .retired }) |status| {
+        for ([_]u21{ 'r', 'X' }) |key| {
+            var h: Harness = undefined;
+            try h.init();
+            defer h.deinit();
+            const st = &h.app.store;
+            const id = try st.createMilestone(.{ .name = "v1", .due = "2023-11-30" });
+            const issue = try st.create(.{ .title = "Work" });
+            try st.edit(issue.slice(), .{ .start_date = "2023-11-14" });
+            try h.press('4', .{});
+            try h.press('E', .{});
+            try h.press('l', .{}); // The milestone's due date.
+            h.app.state.timeline.selected_key = .{ .issue = .{ .id = issue } };
+            try h.draw();
+            try h.press('l', .{}); // An independent issue edit.
+            try testing.expectEqual(@as(usize, 2), h.app.state.timeline.changes());
+            try st.editMilestone(id.slice(), .{ .name = "Renamed elsewhere", .status = status });
+            // Even without group rows, applying selects the stale milestone.
+            h.app.state.timeline.grouping = .none;
+            try h.draw();
+            try h.press('s', .{ .ctrl = true });
+            try testing.expect(h.shows("r keeps your change"));
+            const t = &h.app.state.timeline;
+            try testing.expectEqual(timeline_view.Row.Kind.group, t.rows[t.selected].kind);
+            try testing.expect(t.groups[t.rows[t.selected].group].scope.id.eql(id.slice()));
+            try h.press(key, .{});
+            try testing.expectEqual(@as(usize, 0), t.plan.?.stale.len);
+            try testing.expectEqual(@as(usize, 1), t.plan.?.issues.len);
+            try testing.expectEqual(@as(usize, if (key == 'r') 1 else 0), t.plan.?.milestones.len);
+            try h.press('s', .{ .ctrl = true });
+            try h.press(K.enter, .{});
+            try testing.expect(!t.editing);
+            const m = h.snap().milestones[h.snap().findMilestone(id.slice()).?];
+            try testing.expectEqualStrings("Renamed elsewhere", m.name);
+            try testing.expectEqual(status, m.status);
+            const due = if (key == 'r') "2023-12-01" else "2023-11-30";
+            try testing.expect(m.due.?.eql(issuez.format.fields.Date.parse(due).?));
+            const i = h.snap().find(issue.slice()).?;
+            const start = issuez.format.fields.Date.parse("2023-11-15").?;
+            try testing.expect(h.snap().issues[i].ext.start_date.?.eql(start));
+        }
+    }
+}
+
+test "external pushes refresh the badge and unpushed filter without moving issues" {
+    var h: Harness = undefined;
+    try h.initRemote();
+    defer h.deinit();
+    const id = try h.app.store.create(.{ .title = "One" });
+    try h.press('/', .{});
+    try h.typeText("is:unpushed");
+    try h.press(K.enter, .{});
+    try testing.expect(h.snap().remote.isUnpushed(id.slice()));
+    try testing.expectEqual(@as(usize, 1), h.app.state.list.rows.len);
+    const generation = h.app.store.generation;
+    _ = try issuez.Sync(GitSim).init(&h.sim).push(h.arena_state.allocator(), "origin");
+    h.app.changedElsewhere(false);
+    try h.draw();
+    try testing.expect(h.app.store.generation != generation);
+    try testing.expect(!h.snap().remote.isUnpushed(id.slice()));
+    try testing.expectEqual(@as(usize, 0), h.app.state.list.rows.len);
+    try testing.expect(h.shows("origin ✓"));
+    // Unchanged records do not trigger another reload.
+    try testing.expect(try h.app.store.reloadIfChanged(false) == null);
+}
