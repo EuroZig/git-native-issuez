@@ -299,6 +299,8 @@ fn run(
     defer vx.deinit(gpa, tty.writer());
 
     var loop: vaxis.Loop(Event) = .init(io, &tty, &vx);
+    try loop.installResizeHandler();
+    defer loop.uninstallResizeHandler();
     try loop.start();
     defer loop.stop();
 
