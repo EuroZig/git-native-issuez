@@ -1,5 +1,4 @@
-//! Repositories, git, and the leak check for the C API tests
-//! (docs/test-plan.md §2.3).
+//! Repositories, git, and the leak check for the C API tests.
 
 const std = @import("std");
 const testing = std.testing;

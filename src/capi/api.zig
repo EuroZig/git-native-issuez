@@ -2781,8 +2781,9 @@ pub const items = [_]Item{
         "issuez_purge_result_exposed_remote_count",
         fn (?*const PurgeResult) callconv(.c) usize,
         &.{"r"},
-        "Remotes whose tracking refs show they had the purged commits. The next " ++
-            "issuez_sync with each replaces their copy (leased on what it fetched).",
+        "Remotes whose tracking refs show they had the purged commits, one synced by URL " ++
+            "or path as the url-<hash> its refs are kept under. The next issuez_sync with " ++
+            "each replaces their copy (leased on what it fetched).",
     ),
     f(
         "issuez_purge_result_exposed_remote_at",

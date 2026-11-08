@@ -25,10 +25,8 @@ main_repo=https://github.com/EuroZig/git-native-issuez
 find "$module" -mindepth 1 -maxdepth 1 ! -name .git -exec rm -rf {} +
 cp -R "$root/bindings/go/." "$module/"
 cp "$root/LICENSE" "$root/THIRD_PARTY_LICENSES" "$module/"
-# In a checkout: this machine's build outputs and the empty directories.
-rm -rf "$module/issuez/lib"
 
-# <archive's platform> <directory the cgo lines in issuez.go search>
+# <archive's platform> <directory in issuez/lib/>
 while read -r platform dir; do
     name="libissuez-$version-$platform"
     mkdir -p "$module/issuez/lib/$dir"
@@ -43,6 +41,23 @@ aarch64-linux-gnu linux_arm64
 aarch64-linux-musl linux_arm64_musl
 arm-linux-gnueabihf linux_arm
 arm-linux-musleabihf linux_arm_musl
+EOF
+
+# Where the package finds them; the module here takes them from CGO_LDFLAGS.
+cat > "$module/issuez/archives.go" <<'EOF'
+package issuez
+
+/*
+#cgo darwin,arm64 LDFLAGS: -L${SRCDIR}/lib/darwin_arm64
+#cgo darwin,amd64 LDFLAGS: -L${SRCDIR}/lib/darwin_amd64
+#cgo linux,amd64,!musl LDFLAGS: -L${SRCDIR}/lib/linux_amd64
+#cgo linux,amd64,musl LDFLAGS: -L${SRCDIR}/lib/linux_amd64_musl
+#cgo linux,arm64,!musl LDFLAGS: -L${SRCDIR}/lib/linux_arm64
+#cgo linux,arm64,musl LDFLAGS: -L${SRCDIR}/lib/linux_arm64_musl
+#cgo linux,arm,!musl LDFLAGS: -L${SRCDIR}/lib/linux_arm
+#cgo linux,arm,musl LDFLAGS: -L${SRCDIR}/lib/linux_arm_musl
+*/
+import "C"
 EOF
 
 find "$module" -type f \( -name '*.go' -o -name go.mod -o -name '*.md' \) \

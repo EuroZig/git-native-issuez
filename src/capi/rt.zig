@@ -118,7 +118,7 @@ pub fn issuez_init(abi_version: u32, err: ?*?*api.Error) callconv(.c) Code {
 /// Once, from whichever thread gets here first.
 fn startOnce() void {
     while (true) {
-        switch (init_state.cmpxchgWeak(0, 1, .acquire, .acquire) orelse 0) {
+        switch (init_state.cmpxchgStrong(0, 1, .acquire, .acquire) orelse 0) {
             0 => break,
             1 => std.atomic.spinLoopHint(),
             else => return,

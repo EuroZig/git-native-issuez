@@ -224,7 +224,6 @@ own, with `go get github.com/EuroZig/git-native-issuez-go/issuez`:
 - [docs/lazygit.md](docs/lazygit.md): an issues menu for lazygit.
 - [docs/mcp.md](docs/mcp.md): the MCP server for coding agents.
 - [docs/design.md](docs/design.md): how the library is put together.
-- [docs/zig-api.md](docs/zig-api.md): every public Zig function.
 - [docs/embedding.md](docs/embedding.md): embedding the library in a host,
   from Zig, C or Go.
 - [docs/compatibility.md](docs/compatibility.md): where the CLI differs from

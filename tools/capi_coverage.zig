@@ -1,5 +1,5 @@
 //! `capi-coverage <issuez-api.json> <test dir>`: every C API function and
-//! generated helper has a Zig test named after it (docs/test-plan.md §2.4):
+//! generated helper has a Zig test named after it:
 //! `test "issuez_x: ..."`, or several names before the colon, separated by
 //! ", ". Names that don't fit in the line go in `// covers: ...` lines
 //! right above the test, also separated by ", ". `pending.txt` in the

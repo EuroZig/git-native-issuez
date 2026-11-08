@@ -1,4 +1,4 @@
-//! Reading issues (docs/test-plan.md §2.5.8): one issue with every field,
+//! Reading issues: one issue with every field,
 //! one with none.
 
 const std = @import("std");

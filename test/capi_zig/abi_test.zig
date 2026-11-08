@@ -1,5 +1,5 @@
 //! The header the compiler sees against the library's description of
-//! itself (docs/test-plan.md §2.6): record sizes, field offsets and enum
+//! itself: record sizes, field offsets and enum
 //! values. Catches a header and a library out of step.
 
 const std = @import("std");

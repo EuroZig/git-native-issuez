@@ -1,4 +1,4 @@
-//! Assertions for C API results (docs/test-plan.md §2.3).
+//! Assertions for C API results.
 
 const std = @import("std");
 const testing = std.testing;

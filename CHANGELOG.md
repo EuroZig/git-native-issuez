@@ -87,7 +87,8 @@ the on-disk format only grew.
   retries (`Receipt.retries` in the library).
 - Push check, for a host's pre-receive hook ([docs/format.md](docs/format.md)
   §11): `git issue push-check [--authors any|warn|enforce] [--pusher-email
-  <email>]... [--allow-numbers] [--allow-purge]` reads the hook's input and
+  <email>]... [--pusher-id <uuid>]... [--allow-numbers] [--allow-purge]` reads
+  the hook's input and
   refuses non-fast-forwards, deletes, local-only refs, histories that fail
   `fsck` or have another `Format-Version`, client numbers, other people's
   commits (by policy), tombstones without leave to purge and attachment
@@ -170,16 +171,14 @@ the on-disk format only grew.
   (`src/capi/api.zig`), and `docs/issuez-api.json` for binding generators.
   Op lists instead of builders, typed problems that point at the op they
   came from, cancel tokens, a thread-safe repo with a pool of git sessions.
-  Parts not built yet fail with `ISSUEZ_E_UNSUPPORTED`. Every function was
-  reviewed against the C idioms (docs/c-api-review.md).
+  Parts not built yet fail with `ISSUEZ_E_UNSUPPORTED`.
 - A Go binding, `bindings/go` (cgo, Go 1.26): results copied into Go
   values, contexts for cancellation, `issuez.Edit` and `issuez.Query`
   values for writes and queries. `zig build go-libs`, `test-go`. Each release
   writes `github.com/EuroZig/git-native-issuez-go`, the binding with the
   archives in the module, so `go get` is all it takes. It also tags the module
   here as `bindings/go/vX.Y.Z`, which links the release's `libissuez` archive
-  through `CGO_LDFLAGS` (see its README). Every exported function was reviewed
-  against the Go idioms (docs/go-api-review.md).
+  through `CGO_LDFLAGS` (see its README).
 - `GitProcess.OpenOptions.git`: the git binary to run.
 - Go: `RefPrefixes`, `IsRef` and `RefSpecs`, the library's ref namespaces
   and forced refspecs for mirrors, so hosts don't restate them.

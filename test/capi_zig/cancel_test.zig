@@ -1,4 +1,4 @@
-//! Cancel tokens and the logger (docs/test-plan.md §2.5.5).
+//! Cancel tokens and the logger.
 
 const std = @import("std");
 const testing = std.testing;

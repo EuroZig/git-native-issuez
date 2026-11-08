@@ -1,4 +1,4 @@
-//! Errors and problems (docs/test-plan.md §2.5.3).
+//! Errors and problems.
 
 const std = @import("std");
 const testing = std.testing;

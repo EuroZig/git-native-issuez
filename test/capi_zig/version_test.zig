@@ -1,4 +1,4 @@
-//! Version and init (docs/test-plan.md §2.5.1).
+//! Version and init.
 
 const std = @import("std");
 const testing = std.testing;

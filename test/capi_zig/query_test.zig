@@ -1,4 +1,4 @@
-//! Queries, lists and the repo's issue cache (docs/test-plan.md §2.5.9).
+//! Queries, lists and the repo's issue cache.
 
 const std = @import("std");
 const testing = std.testing;

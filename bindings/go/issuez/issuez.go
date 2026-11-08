@@ -1,12 +1,10 @@
 // Package issuez binds the git-native-issuez C API (include/issuez.h).
 //
-// It links libissuez.a, found in lib/ for this platform (Linux builds for musl,
-// or Alpine, need the build tag musl) or through CGO_LDFLAGS=-L<its directory>.
-// The module github.com/EuroZig/git-native-issuez-go has lib/; in a checkout,
-// `zig build go-libs` fills it; otherwise take the release's libissuez archive
-// (see the README).
-// The tag issuez_debug links lib/debug/libissuez.a instead, which counts its
-// allocations for the fuzz tests' leak check (`zig build fuzz-go`).
+// It links libissuez.a, from CGO_LDFLAGS=-L<its directory>: the release's
+// libissuez archive, or `zig build go-libs` in a checkout (see the README). The
+// module github.com/EuroZig/git-native-issuez-go has it built in. The tag
+// issuez_debug needs the archive that counts its allocations, for the fuzz
+// tests' leak check (`zig build fuzz-go`).
 //
 // Everything the library returns is copied into plain Go values and the C
 // handles are freed straight away, so values are safe to keep and share.
@@ -24,15 +22,6 @@ package issuez
 
 /*
 #cgo CFLAGS: -I${SRCDIR}/include
-#cgo darwin,arm64,!issuez_debug LDFLAGS: -L${SRCDIR}/lib/darwin_arm64
-#cgo darwin,amd64,!issuez_debug LDFLAGS: -L${SRCDIR}/lib/darwin_amd64
-#cgo linux,amd64,!musl,!issuez_debug LDFLAGS: -L${SRCDIR}/lib/linux_amd64
-#cgo linux,amd64,musl,!issuez_debug LDFLAGS: -L${SRCDIR}/lib/linux_amd64_musl
-#cgo linux,arm64,!musl,!issuez_debug LDFLAGS: -L${SRCDIR}/lib/linux_arm64
-#cgo linux,arm64,musl,!issuez_debug LDFLAGS: -L${SRCDIR}/lib/linux_arm64_musl
-#cgo linux,arm,!musl,!issuez_debug LDFLAGS: -L${SRCDIR}/lib/linux_arm
-#cgo linux,arm,musl,!issuez_debug LDFLAGS: -L${SRCDIR}/lib/linux_arm_musl
-#cgo issuez_debug LDFLAGS: -L${SRCDIR}/lib/debug
 #cgo LDFLAGS: -lissuez
 #cgo linux LDFLAGS: -lpthread
 #include <stdlib.h>

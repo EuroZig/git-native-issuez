@@ -1,4 +1,4 @@
-//! Sync between two repositories and a hub (docs/test-plan.md §2.5.13).
+//! Sync between two repositories and a hub.
 
 const std = @import("std");
 const testing = std.testing;

@@ -604,6 +604,51 @@ pub fn Attachments(comptime B: type) type {
             issue: Issue,
             remote_tip_in: ?Oid,
         ) Error!bool {
+            return self.reconcileTo(arena, issue, remote_tip_in, false, false);
+        }
+
+        /// Internal: the library's own plumbing, not API; it may change.
+        /// When a derived ref has purged history (`hasOldTips`): the local
+        /// ref takes nothing from what has it and exists even with no
+        /// attachments left, so the next push replaces the remote's. Null
+        /// `remote_tip`: the remote's has it. `drop_local`: the local one has.
+        pub fn replacePurged(
+            self: Self,
+            arena: Allocator,
+            issue: Issue,
+            remote_tip: ?Oid,
+            drop_local: bool,
+        ) Error!bool {
+            return self.reconcileTo(arena, issue, remote_tip, true, drop_local);
+        }
+
+        /// Internal: the library's own plumbing, not API; it may change.
+        /// Whether a commit in `derived`'s history names an issue tip that
+        /// left `issue_tip`'s history: it predates a purge's rewrite, and
+        /// lists what the purge removed. Not a commit: false.
+        pub fn hasOldTips(self: Self, arena: Allocator, derived: Oid, issue_tip: Oid) Error!bool {
+            var seen: std.AutoHashMapUnmanaged([Oid.max_byte_len]u8, void) = .empty;
+            var stack: std.ArrayList(Oid) = .empty;
+            try stack.append(arena, derived);
+            while (stack.pop()) |oid| {
+                if ((try seen.getOrPut(arena, oid.bytes)).found_existing) continue;
+                // Anyone can push anything there: too long isn't ours.
+                if (seen.count() > self.repo.limits.max_commits_per_issue) return true;
+                const c = (try self.readCommit(arena, oid)) orelse continue;
+                if (!try self.namesTipIn(arena, oid, issue_tip)) return true;
+                try stack.appendSlice(arena, c.parents);
+            }
+            return false;
+        }
+
+        fn reconcileTo(
+            self: Self,
+            arena: Allocator,
+            issue: Issue,
+            remote_tip_in: ?Oid,
+            must_exist: bool,
+            drop_local: bool,
+        ) Error!bool {
             // Anyone can push anything there. What isn't a commit is
             // ignored, and the next push replaces it.
             const remote_tip = if (remote_tip_in) |r|
@@ -615,9 +660,10 @@ pub fn Attachments(comptime B: type) type {
             const want = try self.treeFor(arena, pointers, .hash_only);
             var attempt: u8 = 0;
             while (attempt < self.repo.limits.cas_retries) : (attempt += 1) {
-                const local = try self.repo.backend.resolveRef(name);
-                if (local == null and remote_tip == null and issue.attachments.len == 0 and
-                    issue.removed_attachments.len == 0) return false;
+                const actual = try self.repo.backend.resolveRef(name);
+                const local = if (drop_local) null else actual;
+                if (!must_exist and local == null and remote_tip == null and
+                    issue.attachments.len == 0 and issue.removed_attachments.len == 0) return false;
                 // Also regenerated when the tip it names left the issue's
                 // history (a replaced history): a push check refuses it.
                 const local_ok = if (local) |l|
@@ -654,7 +700,8 @@ pub fn Attachments(comptime B: type) type {
                         parents.items,
                     );
                 }
-                const op: contract.RefUpdate.Op = if (local) |l|
+                if (actual != null and actual.?.eql(target)) return false;
+                const op: contract.RefUpdate.Op = if (actual) |l|
                     .{ .update = .{ .new = target, .old = l } }
                 else
                     .{ .create = target };

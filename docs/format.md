@@ -522,10 +522,11 @@ The rewrite is a function of the issue's commits and the set of purged
 comments, so every clone that applies the same purges gets the same
 commits, and applying it again changes nothing. Commits are rewritten in
 causal order, an event after the comment it targets:
-- a purged comment becomes `Purged comment`, no body, its trailers minus
-  `X-Attachment`, `X-Attachment-Removed`, `X-Original-Author`,
-  `X-Original-Id` and `Provider-Comment-ID`, then `X-Purged: true` and
-  `X-Rewritten-From`;
+- a purged comment becomes `Purged comment`, no body, the trailers this
+  format names minus `X-Attachment`, `X-Attachment-Removed`,
+  `X-Original-Author`, `X-Original-Id` and `Provider-Comment-ID`, then
+  `X-Purged: true` and `X-Rewritten-From`. Other trailers go, a host's fields
+  too: they can't be told from a comment's text that parses as trailers;
 - an edit event targeting it becomes `Edit comment`, body `Purged comment`,
   trailers treated the same way;
 - every other commit whose parent or `X-Comment` target was rewritten keeps
@@ -560,7 +561,8 @@ Reason: abuse
 `X-Purge: issue` purges the whole issue and has no `X-Purged-Commit`.
 `Reason` is optional. A tombstone says what its whole history says: the
 issue is purged if any commit says so, and the purged comments are the
-union. Commits that don't read as purges are ignored.
+union. Commits that don't read as purges are ignored, and a chain is read
+up to its first 100,000 commits: a longer one can't stop a sync.
 
 Sync fetches `refs/issuez-purged/*` with the issues and merges tombstone
 chains like issues: a fast-forward, or a merge commit `Merge purges` by
@@ -575,7 +577,8 @@ or derived ref still has purged history, the push replaces it, leased on
 the tip just fetched (`--force-with-lease`); this is the only push that
 isn't a fast-forward, and only a tombstone allows it. It first merges
 whatever the remote's tip, purged, has that the local one doesn't, so the
-replace loses nothing. A purged issue's remote ref is deleted the same
+replace loses nothing. A derived ref is never rebuilt on a remote commit
+naming an issue tip that left the issue's history. A purged issue's remote ref is deleted the same
 way. Anyone who can push tombstones can purge every clone: hosts should
 limit who may (§11).
 
@@ -625,8 +628,11 @@ those the old tip doesn't have:
   flagged, under `enforce` rejected; `any` checks nothing. So is a new
   commit whose `X-Author-Id` isn't one of the pusher's UUIDs, whatever its
   email: with no UUIDs given, every `X-Author-Id` is someone else's.
-  Merge commits by `git-issue <git-issue@invalid>` are exempt: sync
-  writes them.
+  Merge commits by `git-issue <git-issue@invalid>` that add nothing are
+  exempt, since sync writes them: the subject of §4, §6 or `Merge purges`,
+  no text, and for an issue at most what the parents resolve to (sets in
+  any order), `X-Number` and `X-Rewritten-From`. The identity alone proves
+  nothing.
 - **Locks.** The verdict says when new commits go to an issue locked at
   its old tip.
 - **Purges.** An issue that a tombstone purges can't be created or

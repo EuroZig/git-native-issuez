@@ -410,6 +410,7 @@ pub fn Sync(comptime B: type) type {
             else
                 try self.refsUnder(arena, staging_prefix);
             const local_tips = try self.refsUnder(arena, attachments_mod.ref_prefix);
+            const tombs = try self.refsUnder(arena, purge_mod.ref_prefix);
             const pushed = try mapUnder(
                 arena,
                 records,
@@ -424,7 +425,21 @@ pub fn Sync(comptime B: type) type {
                 // Issues that never had attachments cost no git process.
                 if (remote_tip == null and !local_tips.contains(id) and
                     issue.attachments.len == 0 and issue.removed_attachments.len == 0) continue;
-                const moved_now = try att.reconcile(arena, issue, remote_tip);
+                // Never on top of purged history: the push replaces it.
+                const tomb = tombs.contains(id);
+                const old_remote = tomb and remote_tip != null and
+                    try att.hasOldTips(arena, remote_tip.?, issue.tip);
+                const old_local = tomb and local_tips.contains(id) and
+                    try att.hasOldTips(arena, local_tips.get(id).?, issue.tip);
+                const moved_now = if (old_remote or old_local)
+                    try att.replacePurged(
+                        arena,
+                        issue,
+                        if (old_remote) null else remote_tip,
+                        old_local,
+                    )
+                else
+                    try att.reconcile(arena, issue, remote_tip);
                 if (moved_now) moved += 1;
                 const remote_derived = remote_tip orelse continue;
                 const local = if (moved_now)
@@ -3016,6 +3031,101 @@ test "attachment sync" {
     const state = try A.fromRepo(a.sync.repo).derivedState(arena, issue);
     try testing.expectEqual(A.DerivedState.ok, state);
     try testing.expectEqual(@as(usize, 3), world.clones[2].lfs.len);
+}
+
+test "a purge's derived ref doesn't take the remote's old history back" {
+    var arena_state: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var world = testWorld();
+    const samples = @import("../format/attachment.zig").samples;
+    const A = attachments_mod.Attachments(GitSim);
+    const P = purge_mod.Purge(GitSim);
+
+    // One issue keeps an image, the other has none left after the purge.
+    var a = try onClone(arena, &world, 0);
+    const att = A.fromRepo(a.sync.repo);
+    const refs = [_][]const u8{
+        try std.fmt.allocPrint(
+            arena,
+            "refs/issues/{s}",
+            .{(try a.sync.repo.create(arena, .{ .title = "Kept" }, .{})).id},
+        ),
+        try std.fmt.allocPrint(
+            arena,
+            "refs/issues/{s}",
+            .{(try a.sync.repo.create(arena, .{ .title = "Empty" }, .{})).id},
+        ),
+    };
+    _ = try att.add(arena, refs[0], .{
+        .files = &.{.{ .name = "keep.webp", .data = samples.webp }},
+    }, .{});
+    var secrets: [2]Oid = undefined;
+    for (refs, &secrets) |ref, *secret| {
+        secret.* = (try att.add(arena, ref, .{
+            .files = &.{.{ .name = "secret.png", .data = samples.png }},
+            .comment = "Secret",
+        }, .{})).tip;
+    }
+    _ = try a.sync.sync(arena, "origin", .{});
+    try a.sim.commit();
+    var bob = try onClone(arena, &world, 1);
+    _ = try bob.sync.sync(arena, "origin", .{});
+    try bob.sim.commit();
+
+    a = try onClone(arena, &world, 0);
+    const old_derived = (try a.sim.resolveRef(
+        try attachments_mod.refName(arena, refs[0]["refs/issues/".len..]),
+    )).?;
+    for (refs, secrets) |ref, secret|
+        _ = try P.fromRepo(a.sync.repo).comment(arena, ref, secret, .{}, .{});
+    _ = try a.sync.sync(arena, "origin", .{});
+    try a.sim.commit();
+    bob = try onClone(arena, &world, 1);
+    _ = try bob.sync.sync(arena, "origin", .{});
+    try bob.sim.commit();
+
+    const clean = struct {
+        // No clone's derived ref has history from before the purge.
+        fn check(a2: Allocator, w: *GitSim.World, names: []const []const u8) !void {
+            for (0..3) |clone| {
+                var at = try onClone(a2, w, clone);
+                const here = attachments_mod.Attachments(GitSim).fromRepo(at.sync.repo);
+                for (names) |ref| {
+                    const tip = (try at.sim.resolveRef(ref)).?;
+                    const issue = try at.sync.repo.load(a2, .{ .name = ref, .tip = tip });
+                    const derived = (try at.sim.resolveRef(try attachments_mod.refName(
+                        a2,
+                        issue.id,
+                    ))).?;
+                    try testing.expect(!try here.hasOldTips(a2, derived, tip));
+                }
+            }
+        }
+    }.check;
+    try clean(arena, &world, &refs);
+
+    // The old history comes back, on the hub or in a clone: the next sync
+    // replaces it.
+    const name = try attachments_mod.refName(arena, refs[0]["refs/issues/".len..]);
+    for ([_]usize{ 2, 0 }) |where| {
+        var at = try onClone(arena, &world, where);
+        const now = (try at.sim.resolveRef(name)).?;
+        try at.sim.updateRefs(&.{.{
+            .name = name,
+            .op = .{ .update = .{ .new = old_derived, .old = now } },
+        }});
+        try at.sim.commit();
+        for (0..2) |_| {
+            a = try onClone(arena, &world, 0);
+            _ = try a.sync.sync(arena, "origin", .{});
+            try a.sim.commit();
+            bob = try onClone(arena, &world, 1);
+            _ = try bob.sync.sync(arena, "origin", .{});
+            try bob.sim.commit();
+        }
+        try clean(arena, &world, &refs);
+    }
 }
 
 test "before_push and no git-lfs" {

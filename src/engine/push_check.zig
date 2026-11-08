@@ -14,6 +14,7 @@ const repo_mod = @import("repo.zig");
 const purge_mod = @import("purge.zig");
 const attachments_mod = @import("attachments.zig");
 const issue_model = @import("../model/issue.zig");
+const labels_fmt = @import("../format/labels.zig");
 
 const Oid = object.Oid;
 const CommitInput = issue_model.CommitInput;
@@ -183,6 +184,26 @@ fn isSyncMerge(c: CommitInput) bool {
         std.mem.eql(u8, c.author.email, @import("sync.zig").merge_identity_email);
 }
 
+/// Whether `value` is what the merge restates: sets in any order, since a
+/// purge's rewrite sorts them (format.md §10).
+fn sameRestated(arena: Allocator, want: trailers.Trailer, value: []const u8) Allocator.Error!bool {
+    const is_set = std.mem.eql(u8, want.key, "Labels") or
+        std.mem.eql(u8, want.key, "X-Blocked-By");
+    if (!is_set) return std.mem.eql(u8, want.value, value);
+    const lt = struct {
+        fn f(_: void, a: []const u8, b: []const u8) bool {
+            return std.mem.order(u8, a, b) == .lt;
+        }
+    }.f;
+    const x = try arena.dupe([]const u8, try labels_fmt.parse(arena, want.value));
+    const y = try arena.dupe([]const u8, try labels_fmt.parse(arena, value));
+    std.mem.sort([]const u8, x, {}, lt);
+    std.mem.sort([]const u8, y, {}, lt);
+    if (x.len != y.len) return false;
+    for (x, y) |p, q| if (!std.mem.eql(u8, p, q)) return false;
+    return true;
+}
+
 pub fn PushCheck(comptime B: type) type {
     return struct {
         const Self = @This();
@@ -230,11 +251,7 @@ pub fn PushCheck(comptime B: type) type {
             for (try self.repo.backend.listRefs(arena, prefixes.tombstones)) |e| {
                 const id = e.name[prefixes.tombstones.len..];
                 if (!uuid_fmt.isCanonical(id)) continue;
-                const t = purge_mod.readAt(arena, self.repo.backend, e.oid) catch |err|
-                    switch (err) {
-                        error.HistoryTooLong => continue,
-                        else => |x| return x,
-                    };
+                const t = try purge_mod.readAt(arena, self.repo.backend, e.oid);
                 try run.tombs.put(arena, id, t);
             }
             for (updates, verdicts) |u, *v| {
@@ -346,10 +363,77 @@ pub fn PushCheck(comptime B: type) type {
             return out.items;
         }
 
-        fn authors(r: *Run, commits: []const CommitInput, problems: *Problems) Error!void {
+        /// A merge under this tool's identity that adds nothing to its
+        /// parents, as sync writes them (format.md §4, §6, §10). The identity
+        /// proves nothing: anyone can write it.
+        fn mergeAddsNothing(
+            r: *Run,
+            c: CommitInput,
+            kind: Kind,
+            id: []const u8,
+            history: []const CommitInput,
+        ) Error!bool {
+            if (!isSyncMerge(c)) return false;
+            const a = r.arena;
+            switch (kind) {
+                .tombstone => return std.mem.eql(u8, c.message, purge_mod.merge_subject ++ "\n"),
+                .milestone => return std.mem.eql(u8, c.message, "Merge milestone\n"),
+                .issue => {},
+                else => return false,
+            }
+            const subject = @import("sync.zig").merge_subject;
+            const block = try trailers.parse(a, c.message, .{});
+            if (block.first_line) |line| {
+                // The subject, a blank line, the trailers.
+                if (line != 2 or !std.mem.eql(u8, std.mem.sliceTo(c.message, '\n'), subject))
+                    return false;
+            } else if (!std.mem.eql(u8, std.mem.trimEnd(u8, c.message, "\n"), subject)) {
+                return false;
+            }
+            var reach: Reach = .empty;
+            for (c.parents) |p| {
+                var from = try reachable(a, history, p);
+                var keys = from.keyIterator();
+                while (keys.next()) |k| try reach.put(a, k.*, {});
+            }
+            var before: std.ArrayList(CommitInput) = .empty;
+            for (history) |h| if (reach.contains(h.oid.bytes)) try before.append(a, h);
+            const resolved = issue_model.resolveMerge(
+                a,
+                id,
+                before.items,
+                c.parents,
+                c.author,
+                subject ++ "\n",
+            ) catch |e| switch (e) {
+                error.OutOfMemory => return error.OutOfMemory,
+                else => return false,
+            };
+            const restated = try issue_model.restatedTrailers(a, resolved);
+            for (block.trailers) |t| {
+                // Says nothing, or has its own check (§11).
+                if (std.ascii.eqlIgnoreCase(t.key, "X-Number") or
+                    std.ascii.eqlIgnoreCase(t.key, purge_mod.rewritten_from_key)) continue;
+                const same = for (restated.items) |want| {
+                    if (!std.ascii.eqlIgnoreCase(want.key, t.key)) continue;
+                    break try sameRestated(a, want, t.value);
+                } else false;
+                if (!same) return false;
+            }
+            return true;
+        }
+
+        fn authors(
+            r: *Run,
+            commits: []const CommitInput,
+            kind: Kind,
+            issue_id: []const u8,
+            history: []const CommitInput,
+            problems: *Problems,
+        ) Error!void {
             if (r.policy.author_policy == .any) return;
             for (commits) |c| {
-                if (isSyncMerge(c)) continue;
+                if (try mergeAddsNothing(r, c, kind, issue_id, history)) continue;
                 // A host's UUID names its user whatever the email says.
                 if (try issue_model.authorIdOf(r.arena, c.message)) |id| {
                     const own = for (r.policy.pusher_ids) |p| {
@@ -413,7 +497,11 @@ pub fn PushCheck(comptime B: type) type {
                 .kind = .non_fast_forward,
                 .message = "not a fast-forward",
             });
-            const base = if (u.old) |o| try r.check.repo.loadCommits(r.arena, o) else null;
+            const base: ?[]const CommitInput = if (u.old) |o|
+                (try historyOf(r, o, &problems)) orelse
+                    return verdictOf(u, .tombstone, id, action, &problems)
+            else
+                null;
             const fresh = try newCommits(r, history, base);
             const empty = object.emptyTree(r.format());
             for (fresh) |c| {
@@ -433,7 +521,7 @@ pub fn PushCheck(comptime B: type) type {
                     });
                 }
             }
-            try authors(r, fresh, &problems);
+            try authors(r, fresh, .tombstone, id, history, &problems);
             var v = verdictOf(u, .tombstone, id, action, &problems);
             v.new_commits = fresh;
             return v;
@@ -629,7 +717,7 @@ pub fn PushCheck(comptime B: type) type {
                 }
             }
 
-            try authors(r, fresh, &problems);
+            try authors(r, fresh, kind, id, history, &problems);
             var v = verdictOf(u, kind, id, action, &problems);
             v.new_commits = fresh;
             v.issue = loaded;
@@ -948,6 +1036,71 @@ test "numbers, authors and locks" {
         .{ .pusher_emails = &.{"mallory@X"}, .author_policy = .enforce },
     );
     try testing.expect(own[0].accept);
+}
+
+test "authors: only a merge that adds nothing is exempt" {
+    var arena_state: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const s = try TestServer.init(arena, 6);
+    const sync = @import("sync.zig");
+    const sim_author: object.Signature = .{
+        .name = sync.merge_identity_name,
+        .email = sync.merge_identity_email,
+        .time = 1_700_000_000,
+        .tz_offset_minutes = 0,
+    };
+    const created = try s.repo.create(arena, .{ .title = "T", .labels = &.{ "b", "a" } }, .{});
+    const ref = try s.issueRef(created.id);
+    const tip = (try s.repo.comment(arena, ref, .{ .text = "Second" }, .{})).tip;
+    try s.set(ref, tip);
+    const verdict = struct {
+        fn f(
+            server: anytype,
+            a: Allocator,
+            name: []const u8,
+            old: Oid,
+            sig: object.Signature,
+            message: []const u8,
+        ) !bool {
+            const new = try server.repo.writeCommit(
+                a,
+                &.{ old, try parentOf(server.repo, a, old) },
+                .{ .author = sig, .committer = sig },
+                message,
+            );
+            const v = try server.check(&.{.{ .ref = name, .old = old, .new = new }}, .{
+                .pusher_emails = &.{"mallory@x"},
+                .author_policy = .enforce,
+                .allow_numbers = true,
+            });
+            return v[0].accept;
+        }
+        fn parentOf(repo: anytype, a: Allocator, oid: Oid) !Oid {
+            for (try repo.loadCommits(a, oid)) |c| if (c.oid.eql(oid)) return c.parents[0];
+            unreachable;
+        }
+    }.f;
+    // What sync writes, in either order of the set, with a kept number.
+    for ([_][]const u8{
+        "Merge issue\n",
+        "Merge issue\n\nState: open\nLabels: b, a\n",
+        "Merge issue\n\nState: open\nLabels: a, b\nX-Number: 7\n",
+    }) |honest| try testing.expect(try verdict(s, arena, ref, tip, sim_author, honest));
+    // A field the parents don't resolve to, text, or another subject.
+    for ([_][]const u8{
+        "Merge issue\n\nState: closed\n",
+        "Merge issue\n\nLabels: pwned\n",
+        "Merge issue\n\nState: open\nX-Assignees: mallory@x\n",
+        "Merge issue\n\nState: open\nReason: forged\n",
+        "Merge issue\n\nA comment\n\nState: open\n",
+        "Merge issue\n\nA comment\n",
+        "Something else\n\nState: open\n",
+    }) |forged| try testing.expect(!try verdict(s, arena, ref, tip, sim_author, forged));
+    // The identity is what makes it exempt.
+    var other = sim_author;
+    other.email = "alice@x";
+    try testing.expect(!try verdict(s, arena, ref, tip, other, "Merge issue\n"));
 }
 
 test "authors: an X-Author-Id must be the pusher's, whatever the email" {

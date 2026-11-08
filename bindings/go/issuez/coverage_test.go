@@ -13,8 +13,8 @@ import (
 )
 
 // TestEveryExportedSymbolHasATest: every exported function F and method
-// T.M has a TestF / TestT_M or an ExampleF / ExampleT_M
-// (docs/test-plan.md §3.5). testdata/untested.txt lists those still
+// T.M has a TestF / TestT_M or an ExampleF / ExampleT_M.
+// testdata/untested.txt lists those still
 // waiting; a name both listed and tested fails too, so the list only
 // shrinks.
 func TestEveryExportedSymbolHasATest(t *testing.T) {

@@ -43,12 +43,11 @@ go build ./...
 - Take the release of the module's version. Before 1.0, a library of
   another minor version is refused when you open a repository
   (`issuez.h is version 0.3, the library 0.4`).
-- In a checkout the archives are build outputs in `issuez/lib/`, found
-  without `CGO_LDFLAGS`: `zig build go-libs` builds this platform's, `zig
-  build go-libs -Dgo-libs-all` every one, and `zig build test-go` builds this
-  platform's and runs the tests. Against those, Linux builds for musl
-  (Alpine) need `-tags musl`. A project using a checkout points at it with a
-  `replace` directive in its `go.mod`.
+- In a checkout, `zig build go-libs` installs this platform's in
+  `zig-out/lib/go/<GOOS>_<GOARCH>[_musl]/`, `-Dgo-libs-all` every one, for
+  `CGO_LDFLAGS` to name; `zig build test-go` builds this platform's and runs
+  the tests. A project using a checkout points at it with a `replace`
+  directive in its `go.mod`.
 
 Cross-compiling needs a C compiler for the target; `zig cc` works:
 `CC="zig cc -target aarch64-linux-musl" GOOS=linux GOARCH=arm64 go build`.

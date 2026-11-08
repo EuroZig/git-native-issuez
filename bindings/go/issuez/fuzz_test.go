@@ -1,6 +1,6 @@
 package issuez
 
-// Fuzz tests (docs/test-plan.md §3.3). White-box: FuzzEditValidate feeds
+// Fuzz tests. White-box: FuzzEditValidate feeds
 // raw ops no builder makes, and the leak check reads the library's count
 // of live allocations, built with -tags issuez_debug (`zig build
 // fuzz-go`). The seeds run as normal tests.

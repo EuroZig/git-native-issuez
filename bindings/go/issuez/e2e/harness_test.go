@@ -1,6 +1,6 @@
 //go:build e2e
 
-// End-to-end tests (docs/test-plan.md §3.4): the Go binding as a host
+// End-to-end tests: the Go binding as a host
 // uses it, against the real CLI as clients use it. The build passes the
 // tools by environment:
 //

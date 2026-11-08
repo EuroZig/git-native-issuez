@@ -271,8 +271,9 @@ func (r *Repo) Sync(ctx context.Context, remote string, opts SyncOptions) (*Sync
 type PurgeResult struct {
 	// The issue's new tip after a comment purge; zero when the issue is gone.
 	NewTip OID
-	// Remotes that had the purged commits. The next Sync with each
-	// replaces their copy.
+	// Remotes that had the purged commits, one synced by URL or path as the
+	// url-<hash> its refs are kept under. The next Sync with each replaces
+	// their copy.
 	ExposedRemotes []string
 	// The attachments it took out of history: a host that keeps their
 	// bytes drops its copies.

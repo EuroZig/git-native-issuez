@@ -1,6 +1,6 @@
-//! The generated op helpers and the header's macros (docs/test-plan.md
-//! §2.5.17): each builds the op the API description says, and the call it
-//! belongs to accepts it. The table follows issuez-api.json's helpers.
+//! The generated op helpers and the header's macros: each builds the op
+//! the API description says, and the call it belongs to accepts it. The
+//! table follows issuez-api.json's helpers.
 
 const std = @import("std");
 const testing = std.testing;

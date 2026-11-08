@@ -1,11 +1,78 @@
-//! Purges, and handles outliving what made them (docs/test-plan.md
-//! §2.5.15, §2.5.16).
+//! Purges, and handles outliving what made them.
 
 const std = @import("std");
 const testing = std.testing;
 const fixture = @import("fixture.zig");
 const expect = @import("expect.zig");
 const c = fixture.c;
+
+test "issuez_purge_issue: the actor's user_id is on the tombstone, and must be a UUID" {
+    const leaks = fixture.Leaks.start();
+    defer leaks.check();
+    var r: fixture.Repo = undefined;
+    try r.init(.{});
+    defer r.deinit();
+    const h = r.handle;
+    const x = try fixture.titled(h, "Doxxing");
+    const uuid = "0c8d7a52-3f1e-4b6a-9d2c-5e4f3a2b1c0d";
+    var actor = fixture.ada;
+    var pr: ?*c.issuez_purge_result = null;
+    var err: ?*c.issuez_error = null;
+
+    actor.user_id = fixture.str("not a uuid");
+    try testing.expect(
+        c.issuez_purge_issue(h, x.idStr(), &actor, fixture.str(""), null, &pr, &err) ==
+            c.ISSUEZ_E_INVALID_ARGUMENT,
+    );
+    c.issuez_error_free(err);
+    err = null;
+
+    actor.user_id = fixture.str(uuid);
+    try expect.code(
+        c.ISSUEZ_OK,
+        c.issuez_purge_issue(h, x.idStr(), &actor, fixture.str(""), null, &pr, &err),
+        err,
+    );
+    c.issuez_purge_result_free(pr);
+    const message = try r.git(&.{
+        "log",
+        "-1",
+        "--format=%B",
+        try std.fmt.allocPrint(r.arena(), "refs/issuez-purged/{s}", .{x.idSlice()}),
+    });
+    try testing.expect(std.mem.find(u8, message, "X-Author-Id: " ++ uuid) != null);
+}
+
+test "issuez_purge_result_exposed_remote_at: a remote synced by URL" {
+    const leaks = fixture.Leaks.start();
+    defer leaks.check();
+    var r: fixture.Repo = undefined;
+    try r.init(.{});
+    defer r.deinit();
+    const h = r.handle;
+    const path = try fixture.hub(&r, "hub.git");
+    _ = try r.git(&.{ "remote", "remove", "origin" });
+    const x = try fixture.titled(h, "Doxxing");
+    var out: ?*c.issuez_sync_report = null;
+    var err: ?*c.issuez_error = null;
+    try expect.code(
+        c.ISSUEZ_OK,
+        c.issuez_sync(h, fixture.str(path), null, 0, null, &out, &err),
+        err,
+    );
+    c.issuez_sync_report_free(out);
+
+    var pr: ?*c.issuez_purge_result = null;
+    try expect.code(
+        c.ISSUEZ_OK,
+        c.issuez_purge_issue(h, x.idStr(), &fixture.ada, fixture.str(""), null, &pr, &err),
+        err,
+    );
+    defer c.issuez_purge_result_free(pr);
+    try testing.expectEqual(@as(usize, 1), c.issuez_purge_result_exposed_remote_count(pr));
+    const name = c.issuez_purge_result_exposed_remote_at(pr, 0);
+    try testing.expect(std.mem.startsWith(u8, name.ptr[0..name.len], "url-"));
+}
 
 // covers: issuez_purge_result_free, issuez_purge_result_new_tip
 // covers: issuez_purge_result_exposed_remote_count, issuez_purge_result_exposed_remote_at

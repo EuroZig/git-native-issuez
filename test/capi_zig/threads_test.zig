@@ -1,4 +1,4 @@
-//! One repo handle from many threads (docs/test-plan.md §2.7).
+//! One repo handle from many threads.
 
 const std = @import("std");
 const testing = std.testing;

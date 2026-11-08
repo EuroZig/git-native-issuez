@@ -1,4 +1,4 @@
-//! Op lists checked without a repo (docs/test-plan.md §2.5.4).
+//! Op lists checked without a repo.
 
 const std = @import("std");
 const testing = std.testing;

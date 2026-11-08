@@ -1,5 +1,5 @@
 //! The C API's tests, from Zig through the generated header and the
-//! static library, as an embedder calls it (docs/test-plan.md §2). Each
+//! static library, as an embedder calls it. Each
 //! test is named after the functions it covers: `tools/capi_coverage.zig`
 //! checks every function has one.
 

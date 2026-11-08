@@ -1,7 +1,7 @@
 /* What only a C compiler can check: the header compiles as C11 with every
  * warning an error, its macros work, and a round trip through the library
  * runs clean under ASan and UBSan. Every function is tested from Zig
- * (test/capi_zig, docs/test-plan.md).
+ * (test/capi_zig).
  *
  *   smoke <empty work dir>
  */

@@ -1,5 +1,4 @@
-//! Writing issues, comments, reactions, and the write receipts
-//! (docs/test-plan.md §2.5.10).
+//! Writing issues, comments, reactions, and the write receipts.
 
 const std = @import("std");
 const testing = std.testing;

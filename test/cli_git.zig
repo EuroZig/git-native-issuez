@@ -180,6 +180,44 @@ test "lazygit: the menu in docs/lazygit.md works" {
     try testing.expectEqual(@as(usize, 2), std.mem.count(u8, pushed.stdout, "\n"));
 }
 
+test "push-check --pusher-id: an X-Author-Id must be the pusher's" {
+    var sb = try Sandbox.init(.{});
+    defer sb.deinit();
+    const arena = sb.arena();
+    try expectSuccess(try gitIssue(&sb, &.{ "create", "Checked" }));
+    const refs = try sb.run(&.{ "git", "for-each-ref", "--format=%(refname)", "refs/issues/" });
+    const ref = std.mem.trim(u8, refs.stdout, "\n");
+    const tip = std.mem.trim(u8, (try sb.run(&.{ "git", "rev-parse", ref })).stdout, "\n");
+    const tree = std.mem.trim(u8, (try sb.run(&.{
+        "git",
+        "rev-parse",
+        try std.fmt.allocPrint(arena, "{s}^{{tree}}", .{ref}),
+    })).stdout, "\n");
+    const uuid = "0c8d7a52-3f1e-4b6a-9d2c-5e4f3a2b1c0d";
+    const created = try sb.run(&.{
+        "git",
+        "commit-tree",
+        tree,
+        "-p",
+        tip,
+        "-m",
+        "Mine",
+        "-m",
+        "X-Author-Id: " ++ uuid,
+    });
+    const new = std.mem.trim(u8, created.stdout, "\n");
+    const email = Sandbox.identity_email;
+    const base = [_][]const u8{ "push-check", "--authors", "enforce", "--pusher-email", email };
+    const refused = try gitIssue(&sb, &(base ++ [_][]const u8{ tip, new, ref }));
+    try testing.expect(refused.code != 0);
+    try expectSuccess(try gitIssue(
+        &sb,
+        &(base ++ [_][]const u8{ "--pusher-id", uuid, tip, new, ref }),
+    ));
+    const bad = try gitIssue(&sb, &(base ++ [_][]const u8{ "--pusher-id", "x", tip, new, ref }));
+    try testing.expect(bad.code != 0);
+}
+
 test "sync with a path or a URL instead of a remote's name" {
     var sb = try Sandbox.init(.{});
     defer sb.deinit();

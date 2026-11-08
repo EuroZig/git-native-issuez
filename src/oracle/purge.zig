@@ -89,10 +89,18 @@ pub fn leaks(c: commands.Clone, tip: []const u8, t: Tomb) Allocator.Error!?[]con
     return null;
 }
 
-const dropped = [_][]const u8{
-    "X-Attachment",     "X-Attachment-Removed", "X-Original-Author",
-    "X-Original-Id",    "Provider-Comment-ID",  "X-Purged",
-    "X-Rewritten-From",
+/// What a purged comment keeps of its trailers: the format's keys, without
+/// its text's, its images', its origin's and the rewrite's own. Anything else
+/// can be text that parses as trailers.
+const comment_keeps = [_][]const u8{
+    "State",              "Title",            "Assignee",     "Priority",
+    "Milestone",          "Format-Version",   "Fixed-By",     "Release",
+    "Reason",             "X-Parent",         "X-Start-Date", "X-Due-Date",
+    "X-Estimate-Minutes", "X-Workflow-State", "X-Deleted",    "X-Milestone-Id",
+    "X-Milestone-Mode",   "X-Number",         "X-Locked",     "X-Lock-Reason",
+    "X-Ref",              "Labels",           "X-Blocked-By", "X-Assignees",
+    "Exported-Commit",    "X-Message",        "X-Reaction",   "X-Author-Id",
+    "X-Event",            "X-Comment",
 };
 
 /// The tip `tip` rewrites to with `purged` (first IDs) purged. Null when
@@ -285,10 +293,10 @@ fn purgedText(
     if (body.len > 0) try out.print(arena, "\n\n{s}", .{body});
     try out.appendSlice(arena, "\n\n");
     for (block.trailers) |t| {
-        const skip = for (dropped) |k| {
+        const keep = for (comment_keeps) |k| {
             if (std.ascii.eqlIgnoreCase(k, t.key)) break true;
         } else false;
-        if (skip) continue;
+        if (!keep) continue;
         if (target != null and std.ascii.eqlIgnoreCase(t.key, "X-Comment")) {
             try out.print(arena, "X-Comment: {s}\n", .{target.?});
         } else try out.print(arena, "{s}: {s}\n", .{ t.key, t.value });

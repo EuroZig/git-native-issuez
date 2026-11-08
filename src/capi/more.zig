@@ -1052,9 +1052,14 @@ fn purge(
             .time = time.unix_seconds,
             .tz_offset_minutes = time.tz_offset_minutes,
         };
+        if (act.user_id.len > 0 and !issuez.format.uuid.isCanonical(act.user_id.slice()))
+            return rt.fail(err, .e_invalid_argument, "the actor's user_id must be a UUID", .{});
     }
     var c = Call.begin(repo, cancel) catch |e| return rt.failError(err, e, .{});
     defer c.end();
+    if (actor) |act| {
+        if (act.user_id.len > 0) c.author_id = act.user_id.slice();
+    }
     const a = c.arena();
     const backend = &c.session.backend;
     const ref_name = std.fmt.allocPrint(
@@ -1082,6 +1087,9 @@ fn purge(
         ),
         else => return c.fail(err, e),
     };
+    // It happened: the host needs the receipt, and cancelling can't stop it now.
+    c.session.backend.cancel = null;
+    c.session.git.cancel = null;
     const kept = if (result.tip) |t|
         attachmentIds(&c, ref_name, t) catch |e| return c.fail(err, e)
     else
@@ -1115,7 +1123,8 @@ fn attachmentIds(c: *Call, ref_name: []const u8, tip: ?Oid) ![]const []const u8 
 }
 
 /// Remotes with a fetched copy of the issue: they had the purged commits
-/// and keep them until the next sync replaces them.
+/// and keep them until the next sync replaces them. One synced by URL or
+/// path, by the `url-<hash>` its refs are kept under.
 fn exposedRemotes(arena: Allocator, backend: anytype, id: []const u8) ![]const []const u8 {
     var out: std.ArrayList([]const u8) = .empty;
     for (try backend.remoteNames(arena)) |remote| {
@@ -1132,6 +1141,20 @@ fn exposedRemotes(arena: Allocator, backend: anytype, id: []const u8) ![]const [
             try out.append(arena, remote);
             break;
         }
+    }
+    const records = "refs/issuez-sync/";
+    for (try backend.listRefs(arena, records)) |r| {
+        const rest = r.name[records.len..];
+        const slash = std.mem.findScalar(u8, rest, '/') orelse continue;
+        const key = rest[0..slash];
+        if (!std.mem.startsWith(u8, key, "url-")) continue;
+        const seen = try issuez.sync.recordRef(arena, key, .seen, .issues, id);
+        const pushed = try issuez.sync.recordRef(arena, key, .pushed, .issues, id);
+        if (!std.mem.eql(u8, r.name, seen) and !std.mem.eql(u8, r.name, pushed)) continue;
+        const known = for (out.items) |o| {
+            if (std.mem.eql(u8, o, key)) break true;
+        } else false;
+        if (!known) try out.append(arena, key);
     }
     return out.items;
 }

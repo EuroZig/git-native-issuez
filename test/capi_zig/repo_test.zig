@@ -1,4 +1,4 @@
-//! Opening and closing repositories (docs/test-plan.md §2.5.6).
+//! Opening and closing repositories.
 
 const std = @import("std");
 const testing = std.testing;

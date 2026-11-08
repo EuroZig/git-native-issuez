@@ -273,11 +273,68 @@ fn deleteOf(r: *Run, kind: Ours, id: []const u8) Allocator.Error!Expect {
     return k.done("delete");
 }
 
-fn authors(r: *Run, fresh: []const Fresh, k: *Kinds) Allocator.Error!void {
+/// format.md §11: a merge under the tool's identity is exempt when it adds
+/// nothing: its subject, and at most what its parents resolve to, a kept
+/// number and `X-Rewritten-From`.
+fn mergeAddsNothing(r: *Run, cm: object.Commit, ours: Ours) Allocator.Error!bool {
+    if (cm.parents.len < 2 or !std.mem.eql(u8, cm.author.email, merge_email)) return false;
+    const arena = r.c.arena;
+    switch (ours) {
+        .tombstone => return std.mem.eql(u8, cm.message, "Merge purges\n"),
+        .milestone => return std.mem.eql(u8, cm.message, "Merge milestone\n"),
+        .issue => {},
+        else => return false,
+    }
+    const rest = std.mem.trimEnd(u8, cm.message, "\n");
+    if (std.mem.eql(u8, rest, "Merge issue")) return true;
+    if (!std.mem.startsWith(u8, rest, "Merge issue\n\n")) return false;
+    const lines = rest["Merge issue\n\n".len..];
+    if (std.mem.find(u8, lines, "\n\n") != null) return false;
+    const block = try commands.trailersOf(arena, cm.message);
+    if (block.first_line == null) return false;
+    var parents: std.ArrayList([]const u8) = .empty;
+    for (cm.parents) |p| try parents.append(arena, try p.hexAlloc(arena));
+    const n = r.c.naiveAt(parents.items) catch |e| switch (e) {
+        error.OutOfMemory => return error.OutOfMemory,
+        // No rule for this history: don't judge it.
+        else => return true,
+    };
+    const want = try commands.restatedBy(arena, n);
+    for (block.trailers) |t| {
+        if (std.ascii.eqlIgnoreCase(t.key, "X-Number") or
+            std.ascii.eqlIgnoreCase(t.key, "X-Rewritten-From")) continue;
+        const same = for (want.items) |w| {
+            if (!std.ascii.eqlIgnoreCase(w.key, t.key)) continue;
+            break try sameSet(arena, w.key, w.value, t.value);
+        } else false;
+        if (!same) return false;
+    }
+    return true;
+}
+
+/// Equal values; `Labels` and `X-Blocked-By` in any order.
+fn sameSet(arena: Allocator, key: []const u8, a: []const u8, b: []const u8) Allocator.Error!bool {
+    if (!std.mem.eql(u8, key, "Labels") and !std.mem.eql(u8, key, "X-Blocked-By"))
+        return std.mem.eql(u8, a, b);
+    var lists: [2]std.ArrayList([]const u8) = .{ .empty, .empty };
+    for ([_][]const u8{ a, b }, &lists) |text, *list| {
+        var it = std.mem.splitScalar(u8, text, ',');
+        while (it.next()) |x| {
+            const item = std.mem.trim(u8, x, " \t");
+            if (item.len > 0) try list.append(arena, item);
+        }
+        stableSort([]const u8, list.items, {}, lessText);
+    }
+    if (lists[0].items.len != lists[1].items.len) return false;
+    for (lists[0].items, lists[1].items) |x, y| if (!std.mem.eql(u8, x, y)) return false;
+    return true;
+}
+
+fn authors(r: *Run, fresh: []const Fresh, ours: Ours, k: *Kinds) Allocator.Error!void {
     if (r.policy.authors == .any) return;
     for (fresh) |f| {
         const cm = f.commit;
-        if (cm.parents.len >= 2 and std.mem.eql(u8, cm.author.email, merge_email)) continue;
+        if (try mergeAddsNothing(r, cm, ours)) continue;
         const own = for (r.policy.pusher_emails) |e| {
             if (std.ascii.eqlIgnoreCase(e, cm.author.email)) break true;
         } else false;
@@ -337,7 +394,7 @@ fn tombstone(r: *Run, u: Update) Allocator.Error!Expect {
         if (!f.commit.tree.eql(empty) or !try isPurge(c, f.commit))
             try k.addAt("not_a_purge", f.hex, true);
     }
-    try authors(r, fresh, &k);
+    try authors(r, fresh, .tombstone, &k);
     var e = try k.done(action);
     e.new_count = fresh.len;
     return e;
@@ -492,7 +549,7 @@ fn issueOrMilestone(
         };
     }
 
-    try authors(r, fresh, &k);
+    try authors(r, fresh, kind, &k);
     var e = try k.done(action);
     e.new_count = fresh.len;
     e.needs_number = needs_number;

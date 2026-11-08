@@ -61,6 +61,12 @@ fn read(arena: Allocator, backend: anytype, id: []const u8) !?Tombstone {
 
 /// Internal: the library's own plumbing, not API; it may change.
 pub fn readAt(arena: Allocator, backend: anytype, tip: Oid) !Tombstone {
+    return readUpTo(arena, backend, tip, 100_000);
+}
+
+/// At most `limit` commits, the same ones in every clone: anyone can push a
+/// chain long enough to stop every sync if that were an error.
+fn readUpTo(arena: Allocator, backend: anytype, tip: Oid, limit: usize) !Tombstone {
     var out: Tombstone = .{ .tip = tip, .issue = false, .comments = &.{} };
     var comments: std.ArrayList(Oid) = .empty;
     var seen: std.AutoHashMapUnmanaged([Oid.max_byte_len]u8, void) = .empty;
@@ -70,7 +76,7 @@ pub fn readAt(arena: Allocator, backend: anytype, tip: Oid) !Tombstone {
     while (stack.pop()) |oid| {
         if ((try seen.getOrPut(arena, oid.bytes)).found_existing) continue;
         steps += 1;
-        if (steps > 100_000) return error.HistoryTooLong;
+        if (steps > limit) break;
         const o = (try backend.readObject(arena, oid)) orelse continue;
         if (o.kind != .commit) continue;
         const c = object.Commit.parse(arena, backend.objectFormat(), o.data) catch continue;
@@ -361,8 +367,9 @@ fn appendTrailer(arena: Allocator, message: []const u8, key: []const u8, oid: Oi
     return (try trailers.append(arena, message, key, hex.slice())) orelse error.CorruptIssue;
 }
 
-/// `subject` and `body`, the commit's trailers minus the dropped ones,
-/// `X-Comment` pointing at `target` when given, then `X-Purged: true` and
+/// `subject` and `body`, the commit's trailers the format gives a meaning
+/// minus the dropped ones (a comment's last paragraph can parse as trailers,
+/// and that text must go), `X-Comment` pointing at `target` when given, then `X-Purged: true` and
 /// `X-Rewritten-From: <first>`, in that order however often it runs.
 fn purgedMessage(
     arena: Allocator,
@@ -375,7 +382,8 @@ fn purgedMessage(
     var list: std.ArrayList(trailers.Trailer) = .empty;
     for (block.trailers) |t| {
         if (dropped(t.key) or std.ascii.eqlIgnoreCase(t.key, purged_marker_key) or
-            std.ascii.eqlIgnoreCase(t.key, rewritten_from_key)) continue;
+            std.ascii.eqlIgnoreCase(t.key, rewritten_from_key) or
+            !issue_model.isFormatKey(t.key)) continue;
         if (target != null and std.ascii.eqlIgnoreCase(t.key, "X-Comment")) {
             const hex = target.?.hex();
             try list.append(arena, .{
@@ -623,7 +631,9 @@ pub fn Purge(comptime B: type) type {
                     } else continue,
                     else => |e| return e,
                 };
-                if (new_tip) |nt| try self.rederive(arena, ref_name, nt);
+                // The purge happened, so this can't fail it. The stale ref
+                // went with the update, and the next sync rebuilds it.
+                if (new_tip) |nt| self.rederive(arena, ref_name, nt) catch {};
                 return .{ .tombstone = tomb, .tip = new_tip, .moved = moved };
             }
             return error.ConcurrentModification;
@@ -770,6 +780,22 @@ fn namesIssue(name: []const u8, id: []const u8) bool {
         }
     }
     return false;
+}
+
+test "a tombstone chain past the limit is read up to it" {
+    const GitSim = @import("../backend/GitSim.zig");
+    var arena_state: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var world: GitSim.World = .{ .seed = 5, .clones = &.{.{ .name = "a" }} };
+    var sim = try GitSim.init(arena, &world, 0);
+    const repo = repo_mod.Repo(GitSim).init(&sim);
+    const who = try repo.identity(arena, null);
+    const first = try repo.writeCommit(arena, &.{}, who, "Purge issue\n\nX-Purge: issue\n");
+    const second = try repo.writeCommit(arena, &.{first}, who, "Other\n");
+    const third = try repo.writeCommit(arena, &.{second}, who, "Other\n");
+    try std.testing.expect((try readUpTo(arena, &sim, third, 3)).issue);
+    try std.testing.expect(!(try readUpTo(arena, &sim, third, 2)).issue);
 }
 
 test "purging a comment rewrites the issue, twice changes nothing" {
@@ -1026,6 +1052,37 @@ test "a purged comment loses its origin, keeps its fields" {
     }
     const issue = try repo.load(arena, .{ .name = ref, .tip = r.tip.? });
     try std.testing.expect(issue.comments[0].original_author == null);
+}
+
+test "a purged comment's text that parses as trailers goes, its fields stay" {
+    const GitSim = @import("../backend/GitSim.zig");
+    var arena_state: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var world: GitSim.World = .{ .seed = 5, .clones = &.{.{ .name = "a" }} };
+    var sim = try GitSim.init(arena, &world, 0);
+    const repo = repo_mod.Repo(GitSim).init(&sim);
+    const created = try repo.create(arena, .{ .title = "T" }, .{});
+    const ref = try std.fmt.allocPrint(arena, "refs/issues/{s}", .{created.id});
+    const who = try repo.identity(arena, null);
+    // As upstream writes it, which doesn't refuse such a comment.
+    const bad = try repo.writeCommit(
+        arena,
+        &.{created.tip},
+        who,
+        "Call me\n\nPhone: 555-1234\nX-Home: 5 Foo St\nState: closed\n",
+    );
+    try sim.updateRefs(&.{.{
+        .name = ref,
+        .op = .{ .update = .{ .new = bad, .old = created.tip } },
+    }});
+    const r = try Purge(GitSim).fromRepo(repo).comment(arena, ref, bad, .{}, .{});
+    for (try repo.loadCommits(arena, r.tip.?)) |c| {
+        try std.testing.expect(std.mem.find(u8, c.message, "555-1234") == null);
+        try std.testing.expect(std.mem.find(u8, c.message, "5 Foo St") == null);
+    }
+    const issue = try repo.load(arena, .{ .name = ref, .tip = r.tip.? });
+    try std.testing.expectEqualStrings("closed", issue.state.text());
 }
 
 /// `rewrite`'s backend for a dry run: hashes the objects, writes none.

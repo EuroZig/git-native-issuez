@@ -1,4 +1,4 @@
-//! Resolving input, snapshots and diffs (docs/test-plan.md §2.5.7).
+//! Resolving input, snapshots and diffs.
 
 const std = @import("std");
 const testing = std.testing;

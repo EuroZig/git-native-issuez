@@ -1,6 +1,5 @@
 //! The push check, as a host's pre-receive hook runs it: the client's
-//! objects in a quarantine, the server's as its alternate
-//! (docs/test-plan.md §2.5.14).
+//! objects in a quarantine, the server's as its alternate.
 
 const std = @import("std");
 const testing = std.testing;

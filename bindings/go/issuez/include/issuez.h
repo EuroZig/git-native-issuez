@@ -1976,8 +1976,9 @@ void issuez_purge_result_free(issuez_purge_result *r);
 issuez_oid issuez_purge_result_new_tip(const issuez_purge_result *r);
 
 /*
- * Remotes whose tracking refs show they had the purged commits. The next
- * issuez_sync with each replaces their copy (leased on what it fetched).
+ * Remotes whose tracking refs show they had the purged commits, one synced by
+ * URL or path as the url-<hash> its refs are kept under. The next issuez_sync
+ * with each replaces their copy (leased on what it fetched).
  */
 size_t issuez_purge_result_exposed_remote_count(const issuez_purge_result *r);
 

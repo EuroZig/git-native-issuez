@@ -1,7 +1,6 @@
 package issuez
 
-// White-box: the exact ops each Edit builder adds (docs/test-plan.md
-// §3.2). edit_test.go applies them through the library.
+// White-box: the exact ops each Edit builder adds. edit_test.go applies them through the library.
 
 import (
 	"reflect"

@@ -5,6 +5,7 @@ const context = @import("../context.zig");
 const common = @import("../common.zig");
 const issuez = @import("issuez");
 const check_mod = issuez.push_check;
+const uuid_fmt = issuez.format.uuid;
 
 pub const help =
     \\usage: git issue push-check [options] [<old> <new> <ref>]...
@@ -23,6 +24,8 @@ pub const help =
     \\
     \\Options:
     \\   --pusher-email <email>   The pusher's email (repeatable)
+    \\   --pusher-id <uuid>       The pusher's host UUID (repeatable): new
+    \\                            commits' X-Author-Id must be one of them
     \\   --authors <policy>       any (default), warn or enforce: new commits
     \\                            not by the pusher are let through, flagged
     \\                            or refused
@@ -38,6 +41,7 @@ pub fn main(comptime B: type, ctx: *context.Context(B), argv: []const []const u8
     const arena = ctx.arena;
     var policy: check_mod.Policy = .{};
     var emails: std.ArrayList([]const u8) = .empty;
+    var ids: std.ArrayList([]const u8) = .empty;
     var words: std.ArrayList([]const u8) = .empty;
     var quiet = false;
     var args: common.Args = .{ .list = argv };
@@ -50,6 +54,11 @@ pub fn main(comptime B: type, ctx: *context.Context(B), argv: []const []const u8
         } else if (std.mem.eql(u8, arg, "--pusher-email")) {
             const e = args.value(ctx.err, arg) orelse return common.exit_error;
             emails.append(arena, e) catch return common.oom(ctx.err);
+        } else if (std.mem.eql(u8, arg, "--pusher-id")) {
+            const id = args.value(ctx.err, arg) orelse return common.exit_error;
+            if (!uuid_fmt.isCanonical(id))
+                return common.fail(ctx.err, "error: --pusher-id needs a UUID\n");
+            ids.append(arena, id) catch return common.oom(ctx.err);
         } else if (std.mem.eql(u8, arg, "--authors")) {
             const v = args.value(ctx.err, arg) orelse return common.exit_error;
             policy.author_policy = std.meta.stringToEnum(check_mod.AuthorPolicy, v) orelse
@@ -65,6 +74,7 @@ pub fn main(comptime B: type, ctx: *context.Context(B), argv: []const []const u8
         }
     }
     policy.pusher_emails = emails.items;
+    policy.pusher_ids = ids.items;
     if (policy.author_policy != .any and emails.items.len == 0) return common.fail(
         ctx.err,
         "error: --authors needs the pusher's --pusher-email\n",

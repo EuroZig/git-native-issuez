@@ -18,7 +18,7 @@
 //!   zig build update-snapshots     rewrite examples/*.out
 //!   zig build capi                 libissuez.a, include/issuez.h, share/issuez/issuez-api.json
 //!   zig build capi-header          rewrite the committed header and API description
-//!   zig build go-libs [-Dgo-libs-all]  archives for the Go binding (host, or every target)
+//!   zig build go-libs [-Dgo-libs-all]  lib/go/<platform>/libissuez.a (host, or every target)
 //!   zig build test-capi            the C smoke test under ASan (needs a C compiler)
 //!   zig build test-go              the Go binding's tests (needs Go)
 //!   zig build test-go-e2e          the Go binding against the CLI (needs Go)
@@ -1193,8 +1193,8 @@ const Cli = struct {
 // ─── The C API and the Go binding ──────────────────────────────────────
 
 /// Where the Go binding lives and what it commits: the header and the API
-/// description. Its archives are build outputs (gitignored); releases have
-/// them as `libissuez-*`.
+/// description. Its archives are build outputs; releases have them as
+/// `libissuez-*`.
 const go_pkg = "bindings/go/issuez";
 const committed_header = go_pkg ++ "/include/issuez.h";
 const committed_api_json = "docs/issuez-api.json";
@@ -1408,8 +1408,8 @@ fn addCapi(
     const unit = b.addTest(.{ .name = "capi", .root_module = lib.root_module });
     test_step.dependOn(&b.addRunArtifact(unit).step);
 
-    // The C API through its header, called from Zig like an embedder would
-    // (docs/test-plan.md §2). The library counts its live allocations.
+    // The C API through its header, called from Zig like an embedder would.
+    // The library counts its live allocations.
     const debug_lib = capiLib(b, target, .Debug, true, zon_version);
     const translated = b.addTranslateC(.{
         .root_source_file = header,
@@ -1429,7 +1429,7 @@ fn addCapi(
     });
     zig_suite.root_module.linkLibrary(debug_lib);
     zig_suite.root_module.addAnonymousImport("issuez-api.json", .{ .root_source_file = api_json });
-    // Every function and helper needs a test (§2.4).
+    // Every function and helper needs a test.
     const coverage = b.addExecutable(.{
         .name = "capi-coverage",
         .root_module = b.createModule(.{
@@ -1452,38 +1452,42 @@ fn addCapi(
     addShards(b, zig_suite, 8, zig_suite_step);
     test_step.dependOn(zig_suite_step);
 
-    // Archives for the Go binding, in the source tree (gitignored).
+    // Archives for the Go binding. `go-libs` installs them; its tests link
+    // this platform's, with build.zig.zon's version so a commit alone keeps
+    // them, through CGO_LDFLAGS.
     const all = b.option(
         bool,
         "go-libs-all",
         "go-libs: every Go platform, not only the host",
     ) orelse false;
-    const go_libs = b.addUpdateSourceFiles();
-    const go_debug_lib = b.addUpdateSourceFiles();
+    const go_libs_step = b.step(
+        "go-libs",
+        "Install the Go binding's archives in lib/go/ (host, or -Dgo-libs-all)",
+    );
+    var go_test_lib: ?std.Build.LazyPath = null;
+    var go_debug_lib: ?std.Build.LazyPath = null;
     for (lib_targets) |t| {
         const resolved = b.resolveTargetQuery(t.query);
         const host = b.graph.host.result;
         const on_host = resolved.result.os.tag == host.os.tag and
             resolved.result.cpu.arch == host.cpu.arch and
             (host.os.tag != .linux or resolved.result.abi.isMusl() == host.abi.isMusl());
-        // The archive that counts its allocations, for the Go fuzz tests'
-        // leak check (-tags issuez_debug).
-        if (on_host) go_debug_lib.addCopyFileToSource(
-            hostArchive(b, capiLib(b, resolved, .ReleaseSafe, true, zon_version)),
-            go_pkg ++ "/lib/debug/libissuez.a",
-        );
+        if (on_host) {
+            go_test_lib = hostArchive(b, capiLib(b, resolved, .ReleaseSafe, false, zon_version));
+            // The archive that counts its allocations, for the Go fuzz tests'
+            // leak check (-tags issuez_debug).
+            go_debug_lib = hostArchive(b, capiLib(b, resolved, .ReleaseSafe, true, zon_version));
+        }
         if (!all and !on_host) continue;
-        const go_lib = capiLib(b, resolved, .ReleaseSafe, false, version);
-        go_libs.addCopyFileToSource(
-            hostArchive(b, go_lib),
-            b.fmt("{s}/lib/{s}/libissuez.a", .{ go_pkg, t.dir }),
-        );
+        go_libs_step.dependOn(&b.addInstallFileWithDir(
+            hostArchive(b, capiLib(b, resolved, .ReleaseSafe, false, version)),
+            .{ .custom = b.fmt("lib/go/{s}", .{t.dir}) },
+            "libissuez.a",
+        ).step);
     }
-    const go_libs_step = b.step(
-        "go-libs",
-        "Build the Go binding's archives (host, or -Dgo-libs-all)",
-    );
-    go_libs_step.dependOn(&go_libs.step);
+    // No such platform (Windows): the target's, for the failure to say so.
+    const go_test_archive = go_test_lib orelse archive;
+    const go_debug_archive = go_debug_lib orelse archive;
 
     // The C smoke test, with the system compiler so ASan is available.
     const cc = b.addSystemCommand(&.{ "cc", "-std=c11", "-Wall", "-Wextra", "-Werror", "-g" });
@@ -1537,11 +1541,13 @@ fn addCapi(
 
     // gofmt prints nothing, vet passes, then the tests under the race
     // detector in a random order, with a statement coverage floor, and the
-    // fuzz seeds with the leak check (docs/test-plan.md §3.6).
+    // fuzz seeds with the leak check.
     const go_test = addQuietCommand(b, &.{
         "sh",
         "-c",
         \\set -e
+        \\dir() { (cd "$(dirname "$1")" && pwd); }
+        \\export CGO_LDFLAGS="-L$(dir "$2")"
         \\out=$(gofmt -l .)
         \\if [ -n "$out" ]; then echo "gofmt: $out" >&2; exit 1; fi
         \\go vet ./...
@@ -1552,7 +1558,7 @@ fn addCapi(
         \\if ! awk -v t="$total" -v min="$1" 'BEGIN { exit !(t >= min) }'; then
         \\  echo "Go statement coverage $total% is under $1%" >&2; exit 1
         \\fi
-        \\go test -tags issuez_debug -count=1 -run '^Fuzz' ./issuez
+        \\CGO_LDFLAGS="-L$(dir "$3")" go test -tags issuez_debug -count=1 -run '^Fuzz' ./issuez
         ,
         "sh",
         "95",
@@ -1561,12 +1567,12 @@ fn addCapi(
     go_test.setEnvironmentVariable("CGO_ENABLED", "1");
     // A go.work above this checkout (an embedder's) isn't ours.
     go_test.setEnvironmentVariable("GOWORK", "off");
-    go_test.step.dependOn(&go_libs.step);
-    go_test.step.dependOn(&go_debug_lib.step);
+    go_test.addFileArg(go_test_archive);
+    go_test.addFileArg(go_debug_archive);
     go_test.step.dependOn(&update.step);
     b.step("test-go", "Run the Go binding's tests (needs Go)").dependOn(&go_test.step);
 
-    // Each fuzz test in turn, with the leak check (§3.3).
+    // Each fuzz test in turn, with the leak check.
     const fuzz_time = b.option(
         []const u8,
         "fuzz-time",
@@ -1576,6 +1582,8 @@ fn addCapi(
         "sh",
         "-c",
         \\set -e
+        \\CGO_LDFLAGS="-L$(cd "$(dirname "$2")" && pwd)"
+        \\export CGO_LDFLAGS
         \\for f in FuzzParseOID FuzzSnapshotUnmarshal FuzzEditValidate; do
         \\  go test -tags issuez_debug -run '^$' -fuzz "^$f\$" -fuzztime "$1" ./issuez
         \\done
@@ -1587,7 +1595,7 @@ fn addCapi(
     go_fuzz.setEnvironmentVariable("CGO_ENABLED", "1");
     // A go.work above this checkout (an embedder's) isn't ours.
     go_fuzz.setEnvironmentVariable("GOWORK", "off");
-    go_fuzz.step.dependOn(&go_debug_lib.step);
+    go_fuzz.addFileArg(go_debug_archive);
     go_fuzz.step.dependOn(&update.step);
     go_fuzz.stdio = .inherit;
     b.step(
@@ -1595,7 +1603,7 @@ fn addCapi(
         "Fuzz the Go binding (-Dfuzz-time=60s each; needs Go)",
     ).dependOn(&go_fuzz.step);
 
-    // The binding against the real CLI (§3.4). The root package adds
+    // The binding against the real CLI. The root package adds
     // upstream's bin directory as the second argument.
     const go_e2e = addQuietCommand(b, &.{
         "sh",
@@ -1603,20 +1611,21 @@ fn addCapi(
         \\set -e
         \\# go test runs in the package's directory: absolute paths only.
         \\abs() { (cd "$(dirname "$1")" && printf '%s/%s' "$(pwd)" "$(basename "$1")"); }
-        \\ISSUEZ_GIT_ISSUE=$(abs "$1")
-        \\ISSUEZ_UPSTREAM=${2:+$(abs "$2")}
-        \\export ISSUEZ_GIT_ISSUE ISSUEZ_UPSTREAM
+        \\CGO_LDFLAGS="-L$(dirname "$(abs "$1")")"
+        \\ISSUEZ_GIT_ISSUE=$(abs "$2")
+        \\ISSUEZ_UPSTREAM=${3:+$(abs "$3")}
+        \\export CGO_LDFLAGS ISSUEZ_GIT_ISSUE ISSUEZ_UPSTREAM
         \\go vet -tags e2e ./issuez/e2e/...
         \\go test -tags e2e -count=1 ./issuez/e2e/...
         ,
         "sh",
     });
+    go_e2e.addFileArg(go_test_archive);
     go_e2e.addArtifactArg(exe);
     go_e2e.setCwd(b.path("bindings/go"));
     go_e2e.setEnvironmentVariable("CGO_ENABLED", "1");
     // A go.work above this checkout (an embedder's) isn't ours.
     go_e2e.setEnvironmentVariable("GOWORK", "off");
-    go_e2e.step.dependOn(&go_libs.step);
     go_e2e.step.dependOn(&update.step);
     b.step("test-go-e2e", "Run the Go binding's end-to-end tests against the CLI (needs Go)")
         .dependOn(&go_e2e.step);

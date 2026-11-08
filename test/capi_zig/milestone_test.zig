@@ -1,4 +1,4 @@
-//! Milestones (docs/test-plan.md §2.5.11).
+//! Milestones.
 
 const std = @import("std");
 const testing = std.testing;
