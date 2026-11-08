@@ -46,6 +46,7 @@ pub fn printMerge(
                     .{ short, base.hex().short() },
                 ) catch {},
             .up_to_date, .local_ahead => {},
+            .purged => if (!check) out.print("Purged {s}\n", .{short}) catch {},
             .quarantined => |reason| if (!e.kept_local) err.print("{s} {s}: {s}\n", .{
                 if (check) "[quarantine]" else "Quarantined",
                 short,

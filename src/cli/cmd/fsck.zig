@@ -51,222 +51,108 @@ pub fn main(comptime B: type, ctx: *context.Context(B), argv: []const []const u8
     }
 
     const repo = common.openRepo(B, ctx) orelse return common.exit_fatal;
-    // --repair writes attachment refs, so it needs git-lfs like every
-    // attachment action.
-    if (repair) issuez.Attachments(B).fromRepo(repo).ready(arena) catch |e|
-        return common.repoFailed(B, ctx, e);
-    const refs = repo.refs(arena) catch |e| return common.repoFailed(B, ctx, e);
-    const milestones = issuez.Catalog(B).of(repo).refs(arena) catch |e|
-        return common.repoFailed(B, ctx, e);
-    if (refs.len == 0 and milestones.len == 0) {
+    const F = issuez.fsck.Fsck(B);
+    const report = F.run(
+        arena,
+        repo,
+        .{ .repair = repair },
+    ) catch |e| return common.repoFailed(B, ctx, e);
+    if (report.issues == 0 and report.milestones == 0) {
         ctx.out.writeAll("No issues found.\n") catch {};
         return common.exit_ok;
     }
-
-    var errors: usize = 0;
-    for (refs) |ref| {
-        const short = uuid.shortId(ref.id());
-        const problems = repo.check(arena, ref) catch return common.oom(ctx.err);
-        errors += problems.len;
-        printProblems(B, ctx.err, short, ref, problems);
-        if (problems.len == 0 and !quiet) ctx.out.print("ok {s}\n", .{short}) catch {};
+    // Projection notes come last, after a bad issue.workflowStates, as
+    // every command that projects says it.
+    var warned = false;
+    for (report.events) |e| {
+        if (e == .projection and !warned) {
+            ext_flags.warnBadWorkflowStates(B, ctx, repo);
+            warned = true;
+        }
+        render(B, ctx, F, e, quiet);
     }
-    errors += checkMilestones(B, ctx, repo, milestones, quiet) orelse return common.oom(ctx.err);
-    errors += checkAttachments(B, ctx, repo, refs, repair);
-    reportQuarantine(B, ctx, repo.backend);
-    reportProjection(B, ctx, repo);
+    if (!warned) ext_flags.warnBadWorkflowStates(B, ctx, repo);
+    const errors = report.errors();
     if (errors == 0) {
-        ctx.out.print("Checked {d} issues, no errors found.\n", .{refs.len}) catch {};
+        ctx.out.print("Checked {d} issues, no errors found.\n", .{report.issues}) catch {};
         return common.exit_ok;
     }
-    ctx.err.print("Checked {d} issues, {d} errors found.\n", .{ refs.len, errors }) catch {};
+    ctx.err.print("Checked {d} issues, {d} errors found.\n", .{ report.issues, errors }) catch {};
     return common.exit_error;
 }
 
-/// Like issues, with `Name:` in place of `State:`. Returns the error
-/// count, null when out of memory.
-fn checkMilestones(
+/// What an issue or milestone is called in the output.
+fn label(arena: std.mem.Allocator, kind: anytype, id: []const u8) []const u8 {
+    if (kind == .issue) return uuid.shortId(id);
+    return std.fmt.allocPrint(arena, "milestone {s}", .{uuid.shortId(id)}) catch "milestone";
+}
+
+fn render(
     comptime B: type,
     ctx: *context.Context(B),
-    repo: issuez.engine.Repo(B),
-    refs: []const issuez.engine.IssueRef,
+    comptime F: type,
+    e: F.Event,
     quiet: bool,
-) ?usize {
-    var errors: usize = 0;
-    for (refs) |ref| {
-        const id = uuid.shortId(ref.id());
-        const short = std.fmt.allocPrint(ctx.arena, "milestone {s}", .{id}) catch return null;
-        const problems = repo.checkWith(ctx.arena, ref, &.{ "Name", "Format-Version" }) catch
-            return null;
-        errors += problems.len;
-        printProblems(B, ctx.err, short, ref, problems);
-        if (problems.len == 0 and !quiet) ctx.out.print("ok {s}\n", .{short}) catch {};
-        // Readers take an unknown status as `open`: worth a note.
-        const m = repo.load(ctx.arena, ref) catch continue;
-        const status = m.field("X-Milestone-Status") orelse continue;
-        if (issuez.format.fields.MilestoneStatus.parse(status) == null) ctx.err.print(
-            "note: {s}: X-Milestone-Status '{s}' is not valid and reads as open\n",
-            .{ short, status },
-        ) catch {};
-    }
-    return errors;
-}
-
-fn printProblems(
-    comptime B: type,
-    err: *std.Io.Writer,
-    short: []const u8,
-    ref: issuez.engine.IssueRef,
-    problems: []const issuez.engine.Repo(B).Problem,
 ) void {
-    for (problems) |p| switch (p) {
-        .invalid_uuid => err.print(
-            "error: {s}: invalid UUID format: {s}\n",
-            .{ short, ref.id() },
-        ) catch {},
-        .non_empty_tree => |oid| err.print(
-            "error: {s}: commit {s} does not use empty tree\n",
-            .{ short, oid.hex().short() },
-        ) catch {},
-        .root_count => |n| err.print(
-            "error: {s}: expected 1 root commit, found {d}\n",
-            .{ short, n },
-        ) catch {},
-        .missing_state => err.print(
-            "error: {s}: root commit missing State: trailer\n",
-            .{short},
-        ) catch {},
-        .missing_format_version => err.print(
-            "error: {s}: root commit missing Format-Version: trailer\n",
-            .{short},
-        ) catch {},
-        .missing_root_trailer => |k| err.print(
-            "error: {s}: root commit missing {s}: trailer\n",
-            .{ short, k },
-        ) catch {},
-        .unreadable => |e| err.print(
-            "error: {s}: history unreadable ({t})\n",
-            .{ short, e },
-        ) catch {},
-    };
-}
-
-/// Damaged bytes are errors, the rest are notes. Returns the error count.
-fn checkAttachments(
-    comptime B: type,
-    ctx: *context.Context(B),
-    repo: issuez.engine.Repo(B),
-    refs: []const issuez.engine.IssueRef,
-    repair: bool,
-) usize {
-    const A = issuez.Attachments(B);
-    const att = A.fromRepo(repo);
-    var errors: usize = 0;
-    var issues: std.ArrayList(issuez.engine.Issue) = .empty;
-    const check_bytes = if (att.ready(ctx.arena)) |_| true else |e| switch (e) {
-        error.LfsUnavailable => false,
-        error.AttachmentsUnsupported => return errors,
-        else => {
-            common.reportRepoError(B, ctx, e);
-            return errors + 1;
+    const a = ctx.arena;
+    const err = ctx.err;
+    switch (e) {
+        .ok => |s| if (!quiet) ctx.out.print("ok {s}\n", .{label(a, s.kind, s.id)}) catch {},
+        .problem => |p| {
+            const short = label(a, p.subject.kind, p.subject.id);
+            if (p.problem == .invalid_uuid) {
+                err.print(
+                    "error: {s}: invalid UUID format: {s}\n",
+                    .{ short, p.subject.id },
+                ) catch {};
+            } else {
+                const what = std.fmt.allocPrint(a, "{f}", .{p.problem}) catch "unreadable";
+                err.print("error: {s}: {s}\n", .{ short, what }) catch {};
+            }
         },
-    };
-    var unchecked = false;
-    for (refs) |ref| {
-        const issue = repo.load(ctx.arena, ref) catch continue;
-        issues.append(ctx.arena, issue) catch return errors;
-        const short = uuid.shortId(issue.id);
-        for (issue.attachment_problems) |p| ctx.err.print(
+        .milestone_status => |m| err.print(
+            "note: {s}: X-Milestone-Status '{s}' is not valid and reads as open\n",
+            .{ label(a, .milestone, m.id), m.value },
+        ) catch {},
+        .attachment_trailer => |t| err.print(
             "note: {s}: commit {s}: {s} attachment trailer ignored: {s}\n",
             .{
-                short,
-                p.oid.hex().short(),
-                switch (p.kind) {
-                    .malformed => "malformed",
-                    .changed_object => "object-changing",
-                },
-                p.value,
+                uuid.shortId(t.id),
+                t.problem.oid.hex().short(),
+                t.problem.kind.text(),
+                t.problem.value,
             },
-        ) catch {};
-        if (issue.attachments.len == 0 and issue.removed_attachments.len == 0) continue;
-        if (!check_bytes) unchecked = true;
-        const entries: []const A.Entry = if (!check_bytes)
-            &.{}
-        else
-            att.list(ctx.arena, issue, .{ .verify = true }) catch |e| {
-                common.reportRepoError(B, ctx, e);
-                errors += 1;
-                continue;
-            };
-        for (entries) |e| switch (e.availability) {
-            .local => {},
-            .missing => ctx.err.print(
-                "note: {s}: attachment {s} ({s}): bytes not in this repository\n",
-                .{ short, uuid.shortId(e.attachment.id), e.attachment.name },
-            ) catch {},
-            .corrupt => {
-                errors += 1;
-                ctx.err.print(
-                    "error: {s}: attachment {s} ({s}): stored bytes don't match the hash\n" ++
-                        "       ('git issue attach fetch' gets a good copy)\n",
-                    .{ short, uuid.shortId(e.attachment.id), e.attachment.name },
-                ) catch {};
-            },
-        };
-        const state = att.derivedState(ctx.arena, issue) catch continue;
-        if (state == .ok) continue;
-        if (repair) {
-            if (att.repair(ctx.arena, issue)) |_| {
-                ctx.out.print("repaired refs/attachments/{s}\n", .{issue.id}) catch {};
-            } else |e| {
-                common.reportRepoError(B, ctx, e);
-                errors += 1;
-            }
-        } else ctx.err.print(
+        ) catch {},
+        .attachment_missing => |m| err.print(
+            "note: {s}: attachment {s} ({s}): bytes not in this repository\n",
+            .{ uuid.shortId(m.id), uuid.shortId(m.attachment.id), m.attachment.name },
+        ) catch {},
+        .attachment_corrupt => |m| err.print(
+            "error: {s}: attachment {s} ({s}): stored bytes don't match the hash\n" ++
+                "       ('git issue attach fetch' gets a good copy)\n",
+            .{ uuid.shortId(m.id), uuid.shortId(m.attachment.id), m.attachment.name },
+        ) catch {},
+        .derived_ref => |d| err.print(
             "note: {s}: refs/attachments/{s} is {s} (run 'git issue fsck --repair')\n",
-            .{ short, issue.id, if (state == .absent) "missing" else "out of date" },
-        ) catch {};
-    }
-    if (unchecked) ctx.err.writeAll(
-        "note: git-lfs isn't installed, so attachment bytes weren't checked " ++
-            "(https://git-lfs.com)\n",
-    ) catch {};
-    if (!check_bytes) return errors;
-    const orphans = att.orphans(ctx.arena, issues.items) catch return errors;
-    if (orphans.len > 0) ctx.err.print(
-        "note: {d} stored attachment object(s) no issue references (from failed writes)\n",
-        .{orphans.len},
-    ) catch {};
-    return errors;
-}
-
-/// Quarantine is a sync state, not damage: noted, not counted.
-fn reportQuarantine(comptime B: type, ctx: *context.Context(B), backend: *B) void {
-    const s = issuez.Sync(B).init(backend);
-    const remotes = backend.remoteNames(ctx.arena) catch return;
-    for (remotes) |r| {
-        const st = s.status(ctx.arena, r) catch continue;
-        var open: usize = 0;
-        for (st.quarantined) |q| if (!q.kept_local) {
-            open += 1;
-        };
-        if (open > 0) ctx.err.print(
+            .{ uuid.shortId(d.id), d.id, if (d.missing) "missing" else "out of date" },
+        ) catch {},
+        .repaired => |id| ctx.out.print("repaired refs/attachments/{s}\n", .{id}) catch {},
+        .attachments_failed => |f| common.reportRepoError(B, ctx, f.err),
+        .bytes_unchecked => err.writeAll(
+            "note: git-lfs isn't installed, so attachment bytes weren't checked " ++
+                "(https://git-lfs.com)\n",
+        ) catch {},
+        .orphans => |n| err.print(
+            "note: {d} stored attachment object(s) no issue references (from failed writes)\n",
+            .{n},
+        ) catch {},
+        .quarantined => |q| err.print(
             "note: {d} issue(s) quarantined from '{s}' (see 'git issue status {s}')\n",
-            .{ open, r, r },
-        ) catch {};
+            .{ q.count, q.remote, q.remote },
+        ) catch {},
+        .projection => |p| err.print("note: {s}: {s}\n", .{
+            uuid.shortId(p.id),
+            ext_flags.describeProblem(a, p),
+        }) catch {},
     }
-}
-
-/// Same for hierarchy and blocker problems, which upstream's fsck doesn't
-/// know about.
-fn reportProjection(
-    comptime B: type,
-    ctx: *context.Context(B),
-    repo: issuez.engine.Repo(B),
-) void {
-    const proj = ext_flags.project(B, ctx, repo) orelse return;
-    for (proj.problems) |p| ctx.err.print("note: {s}: {s}\n", .{
-        uuid.shortId(p.id),
-        ext_flags.describeProblem(ctx.arena, p),
-    }) catch {};
 }

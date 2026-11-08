@@ -49,7 +49,7 @@ pub fn parse(arena: Allocator, message: []const u8, options: Options) Allocator.
     return parseLines(arena, lines.items, options);
 }
 
-pub fn parseLines(
+fn parseLines(
     arena: Allocator,
     all_lines: []const []const u8,
     options: Options,
@@ -202,15 +202,19 @@ pub fn bodyLines(arena: Allocator, message: []const u8) Allocator.Error![]const 
     return lines.items[i..end];
 }
 
-/// The body without its trailer block. See `Options.has_title` for
-/// `body_has_title`. No divider, so the block removed is the one the fields
-/// were read from, even after a `---` line.
+pub const TextOptions = struct {
+    /// The body's first line is a title (`Options.has_title`).
+    has_title: bool = false,
+};
+
+/// The body without its trailer block. No divider, so the block removed is
+/// the one the fields were read from, even after a `---` line.
 pub fn textLines(
     arena: Allocator,
     body: []const []const u8,
-    body_has_title: bool,
+    options: TextOptions,
 ) Allocator.Error![]const []const u8 {
-    const block = try parseLines(arena, body, .{ .has_title = body_has_title });
+    const block = try parseLines(arena, body, .{ .has_title = options.has_title });
     const first = block.first_line orelse return body;
     var end = first;
     while (end > 0 and isBlank(body[end - 1])) end -= 1;
@@ -267,6 +271,53 @@ pub fn build(
         return error.BodyLooksLikeTrailers;
     }
     return message;
+}
+
+/// `key: value` added to the message's trailer block, or as a new one
+/// when it has none. Every trailer it had stays one; null when no join
+/// keeps them (the text would swallow the trailer).
+pub fn append(
+    arena: Allocator,
+    message: []const u8,
+    key: []const u8,
+    value: []const u8,
+) Allocator.Error!?[]const u8 {
+    assert(isValidKey(key) and std.mem.findAny(u8, value, "\r\n") == null);
+    const before = try parse(arena, message, .{});
+    const trimmed = std.mem.trimEnd(u8, message, " \t\r\n");
+    const joins: []const []const u8 = if (before.first_line != null)
+        &.{ "\n", "\n\n" }
+    else
+        &.{"\n\n"};
+    for (joins) |join| {
+        const out = try std.fmt.allocPrint(
+            arena,
+            "{s}{s}{s}: {s}\n",
+            .{ trimmed, join, key, value },
+        );
+        const after = try parse(arena, out, .{});
+        if (after.trailers.len != before.trailers.len + 1) continue;
+        const kept = for (before.trailers, after.trailers[0..before.trailers.len]) |x, y| {
+            if (!std.mem.eql(u8, x.key, y.key) or !std.mem.eql(u8, x.value, y.value)) break false;
+        } else true;
+        if (kept) return out;
+    }
+    return null;
+}
+
+test append {
+    const a = std.testing.allocator;
+    var arena_state = std.heap.ArenaAllocator.init(a);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    try std.testing.expectEqualStrings(
+        "Subject\n\nK: v\n",
+        (try append(arena, "Subject\n", "K", "v")).?,
+    );
+    try std.testing.expectEqualStrings(
+        "Subject\n\nText.\n\nState: open\nK: v\n",
+        (try append(arena, "Subject\n\nText.\n\nState: open\n", "K", "v")).?,
+    );
 }
 
 pub fn isValidKey(key: []const u8) bool {
@@ -407,7 +458,7 @@ test "subject and body follow %s / %b" {
     const body = try bodyLines(arena, msg);
     try testing.expectEqual(@as(usize, 6), body.len);
     try testing.expectEqualStrings("body a", body[0]);
-    const text = try textLines(arena, body, false);
+    const text = try textLines(arena, body, .{});
     try testing.expectEqual(@as(usize, 3), text.len);
     try testing.expectEqualStrings("body b", text[2]);
 }
@@ -450,7 +501,7 @@ test "build" {
     const back = try parse(arena, dashes, .{});
     try testing.expectEqualStrings("bug", lastValue(back, "Labels").?);
     // And the text is what's left without them.
-    const text = try textLines(arena, try bodyLines(arena, dashes), false);
+    const text = try textLines(arena, try bodyLines(arena, dashes), .{});
     try testing.expectEqual(@as(usize, 3), text.len);
     try testing.expectEqualStrings("More", text[2]);
     // A subject spans lines but not paragraphs.

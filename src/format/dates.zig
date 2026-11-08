@@ -66,14 +66,6 @@ pub fn parse(text_in: []const u8, today: Date, work_days: WorkDays) ?Date {
     return null;
 }
 
-/// `parse`, as git stores it: `YYYY-MM-DD`, in `arena`. Empty (after
-/// trimming) stays empty, for clearing a date; null when it isn't one.
-pub fn resolve(arena: std.mem.Allocator, text: []const u8, today: Date, work_days: WorkDays) std.mem.Allocator.Error!?[]const u8 {
-    if (std.mem.trim(u8, text, " \t").len == 0) return "";
-    const d = parse(text, today, work_days) orelse return null;
-    return try std.fmt.allocPrint(arena, "{f}", .{d});
-}
-
 /// The last working day on or before `sunday`, in its week.
 fn lastWorkDay(sunday: Date, work_days: WorkDays) Date {
     var d = sunday;
@@ -125,18 +117,6 @@ test parse {
     try t.expectEqualStrings("today", relative(&buf, today, today));
 }
 
-test resolve {
-    const t = std.testing;
-    var arena_state: std.heap.ArenaAllocator = .init(t.allocator);
-    defer arena_state.deinit();
-    const arena = arena_state.allocator();
-    const today = Date.parse("2026-11-04").?;
-    try t.expectEqualStrings("2026-11-07", (try resolve(arena, "+3d", today, .all)).?);
-    try t.expectEqualStrings("2026-12-01", (try resolve(arena, "2026-12-01", today, .all)).?);
-    try t.expectEqualStrings("", (try resolve(arena, " ", today, .all)).?);
-    try t.expect(try resolve(arena, "soon", today, .all) == null);
-}
-
 test "parse: signs and sizes that don't fit are not dates" {
     const t = std.testing;
     const today = Date.parse("2026-11-04").?;
@@ -154,7 +134,9 @@ test "parse: signs and sizes that don't fit are not dates" {
 test "parse: no day after 9999-12-31" {
     const t = std.testing;
     const last = Date.parse("9999-12-31").?;
-    for ([_][]const u8{ "tomorrow", "fri", "mon" }) |text| try t.expect(parse(text, last, .weekdays) == null);
+    for ([_][]const u8{ "tomorrow", "fri", "mon" }) |text| try t.expect(
+        parse(text, last, .weekdays) == null,
+    );
     // A Friday: the week's last working day is today, unless only Monday
     // works, whose next week isn't there.
     try t.expect(parse("eow", last, .weekdays).?.eql(last));
@@ -176,7 +158,9 @@ test "parse: today is the local date, around midnight" {
     const t = std.testing;
     // 2026-11-04 23:30 UTC: already the 5th in Berlin, still the 4th in
     // New York.
-    const now: i64 = (Date.parse("2026-11-04").?.toDays() * @as(i64, std.time.s_per_day)) + 23 * 3600 + 30 * 60;
+    const now: i64 = (Date.parse(
+        "2026-11-04",
+    ).?.toDays() * @as(i64, std.time.s_per_day)) + 23 * 3600 + 30 * 60;
     const berlin = Date.fromUnixLocal(now, 3600);
     const new_york = Date.fromUnixLocal(now, -5 * 3600);
     try t.expect(parse("today", berlin, .all).?.eql(Date.parse("2026-11-05").?));

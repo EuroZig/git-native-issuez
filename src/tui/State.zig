@@ -236,7 +236,12 @@ pub fn fail(s: *State, comptime format: []const u8, args: anytype) void {
 }
 
 /// A message too long for the buffer is cut, ending in `…`.
-fn setStatus(s: *State, kind: @TypeOf(s.status_kind), comptime format: []const u8, args: anytype) void {
+fn setStatus(
+    s: *State,
+    kind: @TypeOf(s.status_kind),
+    comptime format: []const u8,
+    args: anytype,
+) void {
     const ellipsis = "…";
     var w: std.Io.Writer = .fixed(&s.status_buf);
     var len: usize = 0;
@@ -377,7 +382,10 @@ pub fn quitUnlessSyncing(s: *State) Action {
     const kind = s.sync.running orelse return .quit;
     if (s.quit_armed) return .quit;
     s.quit_armed = true;
-    s.fail("a {s} with {s} is running: q again quits and stops it", .{ kind.label(), s.sync.runningRemote() });
+    s.fail(
+        "a {s} with {s} is running: q again quits and stops it",
+        .{ kind.label(), s.sync.runningRemote() },
+    );
     return .none;
 }
 
@@ -484,7 +492,7 @@ pub fn currentQuery(s: *const State) filter.Query {
 
 /// After the filter or scope changed: the selection stays on its issue
 /// when that is still shown, else goes to the top, and is scrolled to.
-fn filterChanged(s: *State) void {
+pub fn filterChanged(s: *State) void {
     s.list.selected = 0;
     s.list.follow = true;
     s.board.follow = true;
@@ -502,7 +510,12 @@ fn filterChanged(s: *State) void {
 pub fn draw(s: *State, win: ui.Window, now_s: i64) Allocator.Error!void {
     _ = s.frame_arena.reset(.retain_capacity);
     s.hits.reset();
-    const f: ui.Frame = .{ .gpa = s.gpa, .arena = s.frame_arena.allocator(), .hits = &s.hits, .now = now_s };
+    const f: ui.Frame = .{
+        .gpa = s.gpa,
+        .arena = s.frame_arena.allocator(),
+        .hits = &s.hits,
+        .now = now_s,
+    };
     s.today = .fromUnixLocal(now_s, s.utc_offset_s);
     s.now_s = now_s;
     win.clear();
@@ -546,22 +559,60 @@ fn drawTopBar(s: *State, f: ui.Frame, bar: ui.Window) Allocator.Error!void {
     const bg: ui.Style = .{ .bg = ui.palette.bar_bg };
     bar.fill(.{ .style = bg });
     var col: u16 = 0;
-    col += ui.text(bar, 1, 0, "◆ issues", .{ .fg = ui.palette.accent, .bg = ui.palette.bar_bg, .bold = true });
+    col += ui.text(
+        bar,
+        1,
+        0,
+        "◆ issues",
+        .{ .fg = ui.palette.accent, .bg = ui.palette.bar_bg, .bold = true },
+    );
     col += 3;
-    const tabs = [_]struct { ui.View, []const u8 }{ .{ .list, "List" }, .{ .board, "Board" }, .{ .milestones, "Milestones" }, .{ .timeline, "Timeline" } };
+    const tabs = [_]struct {
+        ui.View,
+        []const u8,
+    }{
+        .{ .list, "List" },
+        .{ .board, "Board" },
+        .{ .milestones, "Milestones" },
+        .{ .timeline, "Timeline" },
+    };
     for (tabs, 1..) |t, n| {
         const active = s.view == t[0] or (t[0] == .milestones and s.view == .milestone);
-        col += try ui.button(f, bar, col, 0, f.fmt("{d} {s}", .{ n, t[1] }), .{ .tab = t[0] }, ui.buttonStyle(active));
+        col += try ui.button(
+            f,
+            bar,
+            col,
+            0,
+            f.fmt("{d} {s}", .{ n, t[1] }),
+            .{ .tab = t[0] },
+            ui.buttonStyle(active),
+        );
         col += 1;
     }
     if (s.view == .milestone) {
         const name = milestone_view.scopeName(s.snap, s.milestone.scope);
-        col += try ui.button(f, bar, col, 0, f.fmt("◆ {s}", .{name}), .{ .command = .back }, ui.buttonStyle(true));
+        col += try ui.button(
+            f,
+            bar,
+            col,
+            0,
+            f.fmt("◆ {s}", .{name}),
+            .{ .command = .back },
+            ui.buttonStyle(true),
+        );
     }
     if (s.view == .detail) {
         if (s.detail.issue(s.snap)) |i| {
             const label = f.fmt("#{s}", .{issuez.format.uuid.shortId(s.snap.issues[i].id)});
-            col += try ui.button(f, bar, col, 0, label, .{ .command = .back }, ui.buttonStyle(true));
+            col += try ui.button(
+                f,
+                bar,
+                col,
+                0,
+                label,
+                .{ .command = .back },
+                ui.buttonStyle(true),
+            );
         }
     }
     // Counts.
@@ -575,7 +626,10 @@ fn drawTopBar(s: *State, f: ui.Frame, bar: ui.Window) Allocator.Error!void {
     const badge = s.syncBadge(f);
     // Right side buttons.
     const buttons = [_]struct { []const u8, ui.Command }{
-        .{ if (s.view == .milestones) "+ Milestone" else "+ New", if (s.view == .milestones) .new_milestone else .new_issue },
+        .{
+            if (s.view == .milestones) "+ Milestone" else "+ New",
+            if (s.view == .milestones) .new_milestone else .new_issue,
+        },
         .{ "⟳", .reload },
         .{ "?", .help },
         .{ "✕", .quit },
@@ -586,11 +640,19 @@ fn drawTopBar(s: *State, f: ui.Frame, bar: ui.Window) Allocator.Error!void {
     if (bar.width > right + col + 2) {
         var x = bar.width - right;
         const cw = bar.gwidth(counts);
-        if (x > col + cw + 2) _ = ui.text(bar, x - cw - 2, 0, counts, .{ .fg = ui.palette.muted, .bg = ui.palette.bar_bg });
+        if (x > col + cw + 2) _ = ui.text(
+            bar,
+            x - cw - 2,
+            0,
+            counts,
+            .{ .fg = ui.palette.muted, .bg = ui.palette.bar_bg },
+        );
         x += try ui.button(f, bar, x, 0, badge.text, .{ .command = .sync_panel }, badge.style);
         x += 1;
         for (buttons) |b| {
-            const st = if (b[1] == .new_issue or b[1] == .new_milestone) ui.buttonStyle(true) else ui.buttonStyle(false);
+            const st = if (b[1] == .new_issue or b[1] == .new_milestone) ui.buttonStyle(
+                true,
+            ) else ui.buttonStyle(false);
             x += try ui.button(f, bar, x, 0, b[0], .{ .command = b[1] }, st);
             x += 1;
         }
@@ -609,11 +671,17 @@ fn syncBadge(s: *State, f: ui.Frame) struct { text: []const u8, style: ui.Style 
             .merging => "merging",
             .pushing => "pushing",
         } else "starting";
-        return .{ .text = f.fmt("⇅ {s} {s}…", .{ s.sync.runningRemote(), what }), .style = .{ .fg = ui.palette.accent, .bg = ui.palette.bar_bg, .bold = true } };
+        return .{
+            .text = f.fmt("⇅ {s} {s}…", .{ s.sync.runningRemote(), what }),
+            .style = .{ .fg = ui.palette.accent, .bg = ui.palette.bar_bg, .bold = true },
+        };
     }
     const name = r.name orelse {
         if (r.problem.len > 0) return .{ .text = "⇅ remote ⚠", .style = failed };
-        return .{ .text = "⇅ no remote", .style = .{ .fg = ui.palette.faint, .bg = ui.palette.bar_bg } };
+        return .{
+            .text = "⇅ no remote",
+            .style = .{ .fg = ui.palette.faint, .bg = ui.palette.bar_bg },
+        };
     };
     var conflicts: usize = 0;
     for (s.snap.issues) |issue| {
@@ -621,15 +689,28 @@ fn syncBadge(s: *State, f: ui.Frame) struct { text: []const u8, style: ui.Style 
     }
     const up = r.unpushed.count();
     const q = r.quarantined.count();
-    if (s.sync.failed or r.problem.len > 0) return .{ .text = f.fmt("⇅ {s} ⚠", .{name}), .style = failed };
-    if (up == 0 and q == 0 and conflicts == 0) return .{ .text = f.fmt("⇅ {s} ✓", .{name}), .style = .{ .fg = ui.palette.ok, .bg = ui.palette.bar_bg } };
+    if (s.sync.failed or r.problem.len > 0) return .{
+        .text = f.fmt("⇅ {s} ⚠", .{name}),
+        .style = failed,
+    };
+    if (up == 0 and q == 0 and conflicts == 0) return .{
+        .text = f.fmt("⇅ {s} ✓", .{name}),
+        .style = .{ .fg = ui.palette.ok, .bg = ui.palette.bar_bg },
+    };
     var buf: std.ArrayList(u8) = .empty;
     buf.print(f.arena, "⇅ {s}", .{name}) catch {};
     if (up > 0) buf.print(f.arena, " ↑{d}", .{up}) catch {};
     if (q > 0) buf.print(f.arena, " !{d}", .{q}) catch {};
     if (conflicts > 0) buf.print(f.arena, " ✕{d}", .{conflicts}) catch {};
     const trouble = q > 0 or conflicts > 0;
-    return .{ .text = buf.items, .style = .{ .fg = if (trouble) ui.palette.medium else .{ .index = 252 }, .bg = ui.palette.button_bg, .bold = trouble } };
+    return .{
+        .text = buf.items,
+        .style = .{
+            .fg = if (trouble) ui.palette.medium else .{ .index = 252 },
+            .bg = ui.palette.button_bg,
+            .bold = trouble,
+        },
+    };
 }
 
 /// Edit mode can't be missed: the bar turns amber and says what is
@@ -642,15 +723,30 @@ fn drawEditBanner(s: *State, f: ui.Frame, bar: ui.Window) Allocator.Error!void {
     col += ui.text(bar, col, 0, "✎ EDIT MODE", st);
     col += 2;
     const n = t.changes();
-    const what = if (n == 0) "no changes yet" else f.fmt("{d} {s} not applied", .{ n, if (n == 1) "change" else "changes" });
+    const what = if (n == 0) "no changes yet" else f.fmt(
+        "{d} {s} not applied",
+        .{ n, if (n == 1) "change" else "changes" },
+    );
     col += ui.text(bar, col, 0, what, .{ .fg = .{ .index = 16 }, .bg = ui.palette.medium });
     if (t.plan) |p| if (p.stale.len > 0) {
         col += 2;
-        col += ui.text(bar, col, 0, f.fmt("! {d} changed elsewhere", .{p.stale.len}), .{ .fg = .{ .index = 160 }, .bg = ui.palette.medium, .bold = true });
+        col += ui.text(
+            bar,
+            col,
+            0,
+            f.fmt("! {d} changed elsewhere", .{p.stale.len}),
+            .{ .fg = .{ .index = 160 }, .bg = ui.palette.medium, .bold = true },
+        );
     };
     if (t.linking) |id| {
         col += 2;
-        col += ui.text(bar, col, 0, f.fmt("linking #{s}: pick its blocker", .{issuez.format.uuid.shortId(id.slice())}), .{ .fg = .{ .index = 16 }, .bg = ui.palette.medium, .italic = true });
+        col += ui.text(
+            bar,
+            col,
+            0,
+            f.fmt("linking #{s}: pick its blocker", .{issuez.format.uuid.shortId(id.slice())}),
+            .{ .fg = .{ .index = 16 }, .bg = ui.palette.medium, .italic = true },
+        );
     }
     const buttons = [_]struct { []const u8, ui.TimelineCommand, bool }{
         .{ "Apply  ctrl+s", .apply, true },
@@ -663,7 +759,11 @@ fn drawEditBanner(s: *State, f: ui.Frame, bar: ui.Window) Allocator.Error!void {
     if (bar.width > col + w + 2) {
         var x = bar.width - w;
         for (buttons) |b| {
-            const style: ui.Style = if (b[2]) .{ .fg = .{ .index = 231 }, .bg = .{ .index = 28 }, .bold = true } else .{ .fg = .{ .index = 16 }, .bg = .{ .index = 179 } };
+            const style: ui.Style = if (b[2]) .{
+                .fg = .{ .index = 231 },
+                .bg = .{ .index = 28 },
+                .bold = true,
+            } else .{ .fg = .{ .index = 16 }, .bg = .{ .index = 179 } };
             x += try ui.button(f, bar, x, 0, b[0], .{ .tl_command = b[1] }, style);
             x += 1;
         }
@@ -675,22 +775,36 @@ fn drawStatusBar(s: *State, f: ui.Frame, bar: ui.Window) void {
     bar.fill(.{ .style = .{ .bg = ui.palette.bar_bg } });
     if (s.status_len > 0) {
         const fg = if (s.status_kind == .err) ui.palette.err else ui.palette.ok;
-        _ = ui.text(bar, 1, 0, s.status(), .{ .fg = fg, .bg = ui.palette.bar_bg, .bold = s.status_kind == .err });
+        _ = ui.text(
+            bar,
+            1,
+            0,
+            s.status(),
+            .{ .fg = fg, .bg = ui.palette.bar_bg, .bold = s.status_kind == .err },
+        );
         return;
     }
     const hint: []const u8 = if (s.modal) |m| m.hint() else switch (s.view) {
-        .list => "↑↓ move  ⏎ open  n new  a sub-issue  x close/reopen  / filter  s sort  t tree  f scope  2 board  ? help  q quit",
-        .board => "←→ column  ↑↓ card  ⏎ open  < > move card  n new  x close/reopen  / filter  s sort  1 list  ? help",
-        .milestones => "↑↓ move  ⏎ open  n new  e edit  r rename  d due  c complete  R retire  o reopen  / filter  s sort  f scope  w progress  ? help",
+        .list => "↑↓ move  ⏎ open  n new  a sub-issue  x close/reopen  / filter  s sort  t tree " ++
+            " f scope  2 board  ? help  q quit",
+        .board => "←→ column  ↑↓ card  ⏎ open  < > move card  n new  x close/reopen  / filter  " ++
+            "s sort  1 list  ? help",
+        .milestones => "↑↓ move  ⏎ open  n new  e edit  r rename  d due  c complete  R retire  " ++
+            "o reopen  / filter  s sort  f scope  w progress  ? help",
         .timeline => if (s.timeline.editing)
-            "←→ move  shift week  < > due  { } start  ( ) scroll  d s e type  ⏎ schedule  m milestone  b/B blocker  u U undo  ctrl+s apply  esc leave"
+            "←→ move  shift week  < > due  { } start  ( ) scroll  d s e type  ⏎ schedule  m " ++
+                "milestone  b/B blocker  u U undo  ctrl+s apply  esc leave"
         else
-            "↑↓ row  ←→ scroll  z Z zoom  . today  [ ] group  space fold  ⏎ open  D deps  v grouping  E edit  / filter",
+            "↑↓ row  ←→ scroll  z Z zoom  . today  [ ] group  space fold  ⏎ open  D deps  v " ++
+                "grouping  E edit  / filter",
         .milestone => if (s.milestone.split)
-            "+ add existing  m move to…  space mark  > < move across  tab pane  p pick pane  [ ] prev/next  n new  v single  esc back"
+            "+ add existing  m move to…  space mark  > < move across  tab pane  p pick pane  [ " ++
+                "] prev/next  n new  v single  esc back"
         else
-            "↑↓ move  + add existing  m move to…  space mark  [ ] prev/next milestone  n new  N quick add  v split  ⏎ open  esc back",
-        .detail => "↑↓ select  ⏎ edit/open  e description  c comment  a sub-issue  A add existing  x close/reopen  t title  esc back  ? help",
+            "↑↓ move  + add existing  m move to…  space mark  [ ] prev/next milestone  " ++
+                "n new  N quick add  v split  ⏎ open  esc back",
+        .detail => "↑↓ select  ⏎ edit/open  e description  c comment  a sub-issue  " ++
+            "A add existing  x close/reopen  t title  esc back  ? help",
     };
     _ = ui.text(bar, 1, 0, hint, .{ .fg = ui.palette.muted, .bg = ui.palette.bar_bg });
 }
@@ -727,11 +841,19 @@ fn handleKey(s: *State, k: vaxis.Key) Allocator.Error!Action {
         if ((text or changes > 0) and !s.discard_armed) {
             s.discard_armed = true;
             if (text and changes > 0) {
-                s.fail("unsaved text and {d} timeline changes not applied: ctrl+c again quits without them", .{changes});
+                s.fail(
+                    "unsaved text and {d} timeline changes not applied: " ++
+                        "ctrl+c again quits without them",
+                    .{changes},
+                );
             } else if (text) {
                 s.fail("unsaved text: ctrl+c again quits without it, ctrl+s saves", .{});
             } else {
-                s.fail("{d} timeline changes aren't applied: ctrl+c again quits without them, ctrl+s applies", .{changes});
+                s.fail(
+                    "{d} timeline changes aren't applied: " ++
+                        "ctrl+c again quits without them, ctrl+s applies",
+                    .{changes},
+                );
             }
             return .none;
         }
@@ -777,7 +899,10 @@ fn handleKey(s: *State, k: vaxis.Key) Allocator.Error!Action {
         return .none;
     }
     if (k.matches('r', .{ .ctrl = true }) or k.matches(K.f5, .{})) return .reload;
-    const tabs = [_]struct { u21, ui.View }{ .{ '1', .list }, .{ '2', .board }, .{ '3', .milestones }, .{ '4', .timeline } };
+    const tabs = [_]struct {
+        u21,
+        ui.View,
+    }{ .{ '1', .list }, .{ '2', .board }, .{ '3', .milestones }, .{ '4', .timeline } };
     for (tabs) |t| if (k.matches(t[0], .{})) {
         s.goTo(t[1]);
         return .none;
@@ -817,6 +942,10 @@ fn handleKey(s: *State, k: vaxis.Key) Allocator.Error!Action {
         }
         if (k.matches('S', .{})) {
             q.reverse = !q.reverse;
+            return .none;
+        }
+        if (k.matches('M', .{})) {
+            modal_mod.openMilestones(s);
             return .none;
         }
         if (k.matches('f', .{})) {
@@ -890,7 +1019,8 @@ fn handleMouse(s: *State, m: vaxis.Mouse, now_ms: i64) Allocator.Error!Action {
     switch (m.type) {
         .press => {},
         .drag, .motion => {
-            if (s.view == .timeline and (s.timeline.bar_drag != null or s.timeline.row_drag != null)) {
+            const dragging = s.timeline.bar_drag != null or s.timeline.row_drag != null;
+            if (s.view == .timeline and dragging) {
                 timeline_view.edit.dragTo(s, found);
                 return .none;
             }
@@ -991,12 +1121,26 @@ pub fn command(s: *State, c: ui.Command) Action {
         .new_milestone => modal_mod.newMilestone(s),
         .reload => return .reload,
         .help => s.openModal(.{ .help = .{} }),
-        .sort => if (s.view == .milestones) modal_mod.openMilestoneSort(s) else modal_mod.openSort(s),
+        .sort => if (s.view == .milestones) modal_mod.openMilestoneSort(
+            s,
+        ) else modal_mod.openSort(s),
         .quit => return if (timeline_view.edit.mayLeave(s, .quit)) s.quitUnlessSyncing() else .none,
         .sync_panel => return .open_sync_panel,
         .back => s.back(),
-        .ms_edit => if (milestone_view.milestoneOf(s.snap, s.milestone.focusedScope())) |n| modal_mod.editMilestone(s, n),
-        .ms_complete => if (milestone_view.milestoneOf(s.snap, s.milestone.focusedScope())) |n| milestones_view.confirmComplete(s, n),
+        .ms_edit => if (milestone_view.milestoneOf(
+            s.snap,
+            s.milestone.focusedScope(),
+        )) |n| modal_mod.editMilestone(
+            s,
+            n,
+        ),
+        .ms_complete => if (milestone_view.milestoneOf(
+            s.snap,
+            s.milestone.focusedScope(),
+        )) |n| milestones_view.confirmComplete(
+            s,
+            n,
+        ),
         .pick_pane => milestone_view.openPaneMenu(s),
         .ms_add => milestone_view.openAddPicker(s),
         .ms_move => milestone_view.openMoveMenu(s),

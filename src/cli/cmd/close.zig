@@ -12,6 +12,7 @@ pub const close_help =
     \\
     \\Options:
     \\   -m, --message <text>   Message for the state change
+    \\   -c, --comment <text>   A comment in the same commit; repeat for paragraphs
     \\   --fixed-by <sha>       Commit that fixes the issue
     \\   --release <version>    Release that ships the fix
     \\   --reason <reason>      Why it was closed (duplicate, wontfix, invalid, completed)
@@ -26,6 +27,7 @@ pub const reopen_help =
     \\
     \\Options:
     \\   -m, --message <text>   Message for the state change
+    \\   -c, --comment <text>   A comment in the same commit; repeat for paragraphs
     \\   -h, --help             Show this help
     \\
 ;

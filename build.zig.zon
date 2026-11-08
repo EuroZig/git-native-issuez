@@ -1,8 +1,9 @@
 .{
     .name = .git_native_issuez,
-    .version = "0.3.0",
+    .version = "0.4.0",
     .minimum_zig_version = "0.16.0",
     .fingerprint = 0x7bba8a1d2cbb8815,
+    // What the release archives link is in THIRD_PARTY_LICENSES: keep it current.
     .dependencies = .{
         // TUI. Pinned to the last libvaxis main commit before its Zig 0.17
         // bump; builds on Zig 0.16.0. Only fetched when -Dtui=true (default).

@@ -64,6 +64,8 @@ pub const Purpose = union(enum) {
     comment: Id,
     /// The list and board order, not a write.
     sort,
+    /// A milestone to filter by, not a write.
+    milestones,
     /// The milestones view's order.
     milestone_sort,
     /// A milestone's name or due date, at the tip the dialog showed.
@@ -93,7 +95,8 @@ pub const Purpose = union(enum) {
         return switch (p) {
             .title, .description => |id| id,
             .field => |fp| fp.id,
-            .comment, .sort, .milestone_sort, .milestone, .move, .pane_pick, .quick_add, .add_to, .adopt => null,
+            .comment, .sort, .milestones, .milestone_sort, .milestone => null,
+            .move, .pane_pick, .quick_add, .add_to, .adopt => null,
             .stage_date, .stage_estimate, .stage_ms_due, .stage_milestone, .stage_unblock => null,
         };
     }
@@ -191,7 +194,10 @@ pub const Picker = struct {
             var words = std.mem.tokenizeAny(u8, p.filter.text(), " \t");
             while (words.next()) |w| {
                 const w_ = std.mem.trimStart(u8, w, "#");
-                if (std.ascii.findIgnoreCase(it.label, w_) == null and std.ascii.findIgnoreCase(it.detail, w_) == null) continue :next;
+                if (std.ascii.findIgnoreCase(
+                    it.label,
+                    w_,
+                ) == null and std.ascii.findIgnoreCase(it.detail, w_) == null) continue :next;
             }
             try out.append(a, @intCast(n));
         }
@@ -221,7 +227,14 @@ pub const SyncPanel = struct {
         /// Nothing in a section.
         empty: []const u8,
         unpushed: struct { id: Id, label: []const u8, new: bool, milestone: bool },
-        quarantined: struct { id: Id, label: []const u8, reason: []const u8, kept: bool, local: bool, milestone: bool = false },
+        quarantined: struct {
+            id: Id,
+            label: []const u8,
+            reason: []const u8,
+            kept: bool,
+            local: bool,
+            milestone: bool = false,
+        },
         conflict: struct { id: Id, label: []const u8, what: []const u8, field: ?Field },
     };
 
@@ -299,14 +312,17 @@ pub const Modal = union(enum) {
 
     pub fn hint(m: *const Modal) []const u8 {
         return switch (m.*) {
-            .prompt => |*p| if (p.date) "⏎ save  esc cancel  (" ++ dates.hint ++ ")" else "⏎ save  esc cancel",
+            .prompt => |*p| if (p.date) "⏎ save  esc cancel  (" ++ dates.hint ++
+                ")" else "⏎ save  esc cancel",
             .editor => "ctrl+s save  esc cancel  (⏎ new line)",
             .menu => "↑↓ j k choose  a letter jumps  ⏎ select  esc cancel",
             .form => "tab/↑↓ next field  ←→ choose  ctrl+s create  esc cancel",
             .milestone_form => "tab/↑↓ next field  ctrl+s save  esc cancel",
             .confirm => "←→ choose  ⏎ select  esc cancel",
-            .sync_panel => "y sync  f fetch & merge  p push  ←→ remote  ↑↓ j k choose  ⏎ open  a accept remote  l keep local  esc close",
-            .picker => |*p| if (p.multi) "type to filter  ↑↓ choose  tab mark several  ⏎ add  esc cancel" else "type to filter  ↑↓ choose  ⏎ select  esc cancel",
+            .sync_panel => "y sync  f fetch & merge  p push  ←→ remote  ↑↓ j k choose  ⏎ open  " ++
+                "a accept remote  l keep local  esc close",
+            .picker => |*p| if (p.multi) "type to filter  ↑↓ choose  tab mark several  ⏎ add  " ++
+                "esc cancel" else "type to filter  ↑↓ choose  ⏎ select  esc cancel",
             .help => "↑↓ j k scroll  space pgup pgdn a page  g G ends  esc q ? or click to close",
         };
     }
@@ -326,7 +342,12 @@ pub const Modal = union(enum) {
         }
     }
 
-    pub fn wheel(m: *Modal, s: *AppState, found: ?ui.Hits.Found, delta: i32) Allocator.Error!Action {
+    pub fn wheel(
+        m: *Modal,
+        s: *AppState,
+        found: ?ui.Hits.Found,
+        delta: i32,
+    ) Allocator.Error!Action {
         _ = found;
         const a = s.input_arena.allocator();
         switch (m.*) {
@@ -335,14 +356,20 @@ pub const Modal = union(enum) {
             .milestone_form => |*fm| try fm.description.scrollBy(a, delta),
             .menu => |*mn| {
                 const n: i32 = @intCast(mn.options.len);
-                mn.selected = @intCast(std.math.clamp(@as(i32, mn.selected) + std.math.sign(delta), 0, n - 1));
+                mn.selected = @intCast(
+                    std.math.clamp(@as(i32, mn.selected) + std.math.sign(delta), 0, n - 1),
+                );
             },
-            .help => |*h| h.scroll = @intCast(std.math.clamp(@as(i32, h.scroll) + delta, 0, help_lines.len)),
+            .help => |*h| h.scroll = @intCast(
+                std.math.clamp(@as(i32, h.scroll) + delta, 0, help_lines.len),
+            ),
             .prompt, .confirm => {},
             .sync_panel => |*p| p.step(std.math.sign(delta)),
             .picker => |*p| {
                 const n: i64 = @intCast((try p.shown(a)).len);
-                p.selected = @intCast(std.math.clamp(@as(i64, p.selected) + std.math.sign(delta), 0, @max(n - 1, 0)));
+                p.selected = @intCast(
+                    std.math.clamp(@as(i64, p.selected) + std.math.sign(delta), 0, @max(n - 1, 0)),
+                );
             },
         }
         return .none;
@@ -451,7 +478,14 @@ fn print(s: *AppState, comptime format: []const u8, args: anytype) []const u8 {
 /// resets: it is copied first. `value` is the issue's, unless `fresh`.
 /// From a dialog on the same issue (a menu's "Other…"), the tip that one
 /// showed is kept.
-pub fn openPrompt(s: *AppState, title: []const u8, hint: []const u8, value: []const u8, purpose: Purpose, fresh: bool) void {
+pub fn openPrompt(
+    s: *AppState,
+    title: []const u8,
+    hint: []const u8,
+    value: []const u8,
+    purpose: Purpose,
+    fresh: bool,
+) void {
     var input: TextArea = .init(false);
     input.set(s.gpa, value) catch {};
     const kept = s.modal_tip;
@@ -515,7 +549,7 @@ pub fn editField(s: *AppState, i: u32, field: Field) void {
             var options: std.ArrayList(Menu.Option) = .empty;
             const cur: []const u8 = switch (field) {
                 .state => issue.state.text(),
-                .workflow => issue.ext.workflow orelse "",
+                .workflow => issue.workflow orelse "",
                 .priority => issue.field("Priority") orelse "",
                 // Catalog milestones by ID; a plain-text one is none of
                 // the options.
@@ -524,7 +558,12 @@ pub fn editField(s: *AppState, i: u32, field: Field) void {
             };
             // Copied: the menu outlives a reload of the snapshot they're in.
             const add = struct {
-                fn f(list: *std.ArrayList(Menu.Option), arena: Allocator, o: Menu.Option, current: []const u8) void {
+                fn f(
+                    list: *std.ArrayList(Menu.Option),
+                    arena: Allocator,
+                    o: Menu.Option,
+                    current: []const u8,
+                ) void {
                     var opt = o;
                     opt.current = !o.other and std.mem.eql(u8, o.value, current);
                     opt.label = arena.dupe(u8, o.label) catch return;
@@ -536,18 +575,38 @@ pub fn editField(s: *AppState, i: u32, field: Field) void {
                 .state => {
                     add(&options, a, .{ .label = "open", .value = "open" }, cur);
                     add(&options, a, .{ .label = "closed", .value = "closed" }, cur);
-                    for (snap.settings.done_states) |d| add(&options, a, .{ .label = d, .value = d }, cur);
+                    for (snap.settings.done_states) |d| add(
+                        &options,
+                        a,
+                        .{ .label = d, .value = d },
+                        cur,
+                    );
                     if (issue.state == .other and !issue.state.isDone(snap.settings.done_states)) {
-                        add(&options, a, .{ .label = issue.state.text(), .value = issue.state.text() }, cur);
+                        add(
+                            &options,
+                            a,
+                            .{ .label = issue.state.text(), .value = issue.state.text() },
+                            cur,
+                        );
                     }
                 },
                 .workflow => {
-                    for (snap.settings.workflow_states) |w| add(&options, a, .{ .label = w, .value = w }, cur);
+                    for (snap.settings.workflow_states) |w| add(
+                        &options,
+                        a,
+                        .{ .label = w, .value = w },
+                        cur,
+                    );
                     add(&options, a, .{ .label = "(default)", .value = "" }, cur);
                 },
                 .priority => {
                     add(&options, a, .{ .label = "(none)", .value = "" }, cur);
-                    for ([_][]const u8{ "low", "medium", "high", "critical" }) |p| add(&options, a, .{ .label = p, .value = p }, cur);
+                    for ([_][]const u8{ "low", "medium", "high", "critical" }) |p| add(
+                        &options,
+                        a,
+                        .{ .label = p, .value = p },
+                        cur,
+                    );
                 },
                 .milestone => {
                     for (snap.milestones) |m| {
@@ -556,7 +615,12 @@ pub fn editField(s: *AppState, i: u32, field: Field) void {
                     }
                     add(&options, a, .{ .label = "(none)", .value = link_none }, cur);
                     if (snap.proj.parent[i] != std.math.maxInt(u32)) {
-                        add(&options, a, .{ .label = "(inherit from parent)", .value = link_inherit }, cur);
+                        add(
+                            &options,
+                            a,
+                            .{ .label = "(inherit from parent)", .value = link_inherit },
+                            cur,
+                        );
                     }
                     add(&options, a, .{ .label = "Other…", .value = "", .other = true }, cur);
                 },
@@ -573,7 +637,14 @@ pub fn editField(s: *AppState, i: u32, field: Field) void {
                 .purpose = purpose,
             } });
         },
-        .assignee => openPrompt(s, "Assignee", "an email; empty unassigns", issue.field("Assignee") orelse "", purpose, false),
+        .assignee => openPrompt(
+            s,
+            "Assignee",
+            "an email; empty unassigns",
+            issue.field("Assignee") orelse "",
+            purpose,
+            false,
+        ),
         .labels => {
             const joined = std.mem.join(a, ", ", issue.labels) catch "";
             openPrompt(s, "Labels", "comma-separated; empty removes all", joined, purpose, false);
@@ -581,24 +652,38 @@ pub fn editField(s: *AppState, i: u32, field: Field) void {
         .parent => {
             const p = snap.proj.parent[i];
             const value = if (p == std.math.maxInt(u32)) "" else shortId(snap.issues[p].id);
-            openPrompt(s, "Parent", "an issue ID (prefix); empty makes it top-level", value, purpose, false);
+            openPrompt(
+                s,
+                "Parent",
+                "an issue ID (prefix); empty makes it top-level",
+                value,
+                purpose,
+                false,
+            );
         },
         .blocked_by => {
             var ids: std.ArrayList(u8) = .empty;
-            for (issue.ext.blocked_by, 0..) |b, n| {
+            for (issue.blocked_by, 0..) |b, n| {
                 if (n > 0) ids.append(a, ' ') catch {};
                 ids.appendSlice(a, shortId(b)) catch {};
             }
-            openPrompt(s, "Blocked by", "issue IDs (prefixes), space-separated; empty clears", ids.items, purpose, false);
+            openPrompt(
+                s,
+                "Blocked by",
+                "issue IDs (prefixes), space-separated; empty clears",
+                ids.items,
+                purpose,
+                false,
+            );
         },
         .start, .due => {
-            const d = if (field == .start) issue.ext.start_date else issue.ext.due_date;
+            const d = if (field == .start) issue.start_date else issue.due_date;
             const value = if (d) |date| print(s, "{f}", .{date}) else "";
             openPrompt(s, field.label(), dates.hint, value, purpose, false);
             s.modal.?.prompt.date = true;
         },
         .estimate => {
-            const value = if (issue.ext.estimate_minutes) |m| durationText(s, m) else "";
+            const value = if (issue.estimate_minutes) |m| durationText(s, m) else "";
             openPrompt(s, "Estimate", "like 90m, 2h or 1h30m; empty clears", value, purpose, false);
         },
     }
@@ -612,12 +697,17 @@ pub const link_inherit = "inherit";
 /// when it follows its parent, `link_none` without one, and nothing for a
 /// milestone written as plain text.
 fn milestoneCurrent(snap: *const store.Snapshot, i: u32) []const u8 {
-    const ext = snap.issues[i].ext;
+    const ext = &snap.issues[i];
     const has_parent = snap.proj.parent[i] != std.math.maxInt(u32);
-    return switch (fields_fmt.MilestoneMode.of(ext.milestone_mode, ext.milestone_id != null, has_parent)) {
+    return switch (fields_fmt.MilestoneMode.of(
+        ext.milestone_mode,
+        .{ .has_id = ext.milestone_id != null, .has_parent = has_parent },
+    )) {
         .explicit => ext.milestone_id orelse "\x00",
         .inherit => link_inherit,
-        .none => if ((snap.issues[i].field("Milestone") orelse @as([]const u8, "")).len > 0) "\x00" else link_none,
+        .none => if ((snap.issues[i].field(
+            "Milestone",
+        ) orelse @as([]const u8, "")).len > 0) "\x00" else link_none,
     };
 }
 
@@ -642,16 +732,38 @@ pub fn openSort(s: *AppState) void {
 }
 
 /// `Key`'s values as a menu, `current` marked.
-fn openSortMenu(s: *AppState, comptime Key: type, current: Key, title: []const u8, purpose: Purpose) void {
+fn openSortMenu(
+    s: *AppState,
+    comptime Key: type,
+    current: Key,
+    title: []const u8,
+    purpose: Purpose,
+) void {
     s.closeModal();
     const keys = std.enums.values(Key);
-    const options = s.modalArena().alloc(Menu.Option, keys.len) catch return s.fail("out of memory", .{});
+    const options = s.modalArena().alloc(
+        Menu.Option,
+        keys.len,
+    ) catch return s.fail("out of memory", .{});
     var selected: u16 = 0;
     for (keys, options, 0..) |k, *o, n| {
         if (k == current) selected = @intCast(n);
-        o.* = .{ .label = print(s, "{s:<9} {s}", .{ k.label(), k.order() }), .value = k.label(), .current = k == current };
+        o.* = .{
+            .label = print(s, "{s:<9} {s}", .{ k.label(), k.order() }),
+            .value = k.label(),
+            .current = k == current,
+        };
     }
-    s.openModal(.{ .menu = .{ .title = title, .options = options, .selected = selected, .purpose = purpose } });
+    s.openModal(
+        .{
+            .menu = .{
+                .title = title,
+                .options = options,
+                .selected = selected,
+                .purpose = purpose,
+            },
+        },
+    );
 }
 
 /// Choosing the key in use flips the order; another sorts by it.
@@ -661,6 +773,31 @@ fn toggleSort(q: anytype, comptime Key: type, value: []const u8) void {
         q.key = k;
         q.reverse = false;
     }
+}
+
+/// The open milestones with their progress; choosing one filters the
+/// list and the board by it (`m:`), "No milestone" by none.
+pub fn openMilestones(s: *AppState) void {
+    s.closeModal();
+    const a = s.modalArena();
+    var options: std.ArrayList(Menu.Option) = .empty;
+    for (s.snap.milestones) |m| {
+        if (m.status != .open) continue;
+        const p = s.snap.proj.milestoneProgress(a, m.id) catch return s.fail("out of memory", .{});
+        const due = if (m.due) |d| print(s, "  due {f}", .{d}) else "";
+        options.append(a, .{
+            .label = print(s, "{s}  {d}/{d} done{s}", .{ m.name, p.closed, p.total, due }),
+            // A filter term is one word; a longer name matches by its first.
+            .value = m.name[0 .. std.mem.findScalar(u8, m.name, ' ') orelse m.name.len],
+        }) catch return s.fail("out of memory", .{});
+    }
+    options.append(a, .{ .label = "No milestone", .value = "" }) catch
+        return s.fail("out of memory", .{});
+    s.openModal(.{ .menu = .{
+        .title = "Milestones",
+        .options = options.items,
+        .purpose = .milestones,
+    } });
 }
 
 // Keys.
@@ -708,7 +845,9 @@ pub fn key(s: *AppState, k: vaxis.Key) Allocator.Error!Action {
                 s.closeModal();
             } else if (k.matches(K.down, .{}) or k.matches('j', .{}) or k.matches(K.tab, .{})) {
                 mn.selected = @intCast(@mod(@as(i32, mn.selected) + 1, n));
-            } else if (k.matches(K.up, .{}) or k.matches('k', .{}) or k.matches(K.tab, .{ .shift = true })) {
+            } else if (k.matches(K.up, .{}) or k.matches('k', .{}) or
+                k.matches(K.tab, .{ .shift = true }))
+            {
                 mn.selected = @intCast(@mod(@as(i32, mn.selected) - 1, n));
             } else if (k.matches(K.enter, .{}) or k.matches(K.space, .{})) {
                 return submit(s);
@@ -731,19 +870,34 @@ pub fn key(s: *AppState, k: vaxis.Key) Allocator.Error!Action {
                     p.filter.clear();
                     p.selected = 0;
                 } else closePicker(s, p);
-            } else if (k.matches(K.down, .{}) or k.matches('n', .{ .ctrl = true }) or k.matches('j', .{ .ctrl = true })) {
+            } else if (k.matches(
+                K.down,
+                .{},
+            ) or k.matches('n', .{ .ctrl = true }) or k.matches('j', .{ .ctrl = true })) {
                 p.selected = @intCast(std.math.clamp(@as(i64, p.selected) + 1, 0, @max(n - 1, 0)));
-            } else if (k.matches(K.up, .{}) or k.matches('p', .{ .ctrl = true }) or k.matches('k', .{ .ctrl = true })) {
+            } else if (k.matches(
+                K.up,
+                .{},
+            ) or k.matches('p', .{ .ctrl = true }) or k.matches('k', .{ .ctrl = true })) {
                 p.selected = @intCast(std.math.clamp(@as(i64, p.selected) - 1, 0, @max(n - 1, 0)));
             } else if (k.matches(K.page_down, .{})) {
-                p.selected = @intCast(std.math.clamp(@as(i64, p.selected) + page, 0, @max(n - 1, 0)));
+                p.selected = @intCast(
+                    std.math.clamp(@as(i64, p.selected) + page, 0, @max(n - 1, 0)),
+                );
             } else if (k.matches(K.page_up, .{})) {
-                p.selected = @intCast(std.math.clamp(@as(i64, p.selected) - page, 0, @max(n - 1, 0)));
-            } else if (p.multi and (k.matches(K.tab, .{}) or k.matches(K.tab, .{ .shift = true }))) {
+                p.selected = @intCast(
+                    std.math.clamp(@as(i64, p.selected) - page, 0, @max(n - 1, 0)),
+                );
+            } else if (p.multi and (k.matches(
+                K.tab,
+                .{},
+            ) or k.matches(K.tab, .{ .shift = true }))) {
                 if (p.selected < shown.len) {
                     const it = &p.items[shown[p.selected]];
                     if (!it.disabled) it.marked = !it.marked;
-                    if (k.matches(K.tab, .{})) p.selected = @intCast(@min(@as(i64, p.selected) + 1, @max(n - 1, 0)));
+                    if (k.matches(K.tab, .{})) p.selected = @intCast(
+                        @min(@as(i64, p.selected) + 1, @max(n - 1, 0)),
+                    );
                 }
             } else if (k.matches(K.enter, .{}) or save) {
                 return submit(s);
@@ -760,7 +914,10 @@ pub fn key(s: *AppState, k: vaxis.Key) Allocator.Error!Action {
                 s.closeModal();
             } else if (k.matches(K.right, .{}) or k.matches(K.tab, .{}) or k.matches('l', .{})) {
                 c.selected = @intCast(@mod(@as(i32, c.selected) + 1, n));
-            } else if (k.matches(K.left, .{}) or k.matches(K.tab, .{ .shift = true }) or k.matches('h', .{})) {
+            } else if (k.matches(
+                K.left,
+                .{},
+            ) or k.matches(K.tab, .{ .shift = true }) or k.matches('h', .{})) {
                 c.selected = @intCast(@mod(@as(i32, c.selected) - 1, n));
             } else if (k.matches(K.enter, .{}) or k.matches(K.space, .{})) {
                 return submit(s);
@@ -825,7 +982,9 @@ fn firstCodepoint(t: []const u8) ?u21 {
 
 /// Letters equal ignoring ASCII case; others only when they are the same.
 fn sameLetter(a: u21, b: u21) bool {
-    if (a < 0x80 and b < 0x80) return std.ascii.toLower(@intCast(a)) == std.ascii.toLower(@intCast(b));
+    if (a < 0x80 and b < 0x80) return std.ascii.toLower(
+        @intCast(a),
+    ) == std.ascii.toLower(@intCast(b));
     return a == b;
 }
 
@@ -900,7 +1059,10 @@ fn submit(s: *AppState) Action {
     if (s.modalStale()) {
         const id = m.issue().?;
         s.rebaseModal();
-        s.fail("#{s} changed meanwhile: save again to replace it with yours", .{shortId(id.slice())});
+        s.fail(
+            "#{s} changed meanwhile: save again to replace it with yours",
+            .{shortId(id.slice())},
+        );
         return .none;
     }
     if (milestoneStale(s)) |name| {
@@ -951,14 +1113,29 @@ fn submit(s: *AppState) Action {
                     };
                     return .{ .stage = .{ .milestone = .{ .id = id, .link = link } } };
                 },
-                .stage_unblock => |id| return .{ .stage = .{ .remove_blocker = .{ .id = id, .blocker = .of(o.value) } } },
+                .stage_unblock => |id| return .{
+                    .stage = .{ .remove_blocker = .{ .id = id, .blocker = .of(o.value) } },
+                },
                 .pane_pick => {
                     const v = &s.milestone;
-                    v.other = if (std.mem.eql(u8, o.value, link_none)) .none else .{ .id = .of(o.value) };
+                    v.other = if (std.mem.eql(u8, o.value, link_none)) .none else .{
+                        .id = .of(o.value),
+                    };
                     v.split = true;
                     v.pane = 1;
                     v.panes[1] = .{};
                     s.closeModal();
+                    return .none;
+                },
+                .milestones => {
+                    var buf: [256]u8 = undefined;
+                    const term = std.fmt.bufPrint(&buf, "m:{s}", .{o.value}) catch "m:";
+                    s.search.set(s.gpa, term) catch {
+                        s.fail("out of memory", .{});
+                        return .none;
+                    };
+                    s.closeModal();
+                    s.filterChanged();
                     return .none;
                 },
                 .sort, .milestone_sort => {
@@ -976,12 +1153,21 @@ fn submit(s: *AppState) Action {
             const fp = mn.purpose.field;
             if (o.current) return unchanged(s);
             if (o.other) {
-                openPrompt(s, "Milestone", "a milestone name, kept as text if no open milestone has it", "", mn.purpose, true);
+                openPrompt(
+                    s,
+                    "Milestone",
+                    "a milestone name, kept as text if no open milestone has it",
+                    "",
+                    mn.purpose,
+                    true,
+                );
                 return .none;
             }
             return switch (fp.field) {
                 .state => .{ .state = .{ .id = fp.id, .state = o.value } },
-                .workflow => .{ .edit = .{ .id = fp.id, .spec = .{ .workflow = o.value } } },
+                .workflow => .{
+                    .edit = .{ .id = fp.id, .spec = .{ .workflow = .fromInput(o.value) } },
+                },
                 .priority => .{ .edit = .{ .id = fp.id, .spec = .{
                     .priority = if (core.Priority.parse(o.value)) |p| .{ .set = p } else .clear,
                 } } },
@@ -991,7 +1177,9 @@ fn submit(s: *AppState) Action {
         },
         .prompt => |*p| {
             const t = std.mem.trim(u8, p.input.text(), " \t");
-            if (p.original) |o| if (std.mem.eql(u8, t, std.mem.trim(u8, o, " \t"))) return unchanged(s);
+            if (p.original) |o| {
+                if (std.mem.eql(u8, t, std.mem.trim(u8, o, " \t"))) return unchanged(s);
+            }
             switch (p.purpose) {
                 .title => |id| {
                     if (t.len == 0) {
@@ -1002,7 +1190,10 @@ fn submit(s: *AppState) Action {
                 },
                 .field => |fp| return fieldAction(s, a, fp.id, fp.field, t),
                 .stage_date => |sd| {
-                    const d: ?fields_fmt.Date = if (t.len == 0) null else dateOrFail(s, t) orelse return .none;
+                    const d: ?fields_fmt.Date = if (t.len == 0) null else dateOrFail(
+                        s,
+                        t,
+                    ) orelse return .none;
                     const i = s.snap.find(sd.id.slice()) orelse return .none;
                     const cur = @import("timeline_view.zig").datesOf(s, i);
                     const start = if (sd.start) d else cur.start;
@@ -1012,14 +1203,27 @@ fn submit(s: *AppState) Action {
                         return .none;
                     }
                     // Only the date typed: the other stays what it is when applied.
-                    return .{ .stage = .{ .dates = if (sd.start) .{ .id = sd.id, .start = d } else .{ .id = sd.id, .due = d } } };
+                    return .{
+                        .stage = .{
+                            .dates = if (sd.start) .{
+                                .id = sd.id,
+                                .start = d,
+                            } else .{ .id = sd.id, .due = d },
+                        },
+                    };
                 },
                 .stage_ms_due => |id| {
-                    const d: ?fields_fmt.Date = if (t.len == 0) null else dateOrFail(s, t) orelse return .none;
+                    const d: ?fields_fmt.Date = if (t.len == 0) null else dateOrFail(
+                        s,
+                        t,
+                    ) orelse return .none;
                     return .{ .stage = .{ .milestone_due = .{ .id = id, .due = d } } };
                 },
                 .stage_estimate => |id| {
-                    const minutes: ?u32 = if (t.len == 0) null else durationOrFail(s, t) orelse return .none;
+                    const minutes: ?u32 = if (t.len == 0) null else durationOrFail(
+                        s,
+                        t,
+                    ) orelse return .none;
                     return .{ .stage = .{ .estimate = .{ .id = id, .minutes = minutes } } };
                 },
                 .quick_add => |scope| {
@@ -1035,11 +1239,21 @@ fn submit(s: *AppState) Action {
                 .milestone => |mp| switch (mp.what) {
                     .name => {
                         if (!validName(s, t)) return .none;
-                        return .{ .edit_milestone = .{ .id = mp.id, .edit = .{ .name = t, .expect = mp.tip } } };
+                        return .{
+                            .edit_milestone = .{
+                                .id = mp.id,
+                                .edit = .{ .name = t, .expect = mp.tip },
+                            },
+                        };
                     },
                     .due => {
                         const value = dateValue(s, t) orelse return .none;
-                        return .{ .edit_milestone = .{ .id = mp.id, .edit = .{ .due = value, .expect = mp.tip } } };
+                        return .{
+                            .edit_milestone = .{
+                                .id = mp.id,
+                                .edit = .{ .due = value, .expect = mp.tip },
+                            },
+                        };
                     },
                 },
                 else => unreachable,
@@ -1066,7 +1280,10 @@ fn validName(s: *AppState, t: []const u8) bool {
 fn milestoneStale(s: *AppState) ?[]const u8 {
     const m = &(s.modal orelse return null);
     const mt: struct { Id, issuez.engine.Oid } = switch (m.*) {
-        .prompt => |*p| if (p.purpose == .milestone) .{ p.purpose.milestone.id, p.purpose.milestone.tip } else return null,
+        .prompt => |*p| if (p.purpose == .milestone) .{
+            p.purpose.milestone.id,
+            p.purpose.milestone.tip,
+        } else return null,
         .milestone_form => |*f| if (f.editing) |e| .{ e.id, e.tip } else return null,
         else => return null,
     };
@@ -1083,13 +1300,21 @@ fn fieldAction(s: *AppState, a: Allocator, id: Id, field: Field, t: []const u8) 
         }
     }.f;
     switch (field) {
-        .assignee => return edit(id, .{ .assignee = t }),
+        .assignee => {
+            if (t.len == 0) return edit(id, .{ .set_assignees = &.{} });
+            const one = fields_fmt.Assignee.parse(t) orelse {
+                s.fail("'{s}' isn't an email", .{t});
+                return .none;
+            };
+            const list = a.dupe(fields_fmt.Assignee, &.{one}) catch return .none;
+            return edit(id, .{ .set_assignees = list });
+        },
         .labels => return edit(id, .{ .set_labels = splitLabels(a, t) catch return .none }),
         .milestone => return .{ .milestone = .{ .id = id, .name = t } },
         .parent => {
-            if (t.len == 0) return edit(id, .{ .parent = "" });
+            if (t.len == 0) return edit(id, .{ .parent = .clear });
             const p = resolve(s, t) orelse return .none;
-            return edit(id, .{ .parent = p });
+            return edit(id, .{ .parent = .{ .set = p } });
         },
         .blocked_by => {
             var ids: std.ArrayList([]const u8) = .empty;
@@ -1102,7 +1327,10 @@ fn fieldAction(s: *AppState, a: Allocator, id: Id, field: Field, t: []const u8) 
         },
         .start, .due => {
             const value = dateValue(s, t) orelse return .none;
-            return edit(id, if (field == .start) .{ .start_date = value } else .{ .due_date = value });
+            return edit(
+                id,
+                if (field == .start) .{ .start_date = value } else .{ .due_date = value },
+            );
         },
         .estimate => {
             if (t.len == 0) return edit(id, .{ .estimate_minutes = .clear });
@@ -1113,12 +1341,11 @@ fn fieldAction(s: *AppState, a: Allocator, id: Id, field: Field, t: []const u8) 
     }
 }
 
-/// A typed date as written, in the modal arena: empty stays empty (a
-/// clear). Null, with a failure shown, when it isn't one.
-fn dateValue(s: *AppState, t: []const u8) ?[]const u8 {
-    if (t.len == 0) return "";
-    const d = dateOrFail(s, t) orelse return null;
-    return print(s, "{f}", .{d});
+/// A typed date as an edit: empty clears it. Null, with a failure shown,
+/// when it isn't one.
+fn dateValue(s: *AppState, t: []const u8) ?issuez.engine.EditSpec.DateEdit {
+    if (t.len == 0) return .clear;
+    return .{ .set = dateOrFail(s, t) orelse return null };
 }
 
 /// A typed date; null, with a failure shown, when it isn't one.
@@ -1184,17 +1411,43 @@ fn drawPrompt(s: *AppState, f: ui.Frame, win: ui.Window, p: *Prompt) Allocator.E
     const typed = std.mem.trim(u8, p.input.text(), " \t");
     if (p.date and typed.len > 0) {
         if (dates.parse(typed, s.today, s.snap.settings.work_days)) |d| {
-            _ = ui.text(inner, 1, 2, f.fmt("→ {f}, {s}", .{ d, d.weekday().short() }), .{ .fg = palette.ok, .bg = palette.panel_bg });
-        } else _ = ui.text(inner, 1, 2, "not a date yet", .{ .fg = palette.err, .bg = palette.panel_bg, .italic = true });
-    } else _ = ui.text(inner, 1, 2, p.hint, .{ .fg = palette.muted, .bg = palette.panel_bg, .italic = true });
+            _ = ui.text(
+                inner,
+                1,
+                2,
+                f.fmt("→ {f}, {s}", .{ d, d.weekday().short() }),
+                .{ .fg = palette.ok, .bg = palette.panel_bg },
+            );
+        } else _ = ui.text(
+            inner,
+            1,
+            2,
+            "not a date yet",
+            .{ .fg = palette.err, .bg = palette.panel_bg, .italic = true },
+        );
+    } else _ = ui.text(
+        inner,
+        1,
+        2,
+        p.hint,
+        .{ .fg = palette.muted, .bg = palette.panel_bg, .italic = true },
+    );
     try buttons(f, inner, inner.height -| 1, "Save  ⏎");
 }
 
 fn drawEditor(f: ui.Frame, win: ui.Window, e: *Editor) Allocator.Error!void {
     const box = ui.centered(win, 100, win.height -| 4);
     const inner = ui.panel(box, e.title, .{ .bg = palette.panel_bg });
-    const input = inner.child(.{ .x_off = 1, .y_off = 1, .width = inner.width -| 2, .height = inner.height -| 3 });
-    try e.input.draw(f.arena, input, .{ .bg = palette.input_bg }, true, "Write here. Enter starts a new line.");
+    const input = inner.child(
+        .{ .x_off = 1, .y_off = 1, .width = inner.width -| 2, .height = inner.height -| 3 },
+    );
+    try e.input.draw(
+        f.arena,
+        input,
+        .{ .bg = palette.input_bg },
+        true,
+        "Write here. Enter starts a new line.",
+    );
     try f.hit(input, .{ .modal = .{ .field = 0 } });
     try buttons(f, inner, inner.height -| 1, "Save  ctrl+s");
 }
@@ -1217,7 +1470,18 @@ fn drawMenu(f: ui.Frame, win: ui.Window, m: *Menu) Allocator.Error!void {
         const bg: vaxis.Color = if (sel) palette.accent_bg else palette.panel_bg;
         row.fill(.{ .style = .{ .bg = bg } });
         _ = ui.text(row, 1, 0, if (o.current) "●" else " ", .{ .fg = palette.accent, .bg = bg });
-        _ = ui.text(row, 3, 0, o.label, .{ .bg = bg, .bold = sel and !o.disabled, .italic = o.other, .fg = if (o.disabled) palette.faint else .default });
+        _ = ui.text(
+            row,
+            3,
+            0,
+            o.label,
+            .{
+                .bg = bg,
+                .bold = sel and !o.disabled,
+                .italic = o.other,
+                .fg = if (o.disabled) palette.faint else .default,
+            },
+        );
         try f.hit(row, .{ .modal = .{ .choice = n } });
     }
 }
@@ -1229,7 +1493,10 @@ fn syncPanelKey(s: *AppState, p: *SyncPanel, k: vaxis.Key) Action {
     }
     if (k.matches(K.down, .{}) or k.matches('j', .{}) or k.matches(K.tab, .{})) {
         p.step(1);
-    } else if (k.matches(K.up, .{}) or k.matches('k', .{}) or k.matches(K.tab, .{ .shift = true })) {
+    } else if (k.matches(
+        K.up,
+        .{},
+    ) or k.matches('k', .{}) or k.matches(K.tab, .{ .shift = true })) {
         p.step(-1);
     } else if (k.matches(K.enter, .{})) {
         return syncPanelOpen(s, p);
@@ -1257,8 +1524,19 @@ fn syncPanelKey(s: *AppState, p: *SyncPanel, k: vaxis.Key) Action {
             "Yours stays. A rewritten remote becomes the new baseline, so the",
             "next sync pushes yours; other refusals stop being reported.",
         };
-        openConfirm(s, s.fmtInput("{s} {s}?", .{ if (accept) "Accept the remote version of" else "Keep the local version of", q.label }), lines, &.{
-            .{ .label = if (accept) "Accept remote" else "Keep local", .action = .{ .resolve = .{ .id = q.id, .how = if (accept) .accept_remote else .keep_local } } },
+        openConfirm(s, s.fmtInput(
+            "{s} {s}?",
+            .{
+                if (accept) "Accept the remote version of" else "Keep the local version of",
+                q.label,
+            },
+        ), lines, &.{
+            .{
+                .label = if (accept) "Accept remote" else "Keep local",
+                .action = .{
+                    .resolve = .{ .id = q.id, .how = if (accept) .accept_remote else .keep_local },
+                },
+            },
             .{ .label = "Cancel", .action = .open_sync_panel },
         });
     }
@@ -1311,21 +1589,52 @@ fn drawSyncPanel(s: *AppState, f: ui.Frame, win: ui.Window, p: *SyncPanel) Alloc
     var x: u16 = 1;
     x += ui.text(inner, x, 0, "Remote ", mt);
     if (s.snap.remote.remotes.len > 1) {
-        x += try ui.button(f, inner, x, 0, "◂", .{ .modal = .{ .option = .{ .field = 0, .option = 0 } } }, ui.buttonStyle(false));
+        x += try ui.button(
+            f,
+            inner,
+            x,
+            0,
+            "◂",
+            .{ .modal = .{ .option = .{ .field = 0, .option = 0 } } },
+            ui.buttonStyle(false),
+        );
     }
     x += ui.text(inner, x + 1, 0, p.remote, .{ .fg = palette.accent, .bg = bg, .bold = true }) + 2;
     if (s.snap.remote.remotes.len > 1) {
-        x += try ui.button(f, inner, x, 0, "▸", .{ .modal = .{ .option = .{ .field = 0, .option = 1 } } }, ui.buttonStyle(false));
+        x += try ui.button(
+            f,
+            inner,
+            x,
+            0,
+            "▸",
+            .{ .modal = .{ .option = .{ .field = 0, .option = 1 } } },
+            ui.buttonStyle(false),
+        );
     }
     _ = ui.text(inner, x + 2, 0, p.url, mt);
     const last = if (s.sync.running) |kind|
-        f.fmt("{s} running: {s}…", .{ kind.label(), if (s.sync.phase) |ph| @tagName(ph) else "starting" })
+        f.fmt(
+            "{s} running: {s}…",
+            .{ kind.label(), if (s.sync.phase) |ph| @tagName(ph) else "starting" },
+        )
     else if (s.sync.last) |*l| blk: {
         var buf: [512]u8 = undefined;
-        break :blk f.fmt("{s}, {s}", .{ @import("sync_job.zig").report(&buf, l), ui.ago(f, s.sync.last_at) });
+        break :blk f.fmt(
+            "{s}, {s}",
+            .{ @import("sync_job.zig").report(&buf, l), ui.ago(f, s.sync.last_at) },
+        );
     } else "not synced in this session";
     _ = ui.text(inner, 1, 1, "Last   ", mt);
-    _ = ui.text(inner, 8, 1, last, .{ .fg = if (s.sync.last != null and !s.sync.last.?.ok) palette.err else .default, .bg = bg });
+    _ = ui.text(
+        inner,
+        8,
+        1,
+        last,
+        .{
+            .fg = if (s.sync.last != null and !s.sync.last.?.ok) palette.err else .default,
+            .bg = bg,
+        },
+    );
     if (p.problem.len > 0) _ = ui.text(inner, 8, 2, p.problem, .{ .fg = palette.err, .bg = bg });
 
     const rows_h: u16 = inner.height -| 5;
@@ -1339,16 +1648,40 @@ fn drawSyncPanel(s: *AppState, f: ui.Frame, win: ui.Window, p: *SyncPanel) Alloc
         const rbg: vaxis.Color = if (sel) palette.accent_bg else bg;
         if (sel) row.fill(.{ .style = .{ .bg = rbg } });
         switch (p.rows[n]) {
-            .heading => |h| _ = ui.text(row, 1, 0, h, .{ .fg = palette.accent, .bg = bg, .bold = true }),
-            .empty => |e| _ = ui.text(row, 3, 0, e, .{ .fg = palette.faint, .bg = bg, .italic = true }),
+            .heading => |h| _ = ui.text(
+                row,
+                1,
+                0,
+                h,
+                .{ .fg = palette.accent, .bg = bg, .bold = true },
+            ),
+            .empty => |e| _ = ui.text(
+                row,
+                3,
+                0,
+                e,
+                .{ .fg = palette.faint, .bg = bg, .italic = true },
+            ),
             .unpushed => |u| {
                 _ = ui.text(row, 3, 0, u.label, .{ .bg = rbg, .bold = sel });
                 const tag = if (u.new) "new" else "edited";
                 _ = ui.text(row, row.width -| 8, 0, tag, .{ .fg = palette.muted, .bg = rbg });
             },
             .quarantined => |q| {
-                const lw = ui.text(row, 3, 0, q.label, .{ .bg = rbg, .bold = sel, .fg = if (q.kept) palette.muted else .default });
-                _ = ui.text(row, 3 + lw + 2, 0, if (q.kept) f.fmt("{s} · kept local", .{q.reason}) else q.reason, .{ .fg = if (q.kept) palette.faint else palette.err, .bg = rbg });
+                const lw = ui.text(
+                    row,
+                    3,
+                    0,
+                    q.label,
+                    .{ .bg = rbg, .bold = sel, .fg = if (q.kept) palette.muted else .default },
+                );
+                _ = ui.text(
+                    row,
+                    3 + lw + 2,
+                    0,
+                    if (q.kept) f.fmt("{s} · kept local", .{q.reason}) else q.reason,
+                    .{ .fg = if (q.kept) palette.faint else palette.err, .bg = rbg },
+                );
             },
             .conflict => |c| {
                 const lw = ui.text(row, 3, 0, c.label, .{ .bg = rbg, .bold = sel });
@@ -1360,13 +1693,32 @@ fn drawSyncPanel(s: *AppState, f: ui.Frame, win: ui.Window, p: *SyncPanel) Alloc
     // Actions.
     const bar = inner.height -| 1;
     var bx: u16 = 1;
-    const acts = [_]struct { []const u8, @import("sync_job.zig").Kind }{ .{ "Sync  y", .sync }, .{ "Fetch & merge  f", .merge }, .{ "Push  p", .push } };
+    const acts = [_]struct {
+        []const u8,
+        @import("sync_job.zig").Kind,
+    }{ .{ "Sync  y", .sync }, .{ "Fetch & merge  f", .merge }, .{ "Push  p", .push } };
     for (acts, 0..) |a, i| {
-        bx += try ui.button(f, inner, bx, bar, a[0], .{ .modal = .{ .option = .{ .field = 1, .option = @intCast(i) } } }, ui.buttonStyle(i == 0));
+        bx += try ui.button(
+            f,
+            inner,
+            bx,
+            bar,
+            a[0],
+            .{ .modal = .{ .option = .{ .field = 1, .option = @intCast(i) } } },
+            ui.buttonStyle(i == 0),
+        );
         bx += 1;
     }
     const close = "Close  esc";
-    _ = try ui.button(f, inner, inner.width -| (inner.gwidth(close) + 3), bar, close, .{ .modal = .cancel }, ui.buttonStyle(false));
+    _ = try ui.button(
+        f,
+        inner,
+        inner.width -| (inner.gwidth(close) + 3),
+        bar,
+        close,
+        .{ .modal = .cancel },
+        ui.buttonStyle(false),
+    );
 }
 
 fn pickerSubmit(s: *AppState, p: *Picker) Action {
@@ -1410,13 +1762,26 @@ fn pickerSubmit(s: *AppState, p: *Picker) Action {
 
 fn drawPicker(f: ui.Frame, win: ui.Window, p: *Picker) Allocator.Error!void {
     const shown = try p.shown(f.arena);
-    if (shown.len > 0) p.selected = @min(p.selected, @as(u32, @intCast(shown.len - 1))) else p.selected = 0;
-    const box = ui.centered(win, @min(win.width -| 4, 100), @min(win.height -| 2, @as(u16, @intCast(@min(p.items.len, 18))) + 6));
+    if (shown.len > 0) p.selected = @min(
+        p.selected,
+        @as(u32, @intCast(shown.len - 1)),
+    ) else p.selected = 0;
+    const box = ui.centered(
+        win,
+        @min(win.width -| 4, 100),
+        @min(win.height -| 2, @as(u16, @intCast(@min(p.items.len, 18))) + 6),
+    );
     const inner = ui.panel(box, p.title, .{ .bg = palette.panel_bg });
     const bg = palette.panel_bg;
     _ = ui.text(inner, 1, 0, "/", .{ .fg = palette.accent, .bg = bg });
     const input = inner.child(.{ .x_off = 3, .y_off = 0, .width = inner.width -| 4, .height = 1 });
-    try p.filter.draw(f.arena, input, .{ .bg = palette.input_bg }, true, "type to filter: words in the title, an ID, a milestone");
+    try p.filter.draw(
+        f.arena,
+        input,
+        .{ .bg = palette.input_bg },
+        true,
+        "type to filter: words in the title, an ID, a milestone",
+    );
     try f.hit(input, .{ .modal = .{ .field = 0 } });
     const rows: u16 = inner.height -| 3;
     if (p.selected < p.scroll) p.scroll = p.selected;
@@ -1427,11 +1792,25 @@ fn drawPicker(f: ui.Frame, win: ui.Window, p: *Picker) Allocator.Error!void {
         const it = p.items[shown[n]];
         const row = inner.child(.{ .y_off = y + 1, .height = 1 });
         const sel = n == p.selected;
-        const rbg: vaxis.Color = if (sel) palette.accent_bg else if (it.marked) palette.mark_bg else bg;
+        const rbg: vaxis.Color =
+            if (sel) palette.accent_bg else if (it.marked) palette.mark_bg else bg;
         row.fill(.{ .style = .{ .bg = rbg } });
-        _ = ui.text(row, 1, 0, if (it.marked) "✓" else if (it.current) "●" else " ", .{ .fg = if (it.marked) palette.ok else palette.accent, .bg = rbg });
-        const fg: vaxis.Color = if (it.disabled) palette.faint else if (it.done) palette.muted else .default;
-        const lw = ui.text(row, 3, 0, it.label, .{ .fg = fg, .bg = rbg, .bold = sel and !it.disabled, .strikethrough = it.done });
+        _ = ui.text(
+            row,
+            1,
+            0,
+            if (it.marked) "✓" else if (it.current) "●" else " ",
+            .{ .fg = if (it.marked) palette.ok else palette.accent, .bg = rbg },
+        );
+        const fg: vaxis.Color =
+            if (it.disabled) palette.faint else if (it.done) palette.muted else .default;
+        const lw = ui.text(
+            row,
+            3,
+            0,
+            it.label,
+            .{ .fg = fg, .bg = rbg, .bold = sel and !it.disabled, .strikethrough = it.done },
+        );
         if (it.detail.len > 0) {
             const dw = row.gwidth(it.detail);
             const dx = @max(3 + lw + 2, row.width -| (dw + 1));
@@ -1439,7 +1818,13 @@ fn drawPicker(f: ui.Frame, win: ui.Window, p: *Picker) Allocator.Error!void {
         }
         try f.hit(row, .{ .modal = .{ .choice = @intCast(n) } });
     }
-    if (shown.len == 0) _ = ui.text(inner, 3, 1, "nothing matches", .{ .fg = palette.muted, .bg = bg, .italic = true });
+    if (shown.len == 0) _ = ui.text(
+        inner,
+        3,
+        1,
+        "nothing matches",
+        .{ .fg = palette.muted, .bg = bg, .italic = true },
+    );
     const marked = p.marked();
     const count = if (marked > 0)
         f.fmt("{d} of {d} · {d} marked", .{ shown.len, p.items.len, marked })
@@ -1448,7 +1833,10 @@ fn drawPicker(f: ui.Frame, win: ui.Window, p: *Picker) Allocator.Error!void {
     else
         f.fmt("{d} of {d}", .{ shown.len, p.items.len });
     _ = ui.text(inner, 1, inner.height -| 1, count, .{ .fg = palette.muted, .bg = bg });
-    const ok = if (marked > 0) f.fmt("{s} {d}  ⏎", .{ p.verb, marked }) else f.fmt("{s}  ⏎", .{p.verb});
+    const ok = if (marked > 0) f.fmt(
+        "{s} {d}  ⏎",
+        .{ p.verb, marked },
+    ) else f.fmt("{s}  ⏎", .{p.verb});
     try buttons(f, inner, inner.height -| 1, ok);
 }
 
@@ -1460,10 +1848,24 @@ fn drawConfirm(f: ui.Frame, win: ui.Window, c: *Confirm) Allocator.Error!void {
     w = @max(w, @min(bw + 4, 76));
     const box = ui.centered(win, w, @intCast(@min(c.lines.len + 5, win.height)));
     const inner = ui.panel(box, c.title, .{ .bg = palette.panel_bg });
-    for (c.lines, 0..) |l, y| _ = ui.text(inner, 1, @intCast(y + 1), l, .{ .bg = palette.panel_bg });
+    for (c.lines, 0..) |l, y| _ = ui.text(
+        inner,
+        1,
+        @intCast(y + 1),
+        l,
+        .{ .bg = palette.panel_bg },
+    );
     var x: u16 = inner.width -| bw;
     for (c.choices, 0..) |ch, n| {
-        x += try ui.button(f, inner, x, inner.height -| 1, ch.label, .{ .modal = .{ .choice = @intCast(n) } }, ui.buttonStyle(n == c.selected));
+        x += try ui.button(
+            f,
+            inner,
+            x,
+            inner.height -| 1,
+            ch.label,
+            .{ .modal = .{ .choice = @intCast(n) } },
+            ui.buttonStyle(n == c.selected),
+        );
         x += 1;
     }
 }
@@ -1471,7 +1873,12 @@ fn drawConfirm(f: ui.Frame, win: ui.Window, c: *Confirm) Allocator.Error!void {
 /// The question, with its texts copied into the modal arena. Keeps the
 /// arena, where the answers' actions may have their strings: an open
 /// dialog it replaces doesn't take them along.
-pub fn openConfirm(s: *AppState, title: []const u8, lines: []const []const u8, choices: []const Confirm.Choice) void {
+pub fn openConfirm(
+    s: *AppState,
+    title: []const u8,
+    lines: []const []const u8,
+    choices: []const Confirm.Choice,
+) void {
     const a = s.modalArena();
     const ls = a.alloc([]const u8, lines.len) catch return s.fail("out of memory", .{});
     for (ls, lines) |*o, l| o.* = dupe(s, l);
@@ -1484,18 +1891,42 @@ pub fn openConfirm(s: *AppState, title: []const u8, lines: []const []const u8, c
 
 /// The milestones view's sort keys; choosing the current one flips.
 pub fn openMilestoneSort(s: *AppState) void {
-    openSortMenu(s, milestone_filter.SortKey, s.ms_query.key, "Sort milestones by", .milestone_sort);
+    openSortMenu(
+        s,
+        milestone_filter.SortKey,
+        s.ms_query.key,
+        "Sort milestones by",
+        .milestone_sort,
+    );
 }
 
 /// Renaming a milestone, or setting its due date: by catalog position.
-pub fn editMilestonePart(s: *AppState, n: u32, what: @FieldType(Purpose.MilestonePart, "what")) void {
+pub fn editMilestonePart(
+    s: *AppState,
+    n: u32,
+    what: @FieldType(Purpose.MilestonePart, "what"),
+) void {
     const m = s.snap.milestones[n];
     const purpose: Purpose = .{ .milestone = .{ .id = .of(m.id), .tip = m.tip, .what = what } };
     switch (what) {
-        .name => openPrompt(s, s.fmtInput("Rename milestone {s}", .{m.name}), "one line, at most 256 bytes", m.name, purpose, false),
+        .name => openPrompt(
+            s,
+            s.fmtInput("Rename milestone {s}", .{m.name}),
+            "one line, at most 256 bytes",
+            m.name,
+            purpose,
+            false,
+        ),
         .due => {
             const value = if (m.due) |d| print(s, "{f}", .{d}) else "";
-            openPrompt(s, s.fmtInput("Due date of {s}", .{m.name}), dates.hint, value, purpose, false);
+            openPrompt(
+                s,
+                s.fmtInput("Due date of {s}", .{m.name}),
+                dates.hint,
+                value,
+                purpose,
+                false,
+            );
             s.modal.?.prompt.date = true;
         },
     }
@@ -1557,7 +1988,8 @@ pub const MilestoneForm = struct {
     }
 
     fn changed(f: *const MilestoneForm) bool {
-        const e = f.editing orelse return f.name.text().len > 0 or f.due.text().len > 0 or f.description.text().len > 0;
+        const e = f.editing orelse return f.name.text().len > 0 or f.due.text().len > 0 or
+            f.description.text().len > 0;
         return !std.mem.eql(u8, f.name.text(), e.name) or !std.mem.eql(u8, f.due.text(), e.due) or
             !std.mem.eql(u8, f.description.text(), e.description);
     }
@@ -1601,21 +2033,35 @@ pub const MilestoneForm = struct {
         const description = std.mem.trimEnd(u8, f.description.text(), " \n");
         const e = f.editing orelse return .{ .create_milestone = .{
             .name = name,
-            .due = if (due.len == 0) null else due,
+            .due = if (due == .set) due.set else null,
             .description = description,
         } };
         var edit: store.MilestoneEdit = .{ .expect = e.tip };
         if (!std.mem.eql(u8, name, e.name)) edit.name = name;
-        if (!std.mem.eql(u8, due, e.due)) edit.due = due;
-        if (!std.mem.eql(u8, description, std.mem.trimEnd(u8, e.description, " \n"))) edit.description = description;
-        if (edit.name == null and edit.due == null and edit.description == null) return unchanged(s);
+        const was = fields_fmt.Date.parse(e.due);
+        const same_due = switch (due) {
+            .clear => was == null,
+            .set => |d| was != null and was.?.eql(d),
+        };
+        if (!same_due) edit.due = due;
+        if (!std.mem.eql(
+            u8,
+            description,
+            std.mem.trimEnd(u8, e.description, " \n"),
+        )) edit.description = description;
+        if (edit.name == null and edit.due == null and edit.description == null) return unchanged(
+            s,
+        );
         return .{ .edit_milestone = .{ .id = e.id, .edit = edit } };
     }
 
     fn draw(f: *MilestoneForm, s: *AppState, fr: ui.Frame, win: ui.Window) Allocator.Error!void {
         const h: u16 = description_rows + 9;
         const box = ui.centered(win, 80, h);
-        const title = if (f.editing) |e| fr.fmt("Edit milestone {s}", .{e.name}) else "New milestone";
+        const title = if (f.editing) |e| fr.fmt(
+            "Edit milestone {s}",
+            .{e.name},
+        ) else "New milestone";
         const inner = ui.panel(box, title, .{ .bg = palette.panel_bg });
         const label_w: u16 = 13;
         const bg = palette.panel_bg;
@@ -1624,29 +2070,80 @@ pub const MilestoneForm = struct {
             const n: u8 = @intCast(idx);
             const focused = f.focus == n;
             const rows: u16 = if (n == 2) description_rows else 1;
-            _ = ui.text(inner, 1, y, name, .{ .fg = if (focused) palette.accent else palette.muted, .bg = bg, .bold = focused });
-            try fr.hit(inner.child(.{ .x_off = 1, .y_off = y, .width = label_w - 1, .height = 1 }), .{ .modal = .{ .field = n } });
-            const field_win = inner.child(.{ .x_off = label_w, .y_off = y, .width = inner.width -| label_w -| 1, .height = rows });
+            _ = ui.text(
+                inner,
+                1,
+                y,
+                name,
+                .{
+                    .fg = if (focused) palette.accent else palette.muted,
+                    .bg = bg,
+                    .bold = focused,
+                },
+            );
+            try fr.hit(
+                inner.child(.{ .x_off = 1, .y_off = y, .width = label_w - 1, .height = 1 }),
+                .{ .modal = .{ .field = n } },
+            );
+            const field_win = inner.child(
+                .{
+                    .x_off = label_w,
+                    .y_off = y,
+                    .width = inner.width -| label_w -| 1,
+                    .height = rows,
+                },
+            );
             const placeholder: []const u8 = switch (n) {
                 0 => "e.g. v1.0",
                 1 => "optional: 2026-12-01, +2w, fri, eom",
                 else => "What it is for (optional)",
             };
             const ta = f.textArea(n);
-            try ta.draw(fr.arena, field_win, .{ .bg = if (focused) palette.input_bg else palette.select_bg }, focused, placeholder);
+            try ta.draw(
+                fr.arena,
+                field_win,
+                .{ .bg = if (focused) palette.input_bg else palette.select_bg },
+                focused,
+                placeholder,
+            );
             try fr.hit(field_win, .{ .modal = .{ .field = n } });
             if (n == 1) {
                 // The date it will be, as typed.
                 const typed = std.mem.trim(u8, ta.text(), " \t");
                 if (typed.len > 0) {
-                    const note = if (dates.parse(typed, s.today, s.snap.settings.work_days)) |d| fr.fmt("→ {f}, {s}", .{ d, d.weekday().short() }) else "not a date yet";
-                    _ = ui.text(inner, label_w, y + 1, note, .{ .fg = if (std.mem.eql(u8, note, "not a date yet")) palette.err else palette.ok, .bg = bg });
+                    const note = if (dates.parse(
+                        typed,
+                        s.today,
+                        s.snap.settings.work_days,
+                    )) |d| fr.fmt(
+                        "→ {f}, {s}",
+                        .{ d, d.weekday().short() },
+                    ) else "not a date yet";
+                    _ = ui.text(
+                        inner,
+                        label_w,
+                        y + 1,
+                        note,
+                        .{
+                            .fg = if (std.mem.eql(
+                                u8,
+                                note,
+                                "not a date yet",
+                            )) palette.err else palette.ok,
+                            .bg = bg,
+                        },
+                    );
                 }
                 y += 1;
             }
             y += rows + 1;
         }
-        try buttons(fr, inner, inner.height -| 1, if (f.editing != null) "Save  ctrl+s" else "Create  ⏎");
+        try buttons(
+            fr,
+            inner,
+            inner.height -| 1,
+            if (f.editing != null) "Save  ctrl+s" else "Create  ⏎",
+        );
     }
 };
 
@@ -1656,6 +2153,7 @@ const help_lines = [_][]const u8{
     "  n               new issue",
     "  /               filter                s / S    sort by… / reverse",
     "  f               open, done, all       ctrl+r   reload",
+    "  M               milestones            p        sync with the remote",
     "  ?               this help             q        quit (back in an issue)",
     "  in menus a letter jumps to an option; j k q still move and close",
     "",
@@ -1740,7 +2238,17 @@ fn drawHelp(f: ui.Frame, win: ui.Window, h: *Help) Allocator.Error!void {
     while (y < inner.height and h.scroll + y < help_lines.len) : (y += 1) {
         const line = help_lines[h.scroll + y];
         const heading = line.len > 0 and line[0] != ' ';
-        _ = ui.text(inner, 1, y, line, .{ .bg = palette.panel_bg, .fg = if (heading) palette.accent else .default, .bold = heading });
+        _ = ui.text(
+            inner,
+            1,
+            y,
+            line,
+            .{
+                .bg = palette.panel_bg,
+                .fg = if (heading) palette.accent else .default,
+                .bold = heading,
+            },
+        );
     }
 }
 
@@ -1763,7 +2271,16 @@ pub const Form = struct {
     milestone_ids: []const []const u8 = &.{},
     milestone_names: []const []const u8 = &.{},
 
-    const fields = [_][]const u8{ "Title", "Description", "Priority", "Workflow", "Labels", "Assignee", "Parent", "Milestone" };
+    const fields = [_][]const u8{
+        "Title",
+        "Description",
+        "Priority",
+        "Workflow",
+        "Labels",
+        "Assignee",
+        "Parent",
+        "Milestone",
+    };
     const milestone_field = 7;
     const priorities = [_][]const u8{ "none", "low", "medium", "high", "critical" };
     const description_rows = 6;
@@ -1791,7 +2308,11 @@ pub const Form = struct {
         if (parent) |p| {
             const issue = s.snap.issues[p];
             try f.parent.set(s.gpa, shortId(issue.id));
-            f.for_parent = try std.fmt.allocPrint(a, "#{s} {s}", .{ shortId(issue.id), issue.title });
+            f.for_parent = try std.fmt.allocPrint(
+                a,
+                "#{s} {s}",
+                .{ shortId(issue.id), issue.title },
+            );
         }
         // On the board, in the selected column.
         if (s.view == .board) if (s.board.columns.len > s.board.column) {
@@ -1914,10 +2435,13 @@ pub const Form = struct {
             return .none;
         }
         const parent_text = std.mem.trim(u8, f.parent.text(), " \t");
-        const parent: ?[]const u8 = if (parent_text.len == 0) null else resolve(s, parent_text) orelse {
-            f.focus = 6;
-            return .none;
-        };
+        const parent: ?[]const u8 = if (parent_text.len == 0)
+            null
+        else
+            resolve(s, parent_text) orelse {
+                f.focus = 6;
+                return .none;
+            };
         const assignee = std.mem.trim(u8, f.assignee.text(), " \t");
         return .{ .create = .{
             .title = title,
@@ -1936,7 +2460,11 @@ pub const Form = struct {
         // On a short terminal the gaps go, then description rows.
         const roomy: u16 = 2 * fields.len + description_rows + 4;
         const gap: u16 = if (win.height >= roomy) 1 else 0;
-        const desc_rows: u16 = if (gap == 1) description_rows else std.math.clamp(win.height -| @as(u16, fields.len + 4), 1, description_rows);
+        const desc_rows: u16 = if (gap == 1) description_rows else std.math.clamp(
+            win.height -| @as(u16, fields.len + 4),
+            1,
+            description_rows,
+        );
         const h: u16 = if (gap == 1) roomy else @as(u16, fields.len - 1) + desc_rows + 4;
         const box = ui.centered(win, 90, h);
         const title = if (f.for_parent) |p| fr.fmt("New sub-issue of {s}", .{p}) else "New issue";
@@ -1948,10 +2476,29 @@ pub const Form = struct {
             const n: u8 = @intCast(idx);
             const focused = f.focus == n;
             const rows: u16 = if (n == 1) desc_rows else 1;
-            _ = ui.text(inner, 1, y, name, .{ .fg = if (focused) palette.accent else palette.muted, .bg = bg, .bold = focused });
-            const label_win = inner.child(.{ .x_off = 1, .y_off = y, .width = label_w - 1, .height = 1 });
+            _ = ui.text(
+                inner,
+                1,
+                y,
+                name,
+                .{
+                    .fg = if (focused) palette.accent else palette.muted,
+                    .bg = bg,
+                    .bold = focused,
+                },
+            );
+            const label_win = inner.child(
+                .{ .x_off = 1, .y_off = y, .width = label_w - 1, .height = 1 },
+            );
             try fr.hit(label_win, .{ .modal = .{ .field = n } });
-            const field_win = inner.child(.{ .x_off = label_w, .y_off = y, .width = inner.width -| label_w -| 1, .height = rows });
+            const field_win = inner.child(
+                .{
+                    .x_off = label_w,
+                    .y_off = y,
+                    .width = inner.width -| label_w -| 1,
+                    .height = rows,
+                },
+            );
             if (f.textArea(n)) |ta| {
                 const placeholder: []const u8 = switch (n) {
                     0 => "What needs doing?",
@@ -1961,7 +2508,13 @@ pub const Form = struct {
                     6 => "an issue ID prefix, for a sub-issue",
                     else => "",
                 };
-                try ta.draw(fr.arena, field_win, .{ .bg = if (focused) palette.input_bg else palette.select_bg }, focused, placeholder);
+                try ta.draw(
+                    fr.arena,
+                    field_win,
+                    .{ .bg = if (focused) palette.input_bg else palette.select_bg },
+                    focused,
+                    placeholder,
+                );
                 try fr.hit(field_win, .{ .modal = .{ .field = n } });
             } else if (n == milestone_field) {
                 // One at a time: there may be many.
@@ -1969,28 +2522,82 @@ pub const Form = struct {
                     (if (f.parent.text().len > 0) "the parent's" else "none")
                 else
                     f.milestone_names[f.milestone - 1];
-                const st: ui.Style = .{ .fg = .{ .index = 231 }, .bg = if (focused) palette.accent_bg else palette.button_bg, .bold = true };
+                const st: ui.Style = .{
+                    .fg = .{ .index = 231 },
+                    .bg = if (focused) palette.accent_bg else palette.button_bg,
+                    .bold = true,
+                };
                 var x: u16 = 0;
                 const count = f.optionCount(n);
-                x += try ui.button(fr, field_win, x, 0, "◂", .{ .modal = .{ .option = .{ .field = n, .option = if (f.milestone == 0) count - 1 else f.milestone - 1 } } }, ui.buttonStyle(false));
+                x += try ui.button(
+                    fr,
+                    field_win,
+                    x,
+                    0,
+                    "◂",
+                    .{
+                        .modal = .{
+                            .option = .{
+                                .field = n,
+                                .option = if (f.milestone == 0) count - 1 else f.milestone - 1,
+                            },
+                        },
+                    },
+                    ui.buttonStyle(false),
+                );
                 x += 1;
                 x += try ui.button(fr, field_win, x, 0, lab, .{ .modal = .{ .field = n } }, st);
                 x += 1;
-                x += try ui.button(fr, field_win, x, 0, "▸", .{ .modal = .{ .option = .{ .field = n, .option = (f.milestone + 1) % count } } }, ui.buttonStyle(false));
-                if (count == 1) _ = ui.text(field_win, x + 2, 0, "no open milestones", .{ .fg = palette.faint, .bg = bg });
+                x += try ui.button(
+                    fr,
+                    field_win,
+                    x,
+                    0,
+                    "▸",
+                    .{
+                        .modal = .{
+                            .option = .{ .field = n, .option = (f.milestone + 1) % count },
+                        },
+                    },
+                    ui.buttonStyle(false),
+                );
+                if (count == 1) _ = ui.text(
+                    field_win,
+                    x + 2,
+                    0,
+                    "no open milestones",
+                    .{ .fg = palette.faint, .bg = bg },
+                );
             } else {
                 var x: u16 = 0;
                 const count = f.optionCount(n);
                 const cur = f.optionOf(n);
                 var o: u8 = 0;
                 while (o < count) : (o += 1) {
-                    const lab = if (n == 2) priorities[o] else if (o == 0) "default" else f.workflow_states[o - 1];
+                    const lab = if (n == 2)
+                        priorities[o]
+                    else if (o == 0)
+                        "default"
+                    else
+                        f.workflow_states[o - 1];
                     const st: ui.Style = if (o == cur)
-                        .{ .fg = .{ .index = 231 }, .bg = if (focused) palette.accent_bg else palette.button_bg, .bold = true }
+                        .{
+                            .fg = .{ .index = 231 },
+                            .bg = if (focused) palette.accent_bg else palette.button_bg,
+                            .bold = true,
+                        }
                     else
                         .{ .fg = palette.muted, .bg = palette.select_bg };
                     if (x >= field_win.width) break;
-                    x += try ui.button(fr, field_win, x, 0, lab, .{ .modal = .{ .option = .{ .field = n, .option = o } } }, st);
+                    x += try ui.button(
+                        fr,
+                        field_win,
+                        x,
+                        0,
+                        lab,
+                        .{ .modal = .{ .option = .{ .field = n, .option = o } } },
+                        st,
+                    );
                     x += 1;
                 }
             }

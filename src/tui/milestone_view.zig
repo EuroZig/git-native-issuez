@@ -4,6 +4,7 @@
 //! create issues in it.
 
 const std = @import("std");
+const stableSort = @import("issuez").sort.stable;
 const Allocator = std.mem.Allocator;
 const vaxis = @import("vaxis");
 const issuez = @import("issuez");
@@ -81,7 +82,12 @@ pub const State = struct {
     }
 
     /// Drops the marks of `ids`, once they moved.
-    pub fn unmark(v: *State, arena: Allocator, snap: *const Snapshot, ids: []const Id) Allocator.Error!void {
+    pub fn unmark(
+        v: *State,
+        arena: Allocator,
+        snap: *const Snapshot,
+        ids: []const Id,
+    ) Allocator.Error!void {
         const set = try arena.alloc(bool, snap.issues.len);
         @memset(set, false);
         for (ids) |*id| if (snap.find(id.slice())) |i| {
@@ -170,7 +176,13 @@ pub fn draw(s: *AppState, f: ui.Frame, win: ui.Window) Allocator.Error!void {
         const left_w = body.width / 2;
         const left = body.child(.{ .width = left_w -| 1 });
         const right = body.child(.{ .x_off = left_w, .width = body.width -| left_w });
-        for (0..body.height) |y| _ = ui.text(body, left_w -| 1, @intCast(y), "│", .{ .fg = palette.faint });
+        for (0..body.height) |y| _ = ui.text(
+            body,
+            left_w -| 1,
+            @intCast(y),
+            "│",
+            .{ .fg = palette.faint },
+        );
         try drawPane(s, f, left, 0, over != null and over.? == 0 and from != null and from.? != 0);
         try drawPane(s, f, right, 1, over != null and over.? == 1 and from != null and from.? != 1);
     }
@@ -179,8 +191,17 @@ pub fn draw(s: *AppState, f: ui.Frame, win: ui.Window) Allocator.Error!void {
     if (v.marks.items.len > 0) {
         const shown = (try shownMarks(s, f.arena)).len;
         const hidden = v.marks.items.len - shown;
-        const what = if (hidden > 0) f.fmt("{d} marked, {d} hidden", .{ shown, hidden }) else f.fmt("{d} marked", .{shown});
-        _ = ui.text(bar, used + 2, 0, what, .{ .fg = palette.ok, .bg = palette.panel_bg, .bold = true });
+        const what = if (hidden > 0) f.fmt(
+            "{d} marked, {d} hidden",
+            .{ shown, hidden },
+        ) else f.fmt("{d} marked", .{shown});
+        _ = ui.text(
+            bar,
+            used + 2,
+            0,
+            what,
+            .{ .fg = palette.ok, .bg = palette.panel_bg, .bold = true },
+        );
     }
 }
 
@@ -200,14 +221,32 @@ fn drawHeader(s: *AppState, f: ui.Frame, win: ui.Window, data: mf.Data) Allocato
         const h = data.health[idx];
         x += ui.text(top, x, 0, m.name, .{ .fg = palette.accent, .bold = true });
         x += 2;
-        x += ui.text(top, x, 0, @tagName(m.status), .{ .fg = if (m.status == .open) palette.open else palette.done });
+        x += ui.text(
+            top,
+            x,
+            0,
+            @tagName(m.status),
+            .{ .fg = if (m.status == .open) palette.open else palette.done },
+        );
         if (m.due) |d| {
             var buf: [24]u8 = undefined;
             const rel = dates.relative(&buf, d, data.today);
-            x += ui.text(top, x, 0, f.fmt(" · due {f} ({s})", .{ d, rel }), .{ .fg = palette.muted });
+            x += ui.text(
+                top,
+                x,
+                0,
+                f.fmt(" · due {f} ({s})", .{ d, rel }),
+                .{ .fg = palette.muted },
+            );
         } else x += ui.text(top, x, 0, " · no due date", .{ .fg = palette.faint });
         x += ui.text(top, x, 0, " · ", .{ .fg = palette.faint });
-        x += ui.text(top, x, 0, f.fmt("{s} {s}", .{ ui.healthGlyph(h), h.label() }), .{ .fg = ui.healthColor(h) });
+        x += ui.text(
+            top,
+            x,
+            0,
+            f.fmt("{s} {s}", .{ ui.healthGlyph(h), h.label() }),
+            .{ .fg = ui.healthColor(h) },
+        );
     } else {
         x += ui.text(top, x, 0, "Issues in no milestone", .{ .fg = palette.accent, .bold = true });
     }
@@ -225,7 +264,15 @@ fn drawHeader(s: *AppState, f: ui.Frame, win: ui.Window, data: mf.Data) Allocato
     if (top.width > x + w + 2) {
         var ax = top.width - w;
         for (acts, 0..) |a, idx| if (a[2]) {
-            ax += try ui.button(f, top, ax, 0, a[0], .{ .command = a[1] }, ui.buttonStyle(idx == 0));
+            ax += try ui.button(
+                f,
+                top,
+                ax,
+                0,
+                a[0],
+                .{ .command = a[1] },
+                ui.buttonStyle(idx == 0),
+            );
             ax += 1;
         };
     }
@@ -238,11 +285,35 @@ fn drawHeader(s: *AppState, f: ui.Frame, win: ui.Window, data: mf.Data) Allocato
         const active = if (s.milestones.in_progress) sum.leaves_active else 0;
         ui.progressBar(line, lx, 0, bw, sum.leaves.closed, active, sum.leaves.total, .default);
         lx += bw + 1;
-        lx += ui.text(line, lx, 0, f.fmt("{d}/{d} done", .{ sum.leaves.closed, sum.leaves.total }), .{ .bold = true });
+        lx += ui.text(
+            line,
+            lx,
+            0,
+            f.fmt("{d}/{d} done", .{ sum.leaves.closed, sum.leaves.total }),
+            .{ .bold = true },
+        );
     } else lx += ui.text(line, lx, 0, "no issues yet", .{ .fg = palette.muted });
-    if (sum.leaves.total > 0) lx += ui.text(line, lx, 0, f.fmt(" · {d} open", .{mf.openLeaves(sum)}), .{ .fg = palette.muted });
-    if (sum.blocked > 0) lx += ui.text(line, lx, 0, f.fmt(" · {d} blocked", .{sum.blocked}), .{ .fg = palette.err });
-    if (sum.overdue > 0) lx += ui.text(line, lx, 0, f.fmt(" · {d} overdue", .{sum.overdue}), .{ .fg = palette.err });
+    if (sum.leaves.total > 0) lx += ui.text(
+        line,
+        lx,
+        0,
+        f.fmt(" · {d} open", .{mf.openLeaves(sum)}),
+        .{ .fg = palette.muted },
+    );
+    if (sum.blocked > 0) lx += ui.text(
+        line,
+        lx,
+        0,
+        f.fmt(" · {d} blocked", .{sum.blocked}),
+        .{ .fg = palette.err },
+    );
+    if (sum.overdue > 0) lx += ui.text(
+        line,
+        lx,
+        0,
+        f.fmt(" · {d} overdue", .{sum.overdue}),
+        .{ .fg = palette.err },
+    );
     if (sum.estimate_total > 0) {
         lx += ui.text(line, lx, 0, f.fmt(" · est {s}, {s} done", .{
             ui.duration(f, @intCast(@min(sum.estimate_total, std.math.maxInt(u32)))),
@@ -253,18 +324,33 @@ fn drawHeader(s: *AppState, f: ui.Frame, win: ui.Window, data: mf.Data) Allocato
     if (n) |idx| {
         const desc = snap.milestones[idx].description;
         if (desc.len > 0 and win.height > 14) {
-            const first = try f.arena.dupe(u8, desc[0 .. std.mem.findAny(u8, desc, "\r\n") orelse desc.len]);
+            const first = try f.arena.dupe(
+                u8,
+                desc[0 .. std.mem.findAny(u8, desc, "\r\n") orelse desc.len],
+            );
             for (first) |*c| if (c.* < 0x20 or c.* == 0x7f) {
                 c.* = ' ';
             };
-            _ = ui.text(win.child(.{ .y_off = 2, .height = 1 }), 1, 0, first, .{ .fg = palette.muted, .italic = true });
+            _ = ui.text(
+                win.child(.{ .y_off = 2, .height = 1 }),
+                1,
+                0,
+                first,
+                .{ .fg = palette.muted, .italic = true },
+            );
             rows += 1;
         }
     }
     return rows;
 }
 
-fn drawPane(s: *AppState, f: ui.Frame, win: ui.Window, p: u16, dropping: bool) Allocator.Error!void {
+fn drawPane(
+    s: *AppState,
+    f: ui.Frame,
+    win: ui.Window,
+    p: u16,
+    dropping: bool,
+) Allocator.Error!void {
     const v = &s.milestone;
     const scope = v.paneScope(p);
     var q = s.currentQuery();
@@ -277,7 +363,11 @@ fn drawPane(s: *AppState, f: ui.Frame, win: ui.Window, p: u16, dropping: bool) A
         const name = scopeName(s.snap, scope);
         const focused = v.pane == p;
         title.fill(.{ .style = .{ .bg = if (focused) palette.accent_bg else palette.bar_bg } });
-        const st: ui.Style = .{ .fg = if (focused) .{ .index = 231 } else palette.muted, .bg = if (focused) palette.accent_bg else palette.bar_bg, .bold = focused };
+        const st: ui.Style = .{
+            .fg = if (focused) .{ .index = 231 } else palette.muted,
+            .bg = if (focused) palette.accent_bg else palette.bar_bg,
+            .bold = focused,
+        };
         var count: u32 = 0;
         for (rows) |r| count += @intFromBool(!r.context);
         _ = ui.text(title, 1, 0, f.fmt("{s} · {d}", .{ name, count }), st);
@@ -285,7 +375,15 @@ fn drawPane(s: *AppState, f: ui.Frame, win: ui.Window, p: u16, dropping: bool) A
         try f.hit(title, .{ .mpane = p });
         if (p == 1) {
             const pick = "p pick ▾";
-            _ = try ui.button(f, title, title.width -| (title.gwidth(pick) + 3), 0, pick, .{ .command = .pick_pane }, ui.buttonStyle(false));
+            _ = try ui.button(
+                f,
+                title,
+                title.width -| (title.gwidth(pick) + 3),
+                0,
+                pick,
+                .{ .command = .pick_pane },
+                ui.buttonStyle(false),
+            );
         }
         table = win.child(.{ .y_off = 1, .height = win.height -| 1 });
     }
@@ -310,10 +408,16 @@ fn emptyMessage(s: *AppState, f: ui.Frame, scope: Scope) []const u8 {
     for (snap.issues, 0..) |issue, i| {
         if (!issue.deleted and scope.holds(snap, @intCast(i))) total += 1;
     }
-    if (total > 0) return f.fmt("None of the {d} issues here match: f changes the scope, / the filter.", .{total});
+    if (total > 0) return f.fmt(
+        "None of the {d} issues here match: f changes the scope, / the filter.",
+        .{total},
+    );
     const n = milestoneOf(snap, scope) orelse return "Nothing outside the milestones.";
     const status = snap.milestones[n].status;
-    if (status != .open) return f.fmt("No issues in this milestone: it is {s}.", .{@tagName(status)});
+    if (status != .open) return f.fmt(
+        "No issues in this milestone: it is {s}.",
+        .{@tagName(status)},
+    );
     return "No issues in this milestone yet: n adds one.";
 }
 
@@ -359,7 +463,10 @@ fn targets(s: *AppState) []const Id {
     };
     const id = s.snap.issues[r.issue].id;
     if (r.context) {
-        s.info("#{s} isn't in {s}: it shows for its sub-issues", .{ shortId(id), scopeName(s.snap, v.focusedScope()) });
+        s.info(
+            "#{s} isn't in {s}: it shows for its sub-issues",
+            .{ shortId(id), scopeName(s.snap, v.focusedScope()) },
+        );
         return &.{};
     }
     const one = a.alloc(Id, 1) catch return &.{};
@@ -402,7 +509,10 @@ pub fn requestMove(s: *AppState, ids: []const Id, link: store.MilestoneLink) App
     if (ids.len == 0) return .none;
     const snap = s.snap;
     if (link == .id) if (snap.findMilestone(link.id)) |n| if (snap.milestones[n].status != .open) {
-        s.fail("{s} is {s}: reopen it to add work (o)", .{ snap.milestones[n].name, @tagName(snap.milestones[n].status) });
+        s.fail(
+            "{s} is {s}: reopen it to add work (o)",
+            .{ snap.milestones[n].name, @tagName(snap.milestones[n].status) },
+        );
         return .none;
     };
     const a = s.modalArena();
@@ -423,16 +533,24 @@ pub fn requestMove(s: *AppState, ids: []const Id, link: store.MilestoneLink) App
     }
     // Moved, the marks they came from are done.
     const unmark: []const Id = if (all_marked) ids else &.{};
-    const action: AppState.Action = .{ .move_issues = .{ .ids = ids, .link = link, .unmark = unmark } };
+    const action: AppState.Action = .{
+        .move_issues = .{ .ids = ids, .link = link, .unmark = unmark },
+    };
     if (inherited == 0 or link == .inherit) return action;
-    const what = if (ids.len == 1) "It inherits its milestone from a parent." else s.fmtInput("{d} of them inherit their milestone from a parent.", .{inherited});
+    const what = if (ids.len == 1) "It inherits its milestone from a parent." else s.fmtInput(
+        "{d} of them inherit their milestone from a parent.",
+        .{inherited},
+    );
     modal_mod.openConfirm(s, s.fmtInput("Move to {s}", .{linkLabel(snap, link)}), &.{
         what,
         "Moving alone gives them a link of their own; moving the",
         "parents moves every sub-issue that inherits too.",
     }, &.{
         .{ .label = "Alone", .action = action },
-        .{ .label = "With the parents", .action = .{ .move_issues = .{ .ids = owners.items, .link = link, .unmark = unmark } } },
+        .{
+            .label = "With the parents",
+            .action = .{ .move_issues = .{ .ids = owners.items, .link = link, .unmark = unmark } },
+        },
         .{ .label = "Cancel", .action = .none },
     });
     return .none;
@@ -448,7 +566,11 @@ pub fn openMoveMenu(s: *AppState) void {
     var items: std.ArrayList(modal_mod.Picker.Item) = .empty;
     for (snap.milestones) |m| {
         if (m.status == .retired) continue;
-        const due = if (m.due) |d| std.fmt.allocPrint(a, "due {f}", .{d}) catch "" else "no due date";
+        const due = if (m.due) |d| std.fmt.allocPrint(
+            a,
+            "due {f}",
+            .{d},
+        ) catch "" else "no due date";
         items.append(a, .{
             .label = a.dupe(u8, m.name) catch "",
             .detail = if (m.status == .completed) "completed" else due,
@@ -457,12 +579,22 @@ pub fn openMoveMenu(s: *AppState) void {
             .disabled = m.status == .completed,
         }) catch {};
     }
-    items.append(a, .{ .label = "(no milestone)", .value = modal_mod.link_none, .current = allIn(snap, ids, .none) }) catch {};
+    items.append(
+        a,
+        .{
+            .label = "(no milestone)",
+            .value = modal_mod.link_none,
+            .current = allIn(snap, ids, .none),
+        },
+    ) catch {};
     const all_children = for (ids) |id| {
         const i = snap.find(id.slice()) orelse continue;
         if (snap.proj.parent[i] == none) break false;
     } else true;
-    if (all_children) items.append(a, .{ .label = "(inherit from parent)", .value = modal_mod.link_inherit }) catch {};
+    if (all_children) items.append(
+        a,
+        .{ .label = "(inherit from parent)", .value = modal_mod.link_inherit },
+    ) catch {};
     // The first that isn't where they are now.
     var selected: u32 = 0;
     for (items.items, 0..) |it, n| if (!it.current and !it.disabled) {
@@ -473,7 +605,17 @@ pub fn openMoveMenu(s: *AppState) void {
         std.fmt.allocPrint(a, "Move #{s} to", .{shortId(ids[0].slice())}) catch "Move to"
     else
         std.fmt.allocPrint(a, "Move {d} issues to", .{ids.len}) catch "Move to";
-    s.openModal(.{ .picker = .{ .title = title, .items = items.items, .selected = selected, .purpose = .{ .move = ids }, .verb = "Move" } });
+    s.openModal(
+        .{
+            .picker = .{
+                .title = title,
+                .items = items.items,
+                .selected = selected,
+                .purpose = .{ .move = ids },
+                .verb = "Move",
+            },
+        },
+    );
 }
 
 /// Every one of `ids` is in `scope` already.
@@ -491,7 +633,10 @@ pub fn openAddPicker(s: *AppState) void {
     const snap = s.snap;
     const scope = s.milestone.focusedScope();
     if (milestoneOf(snap, scope)) |n| if (snap.milestones[n].status != .open) {
-        return s.fail("{s} is {s}: reopen it to add work (o)", .{ snap.milestones[n].name, @tagName(snap.milestones[n].status) });
+        return s.fail(
+            "{s} is {s}: reopen it to add work (o)",
+            .{ snap.milestones[n].name, @tagName(snap.milestones[n].status) },
+        );
     };
     s.closeModal();
     const a = s.modalArena();
@@ -502,7 +647,7 @@ pub fn openAddPicker(s: *AppState) void {
         order.append(a, i) catch {};
     }
     // Open first, then the most recently touched.
-    std.mem.sort(u32, order.items, snap, struct {
+    stableSort(u32, order.items, snap, struct {
         fn lt(sn: *const Snapshot, x: u32, y: u32) bool {
             const dx = sn.isDone(x);
             const dy = sn.isDone(y);
@@ -510,20 +655,45 @@ pub fn openAddPicker(s: *AppState) void {
             return sn.issues[x].updated > sn.issues[y].updated;
         }
     }.lt);
-    const items = a.alloc(modal_mod.Picker.Item, order.items.len) catch return s.fail("out of memory", .{});
+    const items = a.alloc(
+        modal_mod.Picker.Item,
+        order.items.len,
+    ) catch return s.fail("out of memory", .{});
     for (order.items, items) |i, *it| {
         const issue = snap.issues[i];
         const where = snap.milestoneName(i) orelse "no milestone";
         it.* = .{
-            .label = std.fmt.allocPrint(a, "#{s} {s}", .{ shortId(issue.id), issue.title }) catch "",
-            .detail = std.fmt.allocPrint(a, "{s}{s}", .{ where, if (filter.inherits(snap, i)) " (inherited)" else "" }) catch "",
+            .label = std.fmt.allocPrint(
+                a,
+                "#{s} {s}",
+                .{ shortId(issue.id), issue.title },
+            ) catch "",
+            .detail = std.fmt.allocPrint(
+                a,
+                "{s}{s}",
+                .{ where, if (filter.inherits(snap, i)) " (inherited)" else "" },
+            ) catch "",
             .value = a.dupe(u8, issue.id) catch "",
             .done = snap.isDone(i),
         };
     }
     if (items.len == 0) return s.info("every issue is in {s} already", .{scopeName(snap, scope)});
-    const title = std.fmt.allocPrint(a, "Add issues to {s}", .{scopeName(snap, scope)}) catch "Add issues";
-    s.openModal(.{ .picker = .{ .title = title, .items = items, .multi = true, .purpose = .{ .add_to = scope }, .verb = "Add" } });
+    const title = std.fmt.allocPrint(
+        a,
+        "Add issues to {s}",
+        .{scopeName(snap, scope)},
+    ) catch "Add issues";
+    s.openModal(
+        .{
+            .picker = .{
+                .title = title,
+                .items = items,
+                .multi = true,
+                .purpose = .{ .add_to = scope },
+                .verb = "Add",
+            },
+        },
+    );
 }
 
 /// The open milestone before or after `scope` in due order; none comes
@@ -578,7 +748,10 @@ pub fn key(s: *AppState, k: vaxis.Key) Allocator.Error!AppState.Action {
         const r = selectedRow(v) orelse return .none;
         const id = snap.issues[r.issue].id;
         if (r.context) {
-            s.info("#{s} isn't in {s}: it shows for its sub-issues", .{ shortId(id), scopeName(snap, v.focusedScope()) });
+            s.info(
+                "#{s} isn't in {s}: it shows for its sub-issues",
+                .{ shortId(id), scopeName(snap, v.focusedScope()) },
+            );
             return .none;
         }
         try v.toggleMark(s.gpa, id);
@@ -609,7 +782,9 @@ pub fn key(s: *AppState, k: vaxis.Key) Allocator.Error!AppState.Action {
     if (k.matches('[', .{})) return step(s, -1);
     if (k.matches('v', .{})) {
         v.split = !v.split;
-        if (v.split and v.other.eql(v.scope)) v.other = if (v.scope == .none) (neighbour(snap, .none, 1) orelse .none) else .none;
+        if (v.split and v.other.eql(
+            v.scope,
+        )) v.other = if (v.scope == .none) (neighbour(snap, .none, 1) orelse .none) else .none;
         v.pane = 0;
         return .none;
     }
@@ -653,22 +828,44 @@ pub fn openPaneMenu(s: *AppState) void {
             .disabled = m.status == .completed,
         }) catch {};
     }
-    options.append(a, .{ .label = "(no milestone)", .value = modal_mod.link_none, .current = v.split and v.other == .none }) catch {};
+    options.append(
+        a,
+        .{
+            .label = "(no milestone)",
+            .value = modal_mod.link_none,
+            .current = v.split and v.other == .none,
+        },
+    ) catch {};
     var selected: u16 = 0;
     for (options.items, 0..) |o, n| if (o.current) {
         selected = @intCast(n);
     };
-    s.openModal(.{ .menu = .{ .title = "Second pane shows", .options = options.items, .selected = selected, .purpose = .pane_pick } });
+    s.openModal(
+        .{
+            .menu = .{
+                .title = "Second pane shows",
+                .options = options.items,
+                .selected = selected,
+                .purpose = .pane_pick,
+            },
+        },
+    );
 }
 
 /// Titles one after another, each created in the milestone.
 fn quickAdd(s: *AppState) void {
     const scope = s.milestone.focusedScope();
     if (milestoneOf(s.snap, scope)) |n| if (s.snap.milestones[n].status != .open) {
-        return s.fail("{s} is {s}: reopen it to add work (o)", .{ s.snap.milestones[n].name, @tagName(s.snap.milestones[n].status) });
+        return s.fail(
+            "{s} is {s}: reopen it to add work (o)",
+            .{ s.snap.milestones[n].name, @tagName(s.snap.milestones[n].status) },
+        );
     };
     s.closeModal();
-    const title = s.modalArena().dupe(u8, s.fmtInput("Quick add to {s}", .{scopeName(s.snap, scope)})) catch "Quick add";
+    const title = s.modalArena().dupe(
+        u8,
+        s.fmtInput("Quick add to {s}", .{scopeName(s.snap, scope)}),
+    ) catch "Quick add";
     s.openModal(.{ .prompt = .{
         .title = title,
         .hint = "a title, ⏎ creates it and asks for the next; esc when done",

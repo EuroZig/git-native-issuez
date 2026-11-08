@@ -67,7 +67,12 @@ pub fn main(
         }) catch {};
         return common.exit_ok;
     }
-    _ = repo.setDeleted(ctx.arena, ref.name, deleted, .{ .message = message }) catch |e|
+    _ = repo.setDeleted(
+        ctx.arena,
+        ref.name,
+        .{ .deleted = deleted, .message = message },
+        .{},
+    ) catch |e|
         return common.repoFailed(B, ctx, e);
     ctx.out.print("{s} issue {s}\n", .{ if (deleted) "Deleted" else "Restored", short }) catch {};
     return common.exit_ok;

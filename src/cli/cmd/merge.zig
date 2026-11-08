@@ -36,7 +36,8 @@ pub const push_help =
 pub const sync_help =
     \\usage: git issue sync <remote>
     \\
-    \\Merge issues from a remote, then push local changes to it.
+    \\Merge issues from a remote, then push local changes to it. <remote> is a
+    \\remote's name, or a URL or path (its refs are kept under url-<hash>).
     \\
     \\Options:
     \\   -h, --help    Show this help
@@ -78,9 +79,8 @@ pub fn main(
         }
     }
     const r = remote orelse return common.missing(ctx.err, name, "remote name is required");
-    if (!issuez.backend.contract.isValidRemoteName(r)) {
-        // Only named remotes: staging and bookkeeping refs are named after
-        // the remote. Upstream fails here too.
+    // A name, or a URL or path: its refs go under `url-<hash>`.
+    if (!issuez.backend.contract.isValidRemoteTarget(r)) {
         ctx.err.print("error: invalid remote name '{s}'\n", .{r}) catch {};
         remoteHint(ctx.err);
         return common.exit_error;
@@ -96,7 +96,10 @@ pub fn main(
     }
     if (mode == .push or mode == .sync) {
         // A fetching merge just brought `seen/` up to date.
-        const pushed = if (mode == .sync and fetch) s.pushFetched(arena, r, .{}) else s.push(arena, r);
+        const pushed = if (mode == .sync and fetch)
+            s.push(arena, r, .{ .fetch = false })
+        else
+            s.push(arena, r, .{});
         const report = pushed catch |e| return syncError(B, ctx, e, r);
         output.printPush(ctx.out, ctx.err, r, report);
     }

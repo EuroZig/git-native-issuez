@@ -12,6 +12,7 @@
 //! term with a value it doesn't know is false, and `problem` says so.
 
 const std = @import("std");
+const stableSort = @import("issuez").sort.stable;
 const Allocator = std.mem.Allocator;
 const issuez = @import("issuez");
 const Snapshot = @import("store.zig").Snapshot;
@@ -85,8 +86,13 @@ pub const Data = struct {
     today: Date,
 
     /// `today` is the local date, `utc_offset_s` its clock's lead on UTC.
-    pub fn of(arena: Allocator, snap: *const Snapshot, today: Date, utc_offset_s: i32) Allocator.Error!Data {
-        const summaries = try schedule.summarize(arena, snap.proj, snap.milestones, today);
+    pub fn of(
+        arena: Allocator,
+        snap: *const Snapshot,
+        today: Date,
+        utc_offset_s: i32,
+    ) Allocator.Error!Data {
+        const summaries = try schedule.summarize(arena, &snap.proj, snap.milestones, today);
         const health = try arena.alloc(Health, snap.milestones.len);
         for (snap.milestones, summaries[0..snap.milestones.len], health) |m, sum, *h| {
             h.* = schedule.health(m, sum, today, utc_offset_s);
@@ -127,7 +133,17 @@ fn parseTerms(text: []const u8, out: *[max_terms]Term) []const Term {
     return out[0..n];
 }
 
-const is_values = [_][]const u8{ "overdue", "at-risk", "risk", "on-track", "empty", "blocked", "open", "done", "completed" };
+const is_values = [_][]const u8{
+    "overdue",
+    "at-risk",
+    "risk",
+    "on-track",
+    "empty",
+    "blocked",
+    "open",
+    "done",
+    "completed",
+};
 const has_values = [_][]const u8{ "due", "description" };
 
 fn known(values: []const []const u8, v: []const u8) bool {
@@ -164,9 +180,17 @@ pub fn problem(buf: []u8, text: []const u8) ?[]const u8 {
             .has, .no => "due, description",
             .due => "<YYYY-MM-DD, >YYYY-MM-DD or YYYY-MM-DD",
         };
-        return std.fmt.bufPrint(buf, "unknown {t}:{s}, try {s}", .{ t.key, t.value, want }) catch "unknown filter term";
+        return std.fmt.bufPrint(
+            buf,
+            "unknown {t}:{s}, try {s}",
+            .{ t.key, t.value, want },
+        ) catch "unknown filter term";
     }
-    if (count > max_terms) return std.fmt.bufPrint(buf, "only the first {d} filter terms count", .{max_terms}) catch null;
+    if (count > max_terms) return std.fmt.bufPrint(
+        buf,
+        "only the first {d} filter terms count",
+        .{max_terms},
+    ) catch null;
     return null;
 }
 
@@ -225,7 +249,12 @@ fn inScope(status: issuez.format.fields.MilestoneStatus, scope: Scope) bool {
 /// The milestones shown, by position in the snapshot's. `snap.milestones
 /// .len` stands for the issues in none, shown last with scope open or all
 /// and no filter text.
-pub fn rows(arena: Allocator, snap: *const Snapshot, q: Query, data: Data) Allocator.Error![]const u32 {
+pub fn rows(
+    arena: Allocator,
+    snap: *const Snapshot,
+    q: Query,
+    data: Data,
+) Allocator.Error![]const u32 {
     var terms_buf: [max_terms]Term = undefined;
     const terms = parseTerms(q.text, &terms_buf);
     var out: std.ArrayList(u32) = .empty;
@@ -236,7 +265,7 @@ pub fn rows(arena: Allocator, snap: *const Snapshot, q: Query, data: Data) Alloc
         try out.append(arena, n);
     }
     const ctx: Order = .{ .snap = snap, .data = data, .key = q.key, .reverse = q.reverse };
-    std.mem.sort(u32, out.items, ctx, Order.lessThan);
+    stableSort(u32, out.items, ctx, Order.lessThan);
     if (terms.len == 0 and (q.scope == .open or q.scope == .all)) {
         try out.append(arena, @intCast(snap.milestones.len));
     }
@@ -271,7 +300,11 @@ const Order = struct {
             // Then the catalog's order (due, name), then the ID: stable.
             ord = dueOrder(o.snap.milestones[a].due, o.snap.milestones[b].due);
             if (ord == .eq) ord = nameOrder(o.snap.milestones[a].name, o.snap.milestones[b].name);
-            if (ord == .eq) ord = std.mem.order(u8, o.snap.milestones[a].id, o.snap.milestones[b].id);
+            if (ord == .eq) ord = std.mem.order(
+                u8,
+                o.snap.milestones[a].id,
+                o.snap.milestones[b].id,
+            );
         }
         return ord == .lt;
     }
@@ -320,7 +353,12 @@ const Fixture = struct {
 
     fn init(fx: *Fixture) void {
         const ms = struct {
-            fn of(id: []const u8, name: []const u8, due: ?[]const u8, status: issuez.format.fields.MilestoneStatus) issuez.milestone.Milestone {
+            fn of(
+                id: []const u8,
+                name: []const u8,
+                due: ?[]const u8,
+                status: issuez.format.fields.MilestoneStatus,
+            ) issuez.milestone.Milestone {
                 return .{
                     .id = id,
                     .tip = undefined,
@@ -351,7 +389,11 @@ const Fixture = struct {
     }
 
     fn data(fx: *const Fixture) Data {
-        return .{ .summaries = &fx.summaries, .health = &fx.health, .today = Date.parse("2026-11-04").? };
+        return .{
+            .summaries = &fx.summaries,
+            .health = &fx.health,
+            .today = Date.parse("2026-11-04").?,
+        };
     }
 
     /// The names shown, "-" for none.
@@ -429,7 +471,10 @@ test problem {
     var many: std.ArrayList(u8) = .empty;
     defer many.deinit(testing.allocator);
     for (0..max_terms + 1) |_| try many.appendSlice(testing.allocator, "x ");
-    try testing.expectEqualStrings("only the first 32 filter terms count", problem(&buf, many.items).?);
+    try testing.expectEqualStrings(
+        "only the first 32 filter terms count",
+        problem(&buf, many.items).?,
+    );
     var terms_buf: [max_terms]Term = undefined;
     try testing.expectEqual(@as(usize, max_terms), parseTerms(many.items, &terms_buf).len);
 }

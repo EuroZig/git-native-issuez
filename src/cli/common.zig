@@ -102,22 +102,20 @@ pub fn openRepo(comptime B: type, ctx: *context.Context(B)) ?engine.Repo(B) {
         _ = oom(ctx.err);
         return null;
     };
-    if (settings.invalid_done_state) |v| {
+    var repo = engine.Repo(B).fromSettings(backend, settings) catch {
         ctx.err.print(
             "error: issue.doneStates has '{s}'; " ++ issuez.settings.done_states_rule ++ "\n",
-            .{v},
+            .{settings.invalid_done_state.?},
         ) catch {};
         return null;
-    }
-    var repo = engine.Repo(B).init(backend);
-    settings.apply(&repo);
+    };
     ctx.settings = settings;
     // One listing of the issues per command, until a write.
-    repo.listing = ctx.arena.create(engine.Repo(B).Listing) catch {
+    repo.call.listing = ctx.arena.create(engine.Repo(B).Listing) catch {
         _ = oom(ctx.err);
         return null;
     };
-    repo.listing.?.* = .{};
+    repo.call.listing.?.* = .{};
     return repo;
 }
 
@@ -133,7 +131,11 @@ pub fn openRepoQuiet(comptime B: type, ctx: *context.Context(B)) ?engine.Repo(B)
 /// Upstream's `init` sets `+refs/issues/*:refs/issues/*`, so a plain
 /// `git fetch` can overwrite local issue refs and lose unpushed commits.
 /// We warn on every command until it is fixed.
-fn warnUnsafeRefspecs(arena: std.mem.Allocator, config: anytype, err: *std.Io.Writer) void {
+fn warnUnsafeRefspecs(
+    arena: std.mem.Allocator,
+    config: []const issuez.backend.contract.ConfigEntry,
+    err: *std.Io.Writer,
+) void {
     var warned: std.ArrayList([]const u8) = .empty;
     for (config) |e| {
         if (!std.mem.startsWith(u8, e.key, "remote.") or !std.mem.endsWith(u8, e.key, ".fetch"))
@@ -233,11 +235,15 @@ pub fn reportEngineError(err: *std.Io.Writer, e: anyerror) void {
         error.NothingToEdit => "error: at least one edit option is required\n",
         // Its own messages say which value; this is the rest.
         error.InvalidValue => "error: invalid value\n",
-        error.MessageHasBody => "error: with --description, -m is only the subject (no blank lines)\n",
+        error.MessageHasBody => "error: with --description, -m is only the subject (no blank " ++
+            "lines)\n",
         error.CorruptIssue => "error: issue data is damaged (run 'git issue fsck')\n",
         error.GitSpawnFailed => "fatal: could not run git (is it installed and on PATH?)\n",
         else => {
-            err.print("error: {f}\n", .{issuez.errors.Description{ .err = e, .limits = .{} }}) catch {};
+            err.print(
+                "error: {f}\n",
+                .{issuez.errors.Description{ .err = e, .limits = .{} }},
+            ) catch {};
             return;
         },
     };
@@ -309,6 +315,11 @@ pub fn engineExitCode(e: anyerror) u8 {
 }
 
 /// An email, or `<uuid> <email>`.
+/// A value `validateAssignee` passed.
+pub fn assigneeOf(value: []const u8) issuez.format.fields.Assignee {
+    return issuez.format.fields.Assignee.parse(value).?;
+}
+
 pub fn validateAssignee(err: *std.Io.Writer, value: []const u8) bool {
     const space = std.mem.findScalar(u8, value, ' ') orelse
         return validateEmail(err, "assignee", value);
@@ -341,3 +352,48 @@ pub fn hasNewline(s: []const u8) bool {
 }
 
 pub const IsoDate = issuez.format.time.IsoDate;
+
+/// `--field KEY=VALUE` and `--original-author`/`--original-id`, shared by
+/// create, edit and comment.
+pub const Extras = struct {
+    fields: std.ArrayList(issuez.engine.HostField) = .empty,
+    original: issuez.engine.Original = .{},
+
+    /// True when `arg` was one of them; false otherwise. Null on an error,
+    /// already reported.
+    pub fn parse(
+        x: *Extras,
+        arena: std.mem.Allocator,
+        err: *std.Io.Writer,
+        args: *Args,
+        arg: []const u8,
+    ) ?bool {
+        if (std.mem.eql(u8, arg, "--field")) {
+            const v = args.value(err, arg) orelse return null;
+            const eq = std.mem.findScalar(u8, v, '=') orelse {
+                err.writeAll("error: --field takes KEY=VALUE\n") catch {};
+                return null;
+            };
+            if (hasNewline(v)) {
+                err.writeAll("error: --field value must be one line\n") catch {};
+                return null;
+            }
+            x.fields.append(arena, .{ .key = v[0..eq], .value = v[eq + 1 ..] }) catch return null;
+            return true;
+        }
+        if (std.mem.eql(u8, arg, "--original-author") or std.mem.eql(u8, arg, "--original-id")) {
+            const v = args.value(err, arg) orelse return null;
+            if (hasNewline(v) or v.len == 0) {
+                err.print("error: {s} takes one line of text\n", .{arg}) catch {};
+                return null;
+            }
+            if (std.mem.eql(
+                u8,
+                arg,
+                "--original-author",
+            )) x.original.author = v else x.original.id = v;
+            return true;
+        }
+        return false;
+    }
+};

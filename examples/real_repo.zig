@@ -46,11 +46,15 @@ pub fn main(init: std.process.Init) !u8 {
         const labels: []const []const u8 = @ptrCast(args[4..]);
         // The author defaults to git's configured identity. Pass `.author`
         // to commit as someone else.
-        const created = repo.create(arena, .{ .title = args[3], .labels = labels }) catch |err| {
+        const created = repo.create(
+            arena,
+            .{ .title = args[3], .labels = labels },
+            .{},
+        ) catch |err| {
             try err_out.print("create failed: {t} {s}\n", .{ err, git.lastStderr() });
             return 1;
         };
-        try out.print("Created issue {s}\n", .{created.id.short()});
+        try out.print("Created issue {s}\n", .{issuez.shortId(created.id)});
     } else if (std.mem.eql(u8, command, "ls")) {
         const issues = try repo.loadAll(arena);
         // Newest first, like `git issue ls`.

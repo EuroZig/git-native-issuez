@@ -88,10 +88,18 @@ pub fn confirmDiscard(s: *AppState, then: ?Leave) void {
         return;
     }
     modal_mod.openConfirm(s, "Discard timeline changes?", &.{
-        s.fmtInput("{d} {s} will be lost; nothing was written.", .{ n, if (n == 1) "change" else "changes" }),
+        s.fmtInput(
+            "{d} {s} will be lost; nothing was written.",
+            .{ n, if (n == 1) "change" else "changes" },
+        ),
     }, &.{
         .{ .label = "Keep editing", .action = .none },
-        .{ .label = "Discard", .action = .{ .leave_timeline = .{ .apply = false, .then = then orelse .{ .view = .timeline } } } },
+        .{
+            .label = "Discard",
+            .action = .{
+                .leave_timeline = .{ .apply = false, .then = then orelse .{ .view = .timeline } },
+            },
+        },
     });
 }
 
@@ -101,27 +109,46 @@ pub fn refuse(s: *AppState, plan: draft_mod.Draft.Plan) bool {
     if (plan.gone.len > 0) {
         // Dropped with the next frame, as `buildOverlay` does.
         for (plan.gone) |g| s.timeline.draft.drop(g.slice());
-        s.fail("{d} edited {s} deleted elsewhere: {s} changes are dropped, look again", .{ plan.gone.len, if (plan.gone.len == 1) "issue was" else "issues were", if (plan.gone.len == 1) "its" else "their" });
+        s.fail(
+            "{d} edited {s} deleted elsewhere: {s} changes are dropped, look again",
+            .{
+                plan.gone.len,
+                if (plan.gone.len == 1) "issue was" else "issues were",
+                if (plan.gone.len == 1) "its" else "their",
+            },
+        );
         return true;
     }
     if (plan.stale.len > 0) {
         selectId(s, plan.stale[0].slice());
-        s.fail("{d} changed elsewhere since you edited {s}: r keeps your change, X drops it", .{ plan.stale.len, if (plan.stale.len == 1) "it" else "them" });
+        s.fail(
+            "{d} changed elsewhere since you edited {s}: r keeps your change, X drops it",
+            .{ plan.stale.len, if (plan.stale.len == 1) "it" else "them" },
+        );
         return true;
     }
     if (plan.dangling.len > 0) {
         selectId(s, plan.dangling[0].slice());
-        s.fail("#{s} waits on or moves into what is gone or closed elsewhere: X drops its changes", .{shortId(plan.dangling[0].slice())});
+        s.fail(
+            "#{s} waits on or moves into what is gone or closed elsewhere: X drops its changes",
+            .{shortId(plan.dangling[0].slice())},
+        );
         return true;
     }
     if (plan.loops.len > 0) {
         selectId(s, plan.loops[0].slice());
-        s.fail("#{s} would wait on itself through its blockers: B unlinks one, X drops its changes", .{shortId(plan.loops[0].slice())});
+        s.fail(
+            "#{s} would wait on itself through its blockers: B unlinks one, X drops its changes",
+            .{shortId(plan.loops[0].slice())},
+        );
         return true;
     }
     if (plan.inverted.len > 0) {
         selectId(s, plan.inverted[0].slice());
-        s.fail("#{s} would start after its due date: move one of them", .{shortId(plan.inverted[0].slice())});
+        s.fail(
+            "#{s} would start after its due date: move one of them",
+            .{shortId(plan.inverted[0].slice())},
+        );
         return true;
     }
     return false;
@@ -146,11 +173,24 @@ pub fn confirmApply(s: *AppState) void {
         if (lines.items.len >= max_lines) break;
         const n = snap.findMilestone(c.id.slice()) orelse continue;
         const m = snap.milestones[n];
-        lines.append(a, std.fmt.allocPrint(a, "{s}  due {s} → {s}", .{ m.name, dateText(a, m.due), dateText(a, c.due) }) catch "") catch {};
+        lines.append(
+            a,
+            std.fmt.allocPrint(
+                a,
+                "{s}  due {s} → {s}",
+                .{ m.name, dateText(a, m.due), dateText(a, c.due) },
+            ) catch "",
+        ) catch {};
     }
-    if (plan.count() > max_lines) lines.append(a, std.fmt.allocPrint(a, "… and {d} more", .{plan.count() - max_lines}) catch "") catch {};
+    if (plan.count() > max_lines) lines.append(
+        a,
+        std.fmt.allocPrint(a, "… and {d} more", .{plan.count() - max_lines}) catch "",
+    ) catch {};
     lines.append(a, "All of it is written at once, or none of it.") catch {};
-    modal_mod.openConfirm(s, s.fmtInput("Apply {d} {s}?", .{ plan.count(), if (plan.count() == 1) "change" else "changes" }), lines.items, &.{
+    modal_mod.openConfirm(s, s.fmtInput(
+        "Apply {d} {s}?",
+        .{ plan.count(), if (plan.count() == 1) "change" else "changes" },
+    ), lines.items, &.{
         .{ .label = "Apply", .action = .apply_draft },
         .{ .label = "Back", .action = .none },
     });
@@ -161,18 +201,39 @@ fn dateText(a: Allocator, d: ?Date) []const u8 {
     return std.fmt.allocPrint(a, "{f}", .{v}) catch "";
 }
 
-fn describe(s: *AppState, a: Allocator, i: u32, c: draft_mod.IssueChange) Allocator.Error![]const u8 {
+fn describe(
+    s: *AppState,
+    a: Allocator,
+    i: u32,
+    c: draft_mod.IssueChange,
+) Allocator.Error![]const u8 {
     const snap = s.snap;
     const issue = snap.issues[i];
     var out: std.ArrayList(u8) = .empty;
     try out.print(a, "#{s}", .{shortId(issue.id)});
-    if (c.start) |v| try out.print(a, " start {s} → {s}", .{ dateText(a, issue.ext.start_date), dateText(a, v) });
-    if (c.due) |v| try out.print(a, " due {s} → {s}", .{ dateText(a, issue.ext.due_date), dateText(a, v) });
+    if (c.start) |v| try out.print(
+        a,
+        " start {s} → {s}",
+        .{ dateText(a, issue.start_date), dateText(a, v) },
+    );
+    if (c.due) |v| try out.print(
+        a,
+        " due {s} → {s}",
+        .{ dateText(a, issue.due_date), dateText(a, v) },
+    );
     if (c.estimate) |v| {
-        if (v) |m| try out.print(a, " estimate {s}", .{fmtMinutes(a, m)}) else try out.appendSlice(a, " no estimate");
+        if (v) |m| try out.print(
+            a,
+            " estimate {s}",
+            .{fmtMinutes(a, m)},
+        ) else try out.appendSlice(a, " no estimate");
     }
     if (c.link) |l| switch (l) {
-        .id => |id| try out.print(a, " → {s}", .{if (snap.findMilestone(id.slice())) |n| snap.milestones[n].name else "?"}),
+        .id => |id| try out.print(
+            a,
+            " → {s}",
+            .{if (snap.findMilestone(id.slice())) |n| snap.milestones[n].name else "?"},
+        ),
         .none => try out.appendSlice(a, " → no milestone"),
         .inherit => try out.appendSlice(a, " → its parent's milestone"),
     };
@@ -217,7 +278,9 @@ pub fn stage(s: *AppState, op: Op) bool {
 
 /// The issue's or milestone's tip in `snap`.
 fn tipOf(snap: anytype, id: []const u8) ?issuez.engine.Oid {
-    return if (snap.find(id)) |i| snap.issues[i].tip else if (snap.findMilestone(id)) |n| snap.milestones[n].tip else null;
+    return if (snap.find(
+        id,
+    )) |i| snap.issues[i].tip else if (snap.findMilestone(id)) |n| snap.milestones[n].tip else null;
 }
 
 /// `stage`, for an op made from what `tip` showed.
@@ -244,14 +307,28 @@ fn shift(s: *AppState, which: Which, n: i32) void {
     if (r.kind == .group) {
         const g = t.groups[r.group];
         const m = g.milestone orelse return;
-        if (which == .start) return s.info("a milestone has no start of its own: move its issues", .{});
+        if (which == .start) return s.info(
+            "a milestone has no start of its own: move its issues",
+            .{},
+        );
         const due = view.milestoneDue(s, m) orelse s.today;
-        _ = stage(s, .{ .milestone_due = .{ .id = .of(snap.milestones[m].id), .due = cal.work_days.add(due, n) } });
+        _ = stage(
+            s,
+            .{
+                .milestone_due = .{
+                    .id = .of(snap.milestones[m].id),
+                    .due = cal.work_days.add(due, n),
+                },
+            },
+        );
         return;
     }
     const i = t.selectedIssue() orelse return;
     const d = view.datesOf(s, i);
-    const sp = schedule.span(d, cal) orelse return s.info("no dates yet: ⏎ schedules it from today, s and d type them", .{});
+    const sp = schedule.span(
+        d,
+        cal,
+    ) orelse return s.info("no dates yet: ⏎ schedules it from today, s and d type them", .{});
     // Only the dates it moves: the others stay what they are when applied.
     var op: @FieldType(Op, "dates") = .{ .id = .of(snap.issues[i].id) };
     switch (which) {
@@ -283,7 +360,16 @@ fn schedule_(s: *AppState, i: u32) void {
     var start = s.today;
     if (!cal.work_days.isWorkDay(start)) start = cal.work_days.add(start, 1);
     const days: i32 = @intCast(if (d.estimate_minutes) |m| @min(cal.days(m), 1000) else 1);
-    if (!stage(s, .{ .dates = .{ .id = .of(s.snap.issues[i].id), .start = start, .due = cal.work_days.add(start, days - 1) } })) return;
+    if (!stage(
+        s,
+        .{
+            .dates = .{
+                .id = .of(s.snap.issues[i].id),
+                .start = start,
+                .due = cal.work_days.add(start, days - 1),
+            },
+        },
+    )) return;
     s.info("scheduled from today", .{});
 }
 
@@ -339,13 +425,20 @@ pub fn key(s: *AppState, k: vaxis.Key) Allocator.Error!?AppState.Action {
     const moves = [_]struct { u21, vaxis.Key.Modifiers, Which, i32 }{
         .{ K.left, .{}, .both, -1 },                   .{ K.right, .{}, .both, 1 },
         .{ 'h', .{}, .both, -1 },                      .{ 'l', .{}, .both, 1 },
-        .{ K.left, .{ .shift = true }, .both, -week }, .{ K.right, .{ .shift = true }, .both, week },
-        .{ 'H', .{}, .both, -week },                   .{ 'L', .{}, .both, week },
-        .{ '<', .{}, .due, -1 },                       .{ '>', .{}, .due, 1 },
-        .{ '{', .{}, .start, -1 },                     .{ '}', .{}, .start, 1 },
-        .{ K.left, .{ .alt = true }, .start, -1 },     .{ K.right, .{ .alt = true }, .start, 1 },
+        .{
+            K.left,
+            .{ .shift = true },
+            .both,
+            -week,
+        },
+        .{ K.right, .{ .shift = true }, .both, week }, .{ 'H', .{}, .both, -week },
+        .{ 'L', .{}, .both, week },                    .{ '<', .{}, .due, -1 },
+        .{ '>', .{}, .due, 1 },                        .{ '{', .{}, .start, -1 },
+        .{ '}', .{}, .start, 1 },                      .{ K.left, .{ .alt = true }, .start, -1 },
+        .{ K.right, .{ .alt = true }, .start, 1 },
         // What many terminals send for alt+← →.
-        .{ 'b', .{ .alt = true }, .start, -1 },        .{ 'f', .{ .alt = true }, .start, 1 },
+            .{ 'b', .{ .alt = true }, .start, -1 },
+        .{ 'f', .{ .alt = true }, .start, 1 },
     };
     for (moves) |m| if (k.matches(m[0], m[1])) {
         shift(s, m[2], m[3]);
@@ -363,7 +456,11 @@ pub fn key(s: *AppState, k: vaxis.Key) Allocator.Error!?AppState.Action {
         return .none;
     }
     if (k.matches('d', .{})) {
-        if (i) |x| promptDate(s, x, .due) else if (row) |r| if (r.kind == .group) if (t.groups[r.group].milestone) |n| promptMilestoneDue(s, n);
+        if (i) |x| {
+            promptDate(s, x, .due);
+        } else if (row) |r| if (r.kind == .group) {
+            if (t.groups[r.group].milestone) |n| promptMilestoneDue(s, n);
+        };
         return .none;
     }
     if (k.matches('s', .{})) {
@@ -381,7 +478,10 @@ pub fn key(s: *AppState, k: vaxis.Key) Allocator.Error!?AppState.Action {
     if (k.matches('b', .{})) {
         const x = i orelse return .none;
         t.linking = .of(snap.issues[x].id);
-        s.info("#{s} waits for…: select its blocker, ⏎ links, esc cancels", .{shortId(snap.issues[x].id)});
+        s.info(
+            "#{s} waits for…: select its blocker, ⏎ links, esc cancels",
+            .{shortId(snap.issues[x].id)},
+        );
         return .none;
     }
     if (k.matches('B', .{})) {
@@ -432,11 +532,17 @@ pub fn pickBlocker(s: *AppState) AppState.Action {
     };
     // Waiting for something that waits for it would be a loop.
     if (reaches(s, proj, b, i)) {
-        s.fail("#{s} already waits for #{s}: that would be a loop", .{ shortId(snap.issues[b].id), shortId(id.slice()) });
+        s.fail(
+            "#{s} already waits for #{s}: that would be a loop",
+            .{ shortId(snap.issues[b].id), shortId(id.slice()) },
+        );
         return .none;
     }
     t.linking = null;
-    if (!stage(s, .{ .add_blocker = .{ .id = id, .blocker = .of(snap.issues[b].id) } })) return .none;
+    if (!stage(
+        s,
+        .{ .add_blocker = .{ .id = id, .blocker = .of(snap.issues[b].id) } },
+    )) return .none;
     s.info("#{s} now waits for #{s}", .{ shortId(id.slice()), shortId(snap.issues[b].id) });
     return .none;
 }
@@ -464,8 +570,18 @@ fn promptDate(s: *AppState, i: u32, which: enum { start, due }) void {
     const d = view.datesOf(s, i);
     const v = if (which == .start) d.start else d.due;
     const value = if (v) |x| s.fmtInput("{f}", .{x}) else "";
-    const title = s.fmtInput("{s} of #{s} (staged)", .{ if (which == .start) "Start" else "Due", shortId(issue.id) });
-    modal_mod.openPrompt(s, title, dates.hint, value, .{ .stage_date = .{ .id = .of(issue.id), .start = which == .start } }, true);
+    const title = s.fmtInput(
+        "{s} of #{s} (staged)",
+        .{ if (which == .start) "Start" else "Due", shortId(issue.id) },
+    );
+    modal_mod.openPrompt(
+        s,
+        title,
+        dates.hint,
+        value,
+        .{ .stage_date = .{ .id = .of(issue.id), .start = which == .start } },
+        true,
+    );
     s.modal.?.prompt.date = true;
 }
 
@@ -473,7 +589,14 @@ fn promptMilestoneDue(s: *AppState, n: u32) void {
     const m = s.snap.milestones[n];
     const v = view.milestoneDue(s, n);
     const value = if (v) |x| s.fmtInput("{f}", .{x}) else "";
-    modal_mod.openPrompt(s, s.fmtInput("Due date of {s} (staged)", .{m.name}), dates.hint, value, .{ .stage_ms_due = .of(m.id) }, true);
+    modal_mod.openPrompt(
+        s,
+        s.fmtInput("Due date of {s} (staged)", .{m.name}),
+        dates.hint,
+        value,
+        .{ .stage_ms_due = .of(m.id) },
+        true,
+    );
     s.modal.?.prompt.date = true;
 }
 
@@ -481,7 +604,14 @@ fn promptEstimate(s: *AppState, i: u32) void {
     const issue = s.snap.issues[i];
     const d = view.datesOf(s, i);
     const value = if (d.estimate_minutes) |m| fmtMinutes(s.input_arena.allocator(), m) else "";
-    modal_mod.openPrompt(s, s.fmtInput("Estimate of #{s} (staged)", .{shortId(issue.id)}), "like 90m, 2h or 1h30m; empty clears", value, .{ .stage_estimate = .of(issue.id) }, true);
+    modal_mod.openPrompt(
+        s,
+        s.fmtInput("Estimate of #{s} (staged)", .{shortId(issue.id)}),
+        "like 90m, 2h or 1h30m; empty clears",
+        value,
+        .{ .stage_estimate = .of(issue.id) },
+        true,
+    );
 }
 
 fn milestoneMenu(s: *AppState, i: u32) void {
@@ -492,15 +622,34 @@ fn milestoneMenu(s: *AppState, i: u32) void {
     for (snap.milestones) |m| {
         if (m.status == .retired) continue;
         options.append(a, .{
-            .label = std.fmt.allocPrint(a, "{s}{s}", .{ m.name, if (m.status == .completed) "  (completed)" else "" }) catch "",
+            .label = std.fmt.allocPrint(
+                a,
+                "{s}{s}",
+                .{ m.name, if (m.status == .completed) "  (completed)" else "" },
+            ) catch "",
             .value = a.dupe(u8, m.id) catch "",
             .disabled = m.status == .completed,
         }) catch {};
     }
     options.append(a, .{ .label = "(no milestone)", .value = modal_mod.link_none }) catch {};
-    if (snap.proj.parent[i] != none) options.append(a, .{ .label = "(inherit from parent)", .value = modal_mod.link_inherit }) catch {};
-    const title = std.fmt.allocPrint(a, "Milestone of #{s} (staged)", .{shortId(snap.issues[i].id)}) catch "";
-    s.openModal(.{ .menu = .{ .title = title, .options = options.items, .purpose = .{ .stage_milestone = .of(snap.issues[i].id) } } });
+    if (snap.proj.parent[i] != none) options.append(
+        a,
+        .{ .label = "(inherit from parent)", .value = modal_mod.link_inherit },
+    ) catch {};
+    const title = std.fmt.allocPrint(
+        a,
+        "Milestone of #{s} (staged)",
+        .{shortId(snap.issues[i].id)},
+    ) catch "";
+    s.openModal(
+        .{
+            .menu = .{
+                .title = title,
+                .options = options.items,
+                .purpose = .{ .stage_milestone = .of(snap.issues[i].id) },
+            },
+        },
+    );
 }
 
 fn unblockMenu(s: *AppState, i: u32) void {
@@ -512,12 +661,28 @@ fn unblockMenu(s: *AppState, i: u32) void {
     var options: std.ArrayList(modal_mod.Menu.Option) = .empty;
     for (proj.blockers[i]) |b| {
         options.append(a, .{
-            .label = std.fmt.allocPrint(a, "#{s} {s}", .{ shortId(snap.issues[b].id), snap.issues[b].title }) catch "",
+            .label = std.fmt.allocPrint(
+                a,
+                "#{s} {s}",
+                .{ shortId(snap.issues[b].id), snap.issues[b].title },
+            ) catch "",
             .value = a.dupe(u8, snap.issues[b].id) catch "",
         }) catch {};
     }
-    const title = std.fmt.allocPrint(a, "#{s} stops waiting for (staged)", .{shortId(snap.issues[i].id)}) catch "";
-    s.openModal(.{ .menu = .{ .title = title, .options = options.items, .purpose = .{ .stage_unblock = .of(snap.issues[i].id) } } });
+    const title = std.fmt.allocPrint(
+        a,
+        "#{s} stops waiting for (staged)",
+        .{shortId(snap.issues[i].id)},
+    ) catch "";
+    s.openModal(
+        .{
+            .menu = .{
+                .title = title,
+                .options = options.items,
+                .purpose = .{ .stage_unblock = .of(snap.issues[i].id) },
+            },
+        },
+    );
 }
 
 // Dragging.
@@ -533,8 +698,13 @@ pub fn press(s: *AppState, row: u32, x: u16) void {
     // By its title: to another milestone.
     if (x < t.chart_x) {
         const r = t.rows[row];
-        if (t.grouping == .milestone and (r.kind == .issue or r.kind == .unscheduled_issue) and !r.context) {
-            t.row_drag = .{ .issue = .of(snap.issues[r.issue].id), .from = t.groups[r.group].scope };
+        if (t.grouping == .milestone and (r.kind == .issue or r.kind == .unscheduled_issue) and
+            !r.context)
+        {
+            t.row_drag = .{
+                .issue = .of(snap.issues[r.issue].id),
+                .from = t.groups[r.group].scope,
+            };
         }
         return;
     }
@@ -546,7 +716,16 @@ pub fn press(s: *AppState, row: u32, x: u16) void {
             const n = t.groups[r.group].milestone orelse return;
             const due = view.milestoneDue(s, n) orelse return;
             if (@abs(t.x(due.toDays()) - col) > 1) return;
-            t.bar_drag = .{ .target = .{ .milestone = .of(snap.milestones[n].id) }, .part = .end, .anchor = day, .start = null, .due = due, .written_start = null, .written_due = due, .tip = snap.milestones[n].tip };
+            t.bar_drag = .{
+                .target = .{ .milestone = .of(snap.milestones[n].id) },
+                .part = .end,
+                .anchor = day,
+                .start = null,
+                .due = due,
+                .written_start = null,
+                .written_due = due,
+                .tip = snap.milestones[n].tip,
+            };
         },
         .issue => {
             const i = r.issue;
@@ -559,7 +738,11 @@ pub fn press(s: *AppState, row: u32, x: u16) void {
             const flipped = inverted(d.start, d.due);
             const left: @FieldType(view.State.BarDrag, "part") = if (flipped) .end else .start;
             const right: @FieldType(view.State.BarDrag, "part") = if (flipped) .start else .end;
-            const part: @FieldType(view.State.BarDrag, "part") = if (to > from and col == from) left else if (to > from and col == to) right else .body;
+            const part: @FieldType(
+                view.State.BarDrag,
+                "part",
+            ) = if (to > from and col == from) left else if (to > from and
+                col == to) right else .body;
             t.bar_drag = .{
                 .target = .{ .issue = .of(snap.issues[i].id) },
                 .part = part,
@@ -582,7 +765,8 @@ pub fn dragTo(s: *AppState, found: ?ui.Hits.Found) void {
         // Off the rows, letting go cancels.
         rd.over = null;
         const h = found orelse return;
-        if (h.target == .tl_row and h.target.tl_row < t.rows.len) rd.over = t.groups[t.rows[h.target.tl_row].group].scope;
+        if (h.target == .tl_row and h.target.tl_row < t.rows.len) rd.over =
+            t.groups[t.rows[h.target.tl_row].group].scope;
         return;
     }
     const d = &(t.bar_drag orelse return);
@@ -593,7 +777,9 @@ pub fn dragTo(s: *AppState, found: ?ui.Hits.Found) void {
     if (!d.moved) return;
     d.delta = delta;
     switch (d.target) {
-        .milestone => |id| t.preview = .{ .milestone_due = .{ .id = id, .due = d.due.?.addDays(delta) } },
+        .milestone => |id| t.preview = .{
+            .milestone_due = .{ .id = id, .due = d.due.?.addDays(delta) },
+        },
         .issue => |id| {
             // What it has moves with the body; an end sets that date. A
             // bar already the wrong way round isn't held to the order.
@@ -636,14 +822,22 @@ pub fn release(s: *AppState) void {
         if (over.eql(rd.from)) return;
         // Gone meanwhile.
         if (snap.find(rd.issue.slice()) == null) return;
-        if (over == .id) if (snap.findMilestone(over.id.slice())) |n| if (snap.milestones[n].status != .open) {
-            return s.fail("{s} is {s}: reopen it first to add work", .{ snap.milestones[n].name, @tagName(snap.milestones[n].status) });
+        if (over == .id) if (snap.findMilestone(
+            over.id.slice(),
+        )) |n| if (snap.milestones[n].status != .open) {
+            return s.fail(
+                "{s} is {s}: reopen it first to add work",
+                .{ snap.milestones[n].name, @tagName(snap.milestones[n].status) },
+            );
         };
         if (!stage(s, .{ .milestone = .{ .id = rd.issue, .link = switch (over) {
             .none => .none,
             .id => |m| .{ .id = m },
         } } })) return;
-        s.info("#{s} → {s} (staged)", .{ shortId(rd.issue.slice()), @import("milestone_view.zig").scopeName(snap, over) });
+        s.info(
+            "#{s} → {s} (staged)",
+            .{ shortId(rd.issue.slice()), @import("milestone_view.zig").scopeName(snap, over) },
+        );
         return;
     }
     const d = bar_drag orelse return;

@@ -8,6 +8,7 @@
 const GitSim = @This();
 
 const std = @import("std");
+const stableSort = @import("../sort.zig").stable;
 const assert = std.debug.assert;
 const Allocator = std.mem.Allocator;
 const contract = @import("contract.zig");
@@ -64,7 +65,7 @@ pub const World = struct {
         data: []const u8,
     };
 
-    pub const ConfigEntry = struct { key: []const u8, value: []const u8 };
+    pub const ConfigEntry = contract.ConfigEntry;
     pub const Ref = struct { name: []const u8, oid: []const u8 };
     pub const StoredObject = struct { kind: ObjectKind, data: []const u8 };
 
@@ -116,6 +117,40 @@ prng: std.Random.DefaultPrng,
 
 pub const Error = error{OutOfMemory};
 
+/// A pre-receive hook for simulations: runs before a push lands, on a
+/// quarantine (the receiving clone with the pushed objects added, its refs
+/// as they were). Refusing fails the push like a real hook: PushFailed.
+pub const ReceiveHook = struct {
+    context: *anyopaque,
+    receive: *const fn (
+        context: *anyopaque,
+        arena: Allocator,
+        quarantine: *GitSim,
+        updates: []const Received,
+    ) bool,
+};
+
+/// One ref a push changes; null for none.
+pub const Received = struct { name: []const u8, old: ?Oid, new: ?Oid };
+
+/// Off unless a simulator or fuzzer sets it. Global, since worlds are
+/// plain values.
+pub var receive_hook: ?ReceiveHook = null;
+
+fn runReceiveHook(
+    sim: *GitSim,
+    arena: Allocator,
+    idx: usize,
+    objects: *const ObjectMap,
+    updates: []const Received,
+) Error!bool {
+    const hook = receive_hook orelse return true;
+    if (updates.len == 0) return true;
+    var q = try GitSim.init(arena, sim.world, idx);
+    q.objects = try objects.clone(arena);
+    return hook.receive(hook.context, arena, &q, updates);
+}
+
 /// Call `commit` to write the changes back into `world`.
 pub fn init(arena: Allocator, world: *World, clone_index: usize) Error!GitSim {
     assert(clone_index < world.clones.len);
@@ -161,11 +196,11 @@ pub fn commit(sim: *GitSim) Error!void {
     var it = sim.objects.iterator();
     var i: usize = 0;
     while (it.next()) |e| : (i += 1) oids[i] = e.key_ptr.*;
-    std.mem.sort(Oid, oids, {}, oidLessThan);
+    stableSort(Oid, oids, {}, oidLessThan);
     for (oids, objs) |oid, *o| o.* = sim.objects.get(oid).?;
 
     const names = try sim.arena.dupe([]const u8, sim.refs.keys());
-    std.mem.sort([]const u8, names, {}, stringLessThan);
+    stableSort([]const u8, names, {}, stringLessThan);
     const refs = try sim.arena.alloc(World.Ref, names.len);
     for (names, refs) |name, *r| {
         const hex = sim.refs.get(name).?.hex();
@@ -176,7 +211,7 @@ pub fn commit(sim: *GitSim) Error!void {
     clones[sim.clone_index].objects = objs;
     clones[sim.clone_index].refs = refs;
     clones[sim.clone_index].config = sim.config.items;
-    std.mem.sort(World.LfsObject, sim.lfs.items, {}, lfsLessThan);
+    stableSort(World.LfsObject, sim.lfs.items, {}, lfsLessThan);
     clones[sim.clone_index].lfs = sim.lfs.items;
     sim.world.clones = clones;
     sim.world.seed = sim.prng.next();
@@ -223,7 +258,7 @@ pub fn listRefs(sim: *GitSim, arena: Allocator, prefix: []const u8) Error![]cont
     for (sim.refs.keys(), sim.refs.values()) |name, oid| {
         if (matchesPrefix(name, prefix)) try entries.append(arena, .{ .name = name, .oid = oid });
     }
-    std.mem.sort(contract.RefEntry, entries.items, {}, refLessThan);
+    stableSort(contract.RefEntry, entries.items, {}, refLessThan);
     return entries.toOwnedSlice(arena);
 }
 
@@ -296,7 +331,7 @@ pub fn mergeBases(sim: *GitSim, arena: Allocator, a: Oid, b: Oid) Error![]Oid {
         }
         try bases.append(arena, c);
     }
-    std.mem.sort(Oid, bases.items, {}, oidLessThan);
+    stableSort(Oid, bases.items, {}, oidLessThan);
     return bases.toOwnedSlice(arena);
 }
 
@@ -349,7 +384,7 @@ pub fn configList(sim: *GitSim, arena: Allocator) Error![]const World.ConfigEntr
     return out;
 }
 
-/// In first-seen order.
+/// Sorted, as `git remote` lists them.
 pub fn remoteNames(sim: *GitSim, arena: Allocator) Error![]const []const u8 {
     var out: std.ArrayList([]const u8) = .empty;
     for (sim.config.items) |e| {
@@ -365,7 +400,7 @@ pub fn remoteNames(sim: *GitSim, arena: Allocator) Error![]const []const u8 {
         };
         if (!dup) try out.append(arena, name);
     }
-    std.mem.sort([]const u8, out.items, {}, stringLessThan);
+    stableSort([]const u8, out.items, {}, stringLessThan);
     return out.items;
 }
 
@@ -418,7 +453,7 @@ pub fn lfsWrite(sim: *GitSim, sha256: []const u8, data: []const u8) Error!void {
 pub fn lfsList(sim: *GitSim, arena: Allocator) Error![]const []const u8 {
     var out: std.ArrayList([]const u8) = .empty;
     for (sim.lfs.items) |o| if (o.store == .issuez) try out.append(arena, o.sha256);
-    std.mem.sort([]const u8, out.items, {}, stringLessThan);
+    stableSort([]const u8, out.items, {}, stringLessThan);
     return out.items;
 }
 
@@ -477,7 +512,7 @@ pub fn lfsPush(
             .data = data,
         });
     }
-    std.mem.sort(World.LfsObject, target.items, {}, lfsLessThan);
+    stableSort(World.LfsObject, target.items, {}, lfsLessThan);
     const clones = try arena.dupe(World.Clone, sim.world.clones);
     clones[idx].lfs = target.items;
     sim.world.clones = clones;
@@ -541,7 +576,11 @@ fn lfsLessThan(_: void, a: World.LfsObject, b: World.LfsObject) bool {
 /// Remotes are other clones: `remote.<name>.url = sim:<clone>`.
 fn remoteClone(sim: *GitSim, arena: Allocator, remote: []const u8) Error!?usize {
     const key = try std.fmt.allocPrint(arena, "remote.{s}.url", .{remote});
-    const url = (try sim.configGet(arena, key)) orelse return null;
+    // A URL given instead of a name.
+    const url = if (std.mem.startsWith(u8, remote, "sim:"))
+        remote
+    else
+        (try sim.configGet(arena, key)) orelse return null;
     if (!std.mem.startsWith(u8, url, "sim:")) return null;
     const idx = sim.world.cloneIndex(url["sim:".len..]) orelse return null;
     if (idx == sim.clone_index) protocolViolation(
@@ -619,7 +658,7 @@ pub fn fetch(
     arena: Allocator,
     remote: []const u8,
     refspecs: []const []const u8,
-    prune: bool,
+    options: contract.FetchOptions,
 ) (Error || error{FetchFailed})!void {
     const idx = (try sim.remoteClone(arena, remote)) orelse return error.FetchFailed;
     const remote_clone = sim.world.clones[idx];
@@ -627,7 +666,7 @@ pub fn fetch(
     const remote_objects = try objectsOf(arena, format, remote_clone);
     // Like `git fetch --prune`: a ref under a glob destination goes when no
     // refspec maps a remote ref to it any more (all refspecs together).
-    if (prune) {
+    if (options.prune) {
         var wanted: std.StringHashMapUnmanaged(void) = .empty;
         for (refspecs) |raw| {
             const spec = parseRefspec(raw);
@@ -672,7 +711,7 @@ pub fn push(
     arena: Allocator,
     remote: []const u8,
     refspecs: []const []const u8,
-    atomic: bool,
+    options: contract.PushOptions,
 ) (Error || error{PushFailed})!contract.PushResult {
     const idx = (try sim.remoteClone(arena, remote)) orelse return error.PushFailed;
     const target = sim.world.clones[idx];
@@ -708,26 +747,112 @@ pub fn push(
         if (status == .rejected) any_rejected = true;
         try plans.append(arena, .{ .dst = spec.dst, .new = new, .status = status });
     }
-    if (atomic and any_rejected) {
+    if (options.atomic and any_rejected) {
         for (plans.items) |*p| if (p.status == .ok) {
             p.status = .rejected;
         };
     }
-    var changed = false;
+    var received: std.ArrayList(Received) = .empty;
     for (plans.items) |p| if (p.status == .ok) {
         try copyReachable(arena, format, &sim.objects, &target_objects, p.new);
+        try received.append(arena, .{ .name = p.dst, .old = target_refs.get(p.dst), .new = p.new });
+    };
+    if (!try sim.runReceiveHook(arena, idx, &target_objects, received.items))
+        return error.PushFailed;
+    var changed = false;
+    for (plans.items) |p| if (p.status == .ok) {
         try target_refs.put(arena, p.dst, p.new);
         changed = true;
     };
-    if (changed) {
+    if (changed) try sim.storeRemote(arena, idx, &target_objects, &target_refs);
+    const out = try arena.alloc(contract.PushedRef, plans.items.len);
+    for (plans.items, out) |p, *o| o.* = .{ .name = p.dst, .status = p.status };
+    return .{ .refs = out };
+}
+
+/// Atomic, like `git push --atomic --force-with-lease`: every ref must
+/// still be what its lease expects, and then each is set to its source or
+/// deleted, fast-forward or not.
+/// A local ref, or like git an object ID this clone has.
+fn leasedSource(sim: *const GitSim, src: []const u8) ?Oid {
+    if (sim.refs.get(src)) |oid| return oid;
+    const oid = Oid.parseHex(sim.world.format, src) catch return null;
+    return if (sim.objects.contains(oid)) oid else null;
+}
+
+pub fn pushLeased(
+    sim: *GitSim,
+    arena: Allocator,
+    remote: []const u8,
+    updates: []const contract.LeasedRef,
+) (Error || error{PushFailed})!contract.PushResult {
+    assert(updates.len > 0);
+    const idx = (try sim.remoteClone(arena, remote)) orelse return error.PushFailed;
+    const target = sim.world.clones[idx];
+    const format = sim.world.format;
+    var target_objects = try objectsOf(arena, format, target);
+    var target_refs: std.array_hash_map.String(Oid) = .empty;
+    for (target.refs) |r| try target_refs.put(
+        arena,
+        r.name,
+        Oid.parseHex(format, r.oid) catch protocolViolation("bad oid", .{}),
+    );
+    const out = try arena.alloc(contract.PushedRef, updates.len);
+    var stale = false;
+    for (updates, out) |u, *o| {
+        if (!contract.isValidRefName(u.dst)) protocolViolation(
+            "push to invalid ref '{s}'",
+            .{u.dst},
+        );
+        const new: ?Oid = if (u.src) |src|
+            sim.leasedSource(src) orelse return error.PushFailed
+        else
+            null;
+        const old = target_refs.get(u.dst);
+        o.* = .{ .name = u.dst, .status = .ok };
+        if (!sameRef(old, u.expect)) {
+            stale = true;
+            o.status = .rejected;
+        } else if (sameRef(old, new)) o.status = .up_to_date;
+    }
+    if (stale) {
+        for (out) |*o| o.status = .rejected;
+        return .{ .refs = out };
+    }
+    var received: std.ArrayList(Received) = .empty;
+    for (updates, out) |u, o| {
+        if (o.status == .up_to_date) continue;
+        const new: ?Oid = if (u.src) |src| sim.leasedSource(src).? else null;
+        if (new) |n| try copyReachable(arena, format, &sim.objects, &target_objects, n);
+        try received.append(arena, .{ .name = u.dst, .old = target_refs.get(u.dst), .new = new });
+    }
+    if (!try sim.runReceiveHook(arena, idx, &target_objects, received.items))
+        return error.PushFailed;
+    for (updates) |u| {
+        if (u.src) |src| {
+            try target_refs.put(arena, u.dst, sim.leasedSource(src).?);
+        } else _ = target_refs.orderedRemove(u.dst);
+    }
+    try sim.storeRemote(arena, idx, &target_objects, &target_refs);
+    return .{ .refs = out };
+}
+
+fn storeRemote(
+    sim: *GitSim,
+    arena: Allocator,
+    idx: usize,
+    target_objects: anytype,
+    target_refs: *std.array_hash_map.String(Oid),
+) Error!void {
+    {
         var objs: std.ArrayList(World.StoredObject) = .empty;
         var oids: std.ArrayList(Oid) = .empty;
         var it = target_objects.keyIterator();
         while (it.next()) |k| try oids.append(arena, k.*);
-        std.mem.sort(Oid, oids.items, {}, oidLessThan);
+        stableSort(Oid, oids.items, {}, oidLessThan);
         for (oids.items) |o| try objs.append(arena, target_objects.get(o).?);
         const names = try arena.dupe([]const u8, target_refs.keys());
-        std.mem.sort([]const u8, names, {}, stringLessThan);
+        stableSort([]const u8, names, {}, stringLessThan);
         var refs: std.ArrayList(World.Ref) = .empty;
         for (names) |n| try refs.append(arena, .{
             .name = n,
@@ -738,9 +863,6 @@ pub fn push(
         clones[idx].refs = refs.items;
         sim.world.clones = clones;
     }
-    const out = try arena.alloc(contract.PushedRef, plans.items.len);
-    for (plans.items, out) |p, *o| o.* = .{ .name = p.dst, .status = p.status };
-    return .{ .refs = out };
 }
 
 comptime {
@@ -882,7 +1004,12 @@ test "fetch prunes against all refspecs together, like git" {
     try a.updateRefs(&.{.{ .name = "refs/m/stale", .op = .{ .create = own } }});
     // The first destination lies inside the second: git keeps `m/y/two`
     // although the second refspec has no `y/two`, and prunes `m/stale`.
-    try a.fetch(arena, "hub", &.{ "+refs/y/*:refs/m/y/*", "+refs/x/*:refs/m/*" }, true);
+    try a.fetch(
+        arena,
+        "hub",
+        &.{ "+refs/y/*:refs/m/y/*", "+refs/x/*:refs/m/*" },
+        .{ .prune = true },
+    );
     const left = try a.listRefs(arena, "refs/m/");
     try testing.expectEqual(@as(usize, 2), left.len);
     try testing.expectEqualStrings("refs/m/one", left[0].name);

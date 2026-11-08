@@ -23,6 +23,8 @@ pub const help =
     \\   --delete <comment-id>      Hide a comment
     \\   --restore <comment-id>     Show a deleted comment again
     \\   --attach <file>            Attach an image with the comment (repeatable)
+    \\   --original-author <name>   Imported: its author in the other tracker
+    \\   --original-id <id>         Imported: its ID in the other tracker
     \\   -h, --help                 Show this help
     \\
 ;
@@ -37,6 +39,7 @@ pub fn main(comptime B: type, ctx: *context.Context(B), argv: []const []const u8
     var target: ?[]const u8 = null;
     var files: std.ArrayList([]const u8) = .empty;
 
+    var extras: common.Extras = .{};
     var args: common.Args = .{ .list = argv };
     while (args.next()) |arg| {
         if (!args.isOption(arg)) {
@@ -48,6 +51,9 @@ pub fn main(comptime B: type, ctx: *context.Context(B), argv: []const []const u8
         } else if (std.mem.eql(u8, arg, "-m") or std.mem.eql(u8, arg, "--message")) {
             const v = args.value(ctx.err, "-m") orelse return common.exit_error;
             paragraphs.append(arena, v) catch return common.oom(ctx.err);
+        } else if (std.mem.startsWith(u8, arg, "--original-")) {
+            const was = extras.parse(arena, ctx.err, &args, arg) orelse return common.exit_error;
+            if (!was) return common.unknownOption(ctx.err, "comment", arg);
         } else if (std.mem.eql(u8, arg, "--attach")) {
             const v = args.value(ctx.err, arg) orelse return common.exit_error;
             files.append(arena, v) catch return common.oom(ctx.err);
@@ -108,13 +114,18 @@ pub fn main(comptime B: type, ctx: *context.Context(B), argv: []const []const u8
         att.ready(arena) catch |e| return common.repoFailed(B, ctx, e);
         const inputs = attach.readInputs(B, ctx, att, files.items, null) orelse
             return common.exit_error;
-        _ = att.add(arena, ref.name, .{ .files = inputs, .comment = text }) catch |e|
+        _ = att.add(arena, ref.name, .{ .files = inputs, .comment = text }, .{}) catch |e|
             return common.repoFailed(B, ctx, e);
         ctx.out.print("Added comment to {s}\n", .{short}) catch {};
         return common.exit_ok;
     }
     if (action == .add) {
-        _ = repo.comment(arena, ref.name, .{ .text = text }) catch |e|
+        _ = repo.comment(
+            arena,
+            ref.name,
+            .{ .text = text, .original = extras.original },
+            .{},
+        ) catch |e|
             return common.repoFailed(B, ctx, e);
         ctx.out.print("Added comment to {s}\n", .{short}) catch {};
         return common.exit_ok;
@@ -122,13 +133,18 @@ pub fn main(comptime B: type, ctx: *context.Context(B), argv: []const []const u8
 
     const issue = repo.load(arena, ref) catch |e| return common.repoFailed(B, ctx, e);
     const comment = resolveComment(ctx, issue, target.?) orelse return common.exit_error;
-    const event: issuez.engine.Repo(B).CommentEvent = switch (action) {
+    const event: issuez.CommentEvent = switch (action) {
         .edit => .edit,
         .delete => .delete,
         .restore => .restore,
         .add => unreachable,
     };
-    _ = repo.commentEvent(arena, ref.name, comment.oid, event, text, .{}) catch |e|
+    _ = repo.commentEvent(
+        arena,
+        ref.name,
+        .{ .target = comment.oid, .event = event, .text = text },
+        .{},
+    ) catch |e|
         return common.repoFailed(B, ctx, e);
     const hex = comment.oid.hex();
     const verb = switch (action) {

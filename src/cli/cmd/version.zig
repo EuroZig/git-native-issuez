@@ -7,7 +7,7 @@ const common = @import("../common.zig");
 
 /// `build.zig.zon`'s version, with `git describe`'s distance and commit
 /// unless built from its tag (`describeVersion` in build.zig).
-pub const version: []const u8 = @import("version").version;
+pub const version: []const u8 = @import("issuez").version;
 
 pub const help =
     \\usage: git issue version

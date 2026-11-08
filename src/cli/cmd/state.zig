@@ -16,6 +16,7 @@ pub const help =
     \\   --close                Close the issue
     \\   --state <value>        Set a custom state (letters, digits, - and _)
     \\   -m, --message <text>   Message for the state change
+    \\   -c, --comment <text>   A comment in the same commit; repeat for paragraphs
     \\   --fixed-by <sha>       Commit that fixes the issue
     \\   --release <version>    Release that ships the fix
     \\   --reason <reason>      Why it was closed (duplicate, wontfix, invalid, completed)
@@ -31,6 +32,7 @@ pub fn main(comptime B: type, ctx: *context.Context(B), argv: []const []const u8
     var fixed_by: ?[]const u8 = null;
     var release: ?[]const u8 = null;
     var reason: ?[]const u8 = null;
+    var comment: std.ArrayList([]const u8) = .empty;
 
     var args: common.Args = .{ .list = argv };
     while (args.next()) |arg| {
@@ -54,6 +56,9 @@ pub fn main(comptime B: type, ctx: *context.Context(B), argv: []const []const u8
             release = args.value(ctx.err, "--release") orelse return common.exit_error;
         } else if (std.mem.eql(u8, arg, "--reason")) {
             reason = args.value(ctx.err, "--reason") orelse return common.exit_error;
+        } else if (std.mem.eql(u8, arg, "-c") or std.mem.eql(u8, arg, "--comment")) {
+            const v = args.value(ctx.err, "-c") orelse return common.exit_error;
+            comment.append(arena, v) catch return common.oom(ctx.err);
         } else {
             return common.unknownOption(ctx.err, "state", arg);
         }
@@ -89,7 +94,9 @@ pub fn main(comptime B: type, ctx: *context.Context(B), argv: []const []const u8
         };
     }
 
-    const repo = common.openRepo(B, ctx) orelse return common.exit_fatal;
+    var repo = common.openRepo(B, ctx) orelse return common.exit_fatal;
+    var skipped = false;
+    repo.call.skipped = &skipped;
     const ref = common.resolveOne(
         B,
         repo,
@@ -98,14 +105,29 @@ pub fn main(comptime B: type, ctx: *context.Context(B), argv: []const []const u8
         prefix,
     ) orelse return common.exit_error;
     const parsed = core.State.parse(state);
-    _ = repo.setState(arena, ref.name, .{
+    if (comment.items.len > 0) {
+        if (message != null) return common.fail(ctx.err, "error: --comment can't go with -m\n");
+        const text = std.mem.join(arena, "\n\n", comment.items) catch return common.oom(ctx.err);
+        // One commit: the comment is its text, the state change its fields.
+        _ = repo.edit(arena, ref.name, .{
+            .state = parsed,
+            .fixed_by = fixed_by,
+            .release = release,
+            .reason = reason,
+            .comment = text,
+        }, .{}) catch |e| return common.repoFailed(B, ctx, e);
+    } else _ = repo.setState(arena, ref.name, .{
         .state = parsed,
         .message = message,
         .fixed_by = fixed_by,
         .release = release,
         .reason = reason,
-    }) catch |e| return common.repoFailed(B, ctx, e);
+    }, .{}) catch |e| return common.repoFailed(B, ctx, e);
     const short = uuid.shortId(ref.id());
+    if (skipped) {
+        ctx.out.print("Issue {s} is already {s}\n", .{ short, parsed.text() }) catch {};
+        return common.exit_ok;
+    }
     switch (parsed) {
         .open => ctx.out.print("Reopened issue {s}\n", .{short}) catch {},
         .closed => ctx.out.print("Closed issue {s}\n", .{short}) catch {},

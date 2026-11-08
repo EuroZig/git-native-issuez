@@ -83,9 +83,10 @@ test "fixture worlds through the oracle" {
             .output = "error: state is required (--open, --close, or --state <value>)",
         },
         .{
-            .cmd = .{ .merge = .{ .remote = "../other-clone" } },
+            // Neither a name nor a URL or path.
+            .cmd = .{ .merge = .{ .remote = "no such remote" } },
             .exit = 1,
-            .output = "error: invalid remote name '../other-clone'\n" ++
+            .output = "error: invalid remote name 'no such remote'\n" ++
                 "       issues sync through a named remote; add one with:\n" ++
                 "       git remote add <name> <url-or-path>\n",
         },

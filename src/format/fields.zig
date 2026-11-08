@@ -10,6 +10,17 @@ pub const Assignee = struct {
     uuid: ?[]const u8,
     email: []const u8,
 
+    /// Someone known by email only.
+    pub fn byEmail(email: []const u8) Assignee {
+        return .{ .uuid = null, .email = email };
+    }
+
+    /// As written: `<uuid> <email>`, or the email.
+    pub fn text(a: Assignee, arena: std.mem.Allocator) std.mem.Allocator.Error![]const u8 {
+        const id = a.uuid orelse return a.email;
+        return std.fmt.allocPrint(arena, "{s} {s}", .{ id, a.email });
+    }
+
     /// If the first word isn't a UUID the whole value is the email, like
     /// format 1 reads it (upstream accepts `user name@x.y`). Null when
     /// empty, or for a UUID followed by nothing or by more than one word.
@@ -37,9 +48,14 @@ pub const Date = struct {
         const y = std.fmt.parseInt(u16, s[0..4], 10) catch return null;
         const m = std.fmt.parseInt(u8, s[5..7], 10) catch return null;
         const d = std.fmt.parseInt(u8, s[8..10], 10) catch return null;
-        if (y == 0 or m < 1 or m > 12 or d < 1) return null;
-        if (d > std.time.epoch.getDaysInMonth(y, @enumFromInt(m))) return null;
-        return .{ .year = y, .month = m, .day = d };
+        const date: Date = .{ .year = y, .month = m, .day = d };
+        return if (date.isValid()) date else null;
+    }
+
+    /// A day of the calendar, year 1 to 9999.
+    pub fn isValid(d: Date) bool {
+        if (d.year == 0 or d.year > 9999 or d.month < 1 or d.month > 12 or d.day < 1) return false;
+        return d.day <= std.time.epoch.getDaysInMonth(d.year, @enumFromInt(d.month));
     }
 
     pub fn order(a: Date, b: Date) std.math.Order {
@@ -80,7 +96,10 @@ pub const Date = struct {
         const z = days + 719_468;
         const era = @divFloor(z, 146_097);
         const doe = z - era * 146_097;
-        const yoe = @divFloor(doe - @divFloor(doe, 1460) + @divFloor(doe, 36_524) - @divFloor(doe, 146_096), 365);
+        const yoe = @divFloor(
+            doe - @divFloor(doe, 1460) + @divFloor(doe, 36_524) - @divFloor(doe, 146_096),
+            365,
+        );
         const doy = doe - (365 * yoe + @divFloor(yoe, 4) - @divFloor(yoe, 100));
         const mp = @divFloor(5 * doy + 2, 153);
         const day = doy - @divFloor(153 * mp + 2, 5) + 1;
@@ -108,8 +127,16 @@ pub const Date = struct {
         const total = @as(i64, d.year) * 12 + (d.month - 1) + n;
         const year = @divFloor(total, 12);
         if (year < 1 or year > 9999) return null;
-        const first: Date = .{ .year = @intCast(year), .month = @intCast(@mod(total, 12) + 1), .day = 1 };
-        return .{ .year = first.year, .month = first.month, .day = @min(d.day, first.daysInMonth()) };
+        const first: Date = .{
+            .year = @intCast(year),
+            .month = @intCast(@mod(total, 12) + 1),
+            .day = 1,
+        };
+        return .{
+            .year = first.year,
+            .month = first.month,
+            .day = @min(d.day, first.daysInMonth()),
+        };
     }
 
     /// `b` minus `a`, in days.
@@ -149,9 +176,22 @@ pub const Weekday = enum(u3) {
         if (s.len < 3) return null;
         inline for (std.meta.fields(Weekday)) |f| {
             if (std.ascii.eqlIgnoreCase(s[0..3], f.name)) {
-                const full = [_][]const u8{ "monday", "tuesday", "wednesday", "thursday", "friday", "saturday", "sunday" };
+                const full = [_][]const u8{
+                    "monday",
+                    "tuesday",
+                    "wednesday",
+                    "thursday",
+                    "friday",
+                    "saturday",
+                    "sunday",
+                };
                 const long = full[f.value];
-                if (s.len == 3 or (s.len <= long.len and std.ascii.eqlIgnoreCase(s, long[0..s.len]))) return @enumFromInt(f.value);
+                if (s.len == 3 or (s.len <= long.len and std.ascii.eqlIgnoreCase(
+                    s,
+                    long[0..s.len],
+                ))) return @enumFromInt(
+                    f.value,
+                );
             }
         }
         return null;
@@ -253,7 +293,10 @@ test "Date: days, weekdays, round trips" {
     try t.expect(Date.parse("2000-02-28").?.addDays(1).eql(Date.parse("2000-02-29").?));
     try t.expect(Date.parse("2026-12-31").?.addDays(1).eql(Date.parse("2027-01-01").?));
     try t.expectEqual(Weekday.wed, Date.parse("2026-11-04").?.weekday());
-    try t.expectEqual(@as(i32, 30), Date.parse("2026-11-01").?.daysBetween(Date.parse("2026-12-01").?));
+    try t.expectEqual(
+        @as(i32, 30),
+        Date.parse("2026-11-01").?.daysBetween(Date.parse("2026-12-01").?),
+    );
     try t.expect(Date.fromUnix(1_700_000_000).eql(Date.parse("2023-11-14").?));
     try t.expect(Date.fromUnix(-1).eql(Date.parse("1969-12-31").?));
     // 2023-11-14 22:13:20 UTC: the 15th two hours east, the 14th west.
@@ -269,7 +312,9 @@ test "Date: days, weekdays, round trips" {
     try t.expect(Date.fromUnixLocal(0, -1).eql(Date.parse("1969-12-31").?));
     try t.expect(Date.fromDays(Date.min_days).eql(.{ .year = 1, .month = 1, .day = 1 }));
     try t.expect(Date.fromDays(Date.max_days).eql(.{ .year = 9999, .month = 12, .day = 31 }));
-    try t.expect(Date.fromDays(std.math.maxInt(i32)).eql(.{ .year = 9999, .month = 12, .day = 31 }));
+    try t.expect(
+        Date.fromDays(std.math.maxInt(i32)).eql(.{ .year = 9999, .month = 12, .day = 31 }),
+    );
     // Every day of four centuries, against std.time.epoch.
     var days: i32 = -146_097;
     while (days < 146_097 * 2) : (days += 1) {
@@ -303,7 +348,10 @@ test "WorkDays" {
     try t.expectEqual(@as(u32, 5), w.countInclusive(Date.parse("2026-11-02").?, fri));
     try t.expectEqual(@as(u32, 6), w.countInclusive(fri, Date.parse("2026-11-13").?));
     try t.expectEqual(@as(u32, 0), w.countInclusive(fri, Date.parse("2026-11-05").?));
-    try t.expectEqual(@as(u32, 0), w.countInclusive(Date.parse("2026-11-07").?, Date.parse("2026-11-08").?));
+    try t.expectEqual(
+        @as(u32, 0),
+        w.countInclusive(Date.parse("2026-11-07").?, Date.parse("2026-11-08").?),
+    );
     try t.expectEqual(@as(u32, 3), WorkDays.all.countInclusive(fri, Date.parse("2026-11-08").?));
     // Long moves agree with walking day by day.
     var n: i32 = -40;
@@ -335,6 +383,32 @@ pub fn parseMinutes(s: []const u8) ?u32 {
     if (s.len > 1 and s[0] == '0') return null;
     const v = std.fmt.parseInt(u32, s, 10) catch return null;
     return if (v <= max_estimate_minutes) v else null;
+}
+
+/// `X-Number`: decimal, from 1, no leading zeros, at most 2^53 so every
+/// JSON reader keeps it exact.
+pub const max_number: u64 = 1 << 53;
+
+pub fn parseNumber(s: []const u8) ?u64 {
+    if (s.len == 0 or s.len > 16 or s[0] == '0') return null;
+    for (s) |c| if (!std.ascii.isDigit(c)) return null;
+    const v = std.fmt.parseInt(u64, s, 10) catch return null;
+    return if (v <= max_number) v else null;
+}
+
+/// `X-Ref`: a branch or tag, as git names it (`main`, `refs/tags/v1`):
+/// no spaces, controls, `..` or what else git refuses in a ref name.
+pub fn isRefName(s: []const u8) bool {
+    if (s.len == 0 or s.len > 255) return false;
+    if (s[0] == '-' or s[0] == '/' or s[s.len - 1] == '/') return false;
+    if (std.mem.endsWith(u8, s, ".lock") or std.mem.endsWith(u8, s, ".")) return false;
+    if (std.mem.indexOf(u8, s, "..") != null or std.mem.indexOf(u8, s, "//") != null or
+        std.mem.indexOf(u8, s, "@{") != null) return false;
+    for (s) |c| switch (c) {
+        0...0x20, 0x7f, '~', '^', ':', '?', '*', '[', '\\' => return false,
+        else => {},
+    };
+    return true;
 }
 
 /// `90`, `2h`, `90m`, `1h30m`.
@@ -388,9 +462,20 @@ pub const MilestoneMode = enum {
 
     /// The mode in effect: the written one, else `explicit` with an
     /// `X-Milestone-Id`, else `inherit` under a parent, else `none`.
-    pub fn of(written: ?MilestoneMode, has_id: bool, has_parent: bool) MilestoneMode {
-        return written orelse if (has_id) .explicit else if (has_parent) .inherit else .none;
+    pub fn of(written: ?MilestoneMode, known: Known) MilestoneMode {
+        return written orelse if (known.has_id) .explicit else if (known.has_parent)
+            .inherit
+        else
+            .none;
     }
+
+    /// What `of` falls back on when no mode is written.
+    pub const Known = struct {
+        /// An `X-Milestone-Id` is written.
+        has_id: bool = false,
+        /// The issue has a parent.
+        has_parent: bool = false,
+    };
 };
 
 /// `X-Milestone-Status`. Readers take a missing or unknown value as `open`.
@@ -417,6 +502,9 @@ pub const Event = enum {
     comment_delete,
     comment_restore,
     description_edit,
+    /// `X-Reaction: +<emoji>` or `-<emoji>`, on the issue or, with
+    /// `X-Comment`, on a comment.
+    reaction,
 
     /// The tag names with `-` for `_`, so the two can't drift apart.
     const names = blk: {
@@ -440,9 +528,9 @@ pub const Event = enum {
         return names[@intFromEnum(e)];
     }
 
-    /// Needs `X-Comment`.
+    /// Needs `X-Comment`. A reaction may have one.
     pub fn targetsComment(e: Event) bool {
-        return e != .description_edit;
+        return e != .description_edit and e != .reaction;
     }
 
     /// The message text is the new content.
@@ -450,6 +538,27 @@ pub const Event = enum {
         return e == .comment_edit or e == .description_edit;
     }
 };
+
+/// `X-Reaction`: `+` adds the author's reaction, `-` takes it back. The
+/// emoji is a name like `:+1:` or the character itself: 1 to 64 bytes, no
+/// whitespace, controls or commas.
+pub const Reaction = struct {
+    add: bool,
+    emoji: []const u8,
+
+    pub fn parse(s: []const u8) ?Reaction {
+        if (s.len < 2 or (s[0] != '+' and s[0] != '-')) return null;
+        const emoji = s[1..];
+        if (!isEmoji(emoji)) return null;
+        return .{ .add = s[0] == '+', .emoji = emoji };
+    }
+};
+
+pub fn isEmoji(s: []const u8) bool {
+    if (s.len == 0 or s.len > 64) return false;
+    for (s) |c| if (c <= 0x20 or c == 0x7f or c == ',') return false;
+    return true;
+}
 
 /// Used when `issue.workflowStates` isn't set.
 pub const default_workflow = [_][]const u8{ "backlog", "ready", "in-progress", "review" };
@@ -513,10 +622,11 @@ test isSlug {
 }
 
 test MilestoneMode {
-    try testing.expectEqual(MilestoneMode.none, MilestoneMode.of(.none, true, true));
-    try testing.expectEqual(MilestoneMode.explicit, MilestoneMode.of(null, true, true));
-    try testing.expectEqual(MilestoneMode.inherit, MilestoneMode.of(null, false, true));
-    try testing.expectEqual(MilestoneMode.none, MilestoneMode.of(null, false, false));
+    const M = MilestoneMode;
+    try testing.expectEqual(M.none, M.of(.none, .{ .has_id = true, .has_parent = true }));
+    try testing.expectEqual(M.explicit, M.of(null, .{ .has_id = true, .has_parent = true }));
+    try testing.expectEqual(M.inherit, M.of(null, .{ .has_parent = true }));
+    try testing.expectEqual(M.none, M.of(null, .{}));
 }
 
 test MilestoneStatus {

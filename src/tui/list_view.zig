@@ -77,20 +77,45 @@ pub fn drawFilterBar(s: *AppState, f: ui.Frame, bar: ui.Window, tree: bool) Allo
     const bg: ui.Style = .{ .bg = palette.panel_bg };
     bar.fill(.{ .style = bg });
     var col: u16 = 1;
-    const search_icon: ui.Style = .{ .fg = if (s.search_focused) palette.accent else palette.muted, .bg = palette.panel_bg };
+    const search_icon: ui.Style = .{
+        .fg = if (s.search_focused) palette.accent else palette.muted,
+        .bg = palette.panel_bg,
+    };
     col += ui.text(bar, col, 0, "/ ", search_icon);
     const box_w: u16 = @min(@max(bar.width / 3, 20), 48);
     const box = bar.child(.{ .x_off = col, .width = box_w, .height = 1 });
-    try s.searchBox().draw(f.arena, box, .{ .bg = palette.input_bg }, s.search_focused, "filter: words, label:x, @who, p:high, is:blocked");
+    try s.searchBox().draw(
+        f.arena,
+        box,
+        .{ .bg = palette.input_bg },
+        s.search_focused,
+        "filter: words, label:x, @who, p:high, is:blocked",
+    );
     try f.hit(box, .search);
     col += box_w + 2;
 
     for ([_]filter.Scope{ .open, .done, .all }) |sc| {
-        col += try ui.button(f, bar, col, 0, sc.label(), .{ .scope = sc }, ui.buttonStyle(q.scope == sc));
+        col += try ui.button(
+            f,
+            bar,
+            col,
+            0,
+            sc.label(),
+            .{ .scope = sc },
+            ui.buttonStyle(q.scope == sc),
+        );
     }
     col += 2;
     if (tree) {
-        col += try ui.button(f, bar, col, 0, if (q.tree) "▾ Tree" else "▸ Tree", .tree, ui.buttonStyle(q.tree));
+        col += try ui.button(
+            f,
+            bar,
+            col,
+            0,
+            if (q.tree) "▾ Tree" else "▸ Tree",
+            .tree,
+            ui.buttonStyle(q.tree),
+        );
         col += 2;
     }
     col += ui.text(bar, col, 0, "Sort ", .{ .fg = palette.muted, .bg = palette.panel_bg });
@@ -98,14 +123,27 @@ pub fn drawFilterBar(s: *AppState, f: ui.Frame, bar: ui.Window, tree: bool) Allo
         inline else => |k| @tagName(k) ++ " ▾",
     };
     col += try ui.button(f, bar, col, 0, sort_label, .{ .command = .sort }, ui.buttonStyle(false));
-    col += try ui.button(f, bar, col, 0, if (q.reverse) "↑" else "↓", .sort_reverse, ui.buttonStyle(false));
+    col += try ui.button(
+        f,
+        bar,
+        col,
+        0,
+        if (q.reverse) "↑" else "↓",
+        .sort_reverse,
+        ui.buttonStyle(false),
+    );
     return col;
 }
 
 pub fn draw(s: *AppState, f: ui.Frame, win: ui.Window) Allocator.Error!void {
     _ = try drawFilterBar(s, f, win.child(.{ .height = 1 }), true);
     const rows = try filter.rows(f.arena, s.snap, s.currentQuery());
-    try drawTable(s, f, win.child(.{ .y_off = 1, .height = win.height -| 1 }), .{ .l = &s.list, .rows = rows, .query = s.query });
+    try drawTable(
+        s,
+        f,
+        win.child(.{ .y_off = 1, .height = win.height -| 1 }),
+        .{ .l = &s.list, .rows = rows, .query = s.query },
+    );
 }
 
 /// One issue table: the list, or a pane of the milestone view.
@@ -158,11 +196,20 @@ pub fn drawTable(s: *AppState, f: ui.Frame, win: ui.Window, t: Table) Allocator.
 
     if (t.pane) |p| try f.hit(body, .{ .mpane = p });
     if (l.rows.len == 0) {
-        const msg = t.empty orelse if (snap.issues.len == 0) "No issues yet." else "No issues match the filter.";
+        const msg = t.empty orelse if (snap.issues.len == 0) "No issues yet." else "No issues " ++
+            "match the filter.";
         const mid = body.height / 2;
         const mw = body.gwidth(msg);
         _ = ui.text(body, (body.width -| mw) / 2, mid -| 1, msg, .{ .fg = palette.muted });
-        if (t.pane == null) _ = try ui.button(f, body, (body.width -| 14) / 2, mid + 1, "+ New issue", .{ .command = .new_issue }, ui.buttonStyle(true));
+        if (t.pane == null) _ = try ui.button(
+            f,
+            body,
+            (body.width -| 14) / 2,
+            mid + 1,
+            "+ New issue",
+            .{ .command = .new_issue },
+            ui.buttonStyle(true),
+        );
         return;
     }
 
@@ -174,15 +221,37 @@ pub fn drawTable(s: *AppState, f: ui.Frame, win: ui.Window, t: Table) Allocator.
         const marked = for (t.marks) |*m| {
             if (m.eql(snap.issues[r.issue].id)) break true;
         } else false;
-        const dragged = if (s.drag) |d| d.moved and t.pane != null and d.card.column == t.pane.? and d.card.index == index else false;
-        drawRow(s, f, row_win, lay, r, .{ .selected = index == l.selected, .focused = t.focused, .marked = marked, .dragged = dragged });
-        try f.hit(row_win, if (t.pane) |p| .{ .mrow = .{ .column = p, .index = index } } else .{ .row = index });
+        const dragged = if (s.drag) |d| d.moved and t.pane != null and d.card.column == t.pane.? and
+            d.card.index == index else false;
+        drawRow(
+            s,
+            f,
+            row_win,
+            lay,
+            r,
+            .{
+                .selected = index == l.selected,
+                .focused = t.focused,
+                .marked = marked,
+                .dragged = dragged,
+            },
+        );
+        try f.hit(
+            row_win,
+            if (t.pane) |p| .{ .mrow = .{ .column = p, .index = index } } else .{ .row = index },
+        );
     }
     // Scroll position.
     if (l.rows.len > body.height and body.height > 0) {
         const total: u32 = @intCast(l.rows.len);
-        const pos: u16 = @intCast(@as(u64, l.scroll) * (body.height - 1) / @max(total - body.height, 1));
-        body.writeCell(body.width - 1, pos, .{ .char = .{ .grapheme = "┃" }, .style = .{ .fg = palette.faint } });
+        const pos: u16 = @intCast(
+            @as(u64, l.scroll) * (body.height - 1) / @max(total - body.height, 1),
+        );
+        body.writeCell(
+            body.width - 1,
+            pos,
+            .{ .char = .{ .grapheme = "┃" }, .style = .{ .fg = palette.faint } },
+        );
     }
 }
 
@@ -214,24 +283,52 @@ fn drawHeader(f: ui.Frame, head: ui.Window, lay: Layout, q: filter.Query) Alloca
             .updated => "Upd",
         };
         const cell = head.child(.{ .x_off = x, .width = w, .height = 1 });
-        var cx = ui.text(cell, 0, 0, name, if (sort_key != null and sort_key.? == q.key) .{ .fg = palette.accent, .bold = true } else style);
+        var cx = ui.text(
+            cell,
+            0,
+            0,
+            name,
+            if (sort_key != null and sort_key.? == q.key) .{
+                .fg = palette.accent,
+                .bold = true,
+            } else style,
+        );
         if (sort_key) |k| {
-            if (k == q.key) cx += ui.text(cell, cx, 0, if (q.reverse) " ↑" else " ↓", .{ .fg = palette.accent });
+            if (k == q.key) cx += ui.text(
+                cell,
+                cx,
+                0,
+                if (q.reverse) " ↑" else " ↓",
+                .{ .fg = palette.accent },
+            );
             try f.hit(cell, .{ .sort = k });
         }
         x += w;
     }
 }
 
-const RowLook = struct { selected: bool, focused: bool = true, marked: bool = false, dragged: bool = false };
+const RowLook = struct {
+    selected: bool,
+    focused: bool = true,
+    marked: bool = false,
+    dragged: bool = false,
+};
 
-fn drawRow(s: *AppState, f: ui.Frame, win: ui.Window, lay: Layout, row: filter.Row, look: RowLook) void {
+fn drawRow(
+    s: *AppState,
+    f: ui.Frame,
+    win: ui.Window,
+    lay: Layout,
+    row: filter.Row,
+    look: RowLook,
+) void {
     const snap = s.snap;
     const i = row.issue;
     const issue = snap.issues[i];
     const done = snap.isDone(i);
     const selected = look.selected;
-    const bg: vaxis.Color = if (look.dragged) palette.hover_bg else if (selected and look.focused) palette.select_bg else if (look.marked) palette.mark_bg else .default;
+    const bg: vaxis.Color = if (look.dragged) palette.hover_bg else if (selected and
+        look.focused) palette.select_bg else if (look.marked) palette.mark_bg else .default;
     if (bg != .default) win.fill(.{ .style = .{ .bg = bg } });
     const dim = row.context;
 
@@ -245,9 +342,29 @@ fn drawRow(s: *AppState, f: ui.Frame, win: ui.Window, lay: Layout, row: filter.R
             .marker => {
                 const blocked = snap.proj.activelyBlocked(i);
                 // Deleted: only as the context of a sub-issue in the tree.
-                const glyph: []const u8 = if (issue.deleted) "✗" else if (done) "✓" else if (blocked) "⊘" else "●";
-                const fg = if (issue.deleted) palette.err else if (done) palette.done else if (blocked) palette.err else palette.open;
-                _ = ui.text(cell, 0, 0, if (look.marked) "✓" else if (selected) "▌" else " ", .{ .fg = if (look.marked) palette.ok else if (look.focused) palette.accent else palette.muted, .bg = bg });
+                const glyph: []const u8 =
+                    if (issue.deleted) "✗" else if (done) "✓" else if (blocked) "⊘" else "●";
+                const fg = if (issue.deleted or blocked)
+                    palette.err
+                else if (done)
+                    palette.done
+                else
+                    palette.open;
+                _ = ui.text(
+                    cell,
+                    0,
+                    0,
+                    if (look.marked) "✓" else if (selected) "▌" else " ",
+                    .{
+                        .fg = if (look.marked)
+                            palette.ok
+                        else if (look.focused)
+                            palette.accent
+                        else
+                            palette.muted,
+                        .bg = bg,
+                    },
+                );
                 _ = ui.text(win, 1, 0, glyph, .{ .fg = fg, .bg = bg, .dim = dim });
                 // Not pushed yet, or refused by the remote.
                 if (snap.remote.isQuarantined(issue.id)) {
@@ -256,7 +373,13 @@ fn drawRow(s: *AppState, f: ui.Frame, win: ui.Window, lay: Layout, row: filter.R
                     _ = ui.text(win, 2, 0, "↑", .{ .fg = palette.faint, .bg = bg });
                 }
             },
-            .id => _ = ui.text(cell, 0, 0, issuez.format.uuid.shortId(issue.id), .{ .fg = palette.id, .bg = bg, .dim = dim }),
+            .id => _ = ui.text(
+                cell,
+                0,
+                0,
+                issuez.format.uuid.shortId(issue.id),
+                .{ .fg = palette.id, .bg = bg, .dim = dim },
+            ),
             .title => {
                 var tx: u16 = 0;
                 if (row.depth > 0) {
@@ -273,9 +396,21 @@ fn drawRow(s: *AppState, f: ui.Frame, win: ui.Window, lay: Layout, row: filter.R
                 tx += ui.text(cell, tx, 0, issue.title, ts);
                 if (snap.proj.progress(i)) |p| {
                     tx += 1;
-                    tx += ui.text(cell, tx, 0, f.fmt("{d}/{d}", .{ p.closed, p.total }), .{ .fg = palette.muted, .bg = bg });
+                    tx += ui.text(
+                        cell,
+                        tx,
+                        0,
+                        f.fmt("{d}/{d}", .{ p.closed, p.total }),
+                        .{ .fg = palette.muted, .bg = bg },
+                    );
                 }
-                if (row.inherited) _ = ui.text(cell, tx + 1, 0, "↳ inherited", .{ .fg = palette.faint, .bg = bg, .italic = true });
+                if (row.inherited) _ = ui.text(
+                    cell,
+                    tx + 1,
+                    0,
+                    "↳ inherited",
+                    .{ .fg = palette.faint, .bg = bg, .italic = true },
+                );
             },
             .labels => {
                 var lx: u16 = 0;
@@ -287,21 +422,46 @@ fn drawRow(s: *AppState, f: ui.Frame, win: ui.Window, lay: Layout, row: filter.R
             },
             .priority => {
                 const p = issue.field("Priority");
-                _ = ui.text(cell, 0, 0, p orelse "·", .{ .fg = ui.priorityColor(p), .bg = bg, .dim = dim });
+                _ = ui.text(
+                    cell,
+                    0,
+                    0,
+                    p orelse "·",
+                    .{ .fg = ui.priorityColor(p), .bg = bg, .dim = dim },
+                );
             },
             .workflow => {
-                const t = if (done) issue.state.text() else snap.proj.workflow(i) orelse issue.state.text();
-                _ = ui.text(cell, 0, 0, t, .{ .fg = if (done) palette.done else palette.muted, .bg = bg, .dim = dim });
+                const workflow = snap.proj.workflow(i) orelse issue.state.text();
+                const t = if (done) issue.state.text() else workflow;
+                _ = ui.text(
+                    cell,
+                    0,
+                    0,
+                    t,
+                    .{ .fg = if (done) palette.done else palette.muted, .bg = bg, .dim = dim },
+                );
             },
             .assignee => {
                 const a = issue.field("Assignee") orelse "";
-                const shown = if (issue.ext.assignee) |p| p.email else a;
+                const shown = if (issue.assignee) |p| p.email else a;
                 _ = ui.text(cell, 0, 0, shown, .{ .fg = palette.muted, .bg = bg, .dim = dim });
             },
-            .due => if (issue.ext.due_date) |d| {
-                _ = ui.text(cell, 0, 0, f.fmt("{f}", .{d}), .{ .fg = palette.muted, .bg = bg, .dim = dim });
+            .due => if (issue.due_date) |d| {
+                _ = ui.text(
+                    cell,
+                    0,
+                    0,
+                    f.fmt("{f}", .{d}),
+                    .{ .fg = palette.muted, .bg = bg, .dim = dim },
+                );
             },
-            .updated => _ = ui.text(cell, 0, 0, ui.ago(f, issue.updated), .{ .fg = palette.muted, .bg = bg, .dim = dim }),
+            .updated => _ = ui.text(
+                cell,
+                0,
+                0,
+                ui.ago(f, issue.updated),
+                .{ .fg = palette.muted, .bg = bg, .dim = dim },
+            ),
         }
     }
 }

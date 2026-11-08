@@ -1,6 +1,7 @@
 //! What `ls` and `search` do, for programs that list issues themselves.
 
 const std = @import("std");
+const stableSort = @import("../sort.zig").stable;
 const Allocator = std.mem.Allocator;
 const issue_model = @import("../model/issue.zig");
 const labels_fmt = @import("../format/labels.zig");
@@ -33,11 +34,17 @@ pub const Filter = struct {
         if (f.state) |s| if (!issue.state.eql(s)) return false;
         if (f.done) |d| if (issue.state.isDone(f.done_states) != d) return false;
         if (f.label) |l| if (!labels_fmt.contains(issue.labels, l)) return false;
-        if (f.assignee) |a| if (!assigneeMatches(issue.field("Assignee") orelse "", a)) {
-            return false;
-        };
-        if (f.priority) |p| if (issue.priority() != p) return false;
+        if (f.assignee) |a| if (!anyAssignee(issue, a)) return false;
+        if (f.priority) |p| if (issue.priority != p) return false;
         return true;
+    }
+
+    /// Any of the assignees (format.md §3); "" matches none assigned.
+    fn anyAssignee(issue: Issue, wanted: []const u8) bool {
+        if (issue.assignees_written.len == 0)
+            return assigneeMatches(issue.field("Assignee") orelse "", wanted);
+        for (issue.assignees_written) |m| if (assigneeMatches(m, wanted)) return true;
+        return false;
     }
 
     fn assigneeMatches(value: []const u8, wanted: []const u8) bool {
@@ -66,7 +73,7 @@ pub fn list(
 ) Allocator.Error![]Issue {
     var out: std.ArrayList(Issue) = .empty;
     for (issues) |issue| if (filter.matches(issue)) try out.append(arena, issue);
-    std.mem.sort(Issue, out.items, order, lessThan);
+    stableSort(Issue, out.items, order, lessThan);
     return out.items;
 }
 
@@ -82,7 +89,7 @@ fn sortKey(issue: Issue, order: Order) i64 {
         .created => issue.created,
         .updated => issue.updated,
         // Values outside the four levels sort below `low`, like upstream.
-        .priority => if (issue.priority()) |p| p.rank() else 0,
+        .priority => if (issue.priority) |p| p.rank() else 0,
         .state => if (issue.state.isDone(order.done_states)) 0 else 1,
     };
 }
@@ -129,7 +136,9 @@ pub fn searchLines(
     if (issue.labels.len > 0) try s.line(
         try std.fmt.allocPrint(arena, "Labels: {s}", .{try labels_fmt.join(arena, issue.labels)}),
     );
-    for (issue.fields) |f| try s.line(try std.fmt.allocPrint(arena, "{s}: {s}", .{ f.key, f.value }));
+    for (issue.fields) |f| try s.line(
+        try std.fmt.allocPrint(arena, "{s}: {s}", .{ f.key, f.value }),
+    );
     try s.text(issue.description);
     for (issue.comments) |c| {
         if (c.deleted or c.is_merge) continue;
@@ -140,6 +149,152 @@ pub fn searchLines(
 }
 
 const testing = std.testing;
+
+/// A label in use, with how many issues carry it: for pickers and filters.
+pub const LabelCount = struct {
+    name: []const u8,
+    open: u32 = 0,
+    total: u32 = 0,
+};
+
+/// Every label the issues carry, by name; deleted issues don't count.
+pub fn labelCounts(
+    arena: Allocator,
+    issues: []const Issue,
+    done_states: []const []const u8,
+) Allocator.Error![]LabelCount {
+    var by: std.StringArrayHashMapUnmanaged(LabelCount) = .empty;
+    for (issues) |issue| {
+        if (issue.deleted) continue;
+        const done = issue.state.isDone(done_states);
+        for (issue.labels) |l| {
+            const e = try by.getOrPut(arena, l);
+            if (!e.found_existing) e.value_ptr.* = .{ .name = l };
+            e.value_ptr.total += 1;
+            if (!done) e.value_ptr.open += 1;
+        }
+    }
+    const out = by.values();
+    stableSort(LabelCount, out, {}, struct {
+        fn lt(_: void, x: LabelCount, y: LabelCount) bool {
+            return std.mem.order(u8, x.name, y.name) == .lt;
+        }
+    }.lt);
+    return out;
+}
+
+/// Someone the history knows: an author or an assignee, by email.
+pub const Person = struct {
+    email: []const u8,
+    /// The latest name they wrote under; null for assignees only.
+    name: ?[]const u8 = null,
+    /// Their host UUID, when a commit or assignment carried one.
+    user_id: ?[]const u8 = null,
+    authored: u32 = 0,
+    assigned: u32 = 0,
+};
+
+/// Everyone who opened or is assigned an issue, by email (compared
+/// ignoring case): candidates for assignee and author pickers.
+pub fn people(arena: Allocator, issues: []const Issue) Allocator.Error![]Person {
+    var by: std.StringArrayHashMapUnmanaged(Person) = .empty;
+    const add = struct {
+        fn f(
+            al: Allocator,
+            map: *std.StringArrayHashMapUnmanaged(Person),
+            email: []const u8,
+        ) Allocator.Error!*Person {
+            const key = try std.ascii.allocLowerString(al, email);
+            const e = try map.getOrPut(al, key);
+            if (!e.found_existing) e.value_ptr.* = .{ .email = email };
+            return e.value_ptr;
+        }
+    }.f;
+    for (issues) |issue| {
+        if (issue.deleted) continue;
+        const p = try add(arena, &by, issue.author.email);
+        p.authored += 1;
+        p.name = issue.author.name;
+        if (issue.author_id) |id| p.user_id = id;
+        for (issue.assignees) |a| {
+            const q = try add(arena, &by, a.email);
+            q.assigned += 1;
+            if (a.uuid) |id| q.user_id = id;
+        }
+    }
+    const out = by.values();
+    stableSort(Person, out, {}, struct {
+        fn lt(_: void, x: Person, y: Person) bool {
+            return std.ascii.orderIgnoreCase(x.email, y.email) == .lt;
+        }
+    }.lt);
+    return out;
+}
+
+/// The shortest prefix of each of `ids` (sorted) that no other starts
+/// with, at least `min` long: what to show so that `resolve` takes it.
+pub fn shortIds(
+    arena: Allocator,
+    ids: []const []const u8,
+    min: usize,
+) Allocator.Error![]const []const u8 {
+    const out = try arena.alloc([]const u8, ids.len);
+    for (ids, out, 0..) |id, *o, i| {
+        var n = @min(min, id.len);
+        for ([_]?[]const u8{
+            if (i > 0) ids[i - 1] else null,
+            if (i + 1 < ids.len) ids[i + 1] else null,
+        }) |other| if (other) |x| {
+            var common: usize = 0;
+            while (common < id.len and common < x.len and id[common] == x[common]) common += 1;
+            n = @max(n, @min(common + 1, id.len));
+        };
+        o.* = id[0..n];
+    }
+    return out;
+}
+
+test "labelCounts, people, shortIds" {
+    var arena_state: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const sig: @import("../backend/object.zig").Signature = .{
+        .name = "Ada",
+        .email = "ada@e.x",
+        .time = 1,
+        .tz_offset_minutes = 0,
+    };
+    var a = try testIssue(arena, "a", "open", 1, null);
+    a.author = sig;
+    a.labels = &.{ "bug", "ui" };
+    a.assignees = &.{.{ .uuid = null, .email = "Grace@e.x" }};
+    var b = try testIssue(arena, "b", "closed", 2, null);
+    b.author = sig;
+    b.labels = &.{"bug"};
+    b.assignees = &.{.{ .uuid = null, .email = "grace@e.x" }};
+    var c = try testIssue(arena, "c", "open", 3, null);
+    c.author = sig;
+    c.labels = &.{"gone"};
+    c.deleted = true;
+    const issues = [_]Issue{ a, b, c };
+    const labels = try labelCounts(arena, &issues, &.{});
+    try testing.expectEqual(@as(usize, 2), labels.len);
+    try testing.expectEqualStrings("bug", labels[0].name);
+    try testing.expectEqual(@as(u32, 1), labels[0].open);
+    try testing.expectEqual(@as(u32, 2), labels[0].total);
+    const who = try people(arena, &issues);
+    var grace: ?Person = null;
+    for (who) |p| if (std.ascii.eqlIgnoreCase(p.email, "grace@e.x")) {
+        grace = p;
+    };
+    try testing.expectEqual(@as(u32, 2), grace.?.assigned);
+    try testing.expectEqual(@as(u32, 2), who[0].authored); // Ada, not the deleted one
+
+    const short = try shortIds(arena, &.{ "a7f30000", "a7f31111", "b0000000" }, 4);
+    try testing.expectEqualStrings("a7f30", short[0]);
+    try testing.expectEqualStrings("a7f31", short[1]);
+    try testing.expectEqualStrings("b000", short[2]);
+}
 
 fn testIssue(
     arena: Allocator,
@@ -163,6 +318,7 @@ fn testIssue(
         .state = State.parse(state),
         .labels = &.{},
         .fields = fields,
+        .priority = if (prio) |p| Priority.parse(p) else null,
         .conflicts = &.{},
         .author = undefined,
         .created = created,
@@ -216,7 +372,8 @@ test "search finds fixed strings line by line" {
     issue.title = "Fix the Login page";
     issue.description = "Login fails twice.\nlogin retry";
     issue.fields = &.{.{ .key = "Assignee", .value = "login@example.com" }};
-    const sig: @import("../backend/object.zig").Signature = .{ .name = "T", .email = "t@e.x", .time = 1, .tz_offset_minutes = 0 };
+    const Signature = @import("../backend/object.zig").Signature;
+    const sig: Signature = .{ .name = "T", .email = "t@e.x", .time = 1, .tz_offset_minutes = 0 };
     const comment: issue_model.Comment = .{
         .oid = undefined,
         .author = sig,
@@ -237,7 +394,9 @@ test "search finds fixed strings line by line" {
     try testing.expectEqual(@as(usize, 0), (try searchLines(arena, issue, "", .{})).len);
 
     // An assignee with a UUID matches by email too.
-    issue.fields = &.{.{ .key = "Assignee", .value = "a7f3b2c1-4e5d-4a8b-9c1e-2f3a4b5c6d7e ada@e.x" }};
+    issue.fields = &.{
+        .{ .key = "Assignee", .value = "a7f3b2c1-4e5d-4a8b-9c1e-2f3a4b5c6d7e ada@e.x" },
+    };
     try testing.expect((Filter{ .assignee = "ada@e.x" }).matches(issue));
     try testing.expect(!(Filter{ .assignee = "bob@e.x" }).matches(issue));
 }

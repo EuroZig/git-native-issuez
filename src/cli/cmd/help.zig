@@ -30,11 +30,17 @@ pub const text =
     \\   tree        Show the parent/child tree with progress and blockers
     \\   milestone   Create, list and manage milestones
     \\   attach      Attach images to an issue (add, ls, cat, rename, rm)
+    \\   react       React to an issue or a comment
+    \\   purge       Remove an issue or a comment from history for good
+    \\   push-check  Check a push in a server's pre-receive hook
     \\   status      Show unpushed, quarantined and conflicted issues
     \\   quarantine  Resolve a quarantined issue
     \\   completion  Print a shell completion script (bash, zsh, fish)
 ++ (if (build_options.tui) "\n   tui         Interactive terminal UI" else "") ++
-    (if (build_options.mcp) "\n   mcp         Serve the issues to coding agents (MCP, stdio)" else "") ++
+    (if (build_options.mcp)
+        "\n   mcp         Serve the issues to coding agents (MCP, stdio)"
+    else
+        "") ++
     \\
     \\
     \\Run 'git issue <command> --help' for details on a command.

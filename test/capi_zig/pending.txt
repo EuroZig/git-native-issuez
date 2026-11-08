@@ -1,0 +1,2 @@
+# C API functions and helpers without a Zig test yet (docs/test-plan.md §2.4).
+# Take a name off when its test lands; the list must end empty.

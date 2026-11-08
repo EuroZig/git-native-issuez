@@ -1,0 +1,2 @@
+# Exported functions and methods without a test yet (docs/test-plan.md §3.5).
+# Take a name off when its Test or Example lands; the list must end empty.

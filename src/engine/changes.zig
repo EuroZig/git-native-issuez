@@ -5,9 +5,9 @@
 //! may have changed (by a file watcher, a timer, the focus coming back)
 //! checks `RefState` first and reloads only what moved.
 //!
-//!     const before = try RefState.read(arena, backend);
+//!     const before = try RefState.read(B, arena, backend);
 //!     // ... someone writes ...
-//!     const after = try RefState.read(arena, backend);
+//!     const after = try RefState.read(B, arena, backend);
 //!     const d = try diff(arena, before, after);
 //!     for (d.issues) |id| ... // created, changed or deleted
 //!
@@ -37,7 +37,11 @@ pub const RefState = struct {
     /// Every ref in `namespaces`, sorted by name.
     refs: []const RefEntry = &.{},
 
-    pub fn read(arena: Allocator, backend: anytype) !RefState {
+    pub fn read(
+        comptime B: type,
+        arena: Allocator,
+        backend: *B,
+    ) (Allocator.Error || B.Error)!RefState {
         var all: std.ArrayList(RefEntry) = .empty;
         // Each listing is sorted and the namespaces are in order.
         for (namespaces) |prefix| try all.appendSlice(arena, try backend.listRefs(arena, prefix));
@@ -84,7 +88,7 @@ pub const Diff = struct {
     /// them reloads them all.
     milestones: bool = false,
 
-    pub fn empty(d: Diff) bool {
+    pub fn isEmpty(d: Diff) bool {
         return d.issues.len == 0 and !d.milestones;
     }
 
@@ -169,26 +173,30 @@ test "changes between two reads" {
     var sim = try GitSim.init(arena, &world, 0);
     const r = repo_mod.Repo(GitSim).init(&sim);
 
-    const empty = try RefState.read(arena, &sim);
-    const a = try r.create(arena, .{ .title = "A" });
-    const b = try r.create(arena, .{ .title = "B" });
-    const two = try RefState.read(arena, &sim);
+    const empty = try RefState.read(GitSim, arena, &sim);
+    const a = try r.create(arena, .{ .title = "A" }, .{});
+    const b = try r.create(arena, .{ .title = "B" }, .{});
+    const two = try RefState.read(GitSim, arena, &sim);
     try testing.expect(!two.eql(empty));
-    try testing.expect(two.eql(try RefState.read(arena, &sim)));
-    try testing.expect((try diff(arena, two, two)).empty());
+    try testing.expect(two.eql(try RefState.read(GitSim, arena, &sim)));
+    try testing.expect((try diff(arena, two, two)).isEmpty());
 
     const created = try diff(arena, empty, two);
     try testing.expectEqual(@as(usize, 2), created.issues.len);
-    try testing.expect(created.hasIssue(a.id.slice()) and created.hasIssue(b.id.slice()));
+    try testing.expect(created.hasIssue(a.id) and created.hasIssue(b.id));
     try testing.expect(!created.milestones);
 
-    const a_ref = try std.fmt.allocPrint(arena, "{s}{s}", .{ repo_mod.issue_ref_prefix, a.id.slice() });
-    _ = try r.comment(arena, a_ref, .{ .text = "Hello" });
+    const a_ref = try std.fmt.allocPrint(
+        arena,
+        "{s}{s}",
+        .{ repo_mod.issue_ref_prefix, a.id },
+    );
+    _ = try r.comment(arena, a_ref, .{ .text = "Hello" }, .{});
     var kept = try two.clone(testing.allocator);
     defer kept.deinit(testing.allocator);
-    const commented = try diff(arena, kept, try RefState.read(arena, &sim));
+    const commented = try diff(arena, kept, try RefState.read(GitSim, arena, &sim));
     try testing.expectEqual(@as(usize, 1), commented.issues.len);
-    try testing.expectEqualStrings(a.id.slice(), commented.issues[0]);
+    try testing.expectEqualStrings(a.id, commented.issues[0]);
 
     // Deleted ones show too.
     const deleted = try diff(arena, two, empty);

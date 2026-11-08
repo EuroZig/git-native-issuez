@@ -14,7 +14,7 @@ const changes = issuez.changes;
 /// In help.zig, which builds without the MCP server have too.
 pub const help = @import("mcp_help").text;
 
-const version: []const u8 = @import("version").version;
+const version: []const u8 = @import("issuez").version;
 
 /// The repository at `path`, and those that tool calls name with `repo`.
 /// Each is opened on the first call that needs it rather than at start: a
@@ -89,7 +89,11 @@ const ProcessRepos = struct {
     }
 
     fn openPath(r: *ProcessRepos, ctx: *mcp.Context, path: []const u8, default: bool) !GitProcess {
-        return GitProcess.open(r.io, r.gpa, .{ .path = path, .environ_map = r.environ_map }) catch |e| switch (e) {
+        return GitProcess.open(
+            r.io,
+            r.gpa,
+            .{ .path = path, .environ_map = r.environ_map },
+        ) catch |e| switch (e) {
             error.NotARepository => ctx.fail(e, "not a git repository: {s}{s}", .{
                 path,
                 if (default) "; give repo, the repository's absolute path" else "",
@@ -153,9 +157,16 @@ const Live = struct {
         errdefer live.git.close();
         var arena_state: std.heap.ArenaAllocator = .init(gpa);
         defer arena_state.deinit();
-        live.refs = try (try changes.RefState.read(arena_state.allocator(), &live.git)).clone(gpa);
+        const refs = try changes.RefState.read(GitProcess, arena_state.allocator(), &live.git);
+        live.refs = try refs.clone(gpa);
         errdefer live.refs.deinit(gpa);
-        try live.watcher.init(io, gpa, live.git.common_dir.?, .{ .context = live, .changed = changed }, .{});
+        try live.watcher.init(
+            io,
+            gpa,
+            live.git.common_dir.?,
+            .{ .context = live, .changed = changed },
+            .{},
+        );
         // A write between reading the refs and the first watch made no
         // event: look once more, on the watcher's thread like the rest.
         live.watcher.poke(.{ .refs = true });
@@ -171,16 +182,17 @@ const Live = struct {
     /// On the watcher's thread.
     fn changed(context: *anyopaque, change: RepoWatcher.Change) void {
         const live: *Live = @ptrCast(@alignCast(context));
-        live.notify(change.config) catch |e| std.log.scoped(.mcp).warn("watching the repository: {t}", .{e});
+        live.notify(change.config) catch |e|
+            std.log.scoped(.mcp).warn("watching the repository: {t}", .{e});
     }
 
     fn notify(live: *Live, settings: bool) !void {
         var arena_state: std.heap.ArenaAllocator = .init(live.gpa);
         defer arena_state.deinit();
         const arena = arena_state.allocator();
-        const now = try changes.RefState.read(arena, &live.git);
+        const now = try changes.RefState.read(GitProcess, arena, &live.git);
         const d = try changes.diff(arena, live.refs, now);
-        if (d.empty() and !settings) return;
+        if (d.isEmpty() and !settings) return;
         // Before the client hears of it, so a read it makes then and a
         // change after it are told apart.
         const uris = try live.subscriptions.affected(live.io, arena, d, settings);
@@ -190,7 +202,12 @@ const Live = struct {
         // Every subscriber hears of it even if one write fails.
         var failed: ?anyerror = null;
         const send: Send = .{ .live = live, .arena = arena };
-        for (uris) |uri| live.subscriptions.sendIfSubscribed(live.io, uri, send, Send.call) catch |e| {
+        for (uris) |uri| live.subscriptions.sendIfSubscribed(
+            live.io,
+            uri,
+            send,
+            Send.call,
+        ) catch |e| {
             failed = failed orelse e;
         };
         if (failed) |e| return e;
@@ -216,7 +233,9 @@ const Live = struct {
 const Server = tools.Server(ProcessRepos, version);
 
 /// Responses from the server, notifications from the watcher's thread.
-const SafeTransport = mcp.Transport.ThreadSafe(.{ .thread_safe_read = false, .thread_safe_write = true });
+const SafeTransport = mcp.Transport.ThreadSafe(
+    .{ .thread_safe_read = false, .thread_safe_write = true },
+);
 
 pub fn main(
     io: std.Io,
@@ -226,7 +245,14 @@ pub fn main(
     err: *std.Io.Writer,
     args: []const []const u8,
 ) u8 {
-    if (args.len > 0 and std.mem.eql(u8, args[0], "install")) return installMain(io, gpa, environ_map, out, err, args[1..]);
+    if (args.len > 0 and std.mem.eql(u8, args[0], "install")) return installMain(
+        io,
+        gpa,
+        environ_map,
+        out,
+        err,
+        args[1..],
+    );
     var path: []const u8 = ".";
     var i: usize = 0;
     while (i < args.len) : (i += 1) {
@@ -296,7 +322,10 @@ fn installMain(
         } else if (std.mem.eql(u8, arg, "--scope")) {
             const v = value(args, &i, err) orelse return 1;
             options.scope = std.meta.stringToEnum(install.Scope, v) orelse {
-                err.print("error: --scope must be user, local or project, not '{s}'\n", .{v}) catch {};
+                err.print(
+                    "error: --scope must be user, local or project, not '{s}'\n",
+                    .{v},
+                ) catch {};
                 return 1;
             };
         } else {
@@ -335,13 +364,19 @@ test {
 const testing = std.testing;
 
 /// The `result` of a `tools/call` to `server`.
-fn testCall(arena: std.mem.Allocator, server: *Server, name: []const u8, arguments: []const u8) !std.json.ObjectMap {
+fn testCall(
+    arena: std.mem.Allocator,
+    server: *Server,
+    name: []const u8,
+    arguments: []const u8,
+) !std.json.ObjectMap {
     var reader: std.Io.Reader = .fixed("");
     var out: std.Io.Writer.Allocating = .init(arena);
     var stream: mcp.Transport.Stream = .init(&reader, &out.writer);
     const msg = try std.fmt.allocPrint(
         arena,
-        "{{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"tools/call\",\"params\":{{\"name\":\"{s}\",\"arguments\":{s}}}}}",
+        "{{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"tools/call\"," ++
+            "\"params\":{{\"name\":\"{s}\",\"arguments\":{s}}}}}",
         .{ name, arguments },
     );
     try server.handleMessage(testing.io, testing.allocator, &stream.transport, msg);
@@ -359,7 +394,11 @@ fn testTotal(result: std.json.ObjectMap) !i64 {
     return result.get("structuredContent").?.object.get("total").?.integer;
 }
 
-fn testGitInit(arena: std.mem.Allocator, env: *const std.process.Environ.Map, dir: []const u8) !void {
+fn testGitInit(
+    arena: std.mem.Allocator,
+    env: *const std.process.Environ.Map,
+    dir: []const u8,
+) !void {
     const init = try std.process.run(arena, testing.io, .{
         .argv = &.{ "git", "init", "-q", dir },
         .environ_map = env,
@@ -385,7 +424,12 @@ test "repositories: outside one, named by repo, made since" {
     // Not inside the build's own repository.
     try env.put("GIT_CEILING_DIRECTORIES", std.fs.path.dirname(dir).?);
 
-    var repos: ProcessRepos = .{ .io = testing.io, .gpa = testing.allocator, .environ_map = &env, .path = dir };
+    var repos: ProcessRepos = .{
+        .io = testing.io,
+        .gpa = testing.allocator,
+        .environ_map = &env,
+        .path = dir,
+    };
     defer repos.deinit();
     var handler: tools.Handler(ProcessRepos) = .{ .repos = &repos };
     var server: Server = .init(&handler);
@@ -397,7 +441,11 @@ test "repositories: outside one, named by repo, made since" {
 
     // The server runs outside a repository, and each call says so.
     try testing.expectEqualStrings(
-        try std.fmt.allocPrint(arena, "not a git repository: {s}; give repo, the repository's absolute path", .{dir}),
+        try std.fmt.allocPrint(
+            arena,
+            "not a git repository: {s}; give repo, the repository's absolute path",
+            .{dir},
+        ),
         try testError(try testCall(arena, &server, "list_issues", "{}")),
     );
 
@@ -405,13 +453,29 @@ test "repositories: outside one, named by repo, made since" {
     const other = try std.fmt.allocPrint(arena, "{s}/other", .{dir});
     try testGitInit(arena, &env, other);
     const in_other = try std.fmt.allocPrint(arena, "{{\"repo\":\"{s}\"}}", .{other});
-    const create = try std.fmt.allocPrint(arena, "{{\"repo\":\"{s}\",\"title\":\"In the other one\"}}", .{other});
-    try testing.expect((try testCall(arena, &server, "create_issue", create)).get("isError") == null);
-    try testing.expectEqual(@as(i64, 1), try testTotal(try testCall(arena, &server, "list_issues", in_other)));
+    const create = try std.fmt.allocPrint(
+        arena,
+        "{{\"repo\":\"{s}\",\"title\":\"In the other one\"}}",
+        .{other},
+    );
+    try testing.expect(
+        (try testCall(arena, &server, "create_issue", create)).get("isError") == null,
+    );
+    try testing.expectEqual(
+        @as(i64, 1),
+        try testTotal(try testCall(arena, &server, "list_issues", in_other)),
+    );
     const missing = try std.fmt.allocPrint(arena, "{s}/missing", .{dir});
     try testing.expectEqualStrings(
         try std.fmt.allocPrint(arena, "not a git repository: {s}", .{missing}),
-        try testError(try testCall(arena, &server, "list_issues", try std.fmt.allocPrint(arena, "{{\"repo\":\"{s}\"}}", .{missing}))),
+        try testError(
+            try testCall(
+                arena,
+                &server,
+                "list_issues",
+                try std.fmt.allocPrint(arena, "{{\"repo\":\"{s}\"}}", .{missing}),
+            ),
+        ),
     );
     try testing.expectEqualStrings(
         "repo must be an absolute path, not 'other'",
@@ -420,7 +484,10 @@ test "repositories: outside one, named by repo, made since" {
 
     // The server's repository, made since, is found on the next call.
     try testGitInit(arena, &env, dir);
-    try testing.expectEqual(@as(i64, 0), try testTotal(try testCall(arena, &server, "list_issues", "{}")));
+    try testing.expectEqual(
+        @as(i64, 0),
+        try testTotal(try testCall(arena, &server, "list_issues", "{}")),
+    );
 }
 
 test "a subscription hears of changes, its own and others'" {
@@ -466,7 +533,8 @@ test "a subscription hears of changes, its own and others'" {
     });
 
     const subscribe =
-        \\{"jsonrpc":"2.0","id":1,"method":"resources/subscribe","params":{"uri":"git-issue://issues"}}
+        \\{"jsonrpc":"2.0","id":1,"method":"resources/subscribe",
+        \\"params":{"uri":"git-issue://issues"}}
     ;
     try server.handleMessage(io, testing.allocator, &transport.transport, subscribe);
     try testing.expect(repos.live != null);
@@ -474,11 +542,10 @@ test "a subscription hears of changes, its own and others'" {
     // Another process writes.
     var other = try GitProcess.open(io, testing.allocator, .{ .path = dir, .environ_map = &env });
     defer other.close();
-    _ = try issuez.Repo(GitProcess).init(&other).create(arena, .{ .title = "Elsewhere" });
+    _ = try issuez.Repo(GitProcess).init(&other).create(arena, .{ .title = "Elsewhere" }, .{});
 
-    const updated =
-        \\{"jsonrpc":"2.0","method":"notifications/resources/updated","params":{"uri":"git-issue://issues"}}
-    ;
+    const updated = "{\"jsonrpc\":\"2.0\",\"method\":\"notifications/resources/updated\"," ++
+        "\"params\":{\"uri\":\"git-issue://issues\"}}";
     var waited: u32 = 0;
     while (true) : (waited += 1) {
         transport.out_mutex.lockUncancelable(io);

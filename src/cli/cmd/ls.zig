@@ -68,7 +68,9 @@ pub fn main(comptime B: type, ctx: *context.Context(B), argv: []const []const u8
             ctx.out.writeAll(help) catch {};
             return common.exit_ok;
         } else if (std.mem.eql(u8, arg, "-s") or std.mem.eql(u8, arg, "--state")) {
-            state_filter = common.stateFilter(args.value(ctx.err, "-s") orelse return common.exit_error);
+            state_filter = common.stateFilter(
+                args.value(ctx.err, "-s") orelse return common.exit_error,
+            );
             state_given = true;
         } else if (std.mem.eql(u8, arg, "-l") or std.mem.eql(u8, arg, "--label")) {
             label_filter = args.value(ctx.err, "-l") orelse return common.exit_error;
@@ -117,7 +119,7 @@ pub fn main(comptime B: type, ctx: *context.Context(B), argv: []const []const u8
     const filter: query.Filter = .{
         .state = state_filter,
         .done = if (state_given or only_problems) null else false,
-        .done_states = repo.done_states,
+        .done_states = repo.doneStates(),
         .label = label_filter,
         .assignee = assignee_filter,
         .priority = priority_filter,
@@ -126,7 +128,7 @@ pub fn main(comptime B: type, ctx: *context.Context(B), argv: []const []const u8
     const sorted = query.list(arena, all, filter, .{
         .key = sort,
         .reverse = reverse,
-        .done_states = repo.done_states,
+        .done_states = repo.doneStates(),
     }) catch return common.exit_error;
     const proj = if (only_problems or as_json)
         ext_flags.projectIssues(B, ctx, repo, all) orelse return common.exit_error
@@ -145,7 +147,7 @@ pub fn main(comptime B: type, ctx: *context.Context(B), argv: []const []const u8
     if (as_json) {
         var s = json.begin(ctx.out);
         writeJson(&s, arena, listed, proj.?) catch |e| return json.failed(ctx.err, e);
-        json.end(&s);
+        json.end(&s) catch |e| return json.failed(ctx.err, e);
         return common.exit_ok;
     }
 
@@ -161,7 +163,10 @@ pub fn main(comptime B: type, ctx: *context.Context(B), argv: []const []const u8
                 .{ short, issue.state.text(), issue.title },
             ) catch {},
             .full => {
-                ctx.out.print("{s} [{s}] {s}\n", .{ short, issue.state.text(), issue.title }) catch {};
+                ctx.out.print(
+                    "{s} [{s}] {s}\n",
+                    .{ short, issue.state.text(), issue.title },
+                ) catch {};
                 var detail: std.Io.Writer.Allocating = .init(arena);
                 if (issue.labels.len > 0) detail.writer.print(
                     " labels:{s}",
@@ -175,7 +180,7 @@ pub fn main(comptime B: type, ctx: *context.Context(B), argv: []const []const u8
                     " priority:{s}",
                     .{v},
                 ) catch {};
-                if (issue.field("Milestone")) |v| detail.writer.print(
+                if (issue.milestone) |v| detail.writer.print(
                     " milestone:{s}",
                     .{v},
                 ) catch {};

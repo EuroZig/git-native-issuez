@@ -3,6 +3,7 @@
 //! `GitSim` produce the same OIDs.
 
 const std = @import("std");
+const stableSort = @import("../sort.zig").stable;
 const assert = std.debug.assert;
 const Allocator = std.mem.Allocator;
 const hex_fmt = @import("../format/hex.zig");
@@ -89,6 +90,11 @@ pub const Oid = struct {
         var h: Hex = .{ .buf = undefined, .len = oid.object_format.hexLen() };
         _ = std.fmt.bufPrint(&h.buf, "{x}", .{oid.slice()}) catch unreachable;
         return h;
+    }
+
+    /// The hex in `gpa`'s memory; `hex()` keeps it on the stack.
+    pub fn hexAlloc(oid: Oid, gpa: std.mem.Allocator) std.mem.Allocator.Error![]u8 {
+        return gpa.dupe(u8, oid.hex().slice());
     }
 
     pub fn format(oid: Oid, w: *std.Io.Writer) std.Io.Writer.Error!void {
@@ -288,7 +294,7 @@ pub const Tree = struct {
     /// Mode 100644, sorted by name (git's order for plain files).
     pub fn serializeAlloc(arena: Allocator, entries: []const Entry) Allocator.Error![]u8 {
         const sorted = try arena.dupe(Entry, entries);
-        std.mem.sort(Entry, sorted, {}, struct {
+        stableSort(Entry, sorted, {}, struct {
             fn lt(_: void, a: Entry, b: Entry) bool {
                 return std.mem.lessThan(u8, a.name, b.name);
             }

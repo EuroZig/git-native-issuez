@@ -10,3 +10,8 @@ docgen_tmp/
 node_modules/
 # macOS Finder metadata
 .DS_Store
+
+# The Go binding's archives: built by `zig build go-libs`. Releases have them
+# as libissuez-* archives. Their directories stay, so that a module without
+# them links without warnings about its search paths.
+/bindings/go/issuez/lib/**/libissuez.a

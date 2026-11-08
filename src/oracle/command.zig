@@ -25,6 +25,8 @@ pub const Command = union(enum) {
     comment_event: CommentEvent,
     milestone: Milestone,
     attach: Attach,
+    react: React,
+    purge: Purge,
     /// `fsck --repair`.
     repair,
 
@@ -65,6 +67,8 @@ pub const Command = union(enum) {
             .comment_event => |x| try x.render(&out),
             .milestone => |x| try x.render(&out),
             .attach => |x| try x.render(&out),
+            .react => |x| try x.render(&out),
+            .purge => |x| try x.render(&out),
             .repair => try out.words(&.{ "fsck", "--repair" }),
         }
         return out.list.items;
@@ -104,6 +108,13 @@ pub const Create = struct {
     body: ?[]const u8 = null,
     labels: []const []const u8 = &.{},
     assignee: ?[]const u8 = null,
+    /// `--add-assignee` each.
+    more_assignees: []const []const u8 = &.{},
+    number: ?[]const u8 = null,
+    /// `--field KEY=VALUE` each, and provenance.
+    fields: []const []const u8 = &.{},
+    original_author: ?[]const u8 = null,
+    original_id: ?[]const u8 = null,
     priority: ?[]const u8 = null,
     milestone: ?[]const u8 = null,
     ext: Ext = .{},
@@ -113,6 +124,11 @@ pub const Create = struct {
         try out.opt("-m", x.body);
         try out.each("-l", x.labels);
         try out.opt("-a", x.assignee);
+        try out.each("--add-assignee", x.more_assignees);
+        try out.opt("--number", x.number);
+        try out.each("--field", x.fields);
+        try out.opt("--original-author", x.original_author);
+        try out.opt("--original-id", x.original_id);
         try out.opt("-p", x.priority);
         try out.opt("--milestone", x.milestone);
         try x.ext.render(out);
@@ -165,10 +181,14 @@ pub const Comment = struct {
     id: []const u8,
     /// One `-m` each. None, the CLI refuses.
     paragraphs: []const []const u8 = &.{},
+    original_author: ?[]const u8 = null,
+    original_id: ?[]const u8 = null,
 
     fn render(x: Comment, out: *Argv) Allocator.Error!void {
         try out.words(&.{ "comment", x.id });
         try out.each("-m", x.paragraphs);
+        try out.opt("--original-author", x.original_author);
+        try out.opt("--original-id", x.original_id);
     }
 };
 
@@ -181,6 +201,8 @@ pub const State = struct {
     fixed_by: ?[]const u8 = null,
     release: ?[]const u8 = null,
     reason: ?[]const u8 = null,
+    /// `-c` each: a comment in the same commit.
+    comment: []const []const u8 = &.{},
 
     fn render(x: State, out: *Argv) Allocator.Error!void {
         try out.words(&.{ "state", x.id });
@@ -194,6 +216,7 @@ pub const State = struct {
         try out.opt("--fixed-by", x.fixed_by);
         try out.opt("--release", x.release);
         try out.opt("--reason", x.reason);
+        try out.each("-c", x.comment);
     }
 };
 
@@ -207,17 +230,36 @@ pub const Edit = struct {
     /// Each may list several, comma separated.
     remove: []const []const u8 = &.{},
     assignee: ?[]const u8 = null,
+    /// `--add-assignee` and `--unassign` each.
+    add_assignees: []const []const u8 = &.{},
+    unassign: []const []const u8 = &.{},
+    number: ?[]const u8 = null,
+    /// `--lock` (true) or `--unlock` (false), with `--lock-reason`.
+    lock: ?bool = null,
+    lock_reason: ?[]const u8 = null,
+    ref: ?[]const u8 = null,
+    fields: []const []const u8 = &.{},
+    original_author: ?[]const u8 = null,
+    original_id: ?[]const u8 = null,
     priority: ?[]const u8 = null,
     milestone: ?[]const u8 = null,
     ext: Ext = .{},
     /// `--description`, written in the same commit as the other changes.
     description: []const []const u8 = &.{},
+    /// `-c` each: a comment in the same commit, its text.
+    comment: []const []const u8 = &.{},
+    /// `--state` and its details, in the same commit.
+    state: ?[]const u8 = null,
+    fixed_by: ?[]const u8 = null,
+    reason: ?[]const u8 = null,
 
     /// Anything besides the description.
     pub fn changesFields(x: Edit) bool {
         return x.title != null or x.set_labels != null or x.add.len > 0 or
             x.remove.len > 0 or x.assignee != null or x.priority != null or
-            x.milestone != null or !x.ext.isEmpty();
+            x.milestone != null or !x.ext.isEmpty() or x.state != null or
+            x.add_assignees.len > 0 or x.unassign.len > 0 or x.number != null or
+            x.lock != null or x.ref != null or x.fields.len > 0;
     }
 
     fn render(x: Edit, out: *Argv) Allocator.Error!void {
@@ -227,10 +269,53 @@ pub const Edit = struct {
         try out.each("--add-label", x.add);
         try out.each("--remove-label", x.remove);
         try out.opt("-a", x.assignee);
+        try out.each("--add-assignee", x.add_assignees);
+        try out.each("--unassign", x.unassign);
+        try out.opt("--number", x.number);
+        if (x.lock) |l| try out.word(if (l) "--lock" else "--unlock");
+        try out.opt("--lock-reason", x.lock_reason);
+        try out.opt("--ref", x.ref);
+        try out.each("--field", x.fields);
+        try out.opt("--original-author", x.original_author);
+        try out.opt("--original-id", x.original_id);
         try out.opt("-p", x.priority);
         try out.opt("--milestone", x.milestone);
         try x.ext.render(out);
         try out.each("--description", x.description);
+        try out.each("-c", x.comment);
+        try out.opt("--state", x.state);
+        try out.opt("--fixed-by", x.fixed_by);
+        try out.opt("--reason", x.reason);
+    }
+};
+
+/// `react <id> <emoji> [--on <comment>] [--undo]`.
+pub const React = struct {
+    id: []const u8,
+    emoji: []const u8,
+    /// A prefix of a comment's commit ID.
+    on: ?[]const u8 = null,
+    undo: bool = false,
+
+    fn render(x: React, out: *Argv) Allocator.Error!void {
+        try out.words(&.{ "react", x.id, x.emoji });
+        try out.opt("--on", x.on);
+        if (x.undo) try out.word("--undo");
+    }
+};
+
+/// `purge <id> [--comment <comment>] [--reason <text>] --yes`.
+pub const Purge = struct {
+    id: []const u8,
+    /// A prefix of a comment's commit ID.
+    comment: ?[]const u8 = null,
+    reason: ?[]const u8 = null,
+
+    fn render(x: Purge, out: *Argv) Allocator.Error!void {
+        try out.words(&.{ "purge", x.id });
+        try out.opt("--comment", x.comment);
+        try out.opt("--reason", x.reason);
+        try out.word("--yes");
     }
 };
 

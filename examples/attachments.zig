@@ -31,8 +31,8 @@ pub fn main(init: std.process.Init) !void {
     const repo = Repo.init(&sim);
     const att = Attachments.fromRepo(repo);
 
-    const created = try repo.create(arena, .{ .title = "Login button is cut off" });
-    const ref = try std.fmt.allocPrint(arena, "refs/issues/{s}", .{created.id.slice()});
+    const created = try repo.create(arena, .{ .title = "Login button is cut off" }, .{});
+    const ref = try std.fmt.allocPrint(arena, "refs/issues/{s}", .{created.id});
 
     // Check a file before accepting it.
     const input: Attachments.Input = .{ .name = "/home/ada/login.png", .data = screenshot };
@@ -48,7 +48,7 @@ pub fn main(init: std.process.Init) !void {
     const added = try att.add(arena, ref, .{
         .files = &.{input},
         .comment = "Here's what it looks like on a small screen.",
-    });
+    }, .{});
     try out.print("attached {s}\n\n", .{added.ids[0][0..8]});
 
     const issue = try repo.load(arena, .{ .name = ref, .tip = added.tip });
@@ -75,8 +75,8 @@ pub fn main(init: std.process.Init) !void {
     }
 
     // Rename and remove are ordinary commits too.
-    _ = try att.rename(arena, ref, added.ids[0], "login-small-screen.png", .{});
-    _ = try att.remove(arena, ref, &.{added.ids[0]}, .{});
+    _ = try att.rename(arena, ref, added.ids[0], "login-small-screen.png", .{}, .{});
+    _ = try att.remove(arena, ref, &.{added.ids[0]}, .{}, .{});
     const after = try repo.load(arena, .{ .name = ref, .tip = (try sim.resolveRef(ref)).? });
     try out.print("\nafter removal: {d} present, {d} removed\n", .{
         after.attachments.len, after.removed_attachments.len,

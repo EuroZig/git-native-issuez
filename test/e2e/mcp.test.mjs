@@ -34,6 +34,7 @@ const tools = [
   "create_issue",
   "comment_issue",
   "edit_issue",
+  "react_issue",
   "set_issue_state",
 ];
 const readOnly = new Set(["list_issues", "show_issue", "search_issues", "list_milestones"]);
@@ -147,6 +148,7 @@ test("tools/list", async () => {
   assert.deepEqual(required.create_issue, ["title"]);
   assert.deepEqual(required.comment_issue, ["id", "text"]);
   assert.deepEqual(required.set_issue_state, ["id", "state"]);
+  assert.deepEqual(required.react_issue, ["id", "emoji"]);
   assert.deepEqual(required.search_issues, ["text"]);
 });
 

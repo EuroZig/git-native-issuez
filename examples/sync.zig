@@ -32,10 +32,17 @@ pub fn main(init: std.process.Init) !void {
 
     // Alice files an issue and pushes it.
     var alice = try Clone.open(arena, &world, "alice");
-    const created = try alice.sync.repo.create(arena, .{ .title = "Flaky CI", .labels = &.{"ci"} });
-    const ref_name = try std.fmt.allocPrint(arena, "refs/issues/{s}", .{created.id.slice()});
-    const pushed = try alice.sync.push(arena, "origin");
-    try out.print("alice: created {s}, pushed {d}\n", .{ created.id.short(), pushed.pushed });
+    const created = try alice.sync.repo.create(
+        arena,
+        .{ .title = "Flaky CI", .labels = &.{"ci"} },
+        .{},
+    );
+    const ref_name = try std.fmt.allocPrint(arena, "refs/issues/{s}", .{created.id});
+    const pushed = try alice.sync.push(arena, "origin", .{});
+    try out.print(
+        "alice: created {s}, pushed {d}\n",
+        .{ issuez.shortId(created.id), pushed.pushed },
+    );
     try alice.close();
 
     // Bob fetches and merges it.
@@ -46,17 +53,22 @@ pub fn main(init: std.process.Init) !void {
 
     // Both edit the issue without talking to each other.
     alice = try Clone.open(arena, &world, "alice");
-    _ = try alice.sync.repo.edit(arena, ref_name, .{ .priority = .{ .set = .high } });
+    _ = try alice.sync.repo.edit(arena, ref_name, .{ .priority = .{ .set = .high } }, .{});
     try alice.close();
 
     bob = try Clone.open(arena, &world, "bob");
-    _ = try bob.sync.repo.edit(arena, ref_name, .{ .assignee = "bob@example.invalid" });
-    _ = try bob.sync.push(arena, "origin");
+    _ = try bob.sync.repo.edit(
+        arena,
+        ref_name,
+        .{ .set_assignees = &.{.byEmail("bob@example.invalid")} },
+        .{},
+    );
+    _ = try bob.sync.push(arena, "origin", .{});
     try bob.close();
 
     // Alice's push is rejected (the hub moved), so push merges and retries.
     alice = try Clone.open(arena, &world, "alice");
-    const retried = try alice.sync.push(arena, "origin");
+    const retried = try alice.sync.push(arena, "origin", .{});
     try out.print("alice: push needed {d} merge(s), pushed {d}\n", .{
         retried.merges.len,
         retried.pushed,

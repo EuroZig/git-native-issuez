@@ -12,6 +12,7 @@
 //! `sync.defaultRemote`.
 
 const std = @import("std");
+const contract = @import("../backend/contract.zig");
 const Allocator = std.mem.Allocator;
 const core_fmt = @import("../format/core.zig");
 const fields_fmt = @import("../format/fields.zig");
@@ -26,7 +27,7 @@ pub const auto_sync_key = "issue.autoSync";
 pub const default_hours_per_day: u8 = 8;
 
 pub const Settings = struct {
-    /// Besides `closed`. For `Repo.done_states` and `query.Filter`.
+    /// Besides `closed`. For `Repo.doneStates` and `query.Filter`.
     done_states: []const []const u8 = &core_fmt.default_done_states,
     /// What `workflow` may be set to.
     workflow_states: []const []const u8 = &fields_fmt.default_workflow,
@@ -52,20 +53,36 @@ pub const Settings = struct {
 
     pub const Error = WorkflowError;
 
+    /// Whether two reads of git config found the same settings.
+    pub fn eql(a: Settings, b: Settings) bool {
+        return sameList(a.done_states, b.done_states) and
+            sameList(a.workflow_states, b.workflow_states) and
+            sameText(a.invalid_done_state, b.invalid_done_state) and
+            sameText(a.invalid_workflow_state, b.invalid_workflow_state) and
+            a.work_days.bits == b.work_days.bits and
+            a.hours_per_day == b.hours_per_day and
+            sameText(a.invalid_work_days, b.invalid_work_days) and
+            sameText(a.invalid_hours_per_day, b.invalid_hours_per_day) and
+            a.auto_sync_minutes == b.auto_sync_minutes and
+            sameText(a.invalid_auto_sync, b.invalid_auto_sync);
+    }
+
+    fn sameList(x: []const []const u8, y: []const []const u8) bool {
+        if (x.len != y.len) return false;
+        for (x, y) |p, q| if (!std.mem.eql(u8, p, q)) return false;
+        return true;
+    }
+
+    fn sameText(x: ?[]const u8, y: ?[]const u8) bool {
+        if (x == null or y == null) return x == null and y == null;
+        return std.mem.eql(u8, x.?, y.?);
+    }
+
     /// What `Repo` checks on a write that sets `workflow`, for a front end
     /// to check first and say more (the states, the bad setting).
     pub fn checkWorkflow(s: Settings, state: []const u8) Error!void {
         const states = if (s.invalid_workflow_state != null) null else s.workflow_states;
         return checkWorkflowState(states, state);
-    }
-
-    /// Sets `repo`'s done and workflow states. With an invalid
-    /// `issue.workflowStates`, writes that set a workflow state then fail;
-    /// with an invalid `issue.doneStates`, the defaults stand in, and a
-    /// front end should refuse to go on.
-    pub fn apply(s: Settings, repo: anytype) void {
-        repo.done_states = s.done_states;
-        repo.workflow_states = if (s.invalid_workflow_state != null) null else s.workflow_states;
     }
 };
 
@@ -87,14 +104,14 @@ pub const WorkflowError = error{
 
 /// The rule for a write that sets `workflow`. `states` is null when
 /// `issue.workflowStates` is invalid.
-pub fn checkWorkflowState(states: ?[]const []const u8, state: []const u8) WorkflowError!void {
+fn checkWorkflowState(states: ?[]const []const u8, state: []const u8) WorkflowError!void {
     if (!fields_fmt.isSlug(state)) return error.InvalidValue;
     const list = states orelse return error.InvalidWorkflowStates;
     if (!labels_fmt.contains(list, state)) return error.UnknownWorkflowState;
 }
 
 /// The keys' raw values, null when unset.
-pub const Raw = struct {
+const Raw = struct {
     done_states: ?[]const u8 = null,
     workflow_states: ?[]const u8 = null,
     work_days: ?[]const u8 = null,
@@ -102,7 +119,7 @@ pub const Raw = struct {
     auto_sync: ?[]const u8 = null,
 };
 
-pub fn parse(arena: Allocator, raw: Raw) Allocator.Error!Settings {
+fn parse(arena: Allocator, raw: Raw) Allocator.Error!Settings {
     const done_states = raw.done_states;
     const workflow_states = raw.workflow_states;
     var out: Settings = .{};
@@ -140,7 +157,10 @@ fn parseDigits(comptime T: type, raw: []const u8) ?T {
 
 /// From config entries (`.key`, `.value`) as `git config --list` gives
 /// them: section and name lowercase, the last value wins.
-pub fn fromConfig(arena: Allocator, entries: anytype) Allocator.Error!Settings {
+pub fn fromConfig(
+    arena: Allocator,
+    entries: []const contract.ConfigEntry,
+) Allocator.Error!Settings {
     var raw: Raw = .{};
     for (entries) |e| {
         if (std.ascii.eqlIgnoreCase(e.key, done_states_key)) raw.done_states = e.value;
@@ -153,8 +173,15 @@ pub fn fromConfig(arena: Allocator, entries: anytype) Allocator.Error!Settings {
 }
 
 /// With one `configList` when the backend has it, else two `configGet`s.
-pub fn read(arena: Allocator, backend: anytype) (Allocator.Error || @TypeOf(backend.*).Error)!Settings {
-    if (@hasDecl(@TypeOf(backend.*), "configList")) return fromConfig(arena, try backend.configList(arena));
+pub fn read(
+    comptime B: type,
+    arena: Allocator,
+    backend: *B,
+) (Allocator.Error || B.Error)!Settings {
+    if (@hasDecl(B, "configList")) return fromConfig(
+        arena,
+        try backend.configList(arena),
+    );
     return parse(arena, .{
         .done_states = try backend.configGet(arena, done_states_key),
         .workflow_states = try backend.configGet(arena, workflow_states_key),
@@ -162,6 +189,40 @@ pub fn read(arena: Allocator, backend: anytype) (Allocator.Error || @TypeOf(back
         .hours_per_day = try backend.configGet(arena, hours_per_day_key),
         .auto_sync = try backend.configGet(arena, auto_sync_key),
     });
+}
+
+/// A change to one of the two keys: set it to these states, or unset it
+/// (the defaults then).
+pub const Change = union(enum) { set: []const []const u8, unset };
+
+pub const WriteSpec = struct {
+    done_states: ?Change = null,
+    workflow_states: ?Change = null,
+};
+
+/// Writes the keys `spec` names to the repository's git config, after
+/// checking every state (`done_states_rule`, `workflow_states_rule`):
+/// what a settings page saves. Read them back with `read`.
+pub fn write(
+    comptime B: type,
+    arena: Allocator,
+    backend: *B,
+    spec: WriteSpec,
+) (Allocator.Error || error{InvalidValue} || B.Error)!void {
+    if (spec.done_states) |c| if (c == .set) for (c.set) |st| {
+        if (!isDoneState(st)) return error.InvalidValue;
+    };
+    if (spec.workflow_states) |c| if (c == .set) for (c.set) |st| {
+        if (!fields_fmt.isSlug(st)) return error.InvalidValue;
+    };
+    for ([_]struct { []const u8, ?Change }{
+        .{ done_states_key, spec.done_states },
+        .{ workflow_states_key, spec.workflow_states },
+    }) |k| {
+        const change = k[1] orelse continue;
+        for (try backend.configGetAll(arena, k[0])) |old| try backend.configUnsetValue(k[0], old);
+        if (change == .set) try backend.configAdd(k[0], try labels_fmt.join(arena, change.set));
+    }
 }
 
 pub const List = union(enum) {
@@ -172,14 +233,14 @@ pub const List = union(enum) {
 
 /// `issue.doneStates`: states (letters, digits, `-` and `_`), not `open`.
 /// Null (unset) gives the defaults, an empty list none.
-pub fn parseDoneStates(arena: Allocator, raw: ?[]const u8) Allocator.Error!List {
+fn parseDoneStates(arena: Allocator, raw: ?[]const u8) Allocator.Error!List {
     const text = raw orelse return .{ .ok = &core_fmt.default_done_states };
     return parseList(arena, text, isDoneState);
 }
 
 /// `issue.workflowStates`: lowercase letters, digits and `-`. Null or an
 /// empty list gives the defaults.
-pub fn parseWorkflowStates(arena: Allocator, raw: ?[]const u8) Allocator.Error!List {
+fn parseWorkflowStates(arena: Allocator, raw: ?[]const u8) Allocator.Error!List {
     const text = raw orelse return .{ .ok = &fields_fmt.default_workflow };
     const list = try parseList(arena, text, fields_fmt.isSlug);
     return switch (list) {
@@ -228,7 +289,10 @@ test parseWorkflowStates {
     try t.expectEqual(@as(usize, 4), (try parseWorkflowStates(arena, null)).ok.len);
     try t.expectEqual(@as(usize, 4), (try parseWorkflowStates(arena, " , ")).ok.len);
     try t.expectEqual(@as(usize, 2), (try parseWorkflowStates(arena, "todo,doing")).ok.len);
-    try t.expectEqualStrings("In Progress", (try parseWorkflowStates(arena, "todo,In Progress")).invalid);
+    try t.expectEqualStrings(
+        "In Progress",
+        (try parseWorkflowStates(arena, "todo,In Progress")).invalid,
+    );
 }
 
 test fromConfig {
@@ -236,7 +300,7 @@ test fromConfig {
     var arena_state: std.heap.ArenaAllocator = .init(t.allocator);
     defer arena_state.deinit();
     const arena = arena_state.allocator();
-    const Entry = struct { key: []const u8, value: []const u8 };
+    const Entry = contract.ConfigEntry;
     const s = try fromConfig(arena, &[_]Entry{
         .{ .key = "issue.donestates", .value = "wontfix" },
         .{ .key = "issue.donestates", .value = "cancelled,open" },
@@ -262,7 +326,12 @@ test fromConfig {
     });
     try t.expectEqualStrings("soon", bad.invalid_auto_sync.?);
     try t.expect(bad.auto_sync_minutes == null);
-    try t.expect((try fromConfig(arena, &[_]Entry{.{ .key = "issue.autosync", .value = "0" }})).auto_sync_minutes == null);
+    try t.expect(
+        (try fromConfig(
+            arena,
+            &[_]Entry{.{ .key = "issue.autosync", .value = "0" }},
+        )).auto_sync_minutes == null,
+    );
     try t.expectEqualStrings("mon,someday", bad.invalid_work_days.?);
     try t.expectEqual(fields_fmt.WorkDays.all, bad.work_days);
     try t.expectEqualStrings("25", bad.invalid_hours_per_day.?);
@@ -290,4 +359,27 @@ test "Settings.checkWorkflow" {
     try t.expectError(error.UnknownWorkflowState, s.checkWorkflow("done"));
     const bad: Settings = .{ .invalid_workflow_state = "X" };
     try t.expectError(error.InvalidWorkflowStates, bad.checkWorkflow("ready"));
+}
+
+test write {
+    const t = std.testing;
+    var arena_state: std.heap.ArenaAllocator = .init(t.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const GitSim = @import("../backend/GitSim.zig");
+    var world: GitSim.World = .{ .seed = 71, .clones = &.{.{ .name = "a" }} };
+    var sim = try GitSim.init(arena, &world, 0);
+    try write(GitSim, arena, &sim, .{ .done_states = .{ .set = &.{ "wontfix", "cancelled" } } });
+    try write(GitSim, arena, &sim, .{ .workflow_states = .{ .set = &.{ "todo", "doing" } } });
+    var s = try read(GitSim, arena, &sim);
+    try t.expectEqual(@as(usize, 2), s.done_states.len);
+    try t.expectEqualStrings("cancelled", s.done_states[1]);
+    try t.expectEqualStrings("doing", s.workflow_states[1]);
+    try write(GitSim, arena, &sim, .{ .workflow_states = .unset });
+    s = try read(GitSim, arena, &sim);
+    try t.expectEqual(@as(usize, 4), s.workflow_states.len);
+    const done: WriteSpec = .{ .done_states = .{ .set = &.{"open"} } };
+    try t.expectError(error.InvalidValue, write(GitSim, arena, &sim, done));
+    const workflow: WriteSpec = .{ .workflow_states = .{ .set = &.{"In Progress"} } };
+    try t.expectError(error.InvalidValue, write(GitSim, arena, &sim, workflow));
 }

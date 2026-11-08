@@ -14,6 +14,7 @@
 //!     git-issue-fuzz --seed <seed> --iterations 1
 
 const std = @import("std");
+const stableSort = @import("issuez").sort.stable;
 const Allocator = std.mem.Allocator;
 const issuez = @import("issuez");
 const oracle = @import("oracle");
@@ -211,7 +212,29 @@ const label_pool = [_][]const u8{
     "a,b",
     "",
 };
-const email_pool = [_][]const u8{ "a@e.x", "bob@example.com", "", "noat", "a@b", "@x.y" };
+const email_pool = [_][]const u8{
+    "a@e.x",
+    "bob@example.com",
+    "",
+    "noat",
+    "a@b",
+    "@x.y",
+    uuid_email,
+};
+/// The `<uuid> <email>` form: removing `a@e.x` removes it too.
+const uuid_email = "0c8d7a52-3f1e-4b6a-9d2c-5e4f3a2b1c0d a@e.x";
+
+fn validEmail(e: []const u8) bool {
+    return std.mem.eql(u8, e, "a@e.x") or std.mem.eql(u8, e, "bob@example.com") or
+        std.mem.eql(u8, e, uuid_email);
+}
+/// Host fields: fine, cleared, not an X- key, the format's own, a space.
+const field_pool = [_][]const u8{
+    "X-Forgejo-Project=7", "X-Forgejo-Project=", "X-Forgejo-Ref-Id=a b", "Foo=1", "State=x",
+    "X-Number=5",          "X-Forgejo-Ref-Id",
+};
+const original_pool = [_][]const u8{ "octocat", "github:o/r#1", "two\nlines" };
+const number_pool = [_][]const u8{ "1", "2", "3", "12", "01", "0", "x" };
 const priority_pool = [_][]const u8{ "low", "medium", "high", "critical", "urgent" };
 const milestone_pool = [_][]const u8{ "v1", "v2", "Later", "2026 Q4", "" };
 const milestone_key_pool = [_][]const u8{ "v1", "v2", "Later", "zzzz" };
@@ -237,6 +260,8 @@ fn genPrefix(
     ids: []const []const u8,
 ) Allocator.Error![]const u8 {
     if (ids.len == 0 or rand.uintLessThan(u8, 8) == 0) return pick(rand, &.{ "ffff", "0", "zz" });
+    // By number now and then: `#1`, which may match none, one or several.
+    if (rand.uintLessThan(u8, 10) == 0) return pick(rand, &.{ "#1", "#2", "#3", "#01" });
     const id = ids[rand.uintLessThan(usize, ids.len)];
     return arena.dupe(u8, id[0..rand.intRangeAtMost(usize, 4, id.len)]);
 }
@@ -434,13 +459,75 @@ fn generateMilestoneWork(
     return .{ .cmd = cmd };
 }
 
+/// The commits of the first issue, so purges hit its comments.
+fn firstIssueCommits(
+    arena: Allocator,
+    world: World,
+    clone_index: usize,
+    ids: []const []const u8,
+) Allocator.Error![]const []const u8 {
+    if (ids.len == 0) return &.{};
+    const c = try oracle.commands.Clone.init(arena, world.format, world.clones[clone_index]);
+    const name = try std.fmt.allocPrint(arena, "refs/issues/{s}", .{ids[0]});
+    var out: std.ArrayList([]const u8) = .empty;
+    var seen: std.StringHashMapUnmanaged(void) = .empty;
+    var stack: std.ArrayList([]const u8) = .empty;
+    try stack.append(arena, c.ref(name) orelse return &.{});
+    while (stack.pop()) |hex| {
+        if ((try seen.getOrPut(arena, hex)).found_existing) continue;
+        const cm = c.commit(hex) orelse continue;
+        for (cm.parents) |p| try stack.append(arena, try p.hexAlloc(arena));
+        // The root and merges now and then, which purge refuses.
+        const comment = cm.parents.len == 1 and
+            std.mem.find(u8, cm.message, "X-Event:") == null;
+        if (comment or out.items.len == 0) try out.append(arena, hex);
+        // Twice more what a purge has to drop.
+        const rich = std.mem.find(u8, cm.message, "X-Original-") != null or
+            std.mem.find(u8, cm.message, "X-Attachment:") != null;
+        if (comment and rich) try out.appendSlice(arena, &.{ hex, hex });
+    }
+    return out.items;
+}
+
 fn generateLifecycle(
     arena: Allocator,
     rand: std.Random,
     ids: []const []const u8,
     commits: []const []const u8,
+    first_commits: []const []const u8,
 ) Allocator.Error!Generated {
     const id = try genPrefix(arena, rand, ids);
+    // Lock and unlock alone, so a reason set earlier meets an unlock.
+    // Reactions, on the first issue so they meet: again, undone, on a comment.
+    if (rand.uintLessThan(u8, 6) == 0) return .{ .cmd = .{ .react = .{
+        .id = try genPrefix(arena, rand, ids[0..@min(ids.len, 1)]),
+        .emoji = pick(rand, &.{ ":+1:", ":+1:", "\u{1F44D}", "two words", "a,b" }),
+        .on = if (commits.len > 0 and rand.uintLessThan(u8, 3) == 0)
+            commits[rand.uintLessThan(usize, commits.len)][0..8]
+        else
+            null,
+        .undo = rand.uintLessThan(u8, 3) == 0,
+    } } };
+    // Purges, rare: they take what the other commands work on. Mostly a
+    // comment of the first issue, so they meet edits, reactions and
+    // each other.
+    if (rand.uintLessThan(u8, 15) == 0) return .{ .cmd = .{ .purge = .{
+        .id = if (ids.len > 0 and rand.uintLessThan(u8, 4) != 0)
+            ids[0]
+        else
+            try genPrefix(arena, rand, ids[0..@min(ids.len, 1)]),
+        .comment = if (first_commits.len > 0 and rand.uintLessThan(u8, 6) != 0)
+            first_commits[rand.uintLessThan(usize, first_commits.len)][0..8]
+        else
+            null,
+        .reason = if (rand.boolean()) "abuse" else null,
+    } } };
+    // On the first issue, so successive ones meet.
+    if (rand.uintLessThan(u8, 6) == 0) return .{ .cmd = .{ .edit = .{
+        .id = try genPrefix(arena, rand, ids[0..@min(ids.len, 1)]),
+        .lock = rand.uintLessThan(u8, 3) != 0,
+        .lock_reason = if (rand.boolean()) "too heated" else null,
+    } } };
     const cmd: Command = switch (rand.uintLessThan(u8, 5)) {
         4 => blk: { // milestones
             const names = [_][]const u8{ "v1", "v2", "Later", "v1" };
@@ -529,6 +616,30 @@ fn generate(arena: Allocator, rand: std.Random, ids: []const []const u8) Allocat
                 ))) valid = false;
                 x.assignee = e;
             }
+            if (rand.uintLessThan(u8, 4) == 0) {
+                x.more_assignees = try some(arena, rand, 2, pickAlloc, .{ rand, &email_pool });
+                for (x.more_assignees) |e| if (!validEmail(e)) {
+                    valid = false;
+                };
+            }
+            if (rand.uintLessThan(u8, 4) == 0) {
+                x.number = pick(rand, &number_pool);
+                // Taken, or not a number: either may fail.
+                valid = false;
+            }
+            if (rand.uintLessThan(u8, 5) == 0) {
+                x.fields = try some(arena, rand, 2, pickAlloc, .{ rand, &field_pool });
+                for (x.fields) |fl| if (!oracle.commands.hostFieldOk(fl) or
+                    std.mem.endsWith(u8, fl, "="))
+                {
+                    valid = false;
+                };
+            }
+            if (rand.uintLessThan(u8, 6) == 0) {
+                x.original_author = pick(rand, &original_pool);
+                x.original_id = pick(rand, &original_pool);
+                valid = false;
+            }
             if (rand.uintLessThan(u8, 3) == 0) {
                 const p = pick(rand, &priority_pool);
                 if (std.mem.eql(u8, p, "urgent")) valid = false;
@@ -550,6 +661,11 @@ fn generate(arena: Allocator, rand: std.Random, ids: []const []const u8) Allocat
         3...4 => return .{ .cmd = .{ .comment = .{
             .id = try genPrefix(arena, rand, ids),
             .paragraphs = try some(arena, rand, 2, pickAlloc, .{ rand, &message_pool }),
+            .original_author = if (rand.uintLessThan(
+                u8,
+                5,
+            ) == 0) pick(rand, &original_pool) else null,
+            .original_id = if (rand.uintLessThan(u8, 5) == 0) pick(rand, &original_pool) else null,
         } } },
         5...6 => { // state
             const st = pick(rand, &state_pool);
@@ -559,6 +675,9 @@ fn generate(arena: Allocator, rand: std.Random, ids: []const []const u8) Allocat
             if (rand.boolean()) x.message = pick(rand, &messages);
             if (rand.uintLessThan(u8, 3) == 0) x.fixed_by = "abc1234";
             if (rand.uintLessThan(u8, 3) == 0) x.reason = "completed";
+            // A comment in the same commit; with -m the CLI refuses.
+            if (rand.uintLessThan(u8, 3) == 0)
+                x.comment = try some(arena, rand, 2, pickAlloc, .{ rand, &message_pool });
             return .{ .cmd = .{ .state = x } };
         },
         7...8 => { // edit
@@ -570,9 +689,34 @@ fn generate(arena: Allocator, rand: std.Random, ids: []const []const u8) Allocat
             x.add = try some(arena, rand, 2, pickAlloc, .{ rand, &label_pool });
             x.remove = try some(arena, rand, 2, pickAlloc, .{ rand, &label_pool });
             if (rand.uintLessThan(u8, 3) == 0) x.assignee = pick(rand, &email_pool);
+            if (rand.uintLessThan(u8, 4) == 0)
+                x.add_assignees = try some(arena, rand, 2, pickAlloc, .{ rand, &email_pool });
+            if (rand.uintLessThan(u8, 5) == 0)
+                x.unassign = try some(arena, rand, 2, pickAlloc, .{ rand, &email_pool });
+            if (rand.uintLessThan(u8, 5) == 0) x.number = pick(rand, &number_pool);
+            if (rand.uintLessThan(u8, 6) == 0) {
+                x.lock = rand.boolean();
+                if (rand.boolean()) x.lock_reason = pick(
+                    rand,
+                    &.{ "too heated", "", "spam\nmore" },
+                );
+            }
+            if (rand.uintLessThan(
+                u8,
+                6,
+            ) == 0) x.ref = pick(rand, &.{ "main", "refs/tags/v1", "a b", "" });
+            if (rand.uintLessThan(u8, 5) == 0)
+                x.fields = try some(arena, rand, 2, pickAlloc, .{ rand, &field_pool });
+            if (rand.uintLessThan(u8, 8) == 0) x.original_author = pick(rand, &original_pool);
             if (rand.uintLessThan(u8, 3) == 0) x.priority = pick(rand, &priority_pool);
             if (rand.uintLessThan(u8, 4) == 0) x.milestone = pick(rand, &milestone_pool);
             _ = try genExt(arena, rand, ids, &x.ext, true);
+            if (rand.uintLessThan(u8, 3) == 0)
+                x.comment = try some(arena, rand, 2, pickAlloc, .{ rand, &message_pool });
+            if (rand.uintLessThan(u8, 4) == 0) {
+                x.state = pick(rand, &state_pool);
+                if (rand.boolean()) x.fixed_by = "abc1234";
+            } else if (rand.uintLessThan(u8, 8) == 0) x.fixed_by = "abc1234";
             return .{ .cmd = .{ .edit = x } };
         },
         9 => return .{ .cmd = .{ .read = try arena.dupe([]const u8, &.{
@@ -644,7 +788,10 @@ fn fuzzCommands(
             arena,
             .{ .key = "issue.workflowStates", .value = "backlog, doing, done" },
         );
-        if (custom_done) try config.append(arena, .{ .key = "issue.doneStates", .value = "in-review" });
+        if (custom_done) try config.append(
+            arena,
+            .{ .key = "issue.doneStates", .value = "in-review" },
+        );
         if (without_lfs == idx) try config.append(arena, .{ .key = "sim.lfs", .value = "false" });
         c.* = .{
             .name = try std.fmt.allocPrint(arena, "c{d}", .{idx}),
@@ -662,6 +809,14 @@ fn fuzzCommands(
         .clones = clones,
         .files = &fuzz_files,
     };
+
+    var checker: PushChecker = .{ .rand = rand, .identity = world.identity.email };
+    push_checker = &checker;
+    GitSim.receive_hook = checker.hook();
+    defer {
+        push_checker = null;
+        GitSim.receive_hook = null;
+    }
 
     const milestone_focus = rand.uintLessThan(u8, 3) == 0;
     for (0..rand.intRangeAtMost(usize, 5, 40)) |_| {
@@ -689,6 +844,11 @@ fn fuzzCommands(
             try rewriteHub(arena, rand, &world, work_count);
             continue;
         }
+        if (rand.uintLessThan(u8, 8) == 0) {
+            // A push the hub only checks.
+            try pushCheckStep(arena, rand, &world, clone_index, work_count);
+            continue;
+        }
         const quarantined = try quarantinedIds(arena, world.clones[clone_index]);
         if (quarantined.len > 0 and rand.boolean()) {
             const id = pick(rand, quarantined);
@@ -711,7 +871,7 @@ fn fuzzCommands(
         var commits: std.ArrayList([]const u8) = .empty;
         for (world.clones[clone_index].objects) |o| if (o.kind == .commit) {
             const oid = object.hashObject(world.format, .commit, o.data);
-            try commits.append(arena, try arena.dupe(u8, oid.hex().slice()));
+            try commits.append(arena, try oid.hexAlloc(arena));
         };
         var attachment_ids: std.ArrayList([]const u8) = .empty;
         for (world.clones[clone_index].objects) |o| if (o.kind == .commit) {
@@ -726,7 +886,13 @@ fn fuzzCommands(
         else if (milestone_focus and rand.uintLessThan(u8, 2) == 0)
             try generateMilestoneWork(arena, rand, ids.items, milestone_ids.items)
         else if (rand.uintLessThan(u8, 6) == 0)
-            try generateLifecycle(arena, rand, ids.items, commits.items)
+            try generateLifecycle(
+                arena,
+                rand,
+                ids.items,
+                commits.items,
+                try firstIssueCommits(arena, world, clone_index, ids.items),
+            )
         else
             try generate(arena, rand, ids.items);
         const cmd = try withJson(arena, rand, gen.cmd);
@@ -767,6 +933,7 @@ fn fuzzCommands(
         std.debug.print("  sync did not settle after {d} rounds\n", .{round});
         return error.NotConverged;
     }
+    if (checker.failed) return error.ModelMismatch;
     const hub = world.clones[work_count];
     for (hub.objects) |o| {
         if (o.kind != .commit) continue;
@@ -793,7 +960,7 @@ fn upstreamStep(arena: Allocator, world: *World, clone_index: usize) CaseError!v
     const before = world.*;
     var sim = try GitSim.init(arena, world, clone_index);
     const staging = "refs/remotes/origin/issues/";
-    sim.fetch(arena, "origin", &.{"+refs/issues/*:" ++ staging ++ "*"}, false) catch {
+    sim.fetch(arena, "origin", &.{"+refs/issues/*:" ++ staging ++ "*"}, .{}) catch {
         countOutcome("(upstream merge)", false);
         return;
     };
@@ -841,7 +1008,7 @@ fn upstreamStep(arena: Allocator, world: *World, clone_index: usize) CaseError!v
     for (try sim.listRefs(arena, "refs/issues/")) |r| {
         try specs.append(arena, try std.fmt.allocPrint(arena, "{s}:{s}", .{ r.name, r.name }));
     }
-    if (specs.items.len > 0) _ = sim.push(arena, "origin", specs.items, false) catch {};
+    if (specs.items.len > 0) _ = sim.push(arena, "origin", specs.items, .{}) catch {};
     try sim.commit();
     countOutcome("(upstream merge commit)", merged);
 
@@ -972,6 +1139,12 @@ fn rewriteHub(arena: Allocator, rand: std.Random, world: *World, hub_index: usiz
         };
         break :blk try hub.writeObject(.commit, try commit.serializeAlloc(arena));
     };
+    // What the hub's push check would have said.
+    if (push_checker) |c| try c.check(arena, &hub, &.{.{
+        .name = target.name,
+        .old = target.oid,
+        .new = new,
+    }}, false);
     hub.updateRefs(&.{.{
         .name = target.name,
         .op = .{ .update = .{ .new = new, .old = target.oid } },
@@ -1018,6 +1191,10 @@ fn step(
     var discarding: std.Io.Writer.Discarding = .init(&discard_buf);
     const json = cmd == .read and issuez.format.labels.contains(argv, "--json");
     var captured: std.Io.Writer.Allocating = .init(arena);
+    if (push_checker) |c| c.honest = cmd == .push or cmd == .sync;
+    defer if (push_checker) |c| {
+        c.honest = false;
+    };
     const code = try simulate.run(
         io,
         gpa,
@@ -1032,6 +1209,10 @@ fn step(
     countOutcome(cmd.verb(), code == 0);
     const shown = try std.mem.join(arena, " ", argv);
     const clone = world.clones[clone_index].name;
+    if (push_checker) |c| if (c.failed) {
+        std.debug.print("  during: {s} on {s}\n", .{ shown, clone });
+        return error.ModelMismatch;
+    };
 
     if (must_succeed and code != 0) {
         std.debug.print("  valid command failed ({d}): {s}\n", .{ code, shown });
@@ -1061,6 +1242,10 @@ fn step(
         // Our writes never break a guard, so no new violation may appear.
         for (try guardViolations(arena, world, clone_index)) |v| {
             if (issuez.format.labels.contains(violations_before, v)) continue;
+            // A purged issue is gone: references to it dangle (§10).
+            const issue_purge = cmd == .purge and cmd.purge.comment == null;
+            if (issue_purge and (std.mem.endsWith(u8, v, " parent_missing") or
+                std.mem.endsWith(u8, v, " blocker_missing"))) continue;
             std.debug.print(
                 "  {s} on {s} introduced a guard violation: {s}\n",
                 .{ shown, clone, v },
@@ -1076,14 +1261,14 @@ fn step(
 fn checkAround(arena: Allocator, world: *World, clone_index: usize) CaseError!void {
     var sim = try GitSim.init(arena, world, clone_index);
     var repo = issuez.Repo(GitSim).init(&sim);
-    repo.done_states = try doneStatesOf(arena, &sim);
+    repo.settings.done_states = try doneStatesOf(arena, &sim);
     // Unreadable issues make `loadAll` fail; nothing to compare then.
     const issues = repo.loadAll(arena) catch return;
-    const cat = issuez.Catalog(GitSim).of(repo);
+    const cat = issuez.Catalog(GitSim).fromRepo(repo);
     const milestones = cat.infos(arena) catch return error.ModelMismatch;
     const options: issuez.projection.Options = .{
         .milestones = milestones,
-        .done_states = repo.done_states,
+        .done_states = repo.doneStates(),
     };
     const full = try issuez.projection.build(arena, issues, options);
     for (repo.refs(arena) catch return error.ModelMismatch) |r| {
@@ -1145,13 +1330,13 @@ fn guardViolations(
 ) CaseError![]const []const u8 {
     var sim = try GitSim.init(arena, world, clone_index);
     var repo = issuez.Repo(GitSim).init(&sim);
-    repo.done_states = try doneStatesOf(arena, &sim);
+    repo.settings.done_states = try doneStatesOf(arena, &sim);
     const issues = repo.loadAll(arena) catch return error.ModelMismatch;
-    const cat = issuez.Catalog(GitSim).of(repo);
+    const cat = issuez.Catalog(GitSim).fromRepo(repo);
     const milestones = cat.infos(arena) catch return error.ModelMismatch;
     const proj = try issuez.projection.build(arena, issues, .{
         .milestones = milestones,
-        .done_states = repo.done_states,
+        .done_states = repo.doneStates(),
     });
     var out: std.ArrayList([]const u8) = .empty;
     for (proj.problems) |p| switch (p.kind) {
@@ -1188,7 +1373,8 @@ fn issueRefsDigest(arena: Allocator, world: World) Allocator.Error![]const u8 {
 fn isSynced(name: []const u8) bool {
     return std.mem.startsWith(u8, name, "refs/issues/") or
         std.mem.startsWith(u8, name, "refs/milestones/") or
-        std.mem.startsWith(u8, name, "refs/attachments/");
+        std.mem.startsWith(u8, name, "refs/attachments/") or
+        std.mem.startsWith(u8, name, "refs/issuez-purged/");
 }
 
 fn sameIssueRefs(a: World.Clone, b: World.Clone) bool {
@@ -1220,7 +1406,7 @@ fn crossCheckModel(arena: Allocator, world: *World, clone_index: usize) CaseErro
     const refs = repo.refs(arena) catch return error.ModelMismatch;
     for (refs) |r| {
         const issue = repo.load(arena, r) catch return error.ModelMismatch;
-        const tip_hex = try arena.dupe(u8, r.tip.hex().slice());
+        const tip_hex = try r.tip.hexAlloc(arena);
         const n = naive_clone.naive(tip_hex) catch |err| switch (err) {
             error.OutOfMemory => |e| return e,
             error.NoRule => return error.OracleNoRule,
@@ -1238,7 +1424,7 @@ fn crossCheckModel(arena: Allocator, world: *World, clone_index: usize) CaseErro
             std.mem.eql(u8, issue.field("X-Workflow-State") orelse "", n.workflow) and
             std.mem.eql(u8, issue.field("X-Milestone-Id") orelse "", n.milestone_id) and
             std.mem.eql(u8, issue.field("X-Milestone-Mode") orelse "", n.milestone_mode) and
-            sameBlockers(issue.ext, n.blocked_by) and
+            sameBlockers(issue.extensions(), n.blocked_by) and
             sameAttachments(issue.attachments, n.attachments) and
             issue.deleted == std.mem.eql(u8, n.deleted, "true");
         if (!ok) {
@@ -1315,7 +1501,11 @@ fn checkJson(
         return error.ModelMismatch;
     }
 
-    const naive_clone = try oracle.commands.Clone.init(arena, world.format, world.clones[clone_index]);
+    const naive_clone = try oracle.commands.Clone.init(
+        arena,
+        world.format,
+        world.clones[clone_index],
+    );
     const j: JsonCheck = .{ .arena = arena, .clone = naive_clone, .shown = shown, .out = out };
     if (std.mem.eql(u8, verb, "status")) return j.status(value);
     if (std.mem.eql(u8, verb, "attach")) return j.attachments(value, argv[2]);
@@ -1341,6 +1531,14 @@ fn checkJson(
             std.debug.print("  {s}: issue {s} differs from the oracle's reading\n", .{ shown, id });
             return badJson(shown, "a wrong issue", out);
         }
+        if (std.mem.eql(u8, verb, "show") and !try sameHistories(arena, o, n)) {
+            std.debug.print(
+                "  {s}: issue {s}: versions differ from the oracle's\n",
+                .{ shown, id },
+            );
+            return badJson(shown, "wrong versions", out);
+        }
+        if (std.mem.eql(u8, verb, "show")) try checkChanges(arena, naive_clone, o, shown, out);
     }
     countOutcome("(--json issues)", true);
 }
@@ -1414,9 +1612,14 @@ const JsonCheck = struct {
             if (!issuez.format.labels.contains(configured.items, name))
                 return j.bad("a remote that isn't configured");
             const base = try std.fmt.allocPrint(j.arena, "refs/issuez-sync/{s}/", .{name});
-            const issue_marks = try j.refsUnder(try std.fmt.allocPrint(j.arena, "{s}quarantined/issues/", .{base}));
-            const milestone_marks = try j.refsUnder(try std.fmt.allocPrint(j.arena, "{s}quarantined/milestones/", .{base}));
-            const quarantined = asArray(r.get("quarantined")) orelse return j.bad("no quarantined list");
+            const issue_marks = try j.refsUnder(
+                try std.fmt.allocPrint(j.arena, "{s}quarantined/issues/", .{base}),
+            );
+            const milestone_marks = try j.refsUnder(
+                try std.fmt.allocPrint(j.arena, "{s}quarantined/milestones/", .{base}),
+            );
+            const quarantined = asArray(r.get("quarantined")) orelse
+                return j.bad("no quarantined list");
             if (quarantined.len != issue_marks.count() + milestone_marks.count())
                 return j.bad("other quarantines than recorded");
             for (quarantined) |qv| {
@@ -1433,7 +1636,9 @@ const JsonCheck = struct {
                 const tip = marks.get(id) orelse return j.bad("a quarantine that isn't recorded");
                 if (!std.mem.eql(u8, jsonText(q, "remote_tip") orelse "", tip))
                     return j.bad("a quarantine with another remote tip");
-                const kept = j.clone.ref(try std.fmt.allocPrint(j.arena, "{s}kept/{s}/{s}", .{ base, ns, id }));
+                const kept = j.clone.ref(
+                    try std.fmt.allocPrint(j.arena, "{s}kept/{s}/{s}", .{ base, ns, id }),
+                );
                 const kept_local = q.get("kept_local") orelse return j.bad("no kept_local");
                 const want_kept = kept != null and std.mem.eql(u8, kept.?, tip);
                 if (kept_local != .bool or kept_local.bool != want_kept)
@@ -1446,7 +1651,9 @@ const JsonCheck = struct {
                         return j.bad("an unknown reason");
                 }
             }
-            const pushed = try j.refsUnder(try std.fmt.allocPrint(j.arena, "{s}pushed/issues/", .{base}));
+            const pushed = try j.refsUnder(
+                try std.fmt.allocPrint(j.arena, "{s}pushed/issues/", .{base}),
+            );
             var want: std.ArrayList([]const u8) = .empty;
             for (j.clone.clone.refs) |ref| {
                 if (!std.mem.startsWith(u8, ref.name, "refs/issues/")) continue;
@@ -1468,7 +1675,9 @@ const JsonCheck = struct {
         for (conflicts) |cv| {
             const c = asObject(cv) orelse return j.bad("a conflict that isn't an object");
             const id = jsonText(c, "id") orelse return j.bad("a conflict without an id");
-            if (try j.naiveIssue(id) == null) return j.bad("a conflict on an issue that isn't there");
+            if (try j.naiveIssue(id) == null) return j.bad(
+                "a conflict on an issue that isn't there",
+            );
             for ([_][]const u8{ "field", "kept", "lost" }) |k| {
                 if (jsonText(c, k) == null) return j.bad("a conflict without field, kept or lost");
             }
@@ -1531,7 +1740,8 @@ const JsonCheck = struct {
         const want = for (naive) |n| {
             if (std.mem.eql(u8, n.id, id)) break n;
         } else return j.bad("a milestone the oracle doesn't know");
-        if (!all and !std.mem.eql(u8, want.status, "open")) return j.bad("a milestone that isn't open");
+        if (!all and !std.mem.eql(u8, want.status, "open"))
+            return j.bad("a milestone that isn't open");
         if (!try j.isText(m, "name", want.name) or !try j.isText(m, "status", want.status) or
             !std.mem.eql(u8, jsonText(m, "short_id") orelse "", id[0..7]))
             return j.bad("a milestone that differs from the oracle's");
@@ -1548,7 +1758,9 @@ const JsonCheck = struct {
             error.NoRule => return error.OracleNoRule,
         };
         const m = try j.milestone(v, naive, true);
-        const progress = asObject(v.object.get("progress") orelse return j.bad("no progress")) orelse
+        const progress = asObject(
+            v.object.get("progress") orelse return j.bad("no progress"),
+        ) orelse
             return j.bad("a progress that isn't an object");
         const closed = progress.get("closed") orelse return j.bad("no closed count");
         const total = progress.get("total") orelse return j.bad("no total count");
@@ -1559,7 +1771,8 @@ const JsonCheck = struct {
         for (members) |iv| {
             if (iv != .string) return j.bad("an issue entry that isn't an ID");
             try listed.append(j.arena, iv.string);
-            var cur = (try j.naiveIssue(iv.string)) orelse return j.bad("an issue that isn't there");
+            var cur = (try j.naiveIssue(iv.string)) orelse
+                return j.bad("an issue that isn't there");
             if (std.mem.eql(u8, cur.deleted, "true")) return j.bad("a deleted issue");
             // The nearest link up the chain; loops end at the step limit.
             var linked = false;
@@ -1576,7 +1789,8 @@ const JsonCheck = struct {
             if (!std.mem.startsWith(u8, r.name, "refs/issues/")) continue;
             const id = r.name["refs/issues/".len..];
             const n = (try j.naiveIssue(id)).?;
-            if (!std.mem.eql(u8, n.milestone_id, m.id) or std.mem.eql(u8, n.deleted, "true")) continue;
+            const linked = std.mem.eql(u8, n.milestone_id, m.id);
+            if (!linked or std.mem.eql(u8, n.deleted, "true")) continue;
             const mode = n.milestone_mode;
             if (std.mem.eql(u8, mode, "none") or std.mem.eql(u8, mode, "inherit")) continue;
             if (!issuez.format.labels.contains(listed.items, id))
@@ -1636,6 +1850,146 @@ fn utf8(arena: Allocator, v: []const u8) Allocator.Error![]const u8 {
     return std.fmt.allocPrint(arena, "{f}", .{std.unicode.fmtUtf8(v)});
 }
 
+/// Each comment's `changes`, and `created_changes`, as the oracle states
+/// them, for the fields it knows.
+fn checkChanges(
+    arena: Allocator,
+    clone: oracle.commands.Clone,
+    o: std.json.ObjectMap,
+    shown: []const u8,
+    out: []const u8,
+) CaseError!void {
+    const root = blk: {
+        const h = o.get("description_history") orelse return badJson(
+            shown,
+            "no description_history",
+            out,
+        );
+        if (h != .array or h.array.items.len == 0 or h.array.items[0] != .object)
+            return badJson(shown, "no description_history", out);
+        break :blk jsonText(
+            h.array.items[0].object,
+            "id",
+        ) orelse return badJson(shown, "no root", out);
+    };
+    try sameChanges(arena, clone, root, o.get("created_changes"), shown, out);
+    const comments = o.get("comments") orelse return badJson(shown, "no comments", out);
+    if (comments != .array) return badJson(shown, "no comments", out);
+    for (comments.array.items) |c| {
+        if (c != .object) return badJson(shown, "a comment that isn't an object", out);
+        const id = jsonText(
+            c.object,
+            "id",
+        ) orelse return badJson(shown, "a comment without an id", out);
+        try sameChanges(arena, clone, id, c.object.get("changes"), shown, out);
+    }
+}
+
+fn sameChanges(
+    arena: Allocator,
+    clone: oracle.commands.Clone,
+    commit: []const u8,
+    got: ?std.json.Value,
+    shown: []const u8,
+    out: []const u8,
+) CaseError!void {
+    const want = oracle.commands.changesOf(clone, commit) catch |err| switch (err) {
+        error.OutOfMemory => |e| return e,
+        error.NoRule => return error.OracleNoRule,
+    };
+    const list = got orelse return badJson(shown, "no changes", out);
+    if (list != .array) return badJson(shown, "changes that aren't a list", out);
+    const known = struct {
+        fn f(key: []const u8) bool {
+            const c = oracle.commands;
+            return issuez.format.labels.contains(&c.change_scalars, key) or
+                issuez.format.labels.contains(&c.change_sets, key) or
+                std.mem.eql(u8, key, "X-Attachment");
+        }
+    }.f;
+    const same = struct {
+        fn f(a: Allocator, v: ?std.json.Value, w: ?[]const u8) !bool {
+            const x = v orelse return false;
+            if (w) |text| return x == .string and std.mem.eql(u8, x.string, try utf8(a, text));
+            return x == .null;
+        }
+    }.f;
+    var count: usize = 0;
+    for (list.array.items) |c| {
+        if (c != .object) return badJson(shown, "a change that isn't an object", out);
+        const key = jsonText(
+            c.object,
+            "key",
+        ) orelse return badJson(shown, "a change without a key", out);
+        if (known(key)) count += 1;
+    }
+    for (want) |w| {
+        const found = for (list.array.items) |c| {
+            const key = jsonText(c.object, "key") orelse continue;
+            const op = jsonText(c.object, "op") orelse continue;
+            if (!std.mem.eql(u8, key, w.key) or !std.mem.eql(u8, op, w.op)) continue;
+            if (try same(
+                arena,
+                c.object.get("old"),
+                w.old,
+            ) and try same(arena, c.object.get("new"), w.new)) break true;
+        } else false;
+        if (!found) {
+            std.debug.print("  {s}: commit {s}: no change {s} {s} {?s} -> {?s}\n", .{
+                shown, commit, w.op, w.key, w.old, w.new,
+            });
+            return badJson(shown, "a missing change", out);
+        }
+    }
+    if (count != want.len) {
+        std.debug.print(
+            "  {s}: commit {s}: {d} changes, the oracle states {d}\n",
+            .{ shown, commit, count, want.len },
+        );
+        return badJson(shown, "extra changes", out);
+    }
+}
+
+/// `description_history` and each comment's `history` hold the versions
+/// the oracle finds: the same commits, each with the same kind.
+fn sameHistories(
+    arena: Allocator,
+    o: std.json.ObjectMap,
+    n: oracle.commands.NaiveIssue,
+) Allocator.Error!bool {
+    _ = arena;
+    const Same = struct {
+        fn revisions(v: ?std.json.Value, want: []const oracle.commands.NaiveRevision) bool {
+            const list = v orelse return false;
+            if (list != .array or list.array.items.len != want.len) return false;
+            for (want) |w| {
+                const found = for (list.array.items) |r| {
+                    if (r != .object) return false;
+                    const id = jsonText(r.object, "id") orelse return false;
+                    const kind = jsonText(r.object, "kind") orelse return false;
+                    if (std.mem.eql(u8, id, w.commit) and std.mem.eql(u8, kind, w.kind)) break true;
+                } else false;
+                if (!found) return false;
+            }
+            return true;
+        }
+    };
+    if (!Same.revisions(o.get("description_history"), n.description_history)) return false;
+    const comments = o.get("comments") orelse return false;
+    if (comments != .array) return false;
+    for (comments.array.items) |c| {
+        if (c != .object) return false;
+        const merge = c.object.get("merge") orelse return false;
+        if (merge == .bool and merge.bool) continue;
+        const id = jsonText(c.object, "id") orelse return false;
+        const want = for (n.comment_histories) |h| {
+            if (std.mem.eql(u8, h.comment, id)) break h.revisions;
+        } else return false;
+        if (!Same.revisions(c.object.get("history"), want)) return false;
+    }
+    return true;
+}
+
 /// The core fields as the oracle reads them, `null` for "". Extension
 /// fields only when set, since `--json` leaves out values it can't parse.
 fn sameAsNaive(
@@ -1656,6 +2010,15 @@ fn sameAsNaive(
         }
     };
     if (!try Same.text(arena, o, "title", n.title)) return false;
+    // `number` only when it reads as one.
+    const number = o.get("number") orelse return false;
+    if (oracle.commands.validNumber(n.number)) {
+        if (number != .integer or number.integer != std.fmt.parseInt(
+            i64,
+            n.number,
+            10,
+        ) catch -1) return false;
+    } else if (number != .null) return false;
     if (!try Same.text(arena, o, "state", n.state)) return false;
     if (!try Same.text(arena, o, "priority", n.priority)) return false;
     if (!try Same.text(arena, o, "milestone", n.milestone)) return false;
@@ -1676,6 +2039,56 @@ fn sameAsNaive(
         .{ "milestone_id", n.milestone_id },
     }) |f| if (!try Same.ifSet(arena, o, f[0], f[1])) return false;
 
+    // `assignees` by email, in the oracle's order.
+    const assignees = o.get("assignees") orelse return false;
+    if (assignees != .array or assignees.array.items.len != n.assignees.len) return false;
+    for (assignees.array.items, n.assignees) |got, want| {
+        if (got != .string) return false;
+        const raw = try utf8(arena, want);
+        const email = if (std.mem.findScalarLast(u8, raw, ' ')) |sp| raw[sp + 1 ..] else raw;
+        if (!std.mem.eql(u8, got.string, email) and !std.mem.eql(u8, got.string, raw)) return false;
+    }
+    // Host fields, as written, in `fields`.
+    const fields = o.get("fields") orelse return false;
+    if (fields != .object) return false;
+    for (oracle.commands.host_keys, n.host) |k, want| {
+        const got = fields.object.get(k);
+        if (want.len == 0) {
+            if (got != null) return false;
+        } else if (got == null or got.? != .string or !std.mem.eql(
+            u8,
+            got.?.string,
+            try utf8(arena, want),
+        )) return false;
+    }
+    // Reactions: the same members as the oracle's.
+    const reactions = o.get("reactions") orelse return false;
+    if (reactions != .array) return false;
+    var count: usize = 0;
+    for (reactions.array.items) |r| {
+        if (r != .object) return false;
+        const on = r.object.get("comment");
+        const target = if (on != null and on.? == .string) on.?.string else "-";
+        const emoji = jsonText(r.object, "emoji") orelse return false;
+        const users = r.object.get("users") orelse return false;
+        if (users != .array) return false;
+        for (users.array.items) |u| {
+            if (u != .string) return false;
+            const member = try std.fmt.allocPrint(
+                arena,
+                "{s} {s} {s}",
+                .{ target, emoji, u.string },
+            );
+            if (!oracle.commands.containsText(n.reactions, member)) return false;
+            count += 1;
+        }
+    }
+    if (count != n.reactions.len) return false;
+    // Lock and ref: what reads as one, as written.
+    const locked = o.get("locked") orelse return false;
+    if (locked != .bool or locked.bool != std.mem.eql(u8, n.locked, "true")) return false;
+    if (!try Same.text(arena, o, "lock_reason", n.lock_reason)) return false;
+    if (!try Same.ifSet(arena, o, "ref", n.ref)) return false;
     const deleted = o.get("deleted") orelse return false;
     if (deleted != .bool or deleted.bool != std.mem.eql(u8, n.deleted, "true")) return false;
 
@@ -1724,7 +2137,7 @@ fn sameAttachments(
 /// The engine's valid blockers plus its invalid ones are the oracle's set.
 fn sameBlockers(ext: issuez.model.issue.Extensions, naive: []const []const u8) bool {
     var n: usize = ext.blocked_by.len;
-    for (ext.invalid) |f| if (std.mem.eql(u8, f.key, "X-Blocked-By")) {
+    for (ext.invalid_fields) |f| if (std.mem.eql(u8, f.key, "X-Blocked-By")) {
         n += 1;
     };
     if (n != naive.len) return false;
@@ -1891,4 +2304,453 @@ fn checkRoundTrip(arena: Allocator, world: World) CaseError!void {
 fn reject(report: oracle.Report) CaseError {
     for (report.violations.items) |v| std.debug.print("  oracle: {s}\n", .{v});
     return error.OracleRejected;
+}
+
+// ─── Push check ────────────────────────────────────────────────────────
+
+/// Every push that reaches the hub goes through the push check, run by the
+/// engine and by the oracle, which must agree; under a permissive policy an
+/// honest sync must pass (format.md §11). Pushes are never refused here,
+/// so the rest of the case runs as before.
+const PushChecker = struct {
+    rand: std.Random,
+    identity: []const u8,
+    /// A sync or push command is running: its pushes are honest.
+    honest: bool = false,
+    failed: bool = false,
+
+    fn hook(c: *PushChecker) GitSim.ReceiveHook {
+        return .{ .context = c, .receive = receive };
+    }
+
+    fn receive(
+        context: *anyopaque,
+        arena: Allocator,
+        quarantine: *GitSim,
+        updates: []const GitSim.Received,
+    ) bool {
+        const c: *PushChecker = @ptrCast(@alignCast(context));
+        c.check(arena, quarantine, updates, c.honest) catch |e| {
+            std.debug.print("  push check: {t}\n", .{e});
+            c.failed = true;
+        };
+        return true;
+    }
+
+    fn policyOf(c: *PushChecker, arena: Allocator) Allocator.Error!struct {
+        issuez.push_check.Policy,
+        oracle.push_check.Policy,
+    } {
+        const r = c.rand;
+        if (r.boolean()) return .{
+            .{ .allow_numbers = true, .allow_purge = true },
+            .{ .allow_numbers = true, .allow_purge = true },
+        };
+        var emails: std.ArrayList([]const u8) = .empty;
+        if (r.uintLessThan(u8, 4) != 0) try emails.append(
+            arena,
+            if (r.boolean()) c.identity else try std.ascii.allocUpperString(arena, c.identity),
+        );
+        if (r.boolean()) try emails.append(arena, "mallory@example.invalid");
+        const authors = r.uintLessThan(u8, 3);
+        const numbers = r.boolean();
+        const purges = r.boolean();
+        return .{
+            .{
+                .pusher_emails = emails.items,
+                .author_policy = @enumFromInt(authors),
+                .allow_numbers = numbers,
+                .allow_purge = purges,
+            },
+            .{
+                .pusher_emails = emails.items,
+                .authors = @enumFromInt(authors),
+                .allow_numbers = numbers,
+                .allow_purge = purges,
+            },
+        };
+    }
+
+    fn check(
+        c: *PushChecker,
+        arena: Allocator,
+        q: *GitSim,
+        updates: []const GitSim.Received,
+        honest: bool,
+    ) CaseError!void {
+        const engine_policy, const oracle_policy = try c.policyOf(arena);
+        const permissive = engine_policy.allow_numbers and engine_policy.allow_purge and
+            engine_policy.author_policy == .any;
+        const ups = try arena.alloc(issuez.push_check.Update, updates.len);
+        const oups = try arena.alloc(oracle.push_check.Update, updates.len);
+        for (updates, ups, oups) |u, *e, *o| {
+            e.* = .{ .ref = u.name, .old = u.old, .new = u.new };
+            o.* = .{
+                .ref = u.name,
+                .old = if (u.old) |x| try x.hexAlloc(arena) else null,
+                .new = if (u.new) |x| try x.hexAlloc(arena) else null,
+            };
+        }
+        const repo = issuez.Repo(GitSim).init(q);
+        const got = issuez.PushCheck(GitSim).fromRepo(repo).check(
+            arena,
+            ups,
+            engine_policy,
+        ) catch |e| {
+            std.debug.print("  push check failed: {t}\n", .{e});
+            return error.ModelMismatch;
+        };
+
+        var refs: std.ArrayList(World.Ref) = .empty;
+        for (q.refs.keys(), q.refs.values()) |name, oid| try refs.append(
+            arena,
+            .{ .name = name, .oid = try oid.hexAlloc(arena) },
+        );
+        var objects: std.ArrayList(World.StoredObject) = .empty;
+        var it = q.objects.valueIterator();
+        while (it.next()) |o| try objects.append(arena, o.*);
+        const view = try oracle.commands.Clone.init(arena, q.world.format, .{
+            .name = "hub",
+            .refs = refs.items,
+            .objects = objects.items,
+        });
+        const want = oracle.push_check.expect(view, oups, oracle_policy) catch |e| switch (e) {
+            error.OutOfMemory => return error.OutOfMemory,
+            error.NoRule => return countSkip("push check of a history the oracle can't read"),
+        };
+
+        for (got, want) |g, w| {
+            if (w.skip) continue;
+            var kinds: std.ArrayList([]const u8) = .empty;
+            var flags: std.ArrayList([]const u8) = .empty;
+            var at: std.ArrayList([]const u8) = .empty;
+            for (g.problems) |p| {
+                const name = @tagName(p.kind);
+                const per_commit = switch (p.kind) {
+                    .not_derived, .not_a_purge, .author_mismatch, .number_set => true,
+                    else => false,
+                };
+                if (per_commit) if (p.commit) |cm| {
+                    const tag = try std.fmt.allocPrint(
+                        arena,
+                        "{s}@{f}",
+                        .{ name, cm },
+                    );
+                    if (!oracle.commands.containsText(at.items, tag)) try at.append(arena, tag);
+                };
+                if (!p.rejects and !oracle.commands.containsText(flags.items, name))
+                    try flags.append(arena, name);
+                if (!oracle.commands.containsText(kinds.items, name)) try kinds.append(arena, name);
+            }
+            stableSort([]const u8, kinds.items, {}, struct {
+                fn lt(_: void, a: []const u8, b: []const u8) bool {
+                    return std.mem.lessThan(u8, a, b);
+                }
+            }.lt);
+            const same = std.mem.eql(u8, @tagName(g.action), w.action) and
+                g.accept == w.accept and
+                oracle.commands.sameSet(kinds.items, w.kinds) and
+                oracle.commands.sameSet(flags.items, w.flags) and
+                oracle.commands.sameSet(at.items, w.at) and
+                g.needs_number == w.needs_number and
+                g.touches_locked == w.touches_locked and
+                (w.new_count == null or w.new_count.? == g.new_commits.len);
+            if (!same) {
+                std.debug.print(
+                    "  push check of {s} ({s} -> {s}) disagrees:\n" ++
+                        "    engine: {t} accept={} {s} flags {s} number={} locked={} new={d}\n" ++
+                        "    oracle: {s} accept={} {s} flags {s} number={} locked={} new={?d}\n",
+                    .{
+                        g.update.ref,
+                        if (g.update.old) |x| x.hex().slice()[0..8] else "-",
+                        if (g.update.new) |x| x.hex().slice()[0..8] else "-",
+                        g.action,
+                        g.accept,
+                        try std.mem.join(arena, ",", kinds.items),
+                        try std.mem.join(arena, ",", flags.items),
+                        g.needs_number,
+                        g.touches_locked,
+                        g.new_commits.len,
+                        w.action,
+                        w.accept,
+                        try std.mem.join(arena, ",", w.kinds),
+                        try std.mem.join(arena, ",", w.flags),
+                        w.needs_number,
+                        w.touches_locked,
+                        w.new_count,
+                    },
+                );
+                return error.ModelMismatch;
+            }
+            countOutcome(if (g.accept) "(push check accepts)" else "(push check refuses)", true);
+            if (g.touches_locked) countOutcome("(push check: touches locked)", true);
+            if (g.gives_number) countOutcome("(push check: gives a number)", true);
+            if (g.kind == .tombstone and g.accept) countOutcome("(push check: tombstone in)", true);
+            // The stats keep their keys: static names only.
+            inline for (std.meta.fields(issuez.push_check.ProblemKind)) |f| {
+                if (oracle.commands.containsText(kinds.items, f.name))
+                    countOutcome("(push check: " ++ f.name ++ ")", true);
+            }
+            if (honest and permissive and !g.accept) {
+                const only_numbers = for (g.problems) |p| {
+                    if (p.rejects and p.kind != .number_taken) break false;
+                } else true;
+                if (!only_numbers) {
+                    std.debug.print("  an honest push of {s} was refused: {s}\n", .{
+                        g.update.ref,
+                        try std.mem.join(arena, ",", kinds.items),
+                    });
+                    return error.ModelMismatch;
+                }
+            }
+        }
+    }
+};
+
+var push_checker: ?*PushChecker = null;
+
+/// A push that never happens: the clone's refs and some mischief (deletes,
+/// rewinds, local-only and misnamed refs) checked against the hub.
+fn pushCheckStep(
+    arena: Allocator,
+    rand: std.Random,
+    world: *World,
+    clone_index: usize,
+    hub_index: usize,
+) CaseError!void {
+    const checker = push_checker orelse return;
+    var q = try GitSim.init(arena, world, hub_index);
+    const clone = world.clones[clone_index];
+    for (clone.objects) |o|
+        try q.objects.put(arena, object.hashObject(world.format, o.kind, o.data), o);
+    const prefixes = [_][]const u8{
+        "refs/issues/", "refs/milestones/", "refs/attachments/", "refs/issuez-purged/",
+    };
+    var updates: std.ArrayList(GitSim.Received) = .empty;
+    for (clone.refs) |r| {
+        const ours = for (prefixes) |p| {
+            if (std.mem.startsWith(u8, r.name, p)) break true;
+        } else false;
+        if (!ours) continue;
+        const new = Oid.parseHex(world.format, r.oid) catch continue;
+        const old = q.refs.get(r.name);
+        if (old != null and old.?.eql(new)) continue;
+        if (rand.uintLessThan(u8, 4) == 0) continue;
+        try updates.append(arena, .{ .name = r.name, .old = old, .new = new });
+    }
+    const hub_refs = q.refs.keys();
+    if (hub_refs.len > 0 and rand.uintLessThan(u8, 3) == 0) {
+        const name = hub_refs[rand.uintLessThan(usize, hub_refs.len)];
+        const tip = q.refs.get(name).?;
+        const rewind: ?Oid = if (rand.boolean()) blk: {
+            const o = (try q.readObject(arena, tip)) orelse break :blk null;
+            const c = object.Commit.parse(arena, world.format, o.data) catch break :blk null;
+            break :blk if (c.parents.len > 0) c.parents[0] else null;
+        } else null;
+        if (!containsName(updates.items, name)) try updates.append(arena, .{
+            .name = name,
+            .old = tip,
+            .new = rewind,
+        });
+    }
+    if (rand.uintLessThan(u8, 6) == 0) if (updates.items.len > 0) {
+        const junk = [_][]const u8{
+            "refs/issuez-guard/0b6c4f63-6f5a-4a3e-9c2b-1d2e3f4a5b6c",
+            "refs/issues/not-a-uuid",
+            "refs/heads/main",
+        };
+        const name = junk[rand.uintLessThan(usize, junk.len)];
+        if (!containsName(updates.items, name) and q.refs.get(name) == null)
+            try updates.append(arena, .{ .name = name, .old = null, .new = updates.items[0].new });
+    };
+    if (rand.boolean()) try forge(arena, rand, world, clone, &q, &updates);
+    if (updates.items.len == 0) return;
+    countOutcome("(push check step)", true);
+    try checker.check(arena, &q, updates.items, false);
+}
+
+/// Commits no tool of ours writes: numbers, files, a format from the
+/// future, tombstones good and bad.
+fn forge(
+    arena: Allocator,
+    rand: std.Random,
+    world: *World,
+    clone: World.Clone,
+    q: *GitSim,
+    updates: *std.ArrayList(GitSim.Received),
+) CaseError!void {
+    const sig: object.Signature = .{
+        .name = world.identity.name,
+        .email = world.identity.email,
+        .time = world.clock.now,
+        .tz_offset_minutes = 0,
+    };
+    var issues: std.ArrayList(World.Ref) = .empty;
+    for (clone.refs) |r| if (std.mem.startsWith(u8, r.name, "refs/issues/")) {
+        try issues.append(arena, r);
+    };
+    const empty = object.emptyTree(world.format);
+    const kind = rand.uintLessThan(u8, 6);
+    if (kind == 2 or issues.items.len == 0) {
+        countOutcome("(push check forged: new format)", true);
+        const c: object.Commit = .{
+            .tree = empty,
+            .parents = &.{},
+            .author = sig,
+            .committer = sig,
+            .message = try std.fmt.allocPrint(
+                arena,
+                "Forged\n\nState: open\nFormat-Version: {d}\n",
+                .{rand.intRangeAtMost(u8, 1, 2)},
+            ),
+        };
+        const oid = try q.writeObject(.commit, try c.serializeAlloc(arena));
+        const name = try std.fmt.allocPrint(
+            arena,
+            "refs/issues/{s}",
+            .{try randomUuid(arena, rand)},
+        );
+        return updates.append(arena, .{ .name = name, .old = null, .new = oid });
+    }
+    const target = issues.items[rand.uintLessThan(usize, issues.items.len)];
+    const tip = Oid.parseHex(world.format, target.oid) catch return;
+    const id = target.name["refs/issues/".len..];
+    switch (kind) {
+        4 => {
+            // A commit under the derived tip: pointers or not.
+            const name = try std.fmt.allocPrint(arena, "refs/attachments/{s}", .{id});
+            const hex = for (clone.refs) |r| {
+                if (std.mem.eql(u8, r.name, name)) break r.oid;
+            } else return;
+            const d_oid = Oid.parseHex(world.format, hex) catch return;
+            const d_obj = (try q.readObject(arena, d_oid)) orelse return;
+            const d = object.Commit.parse(arena, world.format, d_obj.data) catch return;
+            countOutcome("(push check forged: derived history)", true);
+            const junk_tree = if (rand.uintLessThan(u8, 3) == 0) d.tree else blk: {
+                const blob = try q.writeObject(.blob, "not a pointer\n");
+                break :blk try q.writeObject(.tree, try object.Tree.serializeAlloc(arena, &.{.{
+                    .name = "0b6c4f63-6f5a-4a3e-9c2b-1d2e3f4a5b6c.png",
+                    .oid = blob,
+                }}));
+            };
+            var under = d;
+            under.tree = junk_tree;
+            under.message = "Regenerate attachments\n";
+            const j = try q.writeObject(.commit, try under.serializeAlloc(arena));
+            var top = d;
+            top.parents = try arena.dupe(Oid, &.{j});
+            const oid = try q.writeObject(.commit, try top.serializeAlloc(arena));
+            for (updates.items) |*u| if (std.mem.eql(u8, u.name, name)) {
+                u.new = oid;
+                return;
+            };
+            try updates.append(arena, .{ .name = name, .old = q.refs.get(name), .new = oid });
+            if (!containsName(updates.items, target.name)) {
+                const old = q.refs.get(target.name);
+                if (old == null or !old.?.eql(tip))
+                    try updates.append(arena, .{ .name = target.name, .old = old, .new = tip });
+            }
+        },
+        5 => {
+            // Two issues given one number in one push.
+            countOutcome("(push check forged: numbers)", true);
+            const n = rand.intRangeAtMost(u8, 1, 3);
+            for (0..2) |_| {
+                const t = issues.items[rand.uintLessThan(usize, issues.items.len)];
+                if (containsName(updates.items, t.name)) continue;
+                const parent = Oid.parseHex(world.format, t.oid) catch continue;
+                const c: object.Commit = .{
+                    .tree = empty,
+                    .parents = try arena.dupe(Oid, &.{parent}),
+                    .author = sig,
+                    .committer = sig,
+                    .message = try std.fmt.allocPrint(arena, "Number\n\nX-Number: {d}\n", .{n}),
+                };
+                const oid = try q.writeObject(.commit, try c.serializeAlloc(arena));
+                try updates.append(
+                    arena,
+                    .{ .name = t.name, .old = q.refs.get(t.name), .new = oid },
+                );
+            }
+        },
+        0, 1 => {
+            const tree = if (kind == 1) blk: {
+                countOutcome("(push check forged: files)", true);
+                const blob = try q.writeObject(.blob, "not an issue\n");
+                break :blk try q.writeObject(
+                    .tree,
+                    try object.Tree.serializeAlloc(arena, &.{.{ .name = "x", .oid = blob }}),
+                );
+            } else empty;
+            if (kind == 0) countOutcome("(push check forged: number)", true);
+            const c: object.Commit = .{
+                .tree = tree,
+                .parents = &.{tip},
+                .author = sig,
+                .committer = sig,
+                .message = try std.fmt.allocPrint(
+                    arena,
+                    "Number\n\nX-Number: {d}\n",
+                    .{rand.intRangeAtMost(u8, 1, 3)},
+                ),
+            };
+            const oid = try q.writeObject(.commit, try c.serializeAlloc(arena));
+            for (updates.items) |*u| if (std.mem.eql(u8, u.name, target.name)) {
+                u.new = oid;
+                return;
+            };
+            try updates.append(arena, .{
+                .name = target.name,
+                .old = q.refs.get(target.name),
+                .new = oid,
+            });
+        },
+        else => {
+            countOutcome("(push check forged: tombstone)", true);
+            const tomb_name = try std.fmt.allocPrint(arena, "refs/issuez-purged/{s}", .{id});
+            const old = q.refs.get(tomb_name);
+            const messages = [_][]const u8{
+                "Purge issue\n\nX-Purge: issue\n",
+                "Junk\n\nX-Purge: maybe\n",
+                try std.fmt.allocPrint(
+                    arena,
+                    "Purge comment\n\nX-Purge: comment\nX-Purged-Commit: {f}\n",
+                    .{tip},
+                ),
+                "Purge comment\n\nX-Purge: comment\nX-Purged-Commit: abc\n",
+            };
+            const c: object.Commit = .{
+                .tree = empty,
+                .parents = if (old) |o| try arena.dupe(Oid, &.{o}) else &.{},
+                .author = sig,
+                .committer = sig,
+                .message = messages[rand.uintLessThan(usize, messages.len)],
+            };
+            const oid = try q.writeObject(.commit, try c.serializeAlloc(arena));
+            if (containsName(updates.items, tomb_name)) return;
+            // Or the tombstone goes.
+            const new: ?Oid = if (old != null and rand.uintLessThan(u8, 4) == 0) null else oid;
+            try updates.append(arena, .{ .name = tomb_name, .old = old, .new = new });
+            // The issue goes with it, now and then.
+            if (q.refs.get(target.name)) |hub_tip| if (rand.boolean() and
+                !containsName(updates.items, target.name))
+                try updates.append(arena, .{ .name = target.name, .old = hub_tip, .new = null });
+        },
+    }
+}
+
+fn randomUuid(arena: Allocator, rand: std.Random) Allocator.Error![]const u8 {
+    var b: [16]u8 = undefined;
+    rand.bytes(&b);
+    b[6] = (b[6] & 0x0f) | 0x40;
+    b[8] = (b[8] & 0x3f) | 0x80;
+    const h = std.fmt.bytesToHex(b, .lower);
+    return std.fmt.allocPrint(arena, "{s}-{s}-{s}-{s}-{s}", .{
+        h[0..8], h[8..12], h[12..16], h[16..20], h[20..32],
+    });
+}
+
+fn containsName(list: []const GitSim.Received, name: []const u8) bool {
+    for (list) |u| if (std.mem.eql(u8, u.name, name)) return true;
+    return false;
 }

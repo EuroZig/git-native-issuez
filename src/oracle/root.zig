@@ -14,6 +14,8 @@ const Oid = object.Oid;
 
 pub const command = @import("command.zig");
 pub const Command = command.Command;
+pub const purge = @import("purge.zig");
+pub const push_check = @import("push_check.zig");
 
 /// Reasons a transition was rejected, and checks left out.
 pub const Report = struct {
@@ -44,6 +46,7 @@ pub const owned_prefixes = [_][]const u8{
     "refs/issuez-sync/",
     "refs/issuez-guard/",
     "refs/issuez-cache/",
+    "refs/issuez-purged/",
 };
 
 pub fn isOwnedRef(name: []const u8) bool {
@@ -129,13 +132,14 @@ fn checkClone(
         }
     }
 
-    // Guard refs stay, and only move to a tip this step wrote to an issue
-    // or milestone.
+    // Guard refs stay, except a purged issue's, and only move to a tip
+    // this step wrote to an issue or milestone.
     for (b.refs) |r| if (std.mem.startsWith(u8, r.name, guard_prefix)) {
         const kept = for (a.refs) |n| {
             if (std.mem.eql(u8, n.name, r.name)) break true;
         } else false;
-        if (!kept) try report.fail("clone '{s}': guard ref {s} deleted", .{ a.name, r.name });
+        if (!kept and !try guardOfPurged(arena, format, b, a, r.name))
+            try report.fail("clone '{s}': guard ref {s} deleted", .{ a.name, r.name });
     };
     for (a.refs) |r| {
         if (!std.mem.startsWith(u8, r.name, guard_prefix)) continue;
@@ -143,14 +147,18 @@ fn checkClone(
             if (std.mem.eql(u8, o.name, r.name)) break o.oid;
         } else null;
         if (old != null and std.mem.eql(u8, old.?, r.oid)) continue;
+        // Or under such a tip: sync applies a purge, then merges on top.
+        const ca = try commands.Clone.init(arena, format, a);
         const written = for (a.refs) |t| {
             if (!std.mem.startsWith(u8, t.name, "refs/issues/") and
                 !std.mem.startsWith(u8, t.name, "refs/milestones/")) continue;
-            if (!std.mem.eql(u8, t.oid, r.oid)) continue;
             const was = for (b.refs) |o| {
                 if (std.mem.eql(u8, o.name, t.name)) break o.oid;
             } else null;
-            if (was == null or !std.mem.eql(u8, was.?, t.oid)) break true;
+            if (was != null and std.mem.eql(u8, was.?, t.oid)) continue;
+            if (std.mem.eql(u8, t.oid, r.oid)) break true;
+            if (std.mem.startsWith(u8, t.name, "refs/issues/") and
+                try isAncestorIn(ca, r.oid, t.oid)) break true;
         } else false;
         if (!written) try report.fail(
             "clone '{s}': guard ref {s} moved to a commit no write made",
@@ -181,6 +189,184 @@ fn checkClone(
         try report.fail("clone '{s}': foreign ref {s} was created", .{ a.name, r.name });
 }
 
+/// A guard of an issue this step purged: `<uuid>` with an issue tombstone
+/// now, or `number-<n>` of an issue that went.
+fn guardOfPurged(
+    arena: Allocator,
+    format: object.ObjectFormat,
+    b: World.Clone,
+    a: World.Clone,
+    name: []const u8,
+) Allocator.Error!bool {
+    const rest = name[guard_prefix.len..];
+    const ca = try commands.Clone.init(arena, format, a);
+    if (!std.mem.startsWith(u8, rest, "number-")) {
+        const t = (try purge.of(ca, rest)) orelse return false;
+        return t.issue;
+    }
+    const cb = try commands.Clone.init(arena, format, b);
+    for (b.refs) |r| {
+        if (!std.mem.startsWith(u8, r.name, "refs/issues/") or findRef(a, r.name) != null) continue;
+        const t = (try purge.of(ca, r.name["refs/issues/".len..])) orelse continue;
+        if (!t.issue) continue;
+        const n = cb.naive(r.oid) catch continue;
+        if (std.mem.eql(u8, n.number, rest["number-".len..])) return true;
+    }
+    return false;
+}
+
+/// No issue here still has text its tombstone purged, and no purged
+/// issue is here (format.md §10). `only`: just that issue's tombstone.
+fn checkPurgedStay(
+    arena: Allocator,
+    c: commands.Clone,
+    what: []const u8,
+    only: ?[]const u8,
+    report: *Report,
+) Allocator.Error!void {
+    _ = arena;
+    for (c.clone.refs) |r| {
+        if (!std.mem.startsWith(u8, r.name, purge.prefix)) continue;
+        const id = r.name[purge.prefix.len..];
+        if (only) |o| if (!std.mem.eql(u8, o, id)) continue;
+        const t = try purge.read(c, r.oid);
+        const issue = try std.fmt.allocPrint(c.arena, "refs/issues/{s}", .{id});
+        const tip = c.ref(issue) orelse continue;
+        if (t.issue) {
+            try report.fail("{s} has purged issue {s}", .{ what, id });
+        } else if (try purge.leaks(c, tip, t)) |hex| {
+            try report.fail("{s}: {s} still has purged commit {s}", .{ what, id, hex[0..7] });
+        }
+    }
+}
+
+/// `refs/remotes/.../issues/<id>`, `.../attachments/<id>`, or sync's
+/// records of it, but not `seen/`.
+fn namesPurged(name: []const u8, id: []const u8) bool {
+    if (!std.mem.startsWith(u8, name, "refs/remotes/") and
+        !std.mem.startsWith(u8, name, "refs/issuez-sync/")) return false;
+    if (std.mem.startsWith(u8, name, "refs/issuez-sync/")) {
+        var parts = std.mem.splitScalar(u8, name["refs/issuez-sync/".len..], '/');
+        _ = parts.next();
+        if (std.mem.eql(u8, parts.next() orelse "", "seen")) return false;
+    }
+    var parts = std.mem.splitScalar(u8, name, '/');
+    var prev: []const u8 = "";
+    while (parts.next()) |p| {
+        if (std.mem.eql(u8, p, id) and
+            (std.mem.eql(u8, prev, "issues") or std.mem.eql(u8, prev, "attachments"))) return true;
+        prev = p;
+    }
+    return false;
+}
+
+/// A purge: a tombstone commit on the old tombstone, and the issue gone
+/// or rewritten by the oracle's own statement of the rule (format.md §10).
+fn checkPurge(
+    arena: Allocator,
+    world: World,
+    b: commands.Clone,
+    a: commands.Clone,
+    x: command.Purge,
+    report: *Report,
+) (Allocator.Error || error{NoRule})!void {
+    if (!configEqual(b.clone, a.clone)) try report.fail("purge changed config", .{});
+    const name = (try targetRef(b, x.id, report, "purge")) orelse return;
+    const id = name["refs/issues/".len..];
+    const tip = b.ref(name).?;
+    const tomb_name = try std.fmt.allocPrint(arena, "{s}{s}", .{ purge.prefix, id });
+    const derived = try std.fmt.allocPrint(arena, "refs/attachments/{s}", .{id});
+    const old_tomb = b.ref(tomb_name);
+    // A purged issue that came back another way is purged again, whatever
+    // the purge names.
+    const came_back = if (old_tomb) |ot| (try purge.read(b, ot)).issue else false;
+    var first: ?[]const u8 = null;
+    if (!came_back) if (x.comment) |cp| {
+        var found: ?[]const u8 = null;
+        for (try commentCommits(arena, b, tip)) |hex| {
+            if (!std.mem.startsWith(u8, hex, cp)) continue;
+            // The root holds the title: purging it is purging the issue.
+            if (b.commit(hex).?.parents.len == 0) continue;
+            if (found != null) return report.fail("purge succeeded with an ambiguous comment", .{});
+            found = hex;
+        }
+        const hex = found orelse return report.fail(
+            "purge succeeded on a comment that isn't there",
+            .{},
+        );
+        first = try purge.firstId(b, hex);
+        if (old_tomb) |ot| if ((try purge.read(b, ot)).covers(first.?)) {
+            // Purged and recorded already: nothing to write.
+            const block = try commands.trailersOf(arena, b.commit(hex).?.message);
+            if (std.mem.eql(u8, trailers.lastValue(block, "X-Purged") orelse "", "true")) {
+                if ((try refChanges(arena, b, a)).len != 0)
+                    try report.fail("purge of a purged comment changed refs", .{});
+                return;
+            }
+        };
+    };
+    const new_tomb = a.ref(tomb_name) orelse return report.fail("purge wrote no tombstone", .{});
+    const tc = a.commit(new_tomb) orelse return report.fail("tombstone is not a commit", .{});
+    const want_parents: usize = if (old_tomb != null) 1 else 0;
+    if (tc.parents.len != want_parents or (old_tomb != null and
+        !std.mem.eql(u8, tc.parents[0].hex().slice(), old_tomb.?)))
+        try report.fail("purge: the tombstone commit isn't on the old tombstone", .{});
+    if (!tc.tree.eql(object.emptyTree(world.format))) try report.fail("purge: non-empty tree", .{});
+    try checkIdentity(world, tc, report);
+    var want: std.ArrayList(commands.Trailer) = .empty;
+    try want.append(
+        arena,
+        .{ .key = "X-Purge", .value = if (first == null) "issue" else "comment" },
+    );
+    if (first) |f| try want.append(arena, .{ .key = "X-Purged-Commit", .value = f });
+    if (x.reason) |r| if (r.len > 0) try want.append(arena, .{ .key = "Reason", .value = r });
+    try expectBlock(report, "purge", try commands.trailersOf(arena, tc.message), want.items);
+
+    var new_tip: ?[]const u8 = null;
+    if (first) |f| {
+        var set: std.ArrayList([]const u8) = .empty;
+        if (old_tomb) |ot| try set.appendSlice(arena, (try purge.read(b, ot)).comments);
+        if (!commands.containsText(set.items, f)) try set.append(arena, f);
+        new_tip = (try purge.rewrite(b, tip, set.items)) orelse return error.NoRule;
+        const got = a.ref(name) orelse return report.fail("comment purge deleted {s}", .{name});
+        if (!std.mem.eql(u8, got, new_tip.?)) try report.fail(
+            "purge: {s} is {s}, the rewrite gives {s}",
+            .{ id, got[0..7], new_tip.?[0..7] },
+        );
+    } else if (a.ref(name) != null) try report.fail("purge left {s}", .{name});
+
+    // Only the issue, its tombstone, its derived ref, and deletes of the
+    // refs that still reach the old history.
+    for (try refChanges(arena, b, a)) |ch| {
+        if (std.mem.eql(u8, ch.name, name) or std.mem.eql(u8, ch.name, tomb_name)) continue;
+        if (std.mem.startsWith(u8, ch.name, guard_prefix)) continue; // checkClone
+        if (std.mem.eql(u8, ch.name, derived)) {
+            const n = ch.new orelse continue;
+            if (first == null) try report.fail("purge left {s}", .{derived});
+            // Rebuilt from scratch: its history forgets the images too.
+            const dc = a.commit(n) orelse continue;
+            if (dc.parents.len != 0) try report.fail("purge kept the history of {s}", .{derived});
+            continue;
+        }
+        if (ch.new == null and namesPurged(ch.name, id)) continue;
+        try report.fail("purge changed {s}", .{ch.name});
+    }
+    if (first != null) {
+        if (a.ref(derived) == null and b.ref(derived) != null) {
+            const n = try a.naive(new_tip.?);
+            if (n.attachments.len > 0) try report.fail(
+                "purge left {s} without {s}",
+                .{ id, derived },
+            );
+        }
+    }
+    for (a.clone.refs) |r| if (namesPurged(r.name, id))
+        try report.fail("purge kept {s}", .{r.name});
+    // Only merge and push apply every tombstone again (§10): upstream may
+    // have brought other purged issues back meanwhile.
+    try checkPurgedStay(arena, a, "after purge", id, report);
+}
+
 /// Every entry of the parent cache whose tip is still the issue's names the
 /// parent the history gives (a canonical UUID), or none.
 fn checkParentCache(
@@ -202,16 +388,27 @@ fn checkParentCache(
         var it = std.mem.splitScalar(u8, line, ' ');
         const id = it.next() orelse continue;
         const entry_tip = it.next() orelse continue;
-        const rest = it.rest();
+        const parent_text = it.next() orelse "";
+        const number_text = it.next() orelse "";
         const name = try std.fmt.allocPrint(arena, "refs/issues/{s}", .{id});
         const now = c.ref(name) orelse continue;
         if (!std.mem.eql(u8, now, entry_tip)) continue;
         const naive = c.naive(now) catch continue;
-        const want: []const u8 = if (issuez.format.uuid.isCanonical(naive.parent)) naive.parent else "";
-        const got: []const u8 = if (rest.len > 0 and rest[0] == '=') rest[1..] else "";
+        const linked = issuez.format.uuid.isCanonical(naive.parent);
+        const want: []const u8 = if (linked) naive.parent else "";
+        const has_parent = parent_text.len > 0 and parent_text[0] == '=';
+        const got: []const u8 = if (has_parent) parent_text[1..] else "";
         if (!std.mem.eql(u8, want, got)) try report.fail(
             "clone '{s}': parent cache says {s} has parent '{s}', history says '{s}'",
             .{ a.name, id, got, want },
+        );
+        const valid = commands.validNumber(naive.number);
+        const want_number: []const u8 = if (valid) naive.number else "-";
+        const has_number = number_text.len > 0 and number_text[0] == '#';
+        const got_number: []const u8 = if (has_number) number_text[1..] else "?";
+        if (!std.mem.eql(u8, want_number, got_number)) try report.fail(
+            "clone '{s}': parent cache says {s} has number '{s}', history says '{s}'",
+            .{ a.name, id, got_number, want_number },
         );
     }
 }
@@ -244,7 +441,7 @@ fn checkEmptyTreeHistory(
             .{ clone, ref },
         );
         for (c.parents) |p| {
-            const hex = try arena.dupe(u8, p.hex().slice());
+            const hex = try p.hexAlloc(arena);
             const gop = try seen.getOrPut(arena, hex);
             if (gop.found_existing) continue;
             const parent = objects.get(hex) orelse {
@@ -264,7 +461,7 @@ fn objectSet(
     var set: std.StringHashMapUnmanaged(World.StoredObject) = .empty;
     for (clone.objects) |o| {
         const oid = object.hashObject(format, o.kind, o.data);
-        try set.put(arena, try arena.dupe(u8, oid.hex().slice()), o);
+        try set.put(arena, try oid.hexAlloc(arena), o);
     }
     return set;
 }
@@ -346,6 +543,8 @@ pub fn checkTransition(
         .comment_event => |x| return checkCommentEvent(arena, after, cb, ca, x, report),
         .milestone => |x| return checkMilestone(arena, after, cb, ca, x, report),
         .attach => |x| return checkAttach(arena, after, cb, ca, x, report),
+        .react => |x| return checkReact(arena, after, cb, ca, x, report),
+        .purge => |x| return checkPurge(arena, after, cb, ca, x, report),
         .repair => return checkRepair(arena, cb, ca, report),
     }
 }
@@ -410,36 +609,91 @@ fn checkSync(
     );
 
     // Remote issue refs are never deleted or rewound, and only push moves
-    // them.
+    // them. A purge is the exception: the tombstone the remote has now
+    // allows the delete, or a rewrite to what the oracle's rule gives.
     if (rb) |rbc| for (rbc.clone.refs) |r| {
         if (!std.mem.startsWith(u8, r.name, "refs/issues/")) continue;
+        const tomb = try purge.of(ra.?, r.name["refs/issues/".len..]);
         const now = ra.?.ref(r.name) orelse {
-            try report.fail("{s} deleted remote {s}", .{ cmd, r.name });
+            const allowed = pushing and !check_only and tomb != null and tomb.?.issue;
+            if (!allowed) try report.fail("{s} deleted remote {s}", .{ cmd, r.name });
             continue;
         };
         if (std.mem.eql(u8, now, r.oid)) continue;
         if (!pushing or check_only) {
             try report.fail("{s} changed remote {s}", .{ cmd, r.name });
-        } else if (!try isAncestorIn(ra.?, r.oid, now)) {
+        } else if (!try isAncestorIn(ra.?, r.oid, now) and
+            !try purgedInto(ra.?, r.oid, now, tomb))
+        {
             try report.fail("{s} rewound remote {s}", .{ cmd, r.name });
         }
     };
 
-    // Local issue refs are never deleted or rewound. --check changes nothing.
+    // Local issue refs are never deleted or rewound, but for purges.
+    // --check changes nothing.
     for (lb.clone.refs) |r| {
         if (!std.mem.startsWith(u8, r.name, "refs/issues/")) continue;
+        const tomb = try purge.of(la, r.name["refs/issues/".len..]);
         const now = la.ref(r.name) orelse {
-            try report.fail("{s} deleted local {s}", .{ cmd, r.name });
+            const allowed = !check_only and tomb != null and tomb.?.issue;
+            if (!allowed) try report.fail("{s} deleted local {s}", .{ cmd, r.name });
             continue;
         };
         if (std.mem.eql(u8, now, r.oid)) continue;
         if (check_only) try report.fail("merge --check changed {s}", .{r.name});
-        if (!try isAncestorIn(la, r.oid, now)) try report.fail(
-            "{s} rewound local {s}",
+        if (!try isAncestorIn(la, r.oid, now) and !try purgedInto(la, r.oid, now, tomb))
+            try report.fail("{s} rewound local {s}", .{ cmd, r.name });
+    }
+
+    // Push only merges when rejected, so only merge and sync promise to
+    // take what the remote has.
+    const merges_everything = which != .push;
+
+    // Tombstones are never deleted or rewound, merge and sync take the
+    // remote's, and push sends them.
+    for (lb.clone.refs) |r| {
+        if (!std.mem.startsWith(u8, r.name, purge.prefix)) continue;
+        const now = la.ref(r.name) orelse {
+            try report.fail("{s} deleted local {s}", .{ cmd, r.name });
+            continue;
+        };
+        if (check_only and !std.mem.eql(u8, now, r.oid))
+            try report.fail("merge --check changed {s}", .{r.name});
+        if (!try isAncestorIn(la, r.oid, now)) try report.fail("{s} rewound {s}", .{ cmd, r.name });
+    }
+    if (rb) |rbc| for (rbc.clone.refs) |r| {
+        if (!std.mem.startsWith(u8, r.name, purge.prefix)) continue;
+        const now = ra.?.ref(r.name) orelse {
+            try report.fail("{s} deleted remote {s}", .{ cmd, r.name });
+            continue;
+        };
+        if (!try isAncestorIn(
+            ra.?,
+            r.oid,
+            now,
+        )) try report.fail("{s} rewound remote {s}", .{ cmd, r.name });
+        if (check_only or !merges_everything) continue;
+        if (rbc.commit(r.oid) == null) continue;
+        const mine = la.ref(r.name) orelse {
+            try report.fail("{s} didn't take tombstone {s}", .{ cmd, r.name });
+            continue;
+        };
+        if (!try isAncestorIn(la, r.oid, mine)) try report.fail(
+            "{s}: local {s} doesn't contain the remote's",
             .{ cmd, r.name },
         );
-    }
+    };
     if (check_only) return;
+    try checkPurgedStay(arena, la, cmd, null, report);
+    if (pushing) {
+        try checkPurgedStay(arena, ra.?, "the remote", null, report);
+        for (la.clone.refs) |r| {
+            if (!std.mem.startsWith(u8, r.name, purge.prefix)) continue;
+            const remote_now = ra.?.ref(r.name);
+            if (remote_now == null or !try isAncestorIn(ra.?, r.oid, remote_now.?))
+                try report.fail("{s}: remote lacks local {s}", .{ cmd, r.name });
+        }
+    }
 
     // New merge commits have the deterministic shape and restate our own
     // resolution of their parents.
@@ -451,14 +705,12 @@ fn checkSync(
     }
 
     // merge/sync: every issue the remote had is now here and contains the
-    // remote tip, unless quarantined for a real reason. Push only merges
-    // when rejected, so it can't promise this.
+    // remote tip, unless quarantined for a real reason. Not push.
     const qprefix = try std.fmt.allocPrint(
         arena,
         "refs/issuez-sync/{s}/quarantined/issues/",
         .{name},
     );
-    const merges_everything = which != .push;
     if (merges_everything) for (remote_refs.items) |r| {
         const id = r.name["refs/issues/".len..];
         const qref = try std.fmt.allocPrint(arena, "{s}{s}", .{ qprefix, id });
@@ -466,12 +718,42 @@ fn checkSync(
             try checkQuarantine(arena, lb, r.name, r.oid, report);
             continue;
         }
+        const tomb = try purge.of(la, id);
+        if (tomb != null and tomb.?.issue) continue; // checkPurgedStay
+        // Applying a tombstone again drops the fetched refs that name the
+        // issue (format.md §10): --no-fetch has nothing left to merge.
+        if (no_fetch and tomb != null) {
+            const staged = try std.fmt.allocPrint(
+                arena,
+                "refs/remotes/{s}/issues/{s}",
+                .{ name, id },
+            );
+            if (la.ref(staged) == null) continue;
+        }
         const local_now = la.ref(r.name) orelse {
             try report.fail("{s}: remote issue {s} missing locally", .{ cmd, id });
             continue;
         };
-        if (!try isAncestorIn(la, r.oid, local_now))
+        // Purged here: what the remote has, purged the same way.
+        const want = if (tomb != null and tomb.?.comments.len > 0)
+            (try purge.rewrite(la, r.oid, tomb.?.comments)) orelse r.oid
+        else
+            r.oid;
+        if (!try isAncestorIn(la, want, local_now))
             try report.fail("{s}: local {s} doesn't contain the remote tip", .{ cmd, id });
+        // A merge written now keeps the number the remote has (format.md §4).
+        const before_tip = lb.ref(r.name);
+        const wrote = before_tip == null or !std.mem.eql(u8, before_tip.?, local_now);
+        const top = la.commit(local_now) orelse continue;
+        if (!wrote or top.parents.len != 2) continue;
+        if (!std.mem.eql(u8, top.author.name, "git-issue")) continue;
+        const has_want = std.mem.eql(u8, top.parents[0].hex().slice(), want) or
+            std.mem.eql(u8, top.parents[1].hex().slice(), want);
+        if (!has_want) continue;
+        const theirs = (try la.naive(want)).number;
+        const ours = (try la.naive(local_now)).number;
+        if (commands.validNumber(theirs) and !std.mem.eql(u8, ours, theirs))
+            try report.fail("{s}: merging {s} lost the remote's number {s}", .{ cmd, id, theirs });
     };
 
     if (pushing) {
@@ -509,12 +791,17 @@ fn checkNewMerges(
         ) or try isAncestorIn(c, hex, old.?))) continue;
         if ((try seen.getOrPut(arena, hex)).found_existing) continue;
         const cm = c.commit(hex) orelse return error.NoRule;
-        for (cm.parents) |p| try stack.append(arena, try arena.dupe(u8, p.hex().slice()));
+        for (cm.parents) |p| try stack.append(arena, try p.hexAlloc(arena));
         if (cm.parents.len != 2) continue;
         if (!std.mem.eql(u8, cm.author.name, "git-issue")) continue; // not ours (e.g. upstream)
         const p0 = cm.parents[0].hex();
         const p1 = cm.parents[1].hex();
-        if (std.mem.order(u8, p0.slice(), p1.slice()) != .lt) try report.fail(
+        // A purge's rewrite keeps the parents in their order.
+        const rewritten = trailers.lastValue(
+            try commands.trailersOf(arena, cm.message),
+            "X-Rewritten-From",
+        ) != null;
+        if (!rewritten and std.mem.order(u8, p0.slice(), p1.slice()) != .lt) try report.fail(
             "merge {s}: parents not sorted",
             .{hex[0..7]},
         );
@@ -526,54 +813,48 @@ fn checkNewMerges(
             try report.fail("merge {s}: wrong identity", .{hex[0..7]});
         const t0 = c.commit(p0.slice()).?.committer.time;
         const t1 = c.commit(p1.slice()).?.committer.time;
-        if (cm.author.time != @max(t0, t1) or cm.committer.time != cm.author.time)
+        // A rewrite keeps the date, and a parent may have been a merge it
+        // dropped, which was later than what replaced it.
+        const latest = @max(t0, t1);
+        const on_time = if (rewritten) cm.author.time >= latest else cm.author.time == latest;
+        if (!on_time or cm.committer.time != cm.author.time)
             try report.fail("merge {s}: time is not the latest parent's", .{hex[0..7]});
         // The oracle's own resolution of the two parents.
         const n = try c.naiveAt(&.{
             try arena.dupe(u8, p0.slice()),
             try arena.dupe(u8, p1.slice()),
         });
-        // A field written before but empty now is restated empty.
-        var want: std.ArrayList(commands.Trailer) = .empty;
-        const was = struct {
-            fn f(x: commands.NaiveIssue, key: []const u8) bool {
-                for (x.cleared) |k| if (std.mem.eql(u8, k, key)) return true;
-                return false;
-            }
-        }.f;
-        try want.append(arena, .{ .key = "State", .value = n.state });
-        if (n.title_override) |t| try want.append(arena, .{ .key = "Title", .value = t }) else if (was(n, "Title"))
-            try want.append(arena, .{ .key = "Title", .value = "" });
-        if (n.labels.len > 0) try want.append(
-            arena,
-            .{ .key = "Labels", .value = try std.mem.join(arena, ", ", n.labels) },
-        ) else if (was(n, "Labels")) try want.append(arena, .{ .key = "Labels", .value = "" });
-        for ([_]commands.Trailer{
-            .{ .key = "Assignee", .value = n.assignee },
-            .{ .key = "Priority", .value = n.priority },
-            .{ .key = "Milestone", .value = n.milestone },
-        }) |t| if (t.value.len > 0 or was(n, t.key)) try want.append(arena, t);
-        // Extension fields as written, then the blockers.
-        for ([_]commands.Trailer{
-            .{ .key = "X-Parent", .value = n.parent },
-            .{ .key = "X-Start-Date", .value = n.start },
-            .{ .key = "X-Due-Date", .value = n.due },
-            .{ .key = "X-Estimate-Minutes", .value = n.estimate },
-            .{ .key = "X-Workflow-State", .value = n.workflow },
-            .{ .key = "X-Milestone-Id", .value = n.milestone_id },
-            .{ .key = "X-Milestone-Mode", .value = n.milestone_mode },
-            .{ .key = "X-Deleted", .value = n.deleted },
-        }) |t| if (t.value.len > 0 or was(n, t.key)) try want.append(arena, t);
-        const block = try commands.trailersOf(arena, cm.message);
-        if (n.blocked_by.len > 0) {
-            // A set: the oracle doesn't model member order.
-            var value: []const u8 = try std.mem.join(arena, ", ", n.blocked_by);
-            if (trailers.lastValue(block, "X-Blocked-By")) |got| {
-                if (sameMembers(try splitSet(arena, got), n.blocked_by)) value = got;
-            }
-            try want.append(arena, .{ .key = "X-Blocked-By", .value = value });
-        } else if (was(n, "X-Blocked-By")) {
-            try want.append(arena, .{ .key = "X-Blocked-By", .value = "" });
+        var want = try commands.restatedBy(arena, n);
+        var block = try commands.trailersOf(arena, cm.message);
+        // A purge's rewrite adds its own trailer, nothing else.
+        if (rewritten) {
+            var kept: std.ArrayList(commands.Trailer) = .empty;
+            for (block.trailers) |t| if (!std.ascii.eqlIgnoreCase(t.key, "X-Rewritten-From"))
+                try kept.append(arena, t);
+            block.trailers = kept.items;
+        }
+        // A set: the oracle doesn't model member order.
+        if (trailers.lastValue(block, "X-Blocked-By")) |got| {
+            if (sameMembers(try splitSet(arena, got), n.blocked_by)) for (want.items) |*t| {
+                if (std.mem.eql(u8, t.key, "X-Blocked-By")) t.value = got;
+            };
+        }
+        // The one trailer that isn't the resolution: the number the remote
+        // had, which is one parent's.
+        if (trailers.lastValue(block, "X-Number")) |kept| {
+            const n0 = (try c.naive(p0.slice())).number;
+            const n1 = (try c.naive(p1.slice())).number;
+            // A rewrite keeps it, though the merge that gave a parent it may be gone.
+            const a_parents = std.mem.eql(u8, kept, n0) or std.mem.eql(u8, kept, n1);
+            if (!rewritten and !a_parents) try report.fail(
+                "merge {s}: restated number {s}, neither parent's",
+                .{ hex[0..7], kept },
+            );
+            if (std.mem.eql(u8, kept, n.number)) try report.fail(
+                "merge {s}: restated the number {s} it resolved to",
+                .{ hex[0..7], kept },
+            );
+            try want.append(arena, .{ .key = "X-Number", .value = kept });
         }
         try expectBlock(report, "merge", block, want.items);
         // Restating changes nothing: the merge reads as its parents do.
@@ -670,9 +951,22 @@ fn closure(
     while (stack.pop()) |hex| {
         if ((try set.getOrPut(arena, hex)).found_existing) continue;
         const cm = c.commit(hex) orelse continue;
-        for (cm.parents) |p| try stack.append(arena, try arena.dupe(u8, p.hex().slice()));
+        for (cm.parents) |p| try stack.append(arena, try p.hexAlloc(arena));
     }
     return set;
+}
+
+/// `now` contains `old` rewritten by the tombstone's purged comments.
+fn purgedInto(
+    c: commands.Clone,
+    old: []const u8,
+    now: []const u8,
+    tomb: ?purge.Tomb,
+) Allocator.Error!bool {
+    const t = tomb orelse return false;
+    if (t.comments.len == 0) return false;
+    const want = (try purge.rewrite(c, old, t.comments)) orelse return false;
+    return isAncestorIn(c, want, now);
 }
 
 fn isAncestorIn(
@@ -837,7 +1131,10 @@ fn issueIdOf(name: []const u8, remote: []const u8) ?SyncedId {
     _ = parts.next() orelse return null;
     const ns = parts.next() orelse return null;
     const id = parts.next() orelse return null;
-    for (synced_namespaces) |known| if (std.mem.eql(u8, ns, known)) return .{ .ns = known, .id = id };
+    for (synced_namespaces) |known| if (std.mem.eql(u8, ns, known)) return .{
+        .ns = known,
+        .id = id,
+    };
     return null;
 }
 
@@ -935,6 +1232,21 @@ fn checkCreate(
     const expected = try commands.expectedCreateMessage(arena, x, resolved);
     if (!std.mem.eql(u8, c.message, expected))
         try report.fail("create wrote message\n{s}\nexpected\n{s}", .{ c.message, expected });
+    for (x.fields) |f| if (!commands.hostFieldOk(f))
+        try report.fail("create succeeded with field '{s}'", .{f});
+    if (x.number) |n| if (try numberTaken(b, n, null))
+        try report.fail("create gave number {s}, which another issue here has", .{n});
+}
+
+/// Another issue in the clone reads as having number `n` (format.md §3).
+fn numberTaken(c: commands.Clone, n: []const u8, except: ?[]const u8) Allocator.Error!bool {
+    for (c.clone.refs) |r| {
+        if (!std.mem.startsWith(u8, r.name, "refs/issues/")) continue;
+        if (except) |e| if (std.mem.eql(u8, r.name["refs/issues/".len..], e)) continue;
+        const naive = c.naive(r.oid) catch continue;
+        if (commands.validNumber(naive.number) and std.mem.eql(u8, naive.number, n)) return true;
+    }
+    return false;
 }
 
 /// The one commit `cmd` must have added on top of issue `id`: a single
@@ -979,6 +1291,31 @@ fn appendCommit(
     return c;
 }
 
+/// A write that wrote nothing: fine only when all it asked for is
+/// already so. True when nothing was written.
+fn checkSkipped(
+    arena: Allocator,
+    b: commands.Clone,
+    a: commands.Clone,
+    cmd: []const u8,
+    id: []const u8,
+    want: []const commands.Trailer,
+    report: *Report,
+) Allocator.Error!bool {
+    if ((try refChanges(arena, b, a)).len != 0) return false;
+    if (!configEqual(b.clone, a.clone)) try report.fail("{s} changed config", .{cmd});
+    const name = (try targetRef(b, id, report, cmd)) orelse return true;
+    const restated = b.restates(b.ref(name).?, want) catch |e| switch (e) {
+        error.OutOfMemory => return error.OutOfMemory,
+        error.NoRule => {
+            try report.skip("a write that wrote nothing, which the oracle can't judge");
+            return true;
+        },
+    };
+    if (!restated) try report.fail("{s} wrote nothing, but changes the issue", .{cmd});
+    return true;
+}
+
 fn checkComment(
     arena: Allocator,
     world: World,
@@ -990,10 +1327,15 @@ fn checkComment(
     if (x.paragraphs.len == 0) return report.fail("comment without text succeeded", .{});
     const c = (try appendCommit(arena, world, b, a, "comment", x.id, report)) orelse return;
     const block = try commands.trailersOf(arena, c.message);
-    if (block.first_line != null) try report.fail("comment message has a trailer block", .{});
+    const provenance = try commands.originalTrailers(arena, x.original_author, x.original_id);
+    // Only provenance, if any: the text is the comment.
+    try expectBlock(report, "comment", block, provenance);
     const text = try std.mem.join(arena, "\n\n", x.paragraphs);
     const want = try commands.contentLines(arena, text);
-    const got = try commands.contentLines(arena, c.message);
+    const got = if (provenance.len > 0)
+        try commands.textLines(arena, c.message)
+    else
+        try commands.contentLines(arena, c.message);
     if (!sameLines(want, got)) try report.fail("comment text differs:\n{s}", .{c.message});
 }
 
@@ -1005,10 +1347,34 @@ fn checkState(
     x: command.State,
     report: *Report,
 ) Allocator.Error!void {
+    if (x.comment.len > 0 and x.message != null) return report.fail(
+        "state with -c and -m succeeded",
+        .{},
+    );
+    const want = try commands.expectedStateTrailers(arena, x);
+    if (x.comment.len == 0 and try checkSkipped(arena, b, a, "state", x.id, want, report)) return;
     const c = (try appendCommit(arena, world, b, a, "state", x.id, report)) orelse return;
     const block = try commands.trailersOf(arena, c.message);
-    try expectBlock(report, "state", block, try commands.expectedStateTrailers(arena, x));
+    try expectBlock(report, "state", block, want);
     try expectSubject(arena, report, "state", x.message, c.message);
+    try expectCommentText(arena, report, "state", x.comment, c.message);
+}
+
+/// A comment in a commit with fields: the commit's text is the comment.
+fn expectCommentText(
+    arena: Allocator,
+    report: *Report,
+    cmd: []const u8,
+    paragraphs: []const []const u8,
+    message: []const u8,
+) Allocator.Error!void {
+    if (paragraphs.len == 0) return;
+    const want = try commands.contentLines(arena, try std.mem.join(arena, "\n\n", paragraphs));
+    const got = try commands.textLines(arena, message);
+    if (!sameLines(
+        want,
+        got,
+    )) try report.fail("{s}: comment text differs:\n{s}", .{ cmd, message });
 }
 
 fn checkEdit(
@@ -1019,8 +1385,34 @@ fn checkEdit(
     x: command.Edit,
     report: *Report,
 ) (Allocator.Error || error{NoRule})!void {
+    if (x.comment.len > 0 and x.description.len > 0)
+        return report.fail("edit with -c and --description succeeded", .{});
+    if (x.state == null and x.fixed_by != null) return report.fail(
+        "--fixed-by without --state succeeded",
+        .{},
+    );
+    for (x.fields) |f| if (!commands.hostFieldOk(f))
+        return report.fail("edit succeeded with field '{s}'", .{f});
+    if (x.comment.len == 0 and (try refChanges(arena, b, a)).len == 0) {
+        const name = (try targetRef(b, x.id, report, "edit")) orelse return;
+        const previous = try b.naive(b.ref(name).?);
+        const resolved = (try commands.resolveExt(arena, b, x.ext, x.milestone, previous)) orelse
+            return report.fail("edit succeeded with values the oracle rejects", .{});
+        const want = try commands.expectedEditTrailers(arena, x, resolved, previous);
+        _ = try checkSkipped(arena, b, a, "edit", x.id, want, report);
+        return;
+    }
     const c = (try appendCommit(arena, world, b, a, "edit", x.id, report)) orelse return;
+    try expectCommentText(arena, report, "edit", x.comment, c.message);
     const previous = try b.naive(c.parents[0].hex().slice());
+    if (x.number) |n| {
+        const name = (try targetRef(b, x.id, report, "edit")) orelse return;
+        const id = name["refs/issues/".len..];
+        if (commands.validNumber(previous.number) and !std.mem.eql(u8, previous.number, n))
+            try report.fail("edit changed number {s} to {s}", .{ previous.number, n });
+        if (!commands.validNumber(previous.number) and try numberTaken(b, n, id))
+            try report.fail("edit gave number {s}, which another issue here has", .{n});
+    }
     const resolved = (try commands.resolveExt(
         arena,
         b,
@@ -1137,6 +1529,57 @@ fn targetRef(
     return m[0];
 }
 
+/// A reaction is one commit with the reaction trailers, or nothing when it
+/// is already as asked (format.md §5).
+fn checkReact(
+    arena: Allocator,
+    world: World,
+    b: commands.Clone,
+    a: commands.Clone,
+    x: command.React,
+    report: *Report,
+) (Allocator.Error || error{NoRule})!void {
+    const name = (try targetRef(b, x.id, report, "react")) orelse return;
+    const tip = b.ref(name).?;
+    var target: []const u8 = "-";
+    if (x.on) |prefix| {
+        var found: ?[]const u8 = null;
+        for (try commentCommits(arena, b, tip)) |hex| {
+            if (!std.mem.startsWith(u8, hex, prefix)) continue;
+            if (found != null) return report.fail("react succeeded with an ambiguous comment", .{});
+            found = hex;
+        }
+        target = found orelse return report.fail(
+            "react succeeded on a comment that isn't there",
+            .{},
+        );
+    }
+    const member = try std.fmt.allocPrint(
+        arena,
+        "{s} {s} {s}",
+        .{ target, x.emoji, world.identity.email },
+    );
+    const has = commands.containsText((try b.naive(tip)).reactions, member);
+    if (has != x.undo) {
+        // Already as asked: nothing written.
+        if (!std.mem.eql(
+            u8,
+            a.ref(name) orelse "",
+            tip,
+        )) try report.fail("react wrote a reaction that changes nothing", .{});
+        return;
+    }
+    const c = (try appendCommit(arena, world, b, a, "react", x.id, report)) orelse return;
+    var want: std.ArrayList(commands.Trailer) = .empty;
+    try want.append(arena, .{ .key = "X-Event", .value = "reaction" });
+    if (x.on != null) try want.append(arena, .{ .key = "X-Comment", .value = target });
+    try want.append(arena, .{
+        .key = "X-Reaction",
+        .value = try std.fmt.allocPrint(arena, "{s}{s}", .{ if (x.undo) "-" else "+", x.emoji }),
+    });
+    try expectBlock(report, "react", try commands.trailersOf(arena, c.message), want.items);
+}
+
 /// Oldest first, along first parents.
 fn appended(
     arena: Allocator,
@@ -1164,7 +1607,7 @@ fn appended(
             return null;
         }
         try chain.insert(arena, 0, c);
-        hex = try arena.dupe(u8, c.parents[0].hex().slice());
+        hex = try c.parents[0].hexAlloc(arena);
     }
     return chain.items;
 }
@@ -1222,7 +1665,7 @@ fn commentCommits(
             event = true;
         };
         if (cm.parents.len == 1 and !event) try out.append(arena, hex);
-        for (cm.parents) |p| try stack.append(arena, try arena.dupe(u8, p.hex().slice()));
+        for (cm.parents) |p| try stack.append(arena, try p.hexAlloc(arena));
     }
     return out.items;
 }
@@ -1252,6 +1695,30 @@ fn checkCommentEvent(
     }
     const t = target orelse
         return report.fail("comment event succeeded on unknown '{s}'", .{x.target});
+    // One that changes nothing isn't written: deleting a deleted comment,
+    // restoring a shown one, or an edit to the same text. Which way
+    // concurrent events resolve is the library's merge rule, so only a
+    // comment never deleted is judged.
+    if ((try refChanges(arena, b, a)).len == 0) {
+        if (!configEqual(b.clone, a.clone)) try report.fail("comment event changed config", .{});
+        if (x.kind == .delete) {
+            const naive = b.naive(b.ref(name).?) catch |e| switch (e) {
+                error.OutOfMemory => return error.OutOfMemory,
+                error.NoRule => return report.skip("a comment event that wrote nothing"),
+            };
+            const ever = for (naive.comment_histories) |h| {
+                if (!std.mem.eql(u8, h.comment, t)) continue;
+                break for (h.revisions) |r| {
+                    if (std.mem.eql(u8, r.kind, "delete")) break true;
+                } else false;
+            } else false;
+            if (!ever) return report.fail(
+                "comment delete of {s} wrote nothing, but it was never deleted",
+                .{t[0..7]},
+            );
+        }
+        return report.skip("a comment event that wrote nothing");
+    }
     const chain = (try appended(arena, b, a, name, report, "comment")) orelse return;
     if (chain.len != 1) return report.fail("comment event: expected one commit", .{});
     try checkIdentity(world, chain[0], report);
@@ -1282,6 +1749,10 @@ fn checkDescription(
     report: *Report,
 ) (Allocator.Error || error{NoRule})!void {
     const name = (try targetRef(b, x.id, report, "edit")) orelse return;
+    // The description and every field as they were: the oracle doesn't
+    // read the description's text.
+    if ((try refChanges(arena, b, a)).len == 0)
+        return report.skip("an edit --description that wrote nothing");
     const chain = (try appended(arena, b, a, name, report, "edit")) orelse return;
     // One commit: the other changes ride along on the event.
     if (chain.len != 1) return report.fail("edit --description wrote {d} commits", .{chain.len});
@@ -1292,7 +1763,10 @@ fn checkDescription(
         const previous = try b.naive(desc.parents[0].hex().slice());
         const resolved = (try commands.resolveExt(arena, b, x.ext, x.milestone, previous)) orelse
             return report.fail("edit succeeded with values the oracle rejects", .{});
-        try want.appendSlice(arena, try commands.expectedEditTrailers(arena, x, resolved, previous));
+        try want.appendSlice(
+            arena,
+            try commands.expectedEditTrailers(arena, x, resolved, previous),
+        );
     }
     try want.append(arena, .{ .key = "X-Event", .value = "description-edit" });
     const block = try commands.trailersOf(arena, desc.message);
@@ -1685,7 +2159,7 @@ fn checkDerived(
         error.OutOfMemory => return error.OutOfMemory,
         error.NoRule => return report.skip("derived ref of a history the oracle can't read"),
     };
-    const tree_hex = try arena.dupe(u8, c.tree.hex().slice());
+    const tree_hex = try c.tree.hexAlloc(arena);
     const entries: []const object.Tree.Entry = if (c.tree.eql(object.emptyTree(a.format)))
         &.{}
     else blk: {
@@ -1707,7 +2181,7 @@ fn checkDerived(
             try report.fail("{s}: no entry {s}", .{ derived, fname });
             continue;
         };
-        const blob = a.objects.get(try arena.dupe(u8, e.oid.hex().slice())) orelse {
+        const blob = a.objects.get(try e.oid.hexAlloc(arena)) orelse {
             try report.fail("{s}: missing pointer blob", .{derived});
             continue;
         };
@@ -1769,7 +2243,9 @@ fn checkDerivedAfterSync(
                 try report.fail("sync left {s} without {s}", .{ id, derived });
             continue;
         };
-        if (b.ref(derived)) |old| if (!try isAncestorIn(a, old, tip))
+        // A purge rebuilds it without its history.
+        if (b.ref(derived)) |old| if (!try isAncestorIn(a, old, tip) and
+            try purge.of(a, id) == null)
             try report.fail("sync rewound {s}", .{derived});
         // Hashed from our own reading of the issue.
         var entries: std.ArrayList(object.Tree.Entry) = .empty;

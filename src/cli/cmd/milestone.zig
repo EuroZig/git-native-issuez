@@ -84,6 +84,9 @@ pub fn main(comptime B: type, ctx: *context.Context(B), argv: []const []const u8
             return common.unknownOption(ctx.err, "milestone", arg);
         }
     }
+    // `--no-due` is "".
+    var due_date: ?issuez.format.fields.Date = null;
+
     if (as_json and sub != .ls and sub != .show)
         return common.missing(ctx.err, "milestone", "--json goes with ls and show");
     if (all and sub != .ls) return common.missing(ctx.err, "milestone", "--all goes with ls");
@@ -102,12 +105,16 @@ pub fn main(comptime B: type, ctx: *context.Context(B), argv: []const []const u8
     const repo = common.openRepo(B, ctx) orelse return common.exit_fatal;
     // After opening: `eow` counts git config issue.workDays.
     if (due) |d| if (d.len > 0) {
-        due = (ctx.date(d) catch return common.exit_error) orelse {
-            ctx.err.print("error: --due must be a date as YYYY-MM-DD, or like today, +3d, fri, eom, not '{s}'\n", .{d}) catch {};
+        due_date = ctx.date(d) orelse {
+            ctx.err.print(
+                "error: --due must be a date as YYYY-MM-DD, or like today, +3d, fri, eom, not " ++
+                    "'{s}'\n",
+                .{d},
+            ) catch {};
             return common.exit_error;
         };
     };
-    const cat = issuez.Catalog(B).of(repo);
+    const cat = issuez.Catalog(B).fromRepo(repo);
     const w = ctx.out;
 
     switch (sub) {
@@ -116,17 +123,17 @@ pub fn main(comptime B: type, ctx: *context.Context(B), argv: []const []const u8
             if (text.len == 0) return common.missing(ctx.err, "milestone", "a name is required");
             const created = cat.create(arena, .{
                 .name = text,
-                .due = due,
+                .due = due_date,
                 .description = description orelse message orelse "",
-            }) catch |e| return common.repoFailed(B, ctx, e);
-            w.print("Created milestone {s}: {s}\n", .{ created.id.short(), text }) catch {};
+            }, .{}) catch |e| return common.repoFailed(B, ctx, e);
+            w.print("Created milestone {s}: {s}\n", .{ issuez.shortId(created.id), text }) catch {};
         },
         .ls => {
             const list = cat.list(arena) catch |e| return common.repoFailed(B, ctx, e);
             if (as_json) {
                 var s = json.begin(w);
-                json.milestones(&s, list, all) catch |e| return json.failed(ctx.err, e);
-                json.end(&s);
+                json.milestones(&s, list, .{ .all = all }) catch |e| return json.failed(ctx.err, e);
+                json.end(&s) catch |e| return json.failed(ctx.err, e);
                 return common.exit_ok;
             }
             for (list) |m| {
@@ -147,8 +154,13 @@ pub fn main(comptime B: type, ctx: *context.Context(B), argv: []const []const u8
                 .show => if (as_json) {
                     const proj = ext_flags.project(B, ctx, repo) orelse return common.exit_error;
                     var s = json.begin(w);
-                    json.milestoneDetail(&s, arena, m, proj) catch |e| return json.failed(ctx.err, e);
-                    json.end(&s);
+                    json.milestoneDetail(
+                        &s,
+                        arena,
+                        m,
+                        proj,
+                    ) catch |e| return json.failed(ctx.err, e);
+                    json.end(&s) catch |e| return json.failed(ctx.err, e);
                 } else {
                     w.print("Milestone {s} [{t}]\n", .{ short, m.status }) catch {};
                     w.writeAll("=" ** 60 ++ "\n") catch {};
@@ -164,7 +176,10 @@ pub fn main(comptime B: type, ctx: *context.Context(B), argv: []const []const u8
                         return common.oom(ctx.err);
                     const members = proj.milestoneIssues(arena, m.id) catch
                         return common.oom(ctx.err);
-                    w.print("\nProgress: {d}/{d} done\n", .{ progress.closed, progress.total }) catch {};
+                    w.print(
+                        "\nProgress: {d}/{d} done\n",
+                        .{ progress.closed, progress.total },
+                    ) catch {};
                     if (members.len > 0) w.print("\nIssues ({d}):\n", .{members.len}) catch {};
                     for (members) |i| {
                         const issue = proj.issues[i];
@@ -180,10 +195,15 @@ pub fn main(comptime B: type, ctx: *context.Context(B), argv: []const []const u8
                     }
                     _ = cat.edit(arena, m.id, .{
                         .name = name,
-                        .due = due,
+                        .due = if (due_date) |d|
+                            .{ .set = d }
+                        else if (due != null)
+                            .clear
+                        else
+                            null,
                         .description = description,
                         .message = message,
-                    }) catch |e| return common.repoFailed(B, ctx, e);
+                    }, .{}) catch |e| return common.repoFailed(B, ctx, e);
                     w.print("Updated milestone {s}\n", .{short}) catch {};
                 },
                 .complete, .reopen, .retire => {
@@ -196,7 +216,7 @@ pub fn main(comptime B: type, ctx: *context.Context(B), argv: []const []const u8
                         w.print("Milestone {s} is already {t}\n", .{ short, to }) catch {};
                         return common.exit_ok;
                     }
-                    _ = cat.edit(arena, m.id, .{ .status = to, .message = message }) catch |e|
+                    _ = cat.edit(arena, m.id, .{ .status = to, .message = message }, .{}) catch |e|
                         return common.repoFailed(B, ctx, e);
                     w.print("Milestone {s} is {t}\n", .{ short, to }) catch {};
                 },

@@ -37,11 +37,18 @@ const Tui = struct {
     exited: bool = false,
 
     fn start(t: *Tui, sb: *Sandbox, name: []const u8) !void {
-        return t.startWith(sb, name, .inherit);
+        return t.startWith(sb, name, &.{ try sb.exe(paths.git_issue_exe), "tui" }, .inherit);
     }
 
-    /// With its stderr, where leaks show, at `stderr`.
-    fn startWith(t: *Tui, sb: *Sandbox, name: []const u8, stderr: std.process.SpawnOptions.StdIo) !void {
+    /// Any program on the pseudo-terminal, in the repository, with its
+    /// stderr (where leaks show) at `stderr`.
+    fn startWith(
+        t: *Tui,
+        sb: *Sandbox,
+        name: []const u8,
+        program: []const []const u8,
+        stderr: std.process.SpawnOptions.StdIo,
+    ) !void {
         const flags: c.O = .{ .ACCMODE = .RDWR, .NOCTTY = true };
         const master = posix_openpt(@bitCast(flags));
         if (master < 0) return error.OpenPtyFailed;
@@ -54,14 +61,15 @@ const Tui = struct {
             .name = name,
             .master = master,
             .child = try std.process.spawn(io, .{
-                .argv = &.{
-                    try sb.exe(paths.tty_exec),
-                    tty,
-                    std.fmt.comptimePrint("{d}", .{rows}),
-                    std.fmt.comptimePrint("{d}", .{cols}),
-                    try sb.exe(paths.git_issue_exe),
-                    "tui",
-                },
+                .argv = try std.mem.concat(sb.arena(), []const u8, &.{
+                    &.{
+                        try sb.exe(paths.tty_exec),
+                        tty,
+                        std.fmt.comptimePrint("{d}", .{rows}),
+                        std.fmt.comptimePrint("{d}", .{cols}),
+                    },
+                    program,
+                }),
                 .cwd = .{ .path = sb.repo },
                 .environ_map = &sb.env,
                 .stdin = .ignore,
@@ -73,10 +81,12 @@ const Tui = struct {
     }
 
     fn deinit(t: *Tui) void {
+        // The terminal first: a program still writing to it gets SIGHUP
+        // and EIO instead of blocking on output nobody reads.
+        _ = c.close(t.master);
         if (!t.exited) {
             t.child.kill(io);
         }
-        _ = c.close(t.master);
         t.screen.deinit();
     }
 
@@ -195,12 +205,13 @@ fn agentCreates(sb: *Sandbox, title: []const u8) !void {
     });
     defer _ = child.wait(io) catch {};
     const a = sb.arena();
-    const messages = try std.fmt.allocPrint(a,
-        \\{{"jsonrpc":"2.0","id":1,"method":"initialize","params":{{"protocolVersion":"2025-11-25","capabilities":{{}},"clientInfo":{{"name":"agent","version":"0"}}}}}}
-        \\{{"jsonrpc":"2.0","method":"notifications/initialized"}}
-        \\{{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{{"name":"create_issue","arguments":{{"title":"{s}"}}}}}}
-        \\
-    , .{title});
+    // One message per line.
+    const messages = try std.fmt.allocPrint(a, "{{\"jsonrpc\":\"2.0\",\"id\":1," ++
+        "\"method\":\"initialize\",\"params\":{{\"protocolVersion\":\"2025-11-25\"," ++
+        "\"capabilities\":{{}},\"clientInfo\":{{\"name\":\"agent\",\"version\":\"0\"}}}}}}\n" ++
+        "{{\"jsonrpc\":\"2.0\",\"method\":\"notifications/initialized\"}}\n" ++
+        "{{\"jsonrpc\":\"2.0\",\"id\":2,\"method\":\"tools/call\",\"params\":" ++
+        "{{\"name\":\"create_issue\",\"arguments\":{{\"title\":\"{s}\"}}}}}}\n", .{title});
     try child.stdin.?.writeStreamingAll(io, messages);
     var buf: [64 * 1024]u8 = undefined;
     var reader = child.stdout.?.readerStreaming(io, &buf);
@@ -266,10 +277,16 @@ test "two TUIs follow what the command line, each other and an agent write" {
 /// Today in UTC, plus `days`, as `YYYY-MM-DD`.
 fn dayFromToday(buf: []u8, days: i64) []const u8 {
     const t = std.Io.Timestamp.now(io, .real);
-    const secs: u64 = @intCast(@divFloor(t.nanoseconds, std.time.ns_per_s) + days * std.time.s_per_day);
+    const secs: u64 = @intCast(
+        @divFloor(t.nanoseconds, std.time.ns_per_s) + days * std.time.s_per_day,
+    );
     const yd = (std.time.epoch.EpochSeconds{ .secs = secs }).getEpochDay().calculateYearDay();
     const md = yd.calculateMonthDay();
-    return std.fmt.bufPrint(buf, "{d:0>4}-{d:0>2}-{d:0>2}", .{ yd.year, md.month.numeric(), md.day_index + 1 }) catch unreachable;
+    return std.fmt.bufPrint(
+        buf,
+        "{d:0>4}-{d:0>2}-{d:0>2}",
+        .{ yd.year, md.month.numeric(), md.day_index + 1 },
+    ) catch unreachable;
 }
 
 test "the timeline's draft sees a change made elsewhere, and applies over it when asked" {
@@ -278,7 +295,10 @@ test "the timeline's draft sees a change made elsewhere, and applies over it whe
     var b1: [16]u8 = undefined;
     var b2: [16]u8 = undefined;
     var b3: [16]u8 = undefined;
-    const created = try gitIssue(&sb, &.{ "create", "Design", "--start", dayFromToday(&b1, 0), "--due", dayFromToday(&b2, 4) });
+    const created = try gitIssue(
+        &sb,
+        &.{ "create", "Design", "--start", dayFromToday(&b1, 0), "--due", dayFromToday(&b2, 4) },
+    );
     const short = std.mem.trimEnd(u8, created["Created issue ".len..], "\n");
 
     var tui: Tui = undefined;
@@ -329,7 +349,10 @@ fn isolateSsh(sb: *Sandbox) !void {
         "#!/bin/sh\nexec '{s}' -F /dev/null \"$@\"\n",
         .{std.mem.trimEnd(u8, found.stdout, "\n")},
     ));
-    try sb.env.put("PATH", try std.fmt.allocPrint(a, "{s}:{s}", .{ bin, sb.env.get("PATH") orelse "/usr/bin:/bin" }));
+    try sb.env.put(
+        "PATH",
+        try std.fmt.allocPrint(a, "{s}:{s}", .{ bin, sb.env.get("PATH") orelse "/usr/bin:/bin" }),
+    );
 }
 
 test "y syncs with a real remote; a dead one fails without a prompt" {
@@ -406,7 +429,7 @@ test "quitting while a sync runs stops it; the user's own ssh runs without the t
     const log = try std.Io.Dir.cwd().createFile(io, log_path, .{});
     defer log.close(io);
     var tui: Tui = undefined;
-    try tui.startWith(&sb, "tui", .{ .file = log });
+    try tui.startWith(&sb, "tui", &.{ try sb.exe(paths.git_issue_exe), "tui" }, .{ .file = log });
     defer tui.deinit();
     const all = [_]*Tui{&tui};
     try expectShows(&all, &tui, "⇅ origin ↑1", "starting");
@@ -452,4 +475,68 @@ test "quitting while a sync runs stops it; the user's own ssh runs without the t
 
 test {
     _ = Screen;
+}
+
+/// The YAML of docs/lazygit.md's configuration block.
+fn lazygitMenu(arena: std.mem.Allocator) ![]const u8 {
+    const doc = try std.Io.Dir.cwd().readFileAlloc(io, paths.lazygit_doc, arena, .limited(1 << 20));
+    const start = (std.mem.find(u8, doc, "```yaml\n") orelse return error.NoYaml) + "```yaml\n".len;
+    const end = std.mem.findPos(u8, doc, start, "```") orelse return error.NoYaml;
+    return doc[start..end];
+}
+
+test "lazygit: docs/lazygit.md's menu, in lazygit itself" {
+    var sb = try Sandbox.init(.{});
+    defer sb.deinit();
+    const arena = sb.arena();
+    const lazygit = (try sb.run(&.{ "sh", "-c", "command -v lazygit" })).stdout;
+    if (lazygit.len == 0) return error.SkipZigTest;
+    _ = try gitIssue(&sb, &.{ "create", "Seen from lazygit" });
+
+    // `git issue` is git-issue on the PATH; lazygit reads only this config.
+    const bin = std.fs.path.dirname(try sb.exe(paths.git_issue_exe)).?;
+    const path = try std.fmt.allocPrint(arena, "{s}:{s}", .{ bin, sb.env.get("PATH") orelse "" });
+    try sb.env.put("PATH", path);
+    const config = try std.fmt.allocPrint(arena, "{s}-lazygit.yml", .{sb.repo});
+    const yaml = try std.mem.concat(arena, u8, &.{
+        "disableStartupPopups: true\nupdate:\n  method: never\n",
+        try lazygitMenu(arena),
+    });
+    try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = config, .data = yaml });
+    try sb.env.put("LG_CONFIG_FILE", config);
+
+    var lg: Tui = undefined;
+    try lg.startWith(&sb, "lazygit", &.{std.mem.trimEnd(u8, lazygit, "\n")}, .inherit);
+    defer lg.deinit();
+    const all = [_]*Tui{&lg};
+    try expectShows(&all, &lg, "Files", "starting");
+    try lg.type("I");
+    try expectShows(&all, &lg, "List open issues", "I");
+    try expectShows(&all, &lg, "New issue", "I");
+    try lg.type("l");
+    try expectShows(&all, &lg, "Seen from lazygit", "l: git issue ls");
+
+    // n: title, priority (high is the fourth), label; then git issue create.
+    try lg.type("\x1b");
+    try expectGone(&all, &lg, "Open issues", "esc");
+    try lg.type("I");
+    try expectShows(&all, &lg, "New issue", "I");
+    try lg.type("n");
+    try expectShows(&all, &lg, "Title", "n");
+    try lg.type("Made in lazygit\r");
+    try expectShows(&all, &lg, "Priority", "the title");
+    try lg.type("jjj\r");
+    try expectShows(&all, &lg, "Label", "the priority");
+    try lg.type("ui\r");
+    const deadline = now() + timeout_ms;
+    while (true) {
+        const listed = try gitIssue(
+            &sb,
+            &.{ "ls", "--format", "oneline", "--priority", "high", "-l", "ui" },
+        );
+        if (std.mem.find(u8, listed, "Made in lazygit") != null) break;
+        if (now() > deadline) return failScreen(&lg, "didn't create", "Made in lazygit", "n");
+        try pump(&all, 50);
+    }
+    try testing.expectEqual(@as(u8, 0), try lg.quit(&all));
 }

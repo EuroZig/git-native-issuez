@@ -35,7 +35,13 @@ pub fn App(comptime B: type) type {
         pub const Runner = struct {
             context: *anyopaque,
             /// error.SyncRunning when one is running already.
-            start: *const fn (context: *anyopaque, remote: []const u8, kind: sync_job.Kind, auto: bool, fetched: bool) anyerror!void,
+            start: *const fn (
+                context: *anyopaque,
+                remote: []const u8,
+                kind: sync_job.Kind,
+                auto: bool,
+                fetched: bool,
+            ) anyerror!void,
         };
 
         /// In place: the state points into the store.
@@ -76,7 +82,8 @@ pub fn App(comptime B: type) type {
         /// says what changed unless an error is showing.
         pub fn changedElsewhere(self: *Self, settings: bool) void {
             const s = &self.state;
-            const out = (self.store.reloadIfChanged(settings) catch |e| return self.failWith(e)) orelse return;
+            const found = self.store.reloadIfChanged(settings) catch |e| return self.failWith(e);
+            const out = found orelse return;
             if (s.status_kind == .err and s.status().len > 0) return;
             if (out.issues == 1) {
                 s.info("#{s} changed elsewhere", .{shortId(out.first.slice())});
@@ -112,7 +119,10 @@ pub fn App(comptime B: type) type {
                     const id = st.create(input) catch |e| return self.failed(e);
                     // The input lives in the modal arena.
                     if (input.parent) |p| {
-                        s.info("created sub-issue #{s} of #{s}", .{ shortId(id.slice()), shortId(p) });
+                        s.info(
+                            "created sub-issue #{s} of #{s}",
+                            .{ shortId(id.slice()), shortId(p) },
+                        );
                     } else s.info("created #{s}", .{shortId(id.slice())});
                     s.closeModal();
                     s.select(id);
@@ -125,12 +135,20 @@ pub fn App(comptime B: type) type {
                     s.info("saved", .{});
                 },
                 .milestone => |m| {
-                    st.setMilestone(m.id.slice(), m.name, s.expectedTip(m.id.slice())) catch |err| return self.failed(err);
+                    st.setMilestone(
+                        m.id.slice(),
+                        m.name,
+                        s.expectedTip(m.id.slice()),
+                    ) catch |err| return self.failed(err);
                     s.closeModal();
                     s.info("saved", .{});
                 },
                 .milestone_link => |m| {
-                    st.setMilestoneLink(m.id.slice(), m.link, s.expectedTip(m.id.slice())) catch |err| return self.failed(err);
+                    st.setMilestoneLink(
+                        m.id.slice(),
+                        m.link,
+                        s.expectedTip(m.id.slice()),
+                    ) catch |err| return self.failed(err);
                     s.closeModal();
                     s.info("saved", .{});
                 },
@@ -139,7 +157,11 @@ pub fn App(comptime B: type) type {
                         s.fail("'{s}' isn't a state", .{x.state});
                         return true;
                     }
-                    st.setState(x.id.slice(), core.State.parse(x.state), s.expectedTip(x.id.slice())) catch |err| return self.failed(err);
+                    st.setState(
+                        x.id.slice(),
+                        core.State.parse(x.state),
+                        s.expectedTip(x.id.slice()),
+                    ) catch |err| return self.failed(err);
                     s.info("now {s}", .{x.state});
                     s.closeModal();
                 },
@@ -151,8 +173,15 @@ pub fn App(comptime B: type) type {
                 .toggle => |id| {
                     const i = st.snap.find(id.slice()) orelse return true;
                     const done = st.snap.isDone(i);
-                    st.setState(id.slice(), if (done) .open else .closed, null) catch |err| return self.failed(err);
-                    s.info("{s} #{s}", .{ if (done) "reopened" else "closed", shortId(id.slice()) });
+                    st.setState(
+                        id.slice(),
+                        if (done) .open else .closed,
+                        null,
+                    ) catch |err| return self.failed(err);
+                    s.info(
+                        "{s} #{s}",
+                        .{ if (done) "reopened" else "closed", shortId(id.slice()) },
+                    );
                 },
                 .move => |m| self.move(m.id, m.column, m.done),
                 .create_milestone => |input| {
@@ -164,7 +193,9 @@ pub fn App(comptime B: type) type {
                 .edit_milestone => |m| {
                     st.editMilestone(m.id.slice(), m.edit) catch |e| return self.failed(e);
                     s.closeModal();
-                    const name = if (st.snap.findMilestone(m.id.slice())) |n| st.snap.milestones[n].name else "";
+                    const name = if (st.snap.findMilestone(
+                        m.id.slice(),
+                    )) |n| st.snap.milestones[n].name else "";
                     if (m.edit.status) |status| {
                         s.info("{s} {s}", .{ switch (status) {
                             .completed => "completed",
@@ -177,7 +208,10 @@ pub fn App(comptime B: type) type {
                     s.closeModal();
                     s.openMilestone(.{ .id = m.id });
                     // Only when it opened, and only for this opening.
-                    const shown = s.view == .milestone and s.milestone.scope == .id and s.milestone.scope.id.eql(m.id.slice());
+                    const shown = s.view == .milestone and s.milestone.scope == .id and
+                        s.milestone.scope.id.eql(
+                            m.id.slice(),
+                        );
                     if (m.open_only and shown) milestone_view.showOpenOnly(s);
                 },
                 .move_issues => |m| self.moveIssues(m.ids, m.link, m.unmark),
@@ -218,7 +252,13 @@ pub fn App(comptime B: type) type {
                 .resolve => |x| {
                     if (self.refuseWhileSyncing()) return true;
                     st.resolve(x.id.slice(), x.how) catch |e| return self.failed(e);
-                    s.info("{s}", .{if (x.how == .accept_remote) "took the remote version; yours is kept under refs/issuez-sync/" else "kept yours"});
+                    s.info(
+                        "{s}",
+                        .{
+                            if (x.how == .accept_remote) "took the remote version; yours is " ++
+                                "kept under refs/issuez-sync/" else "kept yours",
+                        },
+                    );
                     self.openSyncPanel();
                 },
                 .choose_remote => |name| {
@@ -229,7 +269,10 @@ pub fn App(comptime B: type) type {
                 },
                 .quick_create => |input| {
                     const id = st.create(input) catch |e| return self.failed(e);
-                    s.info("created #{s}: {s}; next title, or esc", .{ shortId(id.slice()), input.title });
+                    s.info(
+                        "created #{s}: {s}; next title, or esc",
+                        .{ shortId(id.slice()), input.title },
+                    );
                     s.select(id);
                     if (s.modal) |*md| if (md.* == .prompt) md.prompt.input.clear();
                 },
@@ -253,12 +296,19 @@ pub fn App(comptime B: type) type {
                 return;
             };
             if (s.sync.running) |r| {
-                if (!auto) s.info("a {s} with {s} is running already", .{ r.label(), s.sync.runningRemote() });
+                if (!auto) s.info(
+                    "a {s} with {s} is running already",
+                    .{ r.label(), s.sync.runningRemote() },
+                );
                 return;
             }
             // Fetched from it just now: a push needs one connection only.
             const fetched = kind == .push and s.sync.fetched_at > 0 and
-                std.mem.eql(u8, s.sync.fetchedFrom(), name) and s.now_s - s.sync.fetched_at < sync_job.fetch_fresh_s;
+                std.mem.eql(
+                    u8,
+                    s.sync.fetchedFrom(),
+                    name,
+                ) and s.now_s - s.sync.fetched_at < sync_job.fetch_fresh_s;
             if (self.runner) |r| {
                 r.start(r.context, name, kind, auto, fetched) catch |e| {
                     if (e == error.SyncRunning) {
@@ -268,7 +318,10 @@ pub fn App(comptime B: type) type {
                     var summary: sync_job.Summary = .{ .kind = kind, .auto = auto };
                     summary.setRemote(name);
                     var buf: [400]u8 = undefined;
-                    summary.fail("{s} with {s} couldn't start: {s}", .{ kind.label(), name, self.store.describe(e, &buf) });
+                    summary.fail(
+                        "{s} with {s} couldn't start: {s}",
+                        .{ kind.label(), name, self.store.describe(e, &buf) },
+                    );
                     return self.syncDone(summary, s.now_s);
                 };
             }
@@ -278,7 +331,16 @@ pub fn App(comptime B: type) type {
             s.sync.phase = null;
             if (!auto) s.info("{s} with {s}…", .{ kind.label(), name });
             if (self.runner != null) return;
-            const summary = sync_job.run(B, self.store.backend, self.inline_arena.allocator(), name, kind, auto, fetched, null);
+            const summary = sync_job.run(
+                B,
+                self.store.backend,
+                self.inline_arena.allocator(),
+                name,
+                kind,
+                auto,
+                fetched,
+                null,
+            );
             self.syncDone(summary, s.now_s);
         }
 
@@ -286,7 +348,10 @@ pub fn App(comptime B: type) type {
         fn refuseWhileSyncing(self: *Self) bool {
             const s = &self.state;
             const kind = s.sync.running orelse return false;
-            s.fail("the {s} with {s} is running: try again when it's done", .{ kind.label(), s.sync.runningRemote() });
+            s.fail(
+                "the {s} with {s} is running: try again when it's done",
+                .{ kind.label(), s.sync.runningRemote() },
+            );
             return true;
         }
 
@@ -294,14 +359,20 @@ pub fn App(comptime B: type) type {
         fn noRemote(self: *Self) void {
             const problem = self.store.snap.remote.problem;
             if (problem.len > 0) return self.state.fail("{s}", .{problem});
-            self.state.fail("no remote: add one with git remote add origin <url>, then y syncs", .{});
+            self.state.fail(
+                "no remote: add one with git remote add origin <url>, then y syncs",
+                .{},
+            );
         }
 
         pub fn syncPhase(self: *Self, phase: issuez.sync.Phase) void {
             const s = &self.state;
             s.sync.phase = phase;
             if (!s.sync.auto and (s.status_kind != .err or s.status().len == 0)) {
-                s.info("{s} with {s}: {s}…", .{ s.sync.running.?.label(), s.sync.runningRemote(), @tagName(phase) });
+                s.info(
+                    "{s} with {s}: {s}…",
+                    .{ s.sync.running.?.label(), s.sync.runningRemote(), @tagName(phase) },
+                );
             }
         }
 
@@ -320,7 +391,9 @@ pub fn App(comptime B: type) type {
                 // An automatic one's failure shows in the badge only: it
                 // would come back every few minutes.
                 if (!summary.auto) s.fail("{s}", .{text});
-            } else if (!summary.auto or summary.incoming > 0 or summary.quarantined > 0 or summary.conflicts > 0) {
+            } else if (!summary.auto or summary.incoming > 0 or summary.quarantined > 0 or
+                summary.conflicts > 0)
+            {
                 s.info("{s}", .{text});
             }
             // Records moved too, not only issues: read it all again.
@@ -373,46 +446,100 @@ pub fn App(comptime B: type) type {
             const Row = modal.SyncPanel.Row;
             var rows: std.ArrayList(Row) = .empty;
             const label = struct {
-                fn issue(arena: std.mem.Allocator, sn: *const store_mod.Snapshot, id: []const u8, fallback: []const u8) []const u8 {
-                    if (sn.find(id)) |i| return std.fmt.allocPrint(arena, "#{s} {s}", .{ shortId(id), sn.issues[i].title }) catch "";
-                    if (sn.findMilestone(id)) |n| return std.fmt.allocPrint(arena, "milestone {s}", .{sn.milestones[n].name}) catch "";
-                    return std.fmt.allocPrint(arena, "#{s} {s}", .{ shortId(id), fallback }) catch "";
+                fn issue(
+                    arena: std.mem.Allocator,
+                    sn: *const store_mod.Snapshot,
+                    id: []const u8,
+                    fallback: []const u8,
+                ) []const u8 {
+                    if (sn.find(id)) |i| return std.fmt.allocPrint(
+                        arena,
+                        "#{s} {s}",
+                        .{ shortId(id), sn.issues[i].title },
+                    ) catch "";
+                    if (sn.findMilestone(id)) |n| return std.fmt.allocPrint(
+                        arena,
+                        "milestone {s}",
+                        .{sn.milestones[n].name},
+                    ) catch "";
+                    return std.fmt.allocPrint(
+                        arena,
+                        "#{s} {s}",
+                        .{ shortId(id), fallback },
+                    ) catch "";
                 }
             };
-            rows.append(a, .{ .heading = std.fmt.allocPrint(a, "Not pushed ({d})", .{status.unpushed.len}) catch "" }) catch {};
+            rows.append(
+                a,
+                .{
+                    .heading = std.fmt.allocPrint(
+                        a,
+                        "Not pushed ({d})",
+                        .{status.unpushed.len},
+                    ) catch "",
+                },
+            ) catch {};
             for (status.unpushed) |u| rows.append(a, .{ .unpushed = .{
                 .id = .of(u.id),
                 .label = label.issue(a, snap, u.id, "?"),
                 .new = u.new,
                 .milestone = u.namespace == .milestones,
             } }) catch {};
-            if (status.unpushed.len == 0) rows.append(a, .{ .empty = "everything is pushed" }) catch {};
-            rows.append(a, .{ .heading = std.fmt.allocPrint(a, "Quarantined ({d})", .{status.quarantined.len}) catch "" }) catch {};
+            if (status.unpushed.len == 0) rows.append(
+                a,
+                .{ .empty = "everything is pushed" },
+            ) catch {};
+            rows.append(
+                a,
+                .{
+                    .heading = std.fmt.allocPrint(
+                        a,
+                        "Quarantined ({d})",
+                        .{status.quarantined.len},
+                    ) catch "",
+                },
+            ) catch {};
             for (status.quarantined) |q| rows.append(a, .{ .quarantined = .{
                 .id = .of(q.id),
                 .label = label.issue(a, snap, q.id, q.title),
-                .reason = if (q.reason) |rs| rs.describe() else "no longer applies; the next sync clears it",
+                .reason = if (q.reason) |rs| rs.describe() else "no longer applies; the next " ++
+                    "sync clears it",
                 .kept = q.kept_local,
-                .local = if (q.namespace == .milestones) snap.findMilestone(q.id) != null else snap.find(q.id) != null,
+                .local = if (q.namespace == .milestones) snap.findMilestone(
+                    q.id,
+                ) != null else snap.find(q.id) != null,
                 .milestone = q.namespace == .milestones,
             } }) catch {};
-            if (status.quarantined.len == 0) rows.append(a, .{ .empty = "nothing refused" }) catch {};
+            if (status.quarantined.len == 0) rows.append(
+                a,
+                .{ .empty = "nothing refused" },
+            ) catch {};
             // A row per field in conflict.
             var conflicts: usize = 0;
             for (snap.issues) |issue| {
                 if (!issue.deleted) conflicts += issue.conflicts.len;
             }
-            rows.append(a, .{ .heading = std.fmt.allocPrint(a, "In conflict ({d})", .{conflicts}) catch "" }) catch {};
+            rows.append(
+                a,
+                .{ .heading = std.fmt.allocPrint(a, "In conflict ({d})", .{conflicts}) catch "" },
+            ) catch {};
             for (snap.issues) |issue| {
                 if (issue.deleted) continue;
                 for (issue.conflicts) |cf| rows.append(a, .{ .conflict = .{
                     .id = .of(issue.id),
                     .label = label.issue(a, snap, issue.id, ""),
-                    .what = std.fmt.allocPrint(a, "{f}: kept '{s}', lost '{s}'", .{ cf.target, cf.value, cf.lost }) catch "",
+                    .what = std.fmt.allocPrint(
+                        a,
+                        "{f}: kept '{s}', lost '{s}'",
+                        .{ cf.target, cf.value, cf.lost },
+                    ) catch "",
                     .field = fieldOf(cf.target),
                 } }) catch {};
             }
-            if (conflicts == 0) rows.append(a, .{ .empty = "no concurrent edits left over" }) catch {};
+            if (conflicts == 0) rows.append(
+                a,
+                .{ .empty = "no concurrent edits left over" },
+            ) catch {};
             var panel: modal.SyncPanel = .{
                 .remote = a.dupe(u8, name) catch "",
                 .url = st.remoteUrl(a, name),
@@ -471,21 +598,20 @@ pub fn App(comptime B: type) type {
             var items: std.ArrayList(store_mod.BatchItem) = .empty;
             var dues: std.ArrayList(store_mod.DueItem) = .empty;
             const date = struct {
-                fn f(arena: std.mem.Allocator, d: ?issuez.format.fields.Date) []const u8 {
-                    const v = d orelse return "";
-                    return std.fmt.allocPrint(arena, "{f}", .{v}) catch "";
+                fn f(d: ?issuez.format.fields.Date) issuez.engine.EditSpec.DateEdit {
+                    return if (d) |v| .{ .set = v } else .clear;
                 }
             }.f;
             for (plan.issues) |*c| {
                 const base = t.draft.baseOf(c.id.slice()).?;
                 var spec: issuez.engine.EditSpec = .{ .expect = base.tip };
-                if (c.start) |v| spec.start_date = date(a, v);
-                if (c.due) |v| spec.due_date = date(a, v);
+                if (c.start) |v| spec.start_date = date(v);
+                if (c.due) |v| spec.due_date = date(v);
                 if (c.estimate) |v| spec.estimate_minutes = if (v) |m| .{ .set = m } else .clear;
                 if (c.link) |l| switch (l) {
-                    .id => |*id| spec.milestone_id = a.dupe(u8, id.slice()) catch "",
-                    .none => spec.milestone_mode = .none,
-                    .inherit => spec.milestone_mode = .inherit,
+                    .id => |*id| spec.milestone = .linked(a.dupe(u8, id.slice()) catch ""),
+                    .none => spec.milestone = .{ .link = .none },
+                    .inherit => spec.milestone = .{ .link = .inherit },
                 };
                 var add: std.ArrayList([]const u8) = .empty;
                 for (c.add) |*x| add.append(a, a.dupe(u8, x.slice()) catch "") catch {};
@@ -493,11 +619,21 @@ pub fn App(comptime B: type) type {
                 for (c.remove) |*x| remove.append(a, a.dupe(u8, x.slice()) catch "") catch {};
                 spec.add_blocked_by = add.items;
                 spec.remove_blocked_by = remove.items;
-                items.append(a, .{ .id = a.dupe(u8, c.id.slice()) catch "", .spec = spec }) catch return s.fail("out of memory", .{});
+                items.append(
+                    a,
+                    .{ .id = a.dupe(u8, c.id.slice()) catch "", .spec = spec },
+                ) catch return s.fail("out of memory", .{});
             }
             for (plan.milestones) |*c| {
                 const base = t.draft.baseOf(c.id.slice()).?;
-                dues.append(a, .{ .id = a.dupe(u8, c.id.slice()) catch "", .due = date(a, c.due), .expect = base.tip }) catch return s.fail("out of memory", .{});
+                dues.append(
+                    a,
+                    .{
+                        .id = a.dupe(u8, c.id.slice()) catch "",
+                        .due = date(c.due),
+                        .expect = base.tip,
+                    },
+                ) catch return s.fail("out of memory", .{});
             }
             st.applyPlan(items.items, dues.items) catch |e| return self.failWith(e);
             const n = plan.count();
@@ -506,12 +642,20 @@ pub fn App(comptime B: type) type {
         }
 
         /// One write for all of them: each moves, or none does.
-        fn moveIssues(self: *Self, ids: []const store_mod.Id, link: store_mod.MilestoneLink, unmark: []const store_mod.Id) void {
+        fn moveIssues(
+            self: *Self,
+            ids: []const store_mod.Id,
+            link: store_mod.MilestoneLink,
+            unmark: []const store_mod.Id,
+        ) void {
             const s = &self.state;
             const st = &self.store;
             var items: std.ArrayList(store_mod.BatchItem) = .empty;
             const a = s.input_arena.allocator();
-            const moved = a.alloc(bool, st.snap.issues.len) catch return s.fail("out of memory", .{});
+            const moved = a.alloc(
+                bool,
+                st.snap.issues.len,
+            ) catch return s.fail("out of memory", .{});
             @memset(moved, false);
             // Deleted meanwhile, by a sync or elsewhere.
             var gone: u32 = 0;
@@ -526,32 +670,50 @@ pub fn App(comptime B: type) type {
                 }
                 // Already there: nothing to write.
                 const there = switch (link) {
-                    .id => |mid| if (st.snap.proj.milestone[i]) |m| std.mem.eql(u8, m, mid) and st.snap.issues[i].ext.milestone_id != null else false,
+                    .id => |mid| if (st.snap.proj.milestone[i]) |m| std.mem.eql(
+                        u8,
+                        m,
+                        mid,
+                    ) and st.snap.issues[i].milestone_id != null else false,
                     .none => st.snap.proj.milestone[i] == null and !filter.inherits(&st.snap, i),
                     .inherit => filter.inherits(&st.snap, i),
                 };
                 if (there) continue;
                 moved[i] = true;
                 var spec: issuez.engine.EditSpec = .{ .expect = st.snap.issues[i].tip };
-                switch (link) {
-                    .id => |mid| spec.milestone_id = mid,
-                    .none => spec.milestone_mode = .none,
-                    .inherit => spec.milestone_mode = .inherit,
-                }
-                items.append(a, .{ .id = id.slice(), .spec = spec }) catch return s.fail("out of memory", .{});
+                spec.milestone = switch (link) {
+                    .id => |mid| .linked(mid),
+                    .none => .{ .link = .none },
+                    .inherit => .{ .link = .inherit },
+                };
+                items.append(
+                    a,
+                    .{ .id = id.slice(), .spec = spec },
+                ) catch return s.fail("out of memory", .{});
             }
             const to: []const u8 = switch (link) {
                 .none => "no milestone",
                 .inherit => "the parent's milestone",
-                .id => |mid| if (st.snap.findMilestone(mid)) |n| a.dupe(u8, st.snap.milestones[n].name) catch "" else "?",
+                .id => |mid| if (st.snap.findMilestone(mid)) |n| a.dupe(
+                    u8,
+                    st.snap.milestones[n].name,
+                ) catch "" else "?",
             };
-            const gone_note = if (gone == 0) "" else std.fmt.allocPrint(a, "; {d} {s} gone meanwhile", .{ gone, if (gone == 1) "issue is" else "issues are" }) catch "";
+            const gone_note = if (gone == 0) "" else std.fmt.allocPrint(
+                a,
+                "; {d} {s} gone meanwhile",
+                .{ gone, if (gone == 1) "issue is" else "issues are" },
+            ) catch "";
             if (items.items.len == 0) {
                 s.closeModal();
                 if (gone == ids.len) return s.fail("{s}: nothing to move", .{gone_note[2..]});
                 return s.info("already in {s}{s}", .{ to, gone_note });
             }
-            const inheriting = inheritors(&st.snap, a, moved) catch return s.fail("out of memory", .{});
+            const inheriting = inheritors(
+                &st.snap,
+                a,
+                moved,
+            ) catch return s.fail("out of memory", .{});
             // The IDs are in the modal arena, which closing it resets.
             const what = if (items.items.len == 1)
                 std.fmt.allocPrint(a, "#{s}", .{shortId(items.items[0].id)}) catch ""
@@ -562,14 +724,21 @@ pub fn App(comptime B: type) type {
             s.milestone.unmark(a, &st.snap, unmark) catch {};
             s.closeModal();
             if (inheriting > 0) {
-                s.info("moved {s} to {s}, with {d} sub-issues that inherit{s}", .{ what, to, inheriting, gone_note });
+                s.info(
+                    "moved {s} to {s}, with {d} sub-issues that inherit{s}",
+                    .{ what, to, inheriting, gone_note },
+                );
             } else s.info("moved {s} to {s}{s}", .{ what, to, gone_note });
         }
 
         /// The descendants that move along with the `moved` issues: they
         /// follow their parent's milestone, through a chain of such
         /// parents, and don't move themselves.
-        fn inheritors(snap: *const store_mod.Snapshot, a: Allocator, moved: []const bool) Allocator.Error!u32 {
+        fn inheritors(
+            snap: *const store_mod.Snapshot,
+            a: Allocator,
+            moved: []const bool,
+        ) Allocator.Error!u32 {
             var count: u32 = 0;
             var stack: std.ArrayList(u32) = .empty;
             for (moved, 0..) |m, i| if (m) try stack.append(a, @intCast(i));
@@ -592,13 +761,21 @@ pub fn App(comptime B: type) type {
             const a = s.input_arena.allocator();
             // The IDs are in the modal arena, which closing it resets.
             const p = a.dupe(u8, parent.slice()) catch return s.fail("out of memory", .{});
-            const pi = st.snap.find(p) orelse return s.fail("#{s} isn't here any more", .{shortId(p)});
+            const pi = st.snap.find(
+                p,
+            ) orelse return s.fail("#{s} isn't here any more", .{shortId(p)});
             var items: std.ArrayList(store_mod.BatchItem) = .empty;
             for (ids) |*id| {
                 const i = st.snap.find(id.slice()) orelse continue;
                 if (st.snap.proj.parent[i] == pi) continue;
                 const full = a.dupe(u8, id.slice()) catch return s.fail("out of memory", .{});
-                items.append(a, .{ .id = full, .spec = .{ .parent = p, .expect = st.snap.issues[i].tip } }) catch return s.fail("out of memory", .{});
+                items.append(
+                    a,
+                    .{
+                        .id = full,
+                        .spec = .{ .parent = .{ .set = p }, .expect = st.snap.issues[i].tip },
+                    },
+                ) catch return s.fail("out of memory", .{});
             }
             if (items.items.len == 0) {
                 s.closeModal();
@@ -610,7 +787,10 @@ pub fn App(comptime B: type) type {
                 std.fmt.allocPrint(a, "{d} issues", .{items.items.len}) catch "";
             st.editBatch(items.items) catch |e| return self.failWith(e);
             s.closeModal();
-            s.info("added {s} as {s} of #{s}", .{ what, if (items.items.len == 1) "a sub-issue" else "sub-issues", shortId(p) });
+            s.info(
+                "added {s} as {s} of #{s}",
+                .{ what, if (items.items.len == 1) "a sub-issue" else "sub-issues", shortId(p) },
+            );
         }
 
         /// A card to another column: close it, reopen it, set its workflow
@@ -633,7 +813,8 @@ pub fn App(comptime B: type) type {
             const name = name_buf[0..column.len];
             const workflow = if (std.mem.eql(u8, name, "(none)")) "" else name;
             // Checked before reopening, so a refused state changes nothing.
-            if (workflow.len > 0) st.snap.settings.checkWorkflow(workflow) catch |e| return self.failWith(e);
+            if (workflow.len > 0)
+                st.snap.settings.checkWorkflow(workflow) catch |e| return self.failWith(e);
             if (done) {
                 st.setState(id.slice(), .open, null) catch |e| return self.failWith(e);
                 if (st.takeReloadError()) |e| return self.failWith(e);
@@ -642,9 +823,13 @@ pub fn App(comptime B: type) type {
             // The column it shows in, the default state included.
             const current = st.snap.proj.workflow(now) orelse "";
             if (!std.mem.eql(u8, current, workflow)) {
-                st.edit(id.slice(), .{ .workflow = workflow }) catch |e| return self.failWith(e);
+                st.edit(id.slice(), .{ .workflow = .fromInput(workflow) }) catch |e|
+                    return self.failWith(e);
             }
-            s.info("#{s} → {s}", .{ shortId(id.slice()), if (workflow.len == 0) "(none)" else workflow });
+            s.info(
+                "#{s} → {s}",
+                .{ shortId(id.slice()), if (workflow.len == 0) "(none)" else workflow },
+            );
         }
     };
 }
@@ -708,7 +893,10 @@ const Harness = struct {
         h.sim = try GitSim.init(h.arena_state.allocator(), &h.world, 0);
         h.app.init(testing.allocator, &h.sim);
         try h.app.store.reload();
-        h.screen = try .init(testing.allocator, .{ .rows = rows, .cols = cols, .x_pixel = 0, .y_pixel = 0 });
+        h.screen = try .init(
+            testing.allocator,
+            .{ .rows = rows, .cols = cols, .x_pixel = 0, .y_pixel = 0 },
+        );
         try h.draw();
     }
 
@@ -744,7 +932,15 @@ const Harness = struct {
         var buf: [4]u8 = undefined;
         const printable = cp >= 0x20 and cp < 0x7f and !mods.ctrl;
         const n = if (printable) std.unicode.utf8Encode(cp, &buf) catch 0 else 0;
-        try h.input(.{ .key = .{ .codepoint = cp, .mods = mods, .text = if (printable) buf[0..n] else null } });
+        try h.input(
+            .{
+                .key = .{
+                    .codepoint = cp,
+                    .mods = mods,
+                    .text = if (printable) buf[0..n] else null,
+                },
+            },
+        );
     }
 
     fn typeText(h: *Harness, s: []const u8) !void {
@@ -777,7 +973,9 @@ const Harness = struct {
     }
 
     fn byTitle(h: *Harness, title: []const u8) ?u32 {
-        for (h.snap().issues, 0..) |issue, i| if (std.mem.eql(u8, issue.title, title)) return @intCast(i);
+        for (h.snap().issues, 0..) |issue, i| {
+            if (std.mem.eql(u8, issue.title, title)) return @intCast(i);
+        }
         return null;
     }
 
@@ -939,7 +1137,7 @@ test "edit fields in the detail view" {
     try h.typeText("2026-12-01");
     try h.press(K.enter, .{});
     try testing.expect(h.app.state.modal == null);
-    try testing.expect(h.snap().issues[h.byTitle("New title").?].ext.due_date != null);
+    try testing.expect(h.snap().issues[h.byTitle("New title").?].due_date != null);
 
     // Description and a comment.
     try h.press('e', .{});
@@ -947,7 +1145,10 @@ test "edit fields in the detail view" {
     try h.press(K.enter, .{});
     try h.typeText("Line two");
     try h.press('s', .{ .ctrl = true });
-    try testing.expectEqualStrings("Line one\nLine two", h.snap().issues[h.byTitle("New title").?].description);
+    try testing.expectEqualStrings(
+        "Line one\nLine two",
+        h.snap().issues[h.byTitle("New title").?].description,
+    );
     try h.press('c', .{});
     try h.typeText("Done soon.");
     try h.press('s', .{ .ctrl = true });
@@ -956,6 +1157,50 @@ test "edit fields in the detail view" {
     // Close it.
     try h.press('x', .{});
     try testing.expect(h.snap().isDone(h.byTitle("New title").?));
+}
+
+test "detail: number, lock, ref, origin, reactions and purged comments" {
+    var h: Harness = undefined;
+    try h.init();
+    defer h.deinit();
+    const a = h.arena_state.allocator();
+    const repo = issuez.Repo(GitSim).init(&h.sim);
+    const created = try repo.create(a, .{
+        .title = "Imported",
+        .number = 12,
+        .original = .{ .author = "octo@github", .id = "gh-12" },
+    }, .{});
+    const ref = try std.fmt.allocPrint(a, "refs/issues/{s}", .{created.id});
+    _ = try repo.edit(
+        a,
+        ref,
+        .{ .locked = true, .lock_reason = "too heated", .ref = .{ .set = "v2" } },
+        .{},
+    );
+    const bad = try repo.comment(a, ref, .{ .text = "Abuse" }, .{});
+    const fine = try repo.comment(
+        a,
+        ref,
+        .{ .text = "Fine", .original = .{ .author = "cat@github" } },
+        .{},
+    );
+    _ = try repo.react(a, ref, .{ .emoji = ":+1:" }, .{});
+    _ = try repo.react(a, ref, .{ .target = fine.tip, .emoji = "heart" }, .{});
+    _ = try issuez.purge.Purge(GitSim).fromRepo(repo).comment(a, ref, bad.tip, .{}, .{});
+    try h.app.store.reload();
+    try h.draw();
+    try h.press(K.enter, .{});
+    try testing.expectEqual(ui.View.detail, h.app.state.view);
+    try testing.expect(h.shows("#12"));
+    try testing.expect(h.shows(" locked "));
+    try testing.expect(h.shows("locked: too heated"));
+    try testing.expect(h.shows("ref v2"));
+    try testing.expect(h.shows("imported from octo@github (gh-12)"));
+    try testing.expect(h.shows(":+1: 1"));
+    try testing.expect(h.shows("(via cat@github)"));
+    try testing.expect(h.shows("heart 1"));
+    try testing.expect(h.shows("(purged)"));
+    try testing.expect(!h.shows("Abuse"));
 }
 
 test "board: move cards with keys and by dragging" {
@@ -968,7 +1213,7 @@ test "board: move cards with keys and by dragging" {
     try testing.expect(h.shows("backlog"));
 
     try h.press('>', .{});
-    try testing.expectEqualStrings("ready", h.snap().issues[h.byTitle("Card").?].ext.workflow.?);
+    try testing.expectEqualStrings("ready", h.snap().issues[h.byTitle("Card").?].workflow.?);
 
     // Drag from "ready" (column 1) to "review" (column 3).
     const card = for (h.app.state.hits.items.items) |x| {
@@ -977,7 +1222,13 @@ test "board: move cards with keys and by dragging" {
     const target = for (h.app.state.hits.items.items) |x| {
         if (x.target == .column and x.target.column == 3) break x;
     } else unreachable;
-    const press: vaxis.Mouse = .{ .col = @intCast(card.x + 2), .row = @intCast(card.y + 1), .button = .left, .mods = .{}, .type = .press };
+    const press: vaxis.Mouse = .{
+        .col = @intCast(card.x + 2),
+        .row = @intCast(card.y + 1),
+        .button = .left,
+        .mods = .{},
+        .type = .press,
+    };
     try h.input(.{ .mouse = press });
     var drag = press;
     drag.type = .drag;
@@ -988,7 +1239,7 @@ test "board: move cards with keys and by dragging" {
     var up = drag;
     up.type = .release;
     try h.input(.{ .mouse = up });
-    try testing.expectEqualStrings("review", h.snap().issues[h.byTitle("Card").?].ext.workflow.?);
+    try testing.expectEqualStrings("review", h.snap().issues[h.byTitle("Card").?].workflow.?);
 
     // To done closes, and with scope "open" done work is hidden.
     try h.press('>', .{});
@@ -1035,6 +1286,40 @@ test "list: filter, scope and sort" {
     try testing.expect(!h.app.state.query.reverse);
 }
 
+test "milestones: M picks one to filter by; y syncs or says why not" {
+    var h: Harness = undefined;
+    try h.init();
+    defer h.deinit();
+    const repo = issuez.Repo(GitSim).init(&h.sim);
+    const cat = issuez.Catalog(GitSim).fromRepo(repo);
+    const v1 = try cat.create(h.arena_state.allocator(), .{ .name = "v1.0" }, .{});
+    _ = try h.app.store.create(.{ .title = "In it" });
+    const in_it = h.app.store.snap.issues[0].id;
+    try h.app.store.edit(in_it, .{ .milestone = .linked(v1.id) });
+    _ = try h.app.store.create(.{ .title = "Not in it" });
+    try h.draw();
+    try testing.expectEqual(@as(usize, 2), h.app.state.list.rows.len);
+
+    try h.press('M', .{});
+    const menu = h.app.state.modal.?.menu;
+    try testing.expectEqual(@as(usize, 2), menu.options.len);
+    try testing.expect(std.mem.startsWith(u8, menu.options[0].label, "v1.0  0/1 done"));
+    try h.press(K.enter, .{});
+    try testing.expect(h.app.state.modal == null);
+    try testing.expectEqualStrings("m:v1.0", h.app.state.search.text());
+    try testing.expectEqual(@as(usize, 1), h.app.state.list.rows.len);
+
+    // "No milestone" filters by none.
+    try h.press('M', .{});
+    try h.press(K.down, .{});
+    try h.press(K.enter, .{});
+    try testing.expectEqualStrings("m:", h.app.state.search.text());
+    try testing.expectEqual(@as(usize, 1), h.app.state.list.rows.len);
+
+    try h.press('y', .{});
+    try testing.expect(std.mem.startsWith(u8, h.app.state.status(), "no remote: add one"));
+}
+
 test "tree mode shows sub-issues under their parent" {
     var h: Harness = undefined;
     try h.init();
@@ -1062,7 +1347,9 @@ test "dialogs keep their values, also across a reload" {
     var h: Harness = undefined;
     try h.init();
     defer h.deinit();
-    const id = try h.app.store.create(.{ .title = "Labelled", .labels = &.{ "backend", "security" } });
+    const id = try h.app.store.create(
+        .{ .title = "Labelled", .labels = &.{ "backend", "security" } },
+    );
     const parent = try h.app.store.create(.{ .title = "Parent" });
     h.app.state.openIssue(id.slice());
     try h.draw();
@@ -1102,13 +1389,17 @@ test "sort by ID" {
     var h: Harness = undefined;
     try h.init();
     defer h.deinit();
-    for ([_][]const u8{ "One", "Two", "Three", "Four" }) |t| _ = try h.app.store.create(.{ .title = t });
+    for ([_][]const u8{ "One", "Two", "Three", "Four" }) |t| {
+        _ = try h.app.store.create(.{ .title = t });
+    }
     try h.click(.{ .sort = .id });
     try testing.expectEqual(filter.SortKey.id, h.app.state.query.key);
     const rows = h.app.state.list.rows;
     try testing.expectEqual(@as(usize, 4), rows.len);
     for (rows[0 .. rows.len - 1], rows[1..]) |a, b| {
-        try testing.expect(std.mem.order(u8, h.snap().issues[a.issue].id, h.snap().issues[b.issue].id) == .lt);
+        try testing.expect(
+            std.mem.order(u8, h.snap().issues[a.issue].id, h.snap().issues[b.issue].id) == .lt,
+        );
     }
 }
 
@@ -1138,7 +1429,10 @@ test "saving what the issue already has writes nothing" {
     try h.press('p', .{});
     try h.press('h', .{});
     try h.press(K.enter, .{});
-    try testing.expectEqualStrings("high", h.snap().issues[h.snap().find(id.slice()).?].field("Priority").?);
+    try testing.expectEqualStrings(
+        "high",
+        h.snap().issues[h.snap().find(id.slice()).?].field("Priority").?,
+    );
 }
 
 test "the wheel scrolls the editor away from the cursor" {
@@ -1155,7 +1449,13 @@ test "the wheel scrolls the editor away from the cursor" {
     const input = &h.app.state.modal.?.editor.input;
     const bottom = input.scroll;
     try testing.expect(bottom > 0);
-    const wheel: vaxis.Mouse = .{ .col = Harness.cols / 2, .row = Harness.rows / 2, .button = .wheel_up, .mods = .{}, .type = .press };
+    const wheel: vaxis.Mouse = .{
+        .col = Harness.cols / 2,
+        .row = Harness.rows / 2,
+        .button = .wheel_up,
+        .mods = .{},
+        .type = .press,
+    };
     try h.input(.{ .mouse = wheel });
     try h.input(.{ .mouse = wheel });
     try testing.expectEqual(bottom - 6, input.scroll);
@@ -1269,13 +1569,13 @@ test "changes made elsewhere show, and say so" {
     try testing.expectEqual(generation, h.app.store.generation);
     try testing.expectEqualStrings("", h.app.state.status());
 
-    const theirs = try other.create(arena, .{ .title = "Written by another process" });
+    const theirs = try other.create(arena, .{ .title = "Written by another process" }, .{});
     h.app.changedElsewhere(false);
     try h.draw();
     try testing.expect(h.shows("Written by another process"));
     var buf: [64]u8 = undefined;
     try testing.expectEqualStrings(
-        try std.fmt.bufPrint(&buf, "#{s} changed elsewhere", .{shortId(theirs.id.slice())}),
+        try std.fmt.bufPrint(&buf, "#{s} changed elsewhere", .{shortId(theirs.id)}),
         h.app.state.status(),
     );
     // The selection stays.
@@ -1283,8 +1583,8 @@ test "changes made elsewhere show, and say so" {
     try testing.expectEqualStrings(mine.slice(), h.app.store.snap.issues[selected].id);
 
     const ref = try std.fmt.allocPrint(arena, "refs/issues/{s}", .{mine.slice()});
-    _ = try other.edit(arena, ref, .{ .title = "Mine, renamed elsewhere" });
-    _ = try other.create(arena, .{ .title = "Another" });
+    _ = try other.edit(arena, ref, .{ .title = "Mine, renamed elsewhere" }, .{});
+    _ = try other.create(arena, .{ .title = "Another" }, .{});
     h.app.changedElsewhere(false);
     try h.draw();
     try testing.expect(h.shows("Mine, renamed elsewhere"));
@@ -1292,7 +1592,7 @@ test "changes made elsewhere show, and say so" {
 
     // An error stays on the status line.
     h.app.state.fail("something failed", .{});
-    _ = try other.create(arena, .{ .title = "Third" });
+    _ = try other.create(arena, .{ .title = "Third" }, .{});
     h.app.changedElsewhere(false);
     try h.draw();
     try testing.expect(h.shows("Third"));
@@ -1390,7 +1690,13 @@ test "a description changed meanwhile isn't overwritten without asking" {
     }.of;
     try testing.expect(h.app.state.modal != null);
     try testing.expectEqualStrings("Theirs", desc(&h, id));
-    try testing.expect(std.mem.endsWith(u8, h.app.state.status(), "changed meanwhile: save again to replace it with yours"));
+    try testing.expect(
+        std.mem.endsWith(
+            u8,
+            h.app.state.status(),
+            "changed meanwhile: save again to replace it with yours",
+        ),
+    );
     try h.press('s', .{ .ctrl = true });
     try testing.expect(h.app.state.modal == null);
     try testing.expectEqualStrings("Text mine", desc(&h, id));
@@ -1406,8 +1712,13 @@ test "a field changed elsewhere while its dialog is open isn't overwritten witho
     try h.press('l', .{});
     try h.typeText(", ui");
     // Another process adds one, and the TUI follows.
-    const ref = try std.fmt.allocPrint(h.arena_state.allocator(), "{s}{s}", .{ issuez.engine.issue_ref_prefix, id.slice() });
-    _ = try issuez.Repo(GitSim).init(&h.sim).edit(h.arena_state.allocator(), ref, .{ .add_labels = &.{"urgent"} });
+    const ref = try std.fmt.allocPrint(
+        h.arena_state.allocator(),
+        "{s}{s}",
+        .{ issuez.engine.issue_ref_prefix, id.slice() },
+    );
+    const other = issuez.Repo(GitSim).init(&h.sim);
+    _ = try other.edit(h.arena_state.allocator(), ref, .{ .add_labels = &.{"urgent"} }, .{});
     h.app.changedElsewhere(false);
     try h.draw();
     const labels = struct {
@@ -1420,7 +1731,13 @@ test "a field changed elsewhere while its dialog is open isn't overwritten witho
     try h.press(K.enter, .{});
     try testing.expect(h.app.state.modal != null);
     try testing.expectEqual(@as(usize, 2), labels(&h, id).len);
-    try testing.expect(std.mem.endsWith(u8, h.app.state.status(), "changed meanwhile: save again to replace it with yours"));
+    try testing.expect(
+        std.mem.endsWith(
+            u8,
+            h.app.state.status(),
+            "changed meanwhile: save again to replace it with yours",
+        ),
+    );
     // Told, saving again is meant.
     try h.press(K.enter, .{});
     try testing.expect(h.app.state.modal == null);
@@ -1442,7 +1759,10 @@ test "a menu answer that was the issue's when it opened still writes once it cha
     try testing.expect(h.app.state.modal != null);
     try h.press(K.enter, .{});
     try testing.expect(h.app.state.modal == null);
-    try testing.expectEqual(@as(?[]const u8, null), h.snap().issues[h.snap().find(id.slice()).?].field("Priority"));
+    try testing.expectEqual(
+        @as(?[]const u8, null),
+        h.snap().issues[h.snap().find(id.slice()).?].field("Priority"),
+    );
 }
 
 test "a failed reload after a create doesn't keep the form for a second one" {
@@ -1454,7 +1774,9 @@ test "a failed reload after a create doesn't keep the form for a second one" {
     try h.sim.configAdd("issue.doneStates", "open");
     try h.press('s', .{ .ctrl = true });
     try testing.expect(h.app.state.modal == null);
-    try testing.expect(std.mem.startsWith(u8, h.app.state.status(), "git config issue.doneStates is invalid"));
+    try testing.expect(
+        std.mem.startsWith(u8, h.app.state.status(), "git config issue.doneStates is invalid"),
+    );
     try h.sim.configUnsetValue("issue.doneStates", "open");
     try h.app.store.reload();
     try testing.expectEqual(@as(usize, 1), h.snap().issues.len);
@@ -1491,8 +1813,12 @@ test "an ID prefix picks the issue that isn't deleted" {
     const repo = issuez.Repo(GitSim).init(&h.sim);
     for (ids, 0..) |id, n| {
         if (n == pair[0] or id.buf[0] != prefix[0]) continue;
-        const ref = try std.fmt.allocPrint(h.arena_state.allocator(), "{s}{s}", .{ issuez.engine.issue_ref_prefix, id.slice() });
-        _ = try repo.setDeleted(h.arena_state.allocator(), ref, true, .{});
+        const ref = try std.fmt.allocPrint(
+            h.arena_state.allocator(),
+            "{s}{s}",
+            .{ issuez.engine.issue_ref_prefix, id.slice() },
+        );
+        _ = try repo.setDeleted(h.arena_state.allocator(), ref, .{}, .{});
     }
     try h.app.store.reload();
     const got = h.snap().resolve(prefix);
@@ -1508,7 +1834,7 @@ test "detail: the milestone menu links by ID, inherits and clears" {
     // Two milestones named alike: the completed one isn't offered.
     const old = try st.createMilestone(.{ .name = "v1" });
     try st.editMilestone(old.slice(), .{ .status = .completed });
-    const v1 = try st.createMilestone(.{ .name = "v1", .due = "2026-12-01" });
+    const v1 = try st.createMilestone(.{ .name = "v1", .due = .parse("2026-12-01") });
     const parent = try st.create(.{ .title = "Parent", .milestone_id = v1.slice() });
     _ = try st.create(.{ .title = "Child", .parent = parent.slice() });
     try h.draw();
@@ -1531,7 +1857,7 @@ test "detail: the milestone menu links by ID, inherits and clears" {
     try h.press('m', .{});
     try h.click(.{ .modal = .{ .choice = 0 } });
     const c = h.snap().issues[h.byTitle("Child").?];
-    try testing.expectEqualStrings(v1.slice(), c.ext.milestone_id.?);
+    try testing.expectEqualStrings(v1.slice(), c.milestone_id.?);
     try testing.expectEqualStrings("v1", c.field("Milestone").?);
 }
 
@@ -1540,21 +1866,29 @@ test "store: milestones created and edited" {
     try h.init();
     defer h.deinit();
     const st = &h.app.store;
-    const id = try st.createMilestone(.{ .name = "v2", .due = "2027-01-15", .description = "Next." });
+    const id = try st.createMilestone(
+        .{ .name = "v2", .due = .parse("2027-01-15"), .description = "Next." },
+    );
     try testing.expectEqual(@as(usize, 1), h.snap().milestones.len);
-    try st.editMilestone(id.slice(), .{ .name = "v2.0", .due = "" });
+    try st.editMilestone(id.slice(), .{ .name = "v2.0", .due = .clear });
     const m = h.snap().milestones[h.snap().findMilestone(id.slice()).?];
     try testing.expectEqualStrings("v2.0", m.name);
     try testing.expect(m.due == null);
     try testing.expectEqualStrings("Next.", m.description);
     // Completing needs the work done.
     const i = try st.create(.{ .title = "Work", .milestone_id = id.slice() });
-    try testing.expectError(error.OpenWorkInMilestone, st.editMilestone(id.slice(), .{ .status = .completed }));
+    try testing.expectError(
+        error.OpenWorkInMilestone,
+        st.editMilestone(id.slice(), .{ .status = .completed }),
+    );
     try st.setState(i.slice(), .closed, null);
     try st.editMilestone(id.slice(), .{ .status = .completed });
     // And then takes no new work.
     const j = try st.create(.{ .title = "Late" });
-    try testing.expectError(error.MilestoneCompleted, st.setMilestoneLink(j.slice(), .{ .id = id.slice() }, null));
+    try testing.expectError(
+        error.MilestoneCompleted,
+        st.setMilestoneLink(j.slice(), .{ .id = id.slice() }, null),
+    );
 }
 
 test "milestones view: create, sort, filter, complete" {
@@ -1603,7 +1937,11 @@ test "milestones view: create, sort, filter, complete" {
 
     // Completing with open work says so, and shows it.
     const vi = for (h.app.state.milestones.rows, 0..) |n, r| {
-        if (n < h.snap().milestones.len and std.mem.eql(u8, h.snap().milestones[n].name, "v1.0")) break r;
+        if (n < h.snap().milestones.len and std.mem.eql(
+            u8,
+            h.snap().milestones[n].name,
+            "v1.0",
+        )) break r;
     } else unreachable;
     try h.click(.{ .ms_row = @intCast(vi) });
     try h.press('c', .{});
@@ -1618,7 +1956,10 @@ test "milestones view: create, sort, filter, complete" {
     try h.press('c', .{});
     try testing.expect(h.shows("All 2 issues are done."));
     try h.press(K.enter, .{});
-    try testing.expectEqual(issuez.format.fields.MilestoneStatus.completed, h.snap().milestones[h.snap().findMilestone(id).?].status);
+    try testing.expectEqual(
+        issuez.format.fields.MilestoneStatus.completed,
+        h.snap().milestones[h.snap().findMilestone(id).?].status,
+    );
     // Back to the list of milestones; completed ones are in their scope.
     try h.press(K.escape, .{});
     try testing.expectEqual(ui.View.milestones, h.app.state.view);
@@ -1643,14 +1984,22 @@ test "milestones view: rename, due date, retire, reopen" {
     try h.typeText("+2w");
     try testing.expect(h.shows("→ 2023-11-28"));
     try h.press(K.enter, .{});
-    try testing.expect(h.snap().milestones[0].due.?.eql(issuez.format.fields.Date.parse("2023-11-28").?));
+    try testing.expect(
+        h.snap().milestones[0].due.?.eql(issuez.format.fields.Date.parse("2023-11-28").?),
+    );
     try h.press('R', .{});
     try h.press(K.enter, .{});
-    try testing.expectEqual(issuez.format.fields.MilestoneStatus.retired, h.snap().milestones[0].status);
+    try testing.expectEqual(
+        issuez.format.fields.MilestoneStatus.retired,
+        h.snap().milestones[0].status,
+    );
     try h.click(.{ .ms_scope = .all });
     try h.press('g', .{});
     try h.press('o', .{});
-    try testing.expectEqual(issuez.format.fields.MilestoneStatus.open, h.snap().milestones[0].status);
+    try testing.expectEqual(
+        issuez.format.fields.MilestoneStatus.open,
+        h.snap().milestones[0].status,
+    );
     // Edited in the form: one commit for both.
     try h.press('e', .{});
     try h.press(K.tab, .{});
@@ -1667,8 +2016,8 @@ test "milestone view: create in it, quick add, move with ] and the menu" {
     try h.init();
     defer h.deinit();
     const st = &h.app.store;
-    const v1 = try st.createMilestone(.{ .name = "v1", .due = "2026-12-01" });
-    const v2 = try st.createMilestone(.{ .name = "v2", .due = "2027-01-01" });
+    const v1 = try st.createMilestone(.{ .name = "v1", .due = .parse("2026-12-01") });
+    const v2 = try st.createMilestone(.{ .name = "v2", .due = .parse("2027-01-01") });
     try h.press('3', .{});
     try h.press(K.enter, .{});
     try testing.expectEqual(ui.View.milestone, h.app.state.view);
@@ -1679,7 +2028,7 @@ test "milestone view: create in it, quick add, move with ] and the menu" {
     try h.typeText("In v1");
     try h.press('s', .{ .ctrl = true });
     const in_v1 = h.snap().issues[h.byTitle("In v1").?];
-    try testing.expectEqualStrings(v1.slice(), in_v1.ext.milestone_id.?);
+    try testing.expectEqualStrings(v1.slice(), in_v1.milestone_id.?);
     // Quick add: two titles, then Esc.
     try h.press('N', .{});
     try h.typeText("Quick one");
@@ -1762,12 +2111,24 @@ test "milestone view: inherited sub-issues, split pane and dragging" {
     try testing.expect(h.shows("(no milestone) · "));
     const row = for (h.app.state.hits.items.items) |x| {
         if (x.target == .mrow and x.target.mrow.column == 1 and
-            std.mem.eql(u8, h.snap().issues[h.app.state.milestone.panes[1].rows[x.target.mrow.index].issue].title, "Loose")) break x;
+            std.mem.eql(
+                u8,
+                h.snap().issues[
+                    h.app.state.milestone.panes[1].rows[x.target.mrow.index].issue
+                ].title,
+                "Loose",
+            )) break x;
     } else unreachable;
     const pane = for (h.app.state.hits.items.items) |x| {
         if (x.target == .mpane and x.target.mpane == 0) break x;
     } else unreachable;
-    const press: vaxis.Mouse = .{ .col = @intCast(row.x + 12), .row = @intCast(row.y), .button = .left, .mods = .{}, .type = .press };
+    const press: vaxis.Mouse = .{
+        .col = @intCast(row.x + 12),
+        .row = @intCast(row.y),
+        .button = .left,
+        .mods = .{},
+        .type = .press,
+    };
     try h.input(.{ .mouse = press });
     var drag = press;
     drag.type = .drag;
@@ -1793,8 +2154,8 @@ test "milestones view: lateness fits, the selection outlasts a filter, re-sortin
     defer h.deinit();
     const st = &h.app.store;
     // Harness time: 2023-11-14.
-    _ = try st.createMilestone(.{ .name = "Late one", .due = "2023-11-02" });
-    _ = try st.createMilestone(.{ .name = "Soon one", .due = "2023-11-15" });
+    _ = try st.createMilestone(.{ .name = "Late one", .due = .parse("2023-11-02") });
+    _ = try st.createMilestone(.{ .name = "Soon one", .due = .parse("2023-11-15") });
     try h.press('3', .{});
     try testing.expect(h.shows("2023-11-02 12d late"));
     try testing.expect(h.shows("2023-11-15 tomorrow"));
@@ -1807,7 +2168,10 @@ test "milestones view: lateness fits, the selection outlasts a filter, re-sortin
     try h.press(K.enter, .{});
     try testing.expectEqual(@as(usize, 1), v.rows.len);
     try h.press(K.escape, .{});
-    try testing.expectEqualStrings("Soon one", h.snap().milestones[v.selectedMilestone(h.snap()).?].name);
+    try testing.expectEqualStrings(
+        "Soon one",
+        h.snap().milestones[v.selectedMilestone(h.snap()).?].name,
+    );
     // A term it doesn't know says so.
     try h.press('/', .{});
     try h.typeText("is:late");
@@ -1817,12 +2181,17 @@ test "milestones view: lateness fits, the selection outlasts a filter, re-sortin
 
     // More than fit; the last one selected, then first after re-sorting.
     const a = h.arena_state.allocator();
-    for (0..40) |n| _ = try st.createMilestone(.{ .name = try std.fmt.allocPrint(a, "M{d:0>2}", .{n}) });
+    for (0..40) |n| _ = try st.createMilestone(
+        .{ .name = try std.fmt.allocPrint(a, "M{d:0>2}", .{n}) },
+    );
     try h.draw();
     try h.click(.{ .ms_sort = .name });
     try h.press('G', .{});
     try h.press('k', .{});
-    try testing.expectEqualStrings("Soon one", h.snap().milestones[v.selectedMilestone(h.snap()).?].name);
+    try testing.expectEqualStrings(
+        "Soon one",
+        h.snap().milestones[v.selectedMilestone(h.snap()).?].name,
+    );
     try testing.expect(v.scroll > 0);
     try h.press('S', .{});
     try testing.expectEqual(@as(u32, 0), v.selected);
@@ -1842,9 +2211,20 @@ test "milestones view: the no-milestone row shows whenever it is selectable" {
     try h.init();
     defer h.deinit();
     try h.press('3', .{});
-    var small = try vaxis.Screen.init(testing.allocator, .{ .rows = 8, .cols = 60, .x_pixel = 0, .y_pixel = 0 });
+    var small = try vaxis.Screen.init(
+        testing.allocator,
+        .{ .rows = 8, .cols = 60, .x_pixel = 0, .y_pixel = 0 },
+    );
     defer small.deinit(testing.allocator);
-    const w: ui.Window = .{ .x_off = 0, .y_off = 0, .parent_x_off = 0, .parent_y_off = 0, .width = 60, .height = 8, .screen = &small };
+    const w: ui.Window = .{
+        .x_off = 0,
+        .y_off = 0,
+        .parent_x_off = 0,
+        .parent_y_off = 0,
+        .width = 60,
+        .height = 8,
+        .screen = &small,
+    };
     try h.app.draw(w, @divFloor(h.now_ms, 1000));
     const row = for (h.app.state.hits.items.items) |x| {
         if (x.target == .ms_row) break x;
@@ -1852,13 +2232,13 @@ test "milestones view: the no-milestone row shows whenever it is selectable" {
     try testing.expectEqual(@as(u32, 0), row.target.ms_row);
 }
 
-test "milestone view: the pane button, the header follows the focus, marks and completed milestones" {
+test "milestone view: pane button, header follows focus, marks, completed milestones" {
     var h: Harness = undefined;
     try h.init();
     defer h.deinit();
     const st = &h.app.store;
-    const v1 = try st.createMilestone(.{ .name = "v1", .due = "2026-12-01" });
-    const v2 = try st.createMilestone(.{ .name = "v2", .due = "2027-01-01" });
+    const v1 = try st.createMilestone(.{ .name = "v1", .due = .parse("2026-12-01") });
+    const v2 = try st.createMilestone(.{ .name = "v2", .due = .parse("2027-01-01") });
     const old = try st.createMilestone(.{ .name = "Shipped" });
     try st.editMilestone(old.slice(), .{ .status = .completed });
     _ = try st.create(.{ .title = "A1", .milestone_id = v1.slice() });
@@ -1907,7 +2287,10 @@ test "milestone view: the pane button, the header follows the focus, marks and c
     try testing.expect(h.shows("0 marked, 1 hidden"));
     try h.press('m', .{});
     const a1 = h.snap().issues[h.byTitle("A1").?].id;
-    try testing.expectEqualStrings(try std.fmt.allocPrint(h.arena_state.allocator(), "Move #{s} to", .{shortId(a1)}), h.app.state.modal.?.picker.title);
+    try testing.expectEqualStrings(
+        try std.fmt.allocPrint(h.arena_state.allocator(), "Move #{s} to", .{shortId(a1)}),
+        h.app.state.modal.?.picker.title,
+    );
     try h.press(K.escape, .{});
     // Adding issues keeps the marks.
     try h.press('+', .{});
@@ -1931,8 +2314,8 @@ test "milestone view: context rows aren't in it, and say so" {
     try h.init();
     defer h.deinit();
     const st = &h.app.store;
-    const v1 = try st.createMilestone(.{ .name = "v1", .due = "2026-12-01" });
-    const v2 = try st.createMilestone(.{ .name = "v2", .due = "2027-01-01" });
+    const v1 = try st.createMilestone(.{ .name = "v1", .due = .parse("2026-12-01") });
+    const v2 = try st.createMilestone(.{ .name = "v2", .due = .parse("2027-01-01") });
     const grand = try st.create(.{ .title = "Grand", .milestone_id = v2.slice() });
     const parent = try st.create(.{ .title = "Parent", .parent = grand.slice() });
     _ = try st.create(.{ .title = "Child", .parent = parent.slice(), .milestone_id = v1.slice() });
@@ -1986,7 +2369,14 @@ test "milestone view: why it is empty; open-only for one opening" {
     h.app.state.mv_query.scope = .all;
     try h.press('3', .{});
     const v = &h.app.state.milestones;
-    while (!std.mem.eql(u8, h.snap().milestones[v.selectedMilestone(h.snap()).?].name, "v3")) try h.press('j', .{});
+    while (!std.mem.eql(
+        u8,
+        h.snap().milestones[v.selectedMilestone(h.snap()).?].name,
+        "v3",
+    )) try h.press(
+        'j',
+        .{},
+    );
     try h.press('c', .{});
     try h.press(K.enter, .{}); // Show open issues
     try testing.expectEqual(ui.View.milestone, h.app.state.view);
@@ -2047,16 +2437,38 @@ test "timeline: bars, groups, blockers, zoom" {
     defer h.deinit();
     const st = &h.app.store;
     // Harness time: 2023-11-14, a Tuesday.
-    const v1 = try st.createMilestone(.{ .name = "v1", .due = "2023-11-30" });
+    const v1 = try st.createMilestone(.{ .name = "v1", .due = .parse("2023-11-30") });
     const design = try st.create(.{ .title = "Design", .milestone_id = v1.slice() });
-    try st.edit(design.slice(), .{ .start_date = "2023-11-13", .due_date = "2023-11-17" });
+    try st.edit(
+        design.slice(),
+        .{
+            .start_date = .{ .set = issuez.format.fields.Date.parse("2023-11-13").? },
+            .due_date = .{ .set = issuez.format.fields.Date.parse("2023-11-17").? },
+        },
+    );
     const build = try st.create(.{ .title = "Build", .milestone_id = v1.slice() });
-    try st.edit(build.slice(), .{ .start_date = "2023-11-16", .due_date = "2023-12-05", .add_blocked_by = &.{design.slice()} });
+    try st.edit(
+        build.slice(),
+        .{
+            .start_date = .{ .set = issuez.format.fields.Date.parse("2023-11-16").? },
+            .due_date = .{ .set = issuez.format.fields.Date.parse("2023-12-05").? },
+            .add_blocked_by = &.{design.slice()},
+        },
+    );
     const docs = try st.create(.{ .title = "Docs", .milestone_id = v1.slice() });
-    try st.edit(docs.slice(), .{ .due_date = "2023-11-28", .estimate_minutes = .{ .set = 16 * 60 } });
+    try st.edit(
+        docs.slice(),
+        .{
+            .due_date = .{ .set = issuez.format.fields.Date.parse("2023-11-28").? },
+            .estimate_minutes = .{ .set = 16 * 60 },
+        },
+    );
     _ = try st.create(.{ .title = "Someday", .milestone_id = v1.slice() });
     const loose = try st.create(.{ .title = "Loose" });
-    try st.edit(loose.slice(), .{ .due_date = "2023-11-20" });
+    try st.edit(
+        loose.slice(),
+        .{ .due_date = .{ .set = issuez.format.fields.Date.parse("2023-11-20").? } },
+    );
     try h.press('4', .{});
     try testing.expectEqual(ui.View.timeline, h.app.state.view);
     const t = &h.app.state.timeline;
@@ -2127,15 +2539,27 @@ test "timeline edit mode: staged, applied all at once, guarded when leaving" {
     defer h.deinit();
     const st = &h.app.store;
     const D = issuez.format.fields.Date;
-    const v1 = try st.createMilestone(.{ .name = "v1", .due = "2023-11-30" });
+    const v1 = try st.createMilestone(.{ .name = "v1", .due = .parse("2023-11-30") });
     const design = try st.create(.{ .title = "Design", .milestone_id = v1.slice() });
-    try st.edit(design.slice(), .{ .start_date = "2023-11-13", .due_date = "2023-11-17" });
+    try st.edit(
+        design.slice(),
+        .{
+            .start_date = .{ .set = issuez.format.fields.Date.parse("2023-11-13").? },
+            .due_date = .{ .set = issuez.format.fields.Date.parse("2023-11-17").? },
+        },
+    );
     const build = try st.create(.{ .title = "Build", .milestone_id = v1.slice() });
-    try st.edit(build.slice(), .{ .start_date = "2023-11-20", .due_date = "2023-11-24" });
+    try st.edit(
+        build.slice(),
+        .{
+            .start_date = .{ .set = issuez.format.fields.Date.parse("2023-11-20").? },
+            .due_date = .{ .set = issuez.format.fields.Date.parse("2023-11-24").? },
+        },
+    );
     const dates = struct {
         fn of(hh: *Harness, title: []const u8) [2]?D {
             const issue = hh.snap().issues[hh.byTitle(title).?];
-            return .{ issue.ext.start_date, issue.ext.due_date };
+            return .{ issue.start_date, issue.due_date };
         }
     }.of;
     try h.press('4', .{});
@@ -2152,7 +2576,12 @@ test "timeline edit mode: staged, applied all at once, guarded when leaving" {
     try h.press('>', .{});
     try testing.expect(h.shows("1 change not applied"));
     try testing.expect(dates(&h, "Design")[0].?.eql(D.parse("2023-11-13").?));
-    try testing.expect(timeline_view.datesOf(&h.app.state, h.byTitle("Design").?).due.?.eql(D.parse("2023-11-19").?));
+    try testing.expect(
+        timeline_view.datesOf(
+            &h.app.state,
+            h.byTitle("Design").?,
+        ).due.?.eql(D.parse("2023-11-19").?),
+    );
     // Undo and redo.
     try h.press('u', .{});
     try h.press('u', .{});
@@ -2182,13 +2611,24 @@ test "timeline edit mode: staged, applied all at once, guarded when leaving" {
         if (x.target == .tl_row and x.target.tl_row == t.selected) break x.y;
     } else unreachable;
     const bx: u16 = @intCast(@as(i32, t.chart_x) + t.x(D.parse("2023-11-22").?.toDays()));
-    const press: vaxis.Mouse = .{ .col = @intCast(bx), .row = @intCast(row_y), .button = .left, .mods = .{}, .type = .press };
+    const press: vaxis.Mouse = .{
+        .col = @intCast(bx),
+        .row = @intCast(row_y),
+        .button = .left,
+        .mods = .{},
+        .type = .press,
+    };
     try h.input(.{ .mouse = press });
     var drag = press;
     drag.type = .drag;
     drag.col = @intCast(@as(i32, t.chart_x) + t.x(D.parse("2023-11-24").?.toDays()));
     try h.input(.{ .mouse = drag });
-    try testing.expect(timeline_view.datesOf(&h.app.state, h.byTitle("Build").?).start.?.eql(D.parse("2023-11-22").?));
+    try testing.expect(
+        timeline_view.datesOf(
+            &h.app.state,
+            h.byTitle("Build").?,
+        ).start.?.eql(D.parse("2023-11-22").?),
+    );
     var up = drag;
     up.type = .release;
     try h.input(.{ .mouse = up });
@@ -2216,7 +2656,7 @@ test "timeline edit mode: staged, applied all at once, guarded when leaving" {
     try testing.expect(dates(&h, "Design")[0].?.eql(D.parse("2023-11-14").?));
     try testing.expect(dates(&h, "Build")[0].?.eql(D.parse("2023-11-22").?));
     try testing.expect(dates(&h, "Build")[1].?.eql(D.parse("2023-11-26").?));
-    try testing.expectEqual(@as(usize, 1), h.snap().issues[h.byTitle("Build").?].ext.blocked_by.len);
+    try testing.expectEqual(@as(usize, 1), h.snap().issues[h.byTitle("Build").?].blocked_by.len);
     try testing.expect(h.snap().milestones[0].due.?.eql(D.parse("2023-12-07").?));
     try testing.expect(h.shows("applied 3 changes"));
 
@@ -2259,22 +2699,65 @@ test "every view draws at any size, small or large" {
     try h.init();
     defer h.deinit();
     const st = &h.app.store;
-    const v1 = try st.createMilestone(.{ .name = "A milestone with a rather long name", .due = "2023-11-30", .description = "Line one.\nLine two." });
-    const p = try st.create(.{ .title = "A parent issue whose title goes on and on and on", .milestone_id = v1.slice() });
+    const v1 = try st.createMilestone(
+        .{
+            .name = "A milestone with a rather long name",
+            .due = .parse("2023-11-30"),
+            .description = "Line one.\nLine two.",
+        },
+    );
+    const p = try st.create(
+        .{
+            .title = "A parent issue whose title goes on and on and on",
+            .milestone_id = v1.slice(),
+        },
+    );
     const c = try st.create(.{ .title = "Child", .parent = p.slice() });
-    try st.edit(c.slice(), .{ .start_date = "2023-10-01", .due_date = "2024-03-01", .estimate_minutes = .{ .set = 600 } });
+    try st.edit(
+        c.slice(),
+        .{
+            .start_date = .{ .set = issuez.format.fields.Date.parse("2023-10-01").? },
+            .due_date = .{ .set = issuez.format.fields.Date.parse("2024-03-01").? },
+            .estimate_minutes = .{ .set = 600 },
+        },
+    );
     const d = try st.create(.{ .title = "Due only", .milestone_id = v1.slice() });
-    try st.edit(d.slice(), .{ .due_date = "2023-11-20", .add_blocked_by = &.{c.slice()} });
+    try st.edit(
+        d.slice(),
+        .{
+            .due_date = .{ .set = issuez.format.fields.Date.parse("2023-11-20").? },
+            .add_blocked_by = &.{c.slice()},
+        },
+    );
     _ = try st.create(.{ .title = "Loose" });
 
-    var big = try vaxis.Screen.init(testing.allocator, .{ .rows = 70, .cols = 260, .x_pixel = 0, .y_pixel = 0 });
+    var big = try vaxis.Screen.init(
+        testing.allocator,
+        .{ .rows = 70, .cols = 260, .x_pixel = 0, .y_pixel = 0 },
+    );
     defer big.deinit(testing.allocator);
-    const sizes = [_][2]u16{ .{ 20, 6 }, .{ 24, 8 }, .{ 40, 12 }, .{ 60, 16 }, .{ 80, 24 }, .{ 100, 30 }, .{ 260, 70 } };
+    const sizes = [_][2]u16{
+        .{ 20, 6 },
+        .{ 24, 8 },
+        .{ 40, 12 },
+        .{ 60, 16 },
+        .{ 80, 24 },
+        .{ 100, 30 },
+        .{ 260, 70 },
+    };
     const views = [_]u8{ '1', '2', '3', '4' };
     for (views) |v| {
         try h.press(v, .{});
         for (sizes) |sz| {
-            const w: ui.Window = .{ .x_off = 0, .y_off = 0, .parent_x_off = 0, .parent_y_off = 0, .width = sz[0], .height = sz[1], .screen = &big };
+            const w: ui.Window = .{
+                .x_off = 0,
+                .y_off = 0,
+                .parent_x_off = 0,
+                .parent_y_off = 0,
+                .width = sz[0],
+                .height = sz[1],
+                .screen = &big,
+            };
             try h.app.draw(w, @divFloor(h.now_ms, 1000));
             // Scrolled far away and zoomed, and with each modal kind.
             if (v == '4') {
@@ -2292,7 +2775,15 @@ test "every view draws at any size, small or large" {
     try h.press(K.enter, .{});
     try h.press('v', .{});
     for (sizes) |sz| {
-        const w: ui.Window = .{ .x_off = 0, .y_off = 0, .parent_x_off = 0, .parent_y_off = 0, .width = sz[0], .height = sz[1], .screen = &big };
+        const w: ui.Window = .{
+            .x_off = 0,
+            .y_off = 0,
+            .parent_x_off = 0,
+            .parent_y_off = 0,
+            .width = sz[0],
+            .height = sz[1],
+            .screen = &big,
+        };
         try h.app.draw(w, @divFloor(h.now_ms, 1000));
     }
     try h.press('4', .{});
@@ -2302,13 +2793,29 @@ test "every view draws at any size, small or large" {
     for ([_]u8{ 'z', 'z', 'Z', 'Z', 'Z' }) |z| {
         try h.press(z, .{});
         for (sizes) |sz| {
-            const w: ui.Window = .{ .x_off = 0, .y_off = 0, .parent_x_off = 0, .parent_y_off = 0, .width = sz[0], .height = sz[1], .screen = &big };
+            const w: ui.Window = .{
+                .x_off = 0,
+                .y_off = 0,
+                .parent_x_off = 0,
+                .parent_y_off = 0,
+                .width = sz[0],
+                .height = sz[1],
+                .screen = &big,
+            };
             try h.app.draw(w, @divFloor(h.now_ms, 1000));
         }
     }
     try h.press('s', .{ .ctrl = true });
     for (sizes) |sz| {
-        const w: ui.Window = .{ .x_off = 0, .y_off = 0, .parent_x_off = 0, .parent_y_off = 0, .width = sz[0], .height = sz[1], .screen = &big };
+        const w: ui.Window = .{
+            .x_off = 0,
+            .y_off = 0,
+            .parent_x_off = 0,
+            .parent_y_off = 0,
+            .width = sz[0],
+            .height = sz[1],
+            .screen = &big,
+        };
         try h.app.draw(w, @divFloor(h.now_ms, 1000));
     }
 }
@@ -2318,10 +2825,13 @@ test "timeline edit mode: a row dragged onto another milestone's group" {
     try h.init();
     defer h.deinit();
     const st = &h.app.store;
-    const v1 = try st.createMilestone(.{ .name = "v1", .due = "2023-11-30" });
-    const v2 = try st.createMilestone(.{ .name = "v2", .due = "2023-12-30" });
+    const v1 = try st.createMilestone(.{ .name = "v1", .due = .parse("2023-11-30") });
+    const v2 = try st.createMilestone(.{ .name = "v2", .due = .parse("2023-12-30") });
     const a = try st.create(.{ .title = "Work", .milestone_id = v1.slice() });
-    try st.edit(a.slice(), .{ .due_date = "2023-11-20" });
+    try st.edit(
+        a.slice(),
+        .{ .due_date = .{ .set = issuez.format.fields.Date.parse("2023-11-20").? } },
+    );
     _ = try st.create(.{ .title = "Other", .milestone_id = v2.slice() });
     try h.press('4', .{});
     try h.press('E', .{});
@@ -2333,7 +2843,10 @@ test "timeline edit mode: a row dragged onto another milestone's group" {
                 if (x.target != .tl_row) continue;
                 const r = tl.rows[x.target.tl_row];
                 if (r.kind != kind) continue;
-                const name = if (kind == .group) hh.snap().milestones[tl.groups[r.group].milestone.?].name else hh.snap().issues[r.issue].title;
+                const name = if (kind == .group)
+                    hh.snap().milestones[tl.groups[r.group].milestone.?].name
+                else
+                    hh.snap().issues[r.issue].title;
                 if (std.mem.eql(u8, name, what)) return x;
             }
             unreachable;
@@ -2341,7 +2854,13 @@ test "timeline edit mode: a row dragged onto another milestone's group" {
     }.row;
     const from = hit(&h, .issue, "Work");
     const to = hit(&h, .group, "v2");
-    const press: vaxis.Mouse = .{ .col = @intCast(from.x + 6), .row = @intCast(from.y), .button = .left, .mods = .{}, .type = .press };
+    const press: vaxis.Mouse = .{
+        .col = @intCast(from.x + 6),
+        .row = @intCast(from.y),
+        .button = .left,
+        .mods = .{},
+        .type = .press,
+    };
     // Over v2, then off the rows to the top bar: letting go there cancels.
     {
         try h.input(.{ .mouse = press });
@@ -2377,15 +2896,24 @@ test "timeline edit mode: its keys come first, writes at once are refused" {
     try h.init();
     defer h.deinit();
     const st = &h.app.store;
-    const v1 = try st.createMilestone(.{ .name = "v1", .due = "2023-11-30" });
+    const v1 = try st.createMilestone(.{ .name = "v1", .due = .parse("2023-11-30") });
     const design = try st.create(.{ .title = "Design", .milestone_id = v1.slice() });
-    try st.edit(design.slice(), .{ .start_date = "2023-11-13", .due_date = "2023-11-17" });
+    try st.edit(
+        design.slice(),
+        .{
+            .start_date = .{ .set = issuez.format.fields.Date.parse("2023-11-13").? },
+            .due_date = .{ .set = issuez.format.fields.Date.parse("2023-11-17").? },
+        },
+    );
     try h.press('4', .{});
     const t = &h.app.state.timeline;
     try h.press('j', .{});
     try h.press('E', .{});
     // The start, due and estimate prompts, not the sort menu.
-    for ([_]struct { u21, []const u8 }{ .{ 's', "Start of #" }, .{ 'd', "Due of #" }, .{ 'e', "Estimate of #" } }) |x| {
+    for ([_]struct {
+        u21,
+        []const u8,
+    }{ .{ 's', "Start of #" }, .{ 'd', "Due of #" }, .{ 'e', "Estimate of #" } }) |x| {
         try h.press(x[0], .{});
         try testing.expect(h.app.state.modal.? == .prompt);
         try testing.expect(h.shows(x[1]));
@@ -2435,12 +2963,24 @@ test "timeline: an issue shown in two groups, each row reachable" {
     try h.init();
     defer h.deinit();
     const st = &h.app.store;
-    const v1 = try st.createMilestone(.{ .name = "v1", .due = "2023-11-30" });
-    const v2 = try st.createMilestone(.{ .name = "v2", .due = "2023-12-30" });
+    const v1 = try st.createMilestone(.{ .name = "v1", .due = .parse("2023-11-30") });
+    const v2 = try st.createMilestone(.{ .name = "v2", .due = .parse("2023-12-30") });
     const p = try st.create(.{ .title = "Parent", .milestone_id = v1.slice() });
-    try st.edit(p.slice(), .{ .start_date = "2023-11-13", .due_date = "2023-11-17" });
+    try st.edit(
+        p.slice(),
+        .{
+            .start_date = .{ .set = issuez.format.fields.Date.parse("2023-11-13").? },
+            .due_date = .{ .set = issuez.format.fields.Date.parse("2023-11-17").? },
+        },
+    );
     const c = try st.create(.{ .title = "Child", .parent = p.slice(), .milestone_id = v2.slice() });
-    try st.edit(c.slice(), .{ .start_date = "2023-11-20", .due_date = "2023-11-24" });
+    try st.edit(
+        c.slice(),
+        .{
+            .start_date = .{ .set = issuez.format.fields.Date.parse("2023-11-20").? },
+            .due_date = .{ .set = issuez.format.fields.Date.parse("2023-11-24").? },
+        },
+    );
     try h.press('4', .{});
     const t = &h.app.state.timeline;
     // v1, Parent, v2, Parent (above its child), Child.
@@ -2465,7 +3005,13 @@ test "timeline edit mode: an issue deleted between the question and applying sto
     const st = &h.app.store;
     const a = try st.create(.{ .title = "A" });
     const b = try st.create(.{ .title = "B" });
-    for ([_]store_mod.Id{ a, b }) |id| try st.edit(id.slice(), .{ .start_date = "2023-11-20", .due_date = "2023-11-24" });
+    for ([_]store_mod.Id{ a, b }) |id| try st.edit(
+        id.slice(),
+        .{
+            .start_date = .{ .set = issuez.format.fields.Date.parse("2023-11-20").? },
+            .due_date = .{ .set = issuez.format.fields.Date.parse("2023-11-24").? },
+        },
+    );
     try h.press('4', .{});
     try h.press('E', .{});
     for ([_]store_mod.Id{ a, b }) |id| {
@@ -2478,14 +3024,22 @@ test "timeline edit mode: an issue deleted between the question and applying sto
     try testing.expect(h.shows("Apply 2 changes?"));
     // Deleted elsewhere while the question is open.
     const repo = issuez.Repo(GitSim).init(&h.sim);
-    const ref = try std.fmt.allocPrint(h.arena_state.allocator(), "{s}{s}", .{ issuez.engine.issue_ref_prefix, b.slice() });
-    _ = try repo.setDeleted(h.arena_state.allocator(), ref, true, .{});
+    const ref = try std.fmt.allocPrint(
+        h.arena_state.allocator(),
+        "{s}{s}",
+        .{ issuez.engine.issue_ref_prefix, b.slice() },
+    );
+    _ = try repo.setDeleted(h.arena_state.allocator(), ref, .{}, .{});
     try st.reload();
     try h.press(K.enter, .{});
     try testing.expect(h.shows("deleted elsewhere"));
     // Nothing written: A is as it was, and its change still staged.
     const D = issuez.format.fields.Date;
-    try testing.expect(issuez.schedule.Dates.of(h.snap().issues[h.byTitle("A").?]).start.?.eql(D.parse("2023-11-20").?));
+    try testing.expect(
+        issuez.schedule.Dates.of(
+            &h.snap().issues[h.byTitle("A").?],
+        ).start.?.eql(D.parse("2023-11-20").?),
+    );
     try testing.expectEqual(@as(usize, 1), h.app.state.timeline.changes());
 }
 
@@ -2495,9 +3049,15 @@ test "timeline edit mode: a bar changed elsewhere while held is staged stale" {
     defer h.deinit();
     const st = &h.app.store;
     const D = issuez.format.fields.Date;
-    const v1 = try st.createMilestone(.{ .name = "v1", .due = "2023-11-30" });
+    const v1 = try st.createMilestone(.{ .name = "v1", .due = .parse("2023-11-30") });
     const build = try st.create(.{ .title = "Build", .milestone_id = v1.slice() });
-    try st.edit(build.slice(), .{ .start_date = "2023-11-20", .due_date = "2023-11-24" });
+    try st.edit(
+        build.slice(),
+        .{
+            .start_date = .{ .set = issuez.format.fields.Date.parse("2023-11-20").? },
+            .due_date = .{ .set = issuez.format.fields.Date.parse("2023-11-24").? },
+        },
+    );
     try h.press('4', .{});
     const t = &h.app.state.timeline;
     try h.press('j', .{});
@@ -2506,10 +3066,19 @@ test "timeline edit mode: a bar changed elsewhere while held is staged stale" {
         if (x.target == .tl_row and x.target.tl_row == t.selected) break x.y;
     } else unreachable;
     const at = @as(i32, t.chart_x) + t.x(D.parse("2023-11-22").?.toDays());
-    var m: vaxis.Mouse = .{ .col = @intCast(at), .row = @intCast(y), .button = .left, .mods = .{}, .type = .press };
+    var m: vaxis.Mouse = .{
+        .col = @intCast(at),
+        .row = @intCast(y),
+        .button = .left,
+        .mods = .{},
+        .type = .press,
+    };
     try h.input(.{ .mouse = m });
     // Someone moves Build's due date while it is held.
-    try st.edit(build.slice(), .{ .due_date = "2023-11-28" });
+    try st.edit(
+        build.slice(),
+        .{ .due_date = .{ .set = issuez.format.fields.Date.parse("2023-11-28").? } },
+    );
     try h.draw();
     m.type = .drag;
     m.col = @intCast(@as(i32, t.chart_x) + t.x(D.parse("2023-11-24").?.toDays()));
@@ -2521,7 +3090,7 @@ test "timeline edit mode: a bar changed elsewhere while held is staged stale" {
     // Applying asks first rather than overwriting their date.
     try h.press('s', .{ .ctrl = true });
     try testing.expect(h.shows("r keeps your change"));
-    const written = issuez.schedule.Dates.of(h.snap().issues[h.byTitle("Build").?]);
+    const written = issuez.schedule.Dates.of(&h.snap().issues[h.byTitle("Build").?]);
     try testing.expect(written.due.?.eql(D.parse("2023-11-28").?));
 }
 
@@ -2531,9 +3100,15 @@ test "timeline edit mode: drags across a reload and after leaving" {
     defer h.deinit();
     const st = &h.app.store;
     const D = issuez.format.fields.Date;
-    const v1 = try st.createMilestone(.{ .name = "v1", .due = "2023-11-30" });
+    const v1 = try st.createMilestone(.{ .name = "v1", .due = .parse("2023-11-30") });
     const build = try st.create(.{ .title = "Build", .milestone_id = v1.slice() });
-    try st.edit(build.slice(), .{ .start_date = "2023-11-20", .due_date = "2023-11-24" });
+    try st.edit(
+        build.slice(),
+        .{
+            .start_date = .{ .set = issuez.format.fields.Date.parse("2023-11-20").? },
+            .due_date = .{ .set = issuez.format.fields.Date.parse("2023-11-24").? },
+        },
+    );
     try h.press('4', .{});
     const t = &h.app.state.timeline;
     try h.press('j', .{});
@@ -2545,7 +3120,13 @@ test "timeline edit mode: drags across a reload and after leaving" {
                 if (x.target == .tl_row and x.target.tl_row == tl.selected) break x.y;
             } else unreachable;
             const bx = @as(i32, tl.chart_x) + tl.x(D.parse("2023-11-22").?.toDays());
-            const m: vaxis.Mouse = .{ .col = @intCast(bx), .row = @intCast(y), .button = .left, .mods = .{}, .type = .press };
+            const m: vaxis.Mouse = .{
+                .col = @intCast(bx),
+                .row = @intCast(y),
+                .button = .left,
+                .mods = .{},
+                .type = .press,
+            };
             try hh.input(.{ .mouse = m });
             return m;
         }
@@ -2558,7 +3139,13 @@ test "timeline edit mode: drags across a reload and after leaving" {
     var others: [3]store_mod.Id = undefined;
     for (&others) |*o| {
         o.* = try st.create(.{ .title = "Other", .milestone_id = v1.slice() });
-        try st.edit(o.slice(), .{ .start_date = "2023-11-06", .due_date = "2023-11-08" });
+        try st.edit(
+            o.slice(),
+            .{
+                .start_date = .{ .set = issuez.format.fields.Date.parse("2023-11-06").? },
+                .due_date = .{ .set = issuez.format.fields.Date.parse("2023-11-08").? },
+            },
+        );
     }
     try h.draw();
     // Elsewhere in the snapshot now.
@@ -2569,10 +3156,17 @@ test "timeline edit mode: drags across a reload and after leaving" {
     m.type = .release;
     try h.input(.{ .mouse = m });
     try testing.expectEqual(@as(usize, 1), t.changes());
-    try testing.expect(timeline_view.datesOf(&h.app.state, h.byTitle("Build").?).start.?.eql(D.parse("2023-11-22").?));
+    try testing.expect(
+        timeline_view.datesOf(
+            &h.app.state,
+            h.byTitle("Build").?,
+        ).start.?.eql(D.parse("2023-11-22").?),
+    );
     for (others) |o| {
         const i = h.snap().find(o.slice()).?;
-        try testing.expect(timeline_view.datesOf(&h.app.state, i).start.?.eql(D.parse("2023-11-06").?));
+        try testing.expect(
+            timeline_view.datesOf(&h.app.state, i).start.?.eql(D.parse("2023-11-06").?),
+        );
     }
 
     // A drag that comes back stages nothing.
@@ -2610,7 +3204,13 @@ test "timeline edit mode: a bar the wrong way round still moves" {
     const st = &h.app.store;
     const D = issuez.format.fields.Date;
     const odd = try st.create(.{ .title = "Odd" });
-    try st.edit(odd.slice(), .{ .start_date = "2023-11-24", .due_date = "2023-11-20" });
+    try st.edit(
+        odd.slice(),
+        .{
+            .start_date = .{ .set = issuez.format.fields.Date.parse("2023-11-24").? },
+            .due_date = .{ .set = issuez.format.fields.Date.parse("2023-11-20").? },
+        },
+    );
     try h.press('4', .{});
     const t = &h.app.state.timeline;
     try h.press('j', .{});
@@ -2623,7 +3223,13 @@ test "timeline edit mode: a bar the wrong way round still moves" {
     const y = for (h.app.state.hits.items.items) |x| {
         if (x.target == .tl_row and x.target.tl_row == t.selected) break x.y;
     } else unreachable;
-    var m: vaxis.Mouse = .{ .col = @intCast(@as(i32, t.chart_x) + t.x(D.parse("2023-11-21").?.toDays())), .row = @intCast(y), .button = .left, .mods = .{}, .type = .press };
+    var m: vaxis.Mouse = .{
+        .col = @intCast(@as(i32, t.chart_x) + t.x(D.parse("2023-11-21").?.toDays())),
+        .row = @intCast(y),
+        .button = .left,
+        .mods = .{},
+        .type = .press,
+    };
     try h.input(.{ .mouse = m });
     m.type = .drag;
     m.col = @intCast(@as(i32, t.chart_x) + t.x(D.parse("2023-11-17").?.toDays()));
@@ -2646,14 +3252,31 @@ test "timeline edit mode: q on a terminal too small keeps a draft" {
     defer h.deinit();
     const st = &h.app.store;
     const design = try st.create(.{ .title = "Design" });
-    try st.edit(design.slice(), .{ .start_date = "2023-11-13", .due_date = "2023-11-17" });
+    try st.edit(
+        design.slice(),
+        .{
+            .start_date = .{ .set = issuez.format.fields.Date.parse("2023-11-13").? },
+            .due_date = .{ .set = issuez.format.fields.Date.parse("2023-11-17").? },
+        },
+    );
     try h.press('4', .{});
     try h.press('j', .{});
     try h.press('E', .{});
     try h.press(K.right, .{});
-    var tiny = try vaxis.Screen.init(testing.allocator, .{ .rows = 5, .cols = 20, .x_pixel = 0, .y_pixel = 0 });
+    var tiny = try vaxis.Screen.init(
+        testing.allocator,
+        .{ .rows = 5, .cols = 20, .x_pixel = 0, .y_pixel = 0 },
+    );
     defer tiny.deinit(testing.allocator);
-    const w: ui.Window = .{ .x_off = 0, .y_off = 0, .parent_x_off = 0, .parent_y_off = 0, .width = 20, .height = 5, .screen = &tiny };
+    const w: ui.Window = .{
+        .x_off = 0,
+        .y_off = 0,
+        .parent_x_off = 0,
+        .parent_y_off = 0,
+        .width = 20,
+        .height = 5,
+        .screen = &tiny,
+    };
     try h.app.draw(w, @divFloor(h.now_ms, 1000));
     try testing.expect(h.app.state.too_small);
     const q: State.Input = .{ .key = .{ .codepoint = 'q', .text = "q" } };
@@ -2670,10 +3293,16 @@ test "timeline edit mode: the rows without dates fold, warnings follow a staged 
     try h.init();
     defer h.deinit();
     const st = &h.app.store;
-    const v1 = try st.createMilestone(.{ .name = "v1", .due = "2023-11-30" });
-    const v2 = try st.createMilestone(.{ .name = "v2", .due = "2023-12-30" });
+    const v1 = try st.createMilestone(.{ .name = "v1", .due = .parse("2023-11-30") });
+    const v2 = try st.createMilestone(.{ .name = "v2", .due = .parse("2023-12-30") });
     const late = try st.create(.{ .title = "Late", .milestone_id = v1.slice() });
-    try st.edit(late.slice(), .{ .start_date = "2023-11-27", .due_date = "2023-12-05" });
+    try st.edit(
+        late.slice(),
+        .{
+            .start_date = .{ .set = issuez.format.fields.Date.parse("2023-11-27").? },
+            .due_date = .{ .set = issuez.format.fields.Date.parse("2023-12-05").? },
+        },
+    );
     _ = try st.create(.{ .title = "Someday", .milestone_id = v1.slice() });
     try h.press('4', .{});
     const t = &h.app.state.timeline;
@@ -2692,7 +3321,9 @@ test "timeline edit mode: the rows without dates fold, warnings follow a staged 
     const i = h.byTitle("Late").?;
     var buf: [4]issuez.schedule.Warning = undefined;
     try testing.expectEqual(@as(usize, 1), timeline_view.warningsOf(&h.app.state, i, &buf).len);
-    try testing.expect(timeline_edit.stage(&h.app.state, .{ .milestone = .{ .id = late, .link = .{ .id = v2 } } }));
+    try testing.expect(
+        timeline_edit.stage(&h.app.state, .{ .milestone = .{ .id = late, .link = .{ .id = v2 } } }),
+    );
     try h.draw();
     try testing.expectEqual(@as(usize, 0), timeline_view.warningsOf(&h.app.state, i, &buf).len);
 }
@@ -2742,9 +3373,14 @@ test "milestone view: add existing issues with a search, move with one" {
     try testing.expect(h.shows("Move #"));
     try h.typeText("v2");
     try h.press(K.enter, .{});
-    try testing.expectEqualStrings(v2.slice(), h.snap().proj.milestone[h.byTitle("Login page").?].?);
+    try testing.expectEqualStrings(
+        v2.slice(),
+        h.snap().proj.milestone[h.byTitle("Login page").?].?,
+    );
     // And to none.
-    h.app.state.milestone.panes[0].selected_id = .of(h.snap().issues[h.byTitle("Logout button").?].id);
+    h.app.state.milestone.panes[0].selected_id = .of(
+        h.snap().issues[h.byTitle("Logout button").?].id,
+    );
     try h.draw();
     try h.press('m', .{});
     try h.typeText("no mile");
@@ -2839,7 +3475,10 @@ test "a milestone confirm saves once told the milestone changed meanwhile" {
     try h.click(.{ .ms_scope = .all });
     const Status = issuez.format.fields.MilestoneStatus;
     for ([_]struct { u21, Status }{ .{ 'c', .completed }, .{ 'R', .retired } }) |c| {
-        if (h.snap().milestones[0].status != .open) try st.editMilestone(id.slice(), .{ .status = .open });
+        if (h.snap().milestones[0].status != .open) try st.editMilestone(
+            id.slice(),
+            .{ .status = .open },
+        );
         try h.draw();
         try h.press(c[0], .{});
         try testing.expect(h.app.state.modal.? == .confirm);
@@ -2908,7 +3547,13 @@ test "picker: marks aren't dropped without asking; moving the cursor keeps the r
     // A click beside it asks too, and so does ctrl+c.
     try h.press('+', .{});
     try h.press(K.tab, .{});
-    const beside: vaxis.Mouse = .{ .col = 0, .row = 1, .button = .left, .mods = .{}, .type = .press };
+    const beside: vaxis.Mouse = .{
+        .col = 0,
+        .row = 1,
+        .button = .left,
+        .mods = .{},
+        .type = .press,
+    };
     try h.input(.{ .mouse = beside });
     try testing.expect(h.app.state.modal != null);
     try h.input(.{ .mouse = beside });
@@ -2927,7 +3572,17 @@ test "picker: marks aren't dropped without asking; moving the cursor keeps the r
         .{ .label = "one", .value = "1" },
         .{ .label = "two", .value = "2", .disabled = true },
     });
-    h.app.state.openModal(.{ .picker = .{ .title = "Pick", .items = items, .multi = true, .purpose = .{ .add_to = .none }, .verb = "Add" } });
+    h.app.state.openModal(
+        .{
+            .picker = .{
+                .title = "Pick",
+                .items = items,
+                .multi = true,
+                .purpose = .{ .add_to = .none },
+                .verb = "Add",
+            },
+        },
+    );
     try h.draw();
     try h.press(K.tab, .{});
     try h.click(.{ .modal = .{ .choice = 1 } });
@@ -2996,7 +3651,7 @@ test "sync: y brings in what the remote has and pushes ours; the badge counts" {
     try testing.expect(h.app.state.snap.remote.isUnpushed(mine.slice()));
     // Someone pushed one meanwhile.
     const hub = try h.hub();
-    const theirs = try issuez.Repo(GitSim).init(hub).create(a, .{ .title = "Made elsewhere" });
+    const theirs = try issuez.Repo(GitSim).init(hub).create(a, .{ .title = "Made elsewhere" }, .{});
     try hub.commit();
 
     try h.press('/', .{});
@@ -3010,11 +3665,13 @@ test "sync: y brings in what the remote has and pushes ours; the badge counts" {
     try testing.expect(h.shows("synced with origin: 1 in, 1 out"));
     try testing.expect(h.shows("Made elsewhere"));
     try testing.expect(h.shows("⇅ origin ✓"));
-    try testing.expect(h.snap().find(theirs.id.slice()) != null);
+    try testing.expect(h.snap().find(theirs.id) != null);
     // On the remote now.
     try h.sim.commit();
     const after = try h.hub();
-    try testing.expect(try after.resolveRef(try std.fmt.allocPrint(a, "refs/issues/{s}", .{mine.slice()})) != null);
+    try testing.expect(
+        try after.resolveRef(try std.fmt.allocPrint(a, "refs/issues/{s}", .{mine.slice()})) != null,
+    );
 
     // Changed after: unpushed, and the detail view says so.
     try h.app.store.edit(mine.slice(), .{ .title = "Made here, renamed" });
@@ -3053,11 +3710,25 @@ test "sync panel: conflicts jump to the field, quarantines are kept or taken" {
             return std.fmt.allocPrint(al, "refs/issues/{s}", .{id}) catch unreachable;
         }
     }.f;
-    _ = try issuez.Repo(GitSim).init(hub).edit(a, ref(a, contested.slice()), .{ .priority = .{ .set = .high } });
+    _ = try issuez.Repo(
+        GitSim,
+    ).init(hub).edit(a, ref(a, contested.slice()), .{ .priority = .{ .set = .high } }, .{});
     const repo = issuez.Repo(GitSim).init(hub);
-    const foreign = try repo.writeCommit(a, &.{}, try repo.identity(a, null), "Doubled elsewhere\n\nState: open\nFormat-Version: 1\n");
+    const foreign = try repo.writeCommit(
+        a,
+        &.{},
+        try repo.identity(a, null),
+        "Doubled elsewhere\n\nState: open\nFormat-Version: 1\n",
+    );
     const old = (try hub.resolveRef(ref(a, doubled.slice()))).?;
-    try hub.updateRefs(&.{.{ .name = ref(a, doubled.slice()), .op = .{ .update = .{ .new = foreign, .old = old } } }});
+    try hub.updateRefs(
+        &.{
+            .{
+                .name = ref(a, doubled.slice()),
+                .op = .{ .update = .{ .new = foreign, .old = old } },
+            },
+        },
+    );
     try hub.commit();
     try h.reopen();
 
@@ -3117,7 +3788,7 @@ test "sync: issue.autoSync fetches and merges on its own, never pushes" {
     try h.app.store.reload();
     _ = try h.app.store.create(.{ .title = "Not for pushing" });
     const hub = try h.hub();
-    _ = try issuez.Repo(GitSim).init(hub).create(a, .{ .title = "Arrived on its own" });
+    _ = try issuez.Repo(GitSim).init(hub).create(a, .{ .title = "Arrived on its own" }, .{});
     try hub.commit();
     const t0: i64 = 1_700_000_000;
     h.app.tick(t0); // starts the clock
@@ -3173,7 +3844,11 @@ test "sync panel: a takes the remote's version of a quarantined issue" {
     const a = h.arena_state.allocator();
     const doubled = try h.app.store.create(.{ .title = "Doubled" });
     try h.press('y', .{});
-    try rewriteOnHub(&h, try std.fmt.allocPrint(a, "refs/issues/{s}", .{doubled.slice()}), "Doubled elsewhere\n\nState: open\nFormat-Version: 1\n");
+    try rewriteOnHub(
+        &h,
+        try std.fmt.allocPrint(a, "refs/issues/{s}", .{doubled.slice()}),
+        "Doubled elsewhere\n\nState: open\nFormat-Version: 1\n",
+    );
     try h.press('y', .{});
     try testing.expect(h.shows("1 quarantined"));
     try h.press('Y', .{});
@@ -3184,7 +3859,10 @@ test "sync panel: a takes the remote's version of a quarantined issue" {
     try h.press(K.enter, .{});
     try testing.expect(h.shows("took the remote version"));
     try testing.expect(h.shows("Quarantined (0)"));
-    try testing.expectEqualStrings("Doubled elsewhere", h.snap().issues[h.snap().find(doubled.slice()).?].title);
+    try testing.expectEqualStrings(
+        "Doubled elsewhere",
+        h.snap().issues[h.snap().find(doubled.slice()).?].title,
+    );
 }
 
 test "sync panel: a quarantined milestone opens in the milestone view" {
@@ -3194,7 +3872,11 @@ test "sync panel: a quarantined milestone opens in the milestone view" {
     const a = h.arena_state.allocator();
     const id = try h.app.store.createMilestone(.{ .name = "Beta" });
     try h.press('y', .{});
-    try rewriteOnHub(&h, try std.fmt.allocPrint(a, "refs/milestones/{s}", .{id.slice()}), "Beta elsewhere\n\nFormat-Version: 1\n");
+    try rewriteOnHub(
+        &h,
+        try std.fmt.allocPrint(a, "refs/milestones/{s}", .{id.slice()}),
+        "Beta elsewhere\n\nFormat-Version: 1\n",
+    );
     try h.press('y', .{});
     try testing.expect(h.shows("1 quarantined"));
     try h.press('Y', .{});
@@ -3236,7 +3918,9 @@ test "sync panel: ←→ pick another remote, not while a sync runs" {
     try h.press(K.left, .{});
     try testing.expectEqualStrings("other", h.snap().remote.name.?);
     try testing.expect(h.shows("the sync with other is running"));
-    try testing.expect(h.app.perform(.{ .resolve = .{ .id = .of("0" ** 40), .how = .keep_local } }));
+    try testing.expect(
+        h.app.perform(.{ .resolve = .{ .id = .of("0" ** 40), .how = .keep_local } }),
+    );
     try h.draw();
     try testing.expect(h.shows("the sync with other is running"));
     // The badge names the running one's remote.
@@ -3317,7 +4001,10 @@ test "sync: a remote that couldn't be read says why" {
     var h: Harness = undefined;
     try h.initRemote();
     defer h.deinit();
-    h.app.store.snap.remote = .{ .remotes = &.{"origin"}, .problem = "git config issue.remote: no such remote" };
+    h.app.store.snap.remote = .{
+        .remotes = &.{"origin"},
+        .problem = "git config issue.remote: no such remote",
+    };
     try h.draw();
     try testing.expect(h.shows("⇅ remote ⚠"));
     try h.press('y', .{});
@@ -3364,9 +4051,12 @@ test "timeline: keep or drop a stale milestone without losing other draft edits"
             try h.init();
             defer h.deinit();
             const st = &h.app.store;
-            const id = try st.createMilestone(.{ .name = "v1", .due = "2023-11-30" });
+            const id = try st.createMilestone(.{ .name = "v1", .due = .parse("2023-11-30") });
             const issue = try st.create(.{ .title = "Work" });
-            try st.edit(issue.slice(), .{ .start_date = "2023-11-14" });
+            try st.edit(
+                issue.slice(),
+                .{ .start_date = .{ .set = issuez.format.fields.Date.parse("2023-11-14").? } },
+            );
             try h.press('4', .{});
             try h.press('E', .{});
             try h.press('l', .{}); // The milestone's due date.
@@ -3397,7 +4087,7 @@ test "timeline: keep or drop a stale milestone without losing other draft edits"
             try testing.expect(m.due.?.eql(issuez.format.fields.Date.parse(due).?));
             const i = h.snap().find(issue.slice()).?;
             const start = issuez.format.fields.Date.parse("2023-11-15").?;
-            try testing.expect(h.snap().issues[i].ext.start_date.?.eql(start));
+            try testing.expect(h.snap().issues[i].start_date.?.eql(start));
         }
     }
 }
@@ -3413,7 +4103,7 @@ test "external pushes refresh the badge and unpushed filter without moving issue
     try testing.expect(h.snap().remote.isUnpushed(id.slice()));
     try testing.expectEqual(@as(usize, 1), h.app.state.list.rows.len);
     const generation = h.app.store.generation;
-    _ = try issuez.Sync(GitSim).init(&h.sim).push(h.arena_state.allocator(), "origin");
+    _ = try issuez.Sync(GitSim).init(&h.sim).push(h.arena_state.allocator(), "origin", .{});
     h.app.changedElsewhere(false);
     try h.draw();
     try testing.expect(h.app.store.generation != generation);

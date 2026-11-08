@@ -39,7 +39,9 @@ pub fn main(comptime B: type, ctx: *context.Context(B), argv: []const []const u8
             ctx.out.writeAll(help) catch {};
             return common.exit_ok;
         } else if (std.mem.eql(u8, arg, "-s") or std.mem.eql(u8, arg, "--state")) {
-            state_filter = common.stateFilter(args.value(ctx.err, "-s") orelse return common.exit_error);
+            state_filter = common.stateFilter(
+                args.value(ctx.err, "-s") orelse return common.exit_error,
+            );
         } else if (std.mem.eql(u8, arg, "-i") or std.mem.eql(u8, arg, "--ignore-case")) {
             ignore_case = true;
         } else if (std.mem.eql(u8, arg, "--json")) {
@@ -72,7 +74,8 @@ pub fn main(comptime B: type, ctx: *context.Context(B), argv: []const []const u8
         }) catch return common.oom(ctx.err);
         if (lines.len == 0) continue;
         if (as_json) {
-            writeMatch(&s, arena, issue, lines) catch |e| return json.failed(ctx.err, e);
+            writeMatch(&s, arena, issue, lines, repo.doneStates()) catch |e|
+                return json.failed(ctx.err, e);
             continue;
         }
         ctx.out.print(
@@ -90,7 +93,7 @@ pub fn main(comptime B: type, ctx: *context.Context(B), argv: []const []const u8
     }
     if (as_json) {
         s.endArray() catch |e| return json.failed(ctx.err, e);
-        json.end(&s);
+        json.end(&s) catch |e| return json.failed(ctx.err, e);
     }
     return common.exit_ok;
 }
@@ -100,10 +103,11 @@ fn writeMatch(
     arena: std.mem.Allocator,
     issue: issuez.engine.Issue,
     lines: []const []const u8,
+    done_states: []const []const u8,
 ) json.Error!void {
     try s.beginObject();
     try s.objectField("issue");
-    try json.issue(s, arena, issue, .{});
+    try json.issue(s, arena, issue, .{ .done_states = done_states });
     try json.field(s, "matches", lines);
     try s.endObject();
 }

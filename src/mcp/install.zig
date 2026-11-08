@@ -34,7 +34,19 @@ pub fn command(scope: Scope, exe: []const u8) Command {
 /// `claude mcp add` for `cmd`.
 pub fn claudeArgv(arena: Allocator, options: Options, cmd: Command) ![]const []const u8 {
     var argv: std.ArrayList([]const u8) = .empty;
-    try argv.appendSlice(arena, &.{ "claude", "mcp", "add", "--scope", @tagName(options.scope), options.name, "--", cmd.command });
+    try argv.appendSlice(
+        arena,
+        &.{
+            "claude",
+            "mcp",
+            "add",
+            "--scope",
+            @tagName(options.scope),
+            options.name,
+            "--",
+            cmd.command,
+        },
+    );
     try argv.appendSlice(arena, cmd.args);
     return argv.items;
 }
@@ -95,13 +107,19 @@ pub fn run(
     var cwd: std.process.Child.Cwd = .inherit;
     if (options.scope == .project) {
         const top = try topLevel(io, arena, environ_map) orelse {
-            try err.writeAll("fatal: --scope project needs a work tree: it writes .mcp.json at its top\n");
+            try err.writeAll(
+                "fatal: --scope project needs a work tree: it writes .mcp.json at its top\n",
+            );
             return 128;
         };
         cwd = .{ .path = top };
     }
     const argv = try claudeArgv(arena, options, cmd);
-    const result = std.process.run(arena, io, .{ .argv = argv, .cwd = cwd, .environ_map = environ_map }) catch |e| switch (e) {
+    const result = std.process.run(
+        arena,
+        io,
+        .{ .argv = argv, .cwd = cwd, .environ_map = environ_map },
+    ) catch |e| switch (e) {
         error.FileNotFound => {
             try err.writeAll(
                 \\error: 'claude' is not on PATH. Install Claude Code, or run
@@ -130,12 +148,39 @@ test "the command by scope" {
 
     const user = command(.user, "/opt/bin/git-issue");
     try testing.expectEqualDeep(
-        @as([]const []const u8, &.{ "claude", "mcp", "add", "--scope", "user", "git-issue", "--", "/opt/bin/git-issue", "mcp" }),
+        @as(
+            []const []const u8,
+            &.{
+                "claude",
+                "mcp",
+                "add",
+                "--scope",
+                "user",
+                "git-issue",
+                "--",
+                "/opt/bin/git-issue",
+                "mcp",
+            },
+        ),
         try claudeArgv(arena, .{}, user),
     );
     const project = command(.project, "/opt/bin/git-issue");
     try testing.expectEqualDeep(
-        @as([]const []const u8, &.{ "claude", "mcp", "add", "--scope", "project", "issues", "--", "git", "issue", "mcp" }),
+        @as(
+            []const []const u8,
+            &.{
+                "claude",
+                "mcp",
+                "add",
+                "--scope",
+                "project",
+                "issues",
+                "--",
+                "git",
+                "issue",
+                "mcp",
+            },
+        ),
         try claudeArgv(arena, .{ .scope = .project, .name = "issues" }, project),
     );
 

@@ -180,6 +180,39 @@ test "lazygit: the menu in docs/lazygit.md works" {
     try testing.expectEqual(@as(usize, 2), std.mem.count(u8, pushed.stdout, "\n"));
 }
 
+test "sync with a path or a URL instead of a remote's name" {
+    var sb = try Sandbox.init(.{});
+    defer sb.deinit();
+    const arena = sb.arena();
+    const hub = try std.fmt.allocPrint(arena, "{s}-hub.git", .{sb.repo});
+    const bob = try std.fmt.allocPrint(arena, "{s}-bob", .{sb.repo});
+    try sb.git(&.{ "init", "-q", "--bare", hub });
+    try sb.git(&.{ "init", "-q", bob });
+    try expectSuccess(try gitIssue(&sb, &.{ "create", "Synced by path" }));
+
+    // A path, no remote configured.
+    try expectSuccess(try gitIssue(&sb, &.{ "sync", hub }));
+    const pushed = try sb.run(&.{ "git", "--git-dir", hub, "for-each-ref", "refs/issues/" });
+    try testing.expectEqual(@as(usize, 1), std.mem.count(u8, pushed.stdout, "\n"));
+    const bookkeeping = try sb.run(
+        &.{ "git", "for-each-ref", "--format=%(refname)", "refs/issuez-sync/" },
+    );
+    try testing.expect(std.mem.startsWith(u8, bookkeeping.stdout, "refs/issuez-sync/url-"));
+
+    // A file:// URL, from another clone.
+    const url = try std.fmt.allocPrint(arena, "file://{s}", .{hub});
+    const git_issue = try sb.exe(paths.git_issue_exe);
+    try expectSuccess(try sb.runIn(bob, &.{ git_issue, "sync", url }));
+    const listed = try sb.runIn(bob, &.{ git_issue, "ls" });
+    try expectSuccess(listed);
+    try testing.expect(std.mem.find(u8, listed.stdout, "Synced by path") != null);
+
+    // Neither a name nor a URL.
+    const bad = try gitIssue(&sb, &.{ "sync", "no such remote" });
+    try testing.expectEqual(@as(u8, 1), bad.code);
+    try testing.expect(std.mem.startsWith(u8, bad.stderr, "error: invalid remote name"));
+}
+
 test "quarantine" {
     var sb = try Sandbox.init(.{});
     defer sb.deinit();
@@ -350,7 +383,9 @@ test "a push the remote refuses" {
     try sb.git(&.{ "remote", "add", "origin", hub });
     const hook = try std.fmt.allocPrint(arena, "{s}/hooks/pre-receive", .{hub});
     try expectSuccess(try sb.run(&.{
-        "sh", "-c", "printf '#!/bin/sh\\necho no issues here >&2\\nexit 1\\n' > \"$1\" && chmod +x \"$1\"",
+        "sh", "-c",
+        "printf '#!/bin/sh\\necho no issues here >&2\\nexit 1\\n' > \"$1\" && chmod " ++
+            "+x \"$1\"",
         "sh", hook,
     }));
     try expectSuccess(try gitIssue(&sb, &.{ "create", "Refused" }));
@@ -358,8 +393,61 @@ test "a push the remote refuses" {
     // No retry rounds: the reason comes straight from the remote.
     const pushed = try gitIssue(&sb, &.{ "push", "origin" });
     try testing.expectEqual(@as(u8, 1), pushed.code);
-    try testing.expect(std.mem.startsWith(u8, pushed.stderr, "error: failed to push issues to 'origin'\n"));
+    try testing.expect(
+        std.mem.startsWith(u8, pushed.stderr, "error: failed to push issues to 'origin'\n"),
+    );
     try testing.expect(std.mem.find(u8, pushed.stderr, "no issues here") != null);
+}
+
+test "push-check as a pre-receive hook, in git's quarantine" {
+    var sb = try Sandbox.init(.{});
+    defer sb.deinit();
+    const arena = sb.arena();
+    const hub = try std.fmt.allocPrint(arena, "{s}-hub.git", .{sb.repo});
+    try sb.git(&.{ "init", "-q", "--bare", hub });
+    try sb.git(&.{ "remote", "add", "origin", hub });
+    const hook = try std.fmt.allocPrint(arena, "{s}/hooks/pre-receive", .{hub});
+    const script = try std.fmt.allocPrint(
+        arena,
+        "#!/bin/sh\nexec '{s}' push-check --authors enforce --pusher-email {s}\n",
+        .{ try sb.exe(paths.git_issue_exe), Sandbox.identity_email },
+    );
+    try expectSuccess(try sb.run(&.{
+        "sh", "-c", "printf '%s' \"$2\" > \"$1\" && chmod +x \"$1\"", "sh", hook, script,
+    }));
+    try expectSuccess(try gitIssue(&sb, &.{ "create", "Checked" }));
+    const listed = try sb.run(&.{
+        "git",
+        "for-each-ref",
+        "--format=%(refname:lstrip=2)",
+        "refs/issues/",
+    });
+    const short = listed.stdout[0..8];
+    try expectSuccess(try gitIssue(&sb, &.{ "comment", short, "-m", "More" }));
+    const pushed = try gitIssue(&sb, &.{ "push", "origin" });
+    try expectSuccess(pushed);
+
+    // A rewind is refused, with the hook's reason.
+    const refs = try sb.run(&.{ "git", "for-each-ref", "--format=%(refname)", "refs/issues/" });
+    var names = std.mem.tokenizeScalar(u8, refs.stdout, '\n');
+    const ref = names.next().?;
+    const created = try sb.run(&.{ "git", "rev-list", "--max-parents=0", ref });
+    const root = std.mem.trim(u8, created.stdout, "\n");
+    const forced = try sb.run(&.{
+        "git", "push", "-f", "origin", try std.fmt.allocPrint(arena, "{s}:{s}", .{ root, ref }),
+    });
+    testing.expect(forced.code != 0) catch |e| {
+        std.debug.print("forced: {s}\n{s}\n", .{ forced.stdout, forced.stderr });
+        return e;
+    };
+    try testing.expect(std.mem.find(u8, forced.stderr, "not a fast-forward") != null);
+
+    // Someone else's commits are refused under enforce.
+    try sb.env.put("GIT_AUTHOR_EMAIL", "mallory@example.invalid");
+    try expectSuccess(try gitIssue(&sb, &.{ "create", "Spoofed" }));
+    const spoofed = try gitIssue(&sb, &.{ "push", "origin" });
+    try testing.expectEqual(@as(u8, 1), spoofed.code);
+    try testing.expect(std.mem.find(u8, spoofed.stderr, "isn't the pusher") != null);
 }
 
 test "an object git can't write" {
@@ -380,7 +468,9 @@ test "an object git can't write" {
     const created = try gitIssue(&sb, &.{ "create", "Not written" });
     try testing.expectEqual(@as(u8, 1), created.code);
     try testing.expect(std.mem.startsWith(u8, created.stderr, "error: a git command failed\n"));
-    try testing.expect(std.mem.find(u8, created.stderr, "git: error: insufficient permission") != null);
+    try testing.expect(
+        std.mem.find(u8, created.stderr, "git: error: insufficient permission") != null,
+    );
     const refs = try sb.run(&.{ "git", "for-each-ref", "refs/issues" });
     try expectSuccess(refs);
     try testing.expectEqualStrings("", refs.stdout);
@@ -512,6 +602,93 @@ fn have(sb: *Sandbox, tool: []const u8) bool {
     return out.code == 0;
 }
 
+/// zsh's completion system for real: an interactive `zsh -f` in a
+/// zpty, TAB pressed after each line. A `compadd` wrapper prints the
+/// candidates as `@@a,b@@`; `CASE` separates the lines.
+fn zshCompletes(sb: *Sandbox, dir: []const u8, id: []const u8) !void {
+    const arena = sb.arena();
+    const fdir = try std.fmt.allocPrint(arena, "{s}/zfunc", .{dir});
+    try std.Io.Dir.cwd().createDirPath(testing.io, fdir);
+    const script = try std.Io.Dir.cwd().readFileAlloc(
+        testing.io,
+        try std.fmt.allocPrint(arena, "{s}/completion.zsh", .{dir}),
+        arena,
+        .limited(1 << 20),
+    );
+    try std.Io.Dir.cwd().writeFile(testing.io, .{
+        .sub_path = try std.fmt.allocPrint(arena, "{s}/_git-issue", .{fdir}),
+        .data = script,
+    });
+    const driver = try std.fmt.allocPrint(arena,
+        \\zmodload zsh/zpty 2>/dev/null || {{ print SKIP; exit 0; }}
+        \\zpty z 'zsh -f -i'
+        \\step() {{ zpty -w z "$1"; zpty -w z 'print RE''ADY'; zpty -r z _ '*READY*'; }}
+        \\step 'PS1="" PROMPT_EOL_MARK=""; fpath=({s} $fpath)'
+        \\step 'autoload -Uz compinit; compinit -u -D'
+        \\# Candidates of the calls that add them, not of _describe's filtering.
+        \\step 'compadd() {{ if (( ! ${{@[(I)-[OAD]]}} )); then local -a m
+        \\    builtin compadd -O m "$@"; (( $#m )) && print -r -- "@""@${{(j:,:)m}}@""@"
+        \\    fi; builtin compadd "$@"; }}'
+        \\for line in 'git-issue cr' 'git-issue create -p ' 'git-issue show ' \
+        \\    'git-issue attach ' 'git-issue attach -m text ls ' 'git-issue show abcd '; do
+        \\    zpty -w -n z "$line"$'\t'
+        \\    out=""
+        \\    for i in {{1..50}}; do
+        \\        while zpty -r -t z chunk; do out+=$chunk; done
+        \\        [[ $out == *@@*@@* ]] && break
+        \\        sleep 0.1
+        \\    done
+        \\    zpty -w -n z $'\C-u'
+        \\    step ':'
+        \\    print -r -- CASE; print -r -- "${{out//$'\r'/}}"
+        \\done
+        \\zpty -d z
+        \\
+    , .{fdir});
+    const path = try std.fmt.allocPrint(arena, "{s}/drive.zsh", .{dir});
+    try std.Io.Dir.cwd().writeFile(testing.io, .{ .sub_path = path, .data = driver });
+    const out = try sb.run(&.{ "zsh", "-f", path });
+    try expectSuccess(out);
+    if (std.mem.startsWith(u8, out.stdout, "SKIP")) return;
+    var cases = std.mem.splitSequence(u8, out.stdout, "CASE\n");
+    _ = cases.next();
+    const want = [_]?[]const u8{
+        "create",
+        "low,medium,high,critical",
+        id,
+        "add,ls,cat,rename,rm,fetch",
+        // After the subcommand: its arguments; -m's value doesn't count.
+        id,
+        // show takes one issue: options only.
+        null,
+    };
+    for (want) |w| {
+        const case = cases.next() orelse return error.MissingCase;
+        const first = firstCandidates(case) orelse "";
+        if (w) |expected| {
+            testing.expectEqualStrings(expected, first) catch |err| {
+                std.debug.print("zsh completion case:\n{s}\n", .{case});
+                return err;
+            };
+        } else {
+            const offered = try std.fmt.allocPrint(arena, "@@{s}", .{id});
+            try testing.expect(std.mem.find(u8, case, offered) == null);
+        }
+    }
+}
+
+/// The first non-empty `@@...@@` in zsh's output.
+fn firstCandidates(text: []const u8) ?[]const u8 {
+    var rest = text;
+    while (std.mem.find(u8, rest, "@@")) |start| {
+        const after = rest[start + 2 ..];
+        const end = std.mem.find(u8, after, "@@") orelse return null;
+        if (end > 0) return after[0..end];
+        rest = after[end + 2 ..];
+    }
+    return null;
+}
+
 test "completions and man pages" {
     var sb = try Sandbox.init(.{});
     defer sb.deinit();
@@ -589,6 +766,7 @@ test "completions and man pages" {
         try testing.expect(std.mem.startsWith(u8, parts.next().?, id));
         try testing.expectEqualStrings("", parts.next().?);
     }
+    if (have(&sb, "zsh")) try zshCompletes(&sb, dir, id);
 
     const man = try std.fmt.allocPrint(arena, "{s}/man1", .{dir});
     try expectSuccess(try gitIssue(&sb, &.{ "__manpages", man }));
@@ -1075,26 +1253,49 @@ test "dates relative to today, in the local time zone" {
             const day = (std.time.epoch.EpochSeconds{ .secs = local }).getEpochDay();
             const yd = day.calculateYearDay();
             const md = yd.calculateMonthDay();
-            return std.fmt.allocPrint(a, "{d:0>4}-{d:0>2}-{d:0>2}", .{ yd.year, md.month.numeric(), md.day_index + 1 });
+            return std.fmt.allocPrint(
+                a,
+                "{d:0>4}-{d:0>2}-{d:0>2}",
+                .{ yd.year, md.month.numeric(), md.day_index + 1 },
+            );
         }
     }.f;
 
     const before = try in(arena, 3);
-    try expectSuccess(try gitIssue(&sb, &.{ "create", "Soon", "--due", "+3d", "--start", "today" }));
+    try expectSuccess(
+        try gitIssue(&sb, &.{ "create", "Soon", "--due", "+3d", "--start", "today" }),
+    );
     const ls = try gitIssue(&sb, &.{ "ls", "--json" });
     try expectSuccess(ls);
-    const issue = (try std.json.parseFromSliceLeaky(std.json.Value, arena, ls.stdout, .{})).array.items[0].object;
+    const issue = (try std.json.parseFromSliceLeaky(
+        std.json.Value,
+        arena,
+        ls.stdout,
+        .{},
+    )).array.items[0].object;
     const due = issue.get("due").?.string;
     // Unless midnight passed in between.
     if (!std.mem.eql(u8, due, before)) try testing.expectEqualStrings(try in(arena, 3), due);
     try testing.expectEqual(@as(usize, 10), issue.get("start").?.string.len);
 
-    try expectFailure(try gitIssue(&sb, &.{ "create", "Later", "--due", "soon" }), 1, "error: --due must be a date as YYYY-MM-DD, or like today, +3d, fri, eom, not 'soon'\n");
+    try expectFailure(
+        try gitIssue(&sb, &.{ "create", "Later", "--due", "soon" }),
+        1,
+        "error: --due must be a date as YYYY-MM-DD, or like today, +3d, fri, eom, not 'soon'\n",
+    );
     const tomorrow = try in(arena, 1);
     try expectSuccess(try gitIssue(&sb, &.{ "milestone", "create", "v1", "--due", "tomorrow" }));
     const shown = try gitIssue(&sb, &.{ "milestone", "ls", "--json" });
     try expectSuccess(shown);
-    const ms = (try std.json.parseFromSliceLeaky(std.json.Value, arena, shown.stdout, .{})).array.items[0].object;
+    const ms = (try std.json.parseFromSliceLeaky(
+        std.json.Value,
+        arena,
+        shown.stdout,
+        .{},
+    )).array.items[0].object;
     const ms_due = ms.get("due").?.string;
-    if (!std.mem.eql(u8, ms_due, tomorrow)) try testing.expectEqualStrings(try in(arena, 1), ms_due);
+    if (!std.mem.eql(u8, ms_due, tomorrow)) try testing.expectEqualStrings(
+        try in(arena, 1),
+        ms_due,
+    );
 }

@@ -26,6 +26,9 @@ const cmd_close = @import("cmd/close.zig");
 const cmd_milestone = @import("cmd/milestone.zig");
 const cmd_quarantine = @import("cmd/quarantine.zig");
 const cmd_attach = @import("cmd/attach.zig");
+const cmd_react = @import("cmd/react.zig");
+const cmd_purge = @import("cmd/purge.zig");
+const cmd_push_check = @import("cmd/push_check.zig");
 const completion = @import("completion.zig");
 const manpage = @import("manpage.zig");
 const tui = if (build_options.tui) @import("tui") else struct {};
@@ -66,6 +69,9 @@ pub const Command = enum {
     reopen,
     milestone,
     attach,
+    react,
+    purge,
+    @"push-check",
     completion,
     /// Writes the man pages at build time. Not in the usage.
     __manpages,
@@ -79,7 +85,14 @@ fn bare(comptime B: type, ctx: *context.Context(B)) u8 {
         const repo = if (ctx.backend) |_| true else |_| false;
         const terminal = (std.Io.File.stdin().isTty(ctx.io) catch false) and
             (std.Io.File.stdout().isTty(ctx.io) catch false);
-        if (repo and terminal) return tui.main(ctx.io, ctx.gpa, ctx.environ_map, ctx.out, ctx.err, &.{});
+        if (repo and terminal) return tui.main(
+            ctx.io,
+            ctx.gpa,
+            ctx.environ_map,
+            ctx.out,
+            ctx.err,
+            &.{},
+        );
     }
     return cmd_help.usage(B, ctx);
 }
@@ -104,6 +117,27 @@ pub fn programBaseName(argv0: []const u8) []const u8 {
     const base = if (sep) |i| argv0[i + 1 ..] else argv0;
     if (std.ascii.endsWithIgnoreCase(base, ".exe")) return base[0 .. base.len - 4];
     return base;
+}
+
+/// False for what only prints fixed text, so it runs no git.
+pub fn usesRepository(argv0: []const u8, args: []const []const u8) bool {
+    const sub = resolve(argv0, args).sub orelse return true;
+    const cmd = std.meta.stringToEnum(Command, sub) orelse return true;
+    return switch (cmd) {
+        .version, .@"--version", .@"-v", .help, .@"--help", .@"-h" => false,
+        else => true,
+    };
+}
+
+test usesRepository {
+    const t = std.testing;
+    try t.expect(!usesRepository("git-issue", &.{"--version"}));
+    try t.expect(!usesRepository("git-issue", &.{ "help", "ls" }));
+    try t.expect(!usesRepository("git-issue-version", &.{}));
+    try t.expect(usesRepository("git-issue", &.{}));
+    try t.expect(usesRepository("git-issue", &.{"ls"}));
+    try t.expect(usesRepository("git-issue-ls", &.{"--help"}));
+    try t.expect(usesRepository("git-issue", &.{"nonsense"}));
 }
 
 pub fn run(
@@ -146,12 +180,15 @@ pub fn run(
         .milestone => cmd_milestone.main(B, ctx, inv.args),
         .attach => cmd_attach.main(B, ctx, inv.args),
         .quarantine => cmd_quarantine.main(B, ctx, inv.args),
+        .react => cmd_react.main(B, ctx, inv.args),
+        .purge => cmd_purge.main(B, ctx, inv.args),
+        .@"push-check" => cmd_push_check.main(B, ctx, inv.args),
         .completion => completion.main(B, ctx, inv.args),
         .__manpages => manpage.main(B, ctx, inv.args),
         .sync => if (hasHelp(inv.args))
             cmd_merge.main(B, ctx, inv.args, .sync)
         else if (firstPositional(inv.args)) |target|
-            (if (std.mem.findScalar(u8, target, ':') != null)
+            (if (isProvider(target))
                 unsupportedBridge(B, ctx, sub)
             else
                 cmd_merge.main(B, ctx, inv.args, .sync))
@@ -172,6 +209,17 @@ fn unknown(comptime B: type, ctx: *context.Context(B), sub: []const u8) u8 {
 
 fn hasHelp(args: []const []const u8) bool {
     for (args) |a| if (common.isHelp(a)) return true;
+    return false;
+}
+
+/// Upstream's bridges: `github:<owner>/<repo>`, `gitlab:`, `gitea:`,
+/// `forgejo:`. Any other target with a `:` is a URL.
+fn isProvider(target: []const u8) bool {
+    const colon = std.mem.findScalar(u8, target, ':') orelse return false;
+    if (std.mem.startsWith(u8, target[colon..], "://")) return false;
+    for ([_][]const u8{ "github", "gitlab", "gitea", "forgejo" }) |p| {
+        if (std.mem.eql(u8, target[0..colon], p)) return true;
+    }
     return false;
 }
 

@@ -2,7 +2,7 @@
 # and macOS (x86_64 and aarch64), and only then has `zig build release`
 # cross-compile git-issue in both flavors (default, with the terminal UI and
 # the MCP server, and -Dminimal, the CLI only) for Linux, macOS and Windows and publishes a
-# GitHub release with the archives, SHA256SUMS and the CHANGELOG.md entry
+# GitHub release with the archives (libissuez, the C library, too), SHA256SUMS and the CHANGELOG.md entry
 # as notes. See CONTRIBUTING.md, "Releasing".
 
 name: release
@@ -89,6 +89,13 @@ jobs:
       - if: matrix.platform.apt
         run: sudo apt-get update -qq && sudo apt-get install -y -qq gawk uuid-runtime git-lfs zsh fish mandoc
 
+      # The Go binding's tests (zig build test-bindings, part of ci).
+      - if: matrix.platform.step == 'ci'
+        uses: actions/setup-go@v6
+        with:
+          go-version: '1.26'
+          cache: false
+
       - run: zig build ${{ matrix.platform.step }} -Dseed=${{ github.run_id }} --summary line
       - run: zig build test -Dminimal --summary line
 
@@ -136,6 +143,37 @@ jobs:
             fi
           done
 
+      # The C library as an embedder links it, and the version it reports.
+      - name: Smoke test libissuez
+        run: |
+          cd zig-out/release
+          name="libissuez-$VERSION-x86_64-linux-gnu"
+          tar -xzf "$name.tar.gz"
+          cat > version.c <<'EOF'
+          #include <issuez.h>
+          #include <stdio.h>
+          int main(void) {
+              puts(issuez_version());
+              return issuez_init(ISSUEZ_ABI_VERSION, NULL);
+          }
+          EOF
+          cc -I"$name/include" version.c "$name/lib/libissuez.a" -lpthread -o version
+          test "$(./version)" = "$VERSION"
+
+      # The Go binding as a user builds it: no archives in the module.
+      - uses: actions/setup-go@v6
+        with:
+          go-version: '1.26'
+          cache: false
+      - name: Smoke test the Go binding
+        working-directory: bindings/go
+        env:
+          CGO_ENABLED: "1"
+          GOWORK: "off"
+        run: |
+          export CGO_LDFLAGS="-L$GITHUB_WORKSPACE/zig-out/release/libissuez-$VERSION-x86_64-linux-gnu/lib"
+          go test -count=1 -run '^TestVersion$' ./issuez
+
       # install.sh as users run it, on these archives instead of downloads.
       - name: Install with install.sh
         run: |
@@ -165,6 +203,59 @@ jobs:
           gh release create "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" --verify-tag
           --title "v$VERSION" --notes-file notes.md
           zig-out/release/*.tar.gz zig-out/release/*.zip zig-out/release/SHA256SUMS
+
+      # The version of the Go module. Only now: Go's checksum database
+      # remembers a version for good, so this tag can't move.
+      - name: Tag the Go module
+        run: |
+          git tag "bindings/go/v$VERSION"
+          git push origin "refs/tags/bindings/go/v$VERSION"
+
+  # Writes the Go module with the archives (EuroZig/git-native-issuez-go) for
+  # the new release, from what was published. Pushes straight to its main with
+  # a deploy key, after its tests pass. Go's checksum database remembers a
+  # version for good, so the tag can't move.
+  go-module:
+    needs: [check, release]
+    if: ${{ !contains(needs.check.outputs.version, '-') }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    env:
+      VERSION: ${{ needs.check.outputs.version }}
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          path: source
+      - uses: actions/checkout@v7
+        with:
+          repository: EuroZig/git-native-issuez-go
+          ssh-key: ${{ secrets.GO_MODULE_DEPLOY_KEY }}
+          path: module
+      - uses: actions/setup-go@v6
+        with:
+          go-version: '1.26'
+          cache: false
+
+      - name: Download the archives
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release download "v$VERSION" --repo "$GITHUB_REPOSITORY" \
+            -p 'libissuez-*.tar.gz' -p SHA256SUMS -D "$RUNNER_TEMP/archives"
+          cd "$RUNNER_TEMP/archives"
+          sha256sum -c --ignore-missing SHA256SUMS
+
+      - name: Write and test the module
+        run: source/tools/go-module.sh "$VERSION" "$RUNNER_TEMP/archives" module
+
+      - name: Commit and push
+        working-directory: module
+        run: |
+          git add -A
+          git -c user.name=github-actions -c user.email=github-actions@users.noreply.github.com \
+            commit -m "git-native-issuez $VERSION"
+          git tag "v$VERSION"
+          git push --atomic origin HEAD:main "refs/tags/v$VERSION"
 
   # Points the Homebrew tap at the new release. Pushes straight to the tap's
   # main with a deploy key, after the formula installs and passes its test on

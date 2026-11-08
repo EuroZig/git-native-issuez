@@ -9,6 +9,7 @@
 const GitProcess = @This();
 
 const std = @import("std");
+const stableSort = @import("../sort.zig").stable;
 const builtin = @import("builtin");
 const assert = std.debug.assert;
 const Allocator = std.mem.Allocator;
@@ -26,6 +27,8 @@ io: Io,
 gpa: Allocator,
 env: std.process.Environ.Map,
 repo_path: []u8,
+/// `OpenOptions.git`, owned.
+git_exe: []u8,
 format: ObjectFormat,
 timeouts: Timeouts,
 cat_file: ?*CatFile,
@@ -44,6 +47,12 @@ git_lfs: ?bool = null,
 /// stderr of the last failed command, for error messages.
 last_stderr: [max_stderr_kept]u8,
 last_stderr_len: u16,
+/// Set by an embedder around a call: once it reads true, a git request
+/// that is running is killed and fails with Canceled. Waits look at it
+/// every `cancel_poll`.
+cancel: ?*const std.atomic.Value(bool) = null,
+
+const cancel_poll: Io.Duration = .fromMilliseconds(50);
 
 pub const Error = error{
     OutOfMemory,
@@ -78,6 +87,11 @@ pub const OpenOptions = struct {
     path: []const u8,
     environ_map: *const std.process.Environ.Map,
     timeouts: Timeouts = .{},
+    /// The git to run: a name looked up on the environment's PATH, or a
+    /// path. Embedders pass the one they already use.
+    git: []const u8 = "git",
+    /// Checked while opening; not retained by the returned backend.
+    cancel: ?*const std.atomic.Value(bool) = null,
     /// git runs in a session of its own, without a controlling terminal,
     /// so nothing it starts (ssh, a credential helper) can prompt on the
     /// terminal or read from it: for a program that owns the terminal,
@@ -101,6 +115,7 @@ pub const Timeouts = struct {
 };
 
 pub fn open(io: Io, gpa: Allocator, options: OpenOptions) Error!GitProcess {
+    if (options.cancel) |flag| if (flag.load(.acquire)) return error.Canceled;
     var env = try options.environ_map.clone(gpa);
     errdefer env.deinit();
     try env.put("LC_ALL", "C");
@@ -117,14 +132,18 @@ pub fn open(io: Io, gpa: Allocator, options: OpenOptions) Error!GitProcess {
 
     const repo_path = try gpa.dupe(u8, options.path);
     errdefer gpa.free(repo_path);
+    var git_exe = try gpa.dupe(u8, options.git);
+    errdefer gpa.free(git_exe);
 
     var gp: GitProcess = .{
         .io = io,
         .gpa = gpa,
         .env = env,
         .repo_path = repo_path,
+        .git_exe = git_exe,
         .format = .sha1,
         .timeouts = options.timeouts,
+        .cancel = options.cancel,
         .no_terminal = options.no_terminal,
         .cat_file = null,
         .last_stderr = undefined,
@@ -134,6 +153,14 @@ pub fn open(io: Io, gpa: Allocator, options: OpenOptions) Error!GitProcess {
     var arena_state: std.heap.ArenaAllocator = .init(gpa);
     defer arena_state.deinit();
     const arena = arena_state.allocator();
+
+    if (builtin.os.tag == .macos and std.mem.eql(u8, options.git, "git") and gitIsAppleStub(gp)) {
+        if (try realGit(&gp, arena)) |real| {
+            gpa.free(git_exe);
+            git_exe = real;
+            gp.git_exe = real;
+        }
+    }
 
     const both = try gp.runPair(
         arena,
@@ -156,7 +183,131 @@ pub fn open(io: Io, gpa: Allocator, options: OpenOptions) Error!GitProcess {
     // Absolute for real: git reads the temp files' paths from its own cwd.
     const cwd = std.process.currentPathAlloc(io, arena) catch return error.GitFailed;
     gp.common_dir = try std.fs.path.resolve(gpa, &.{ cwd, repo_path, common });
+    gp.cancel = null;
     return gp;
+}
+
+/// Whether `git` on the PATH is /usr/bin/git, which on macOS only looks up the
+/// real one: 5 ms per run, and a program runs many. Not any other git the
+/// user chose, and not under `git issue`, where git put its own first.
+fn gitIsAppleStub(gp: GitProcess) bool {
+    const path = gp.env.get("PATH") orelse "/usr/bin:/bin";
+    var dirs = std.mem.tokenizeScalar(u8, path, ':');
+    var buffer: [std.fs.max_path_bytes]u8 = undefined;
+    while (dirs.next()) |dir| {
+        const git = std.fmt.bufPrint(&buffer, "{s}/git", .{dir}) catch continue;
+        Io.Dir.cwd().access(gp.io, git, .{ .execute = true }) catch continue;
+        return std.mem.eql(u8, dir, "/usr/bin");
+    }
+    return false;
+}
+
+/// The git behind `git`, or null if it can't say: then `git` it stays.
+fn realGit(gp: *GitProcess, arena: Allocator) Allocator.Error!?[]u8 {
+    const result = gp.run(arena, &.{ "git", "--exec-path" }, null) catch |e| switch (e) {
+        error.OutOfMemory => |oom| return oom,
+        else => return null,
+    };
+    if (!result.ok()) return null;
+    const dir = std.mem.trimEnd(u8, result.stdout, "\n");
+    const git = try std.fs.path.join(gp.gpa, &.{ dir, "git" });
+    Io.Dir.cwd().access(gp.io, git, .{ .execute = true }) catch {
+        gp.gpa.free(git);
+        return null;
+    };
+    return git;
+}
+
+/// A private repository sharing the target's objects. Deinit aborts an
+/// unpublished import; unreachable objects are left for normal Git GC.
+/// Do not write to the staging repository concurrently with commit/deinit.
+pub const Import = struct {
+    git: GitProcess,
+    path: []u8,
+    target_dir: []u8,
+    committed: bool = false,
+
+    pub const CommitError = @import("../engine/repo.zig").Repo(GitProcess).Error ||
+        error{RefConflict};
+
+    pub fn commit(stage: *Import, arena: Allocator, target: *GitProcess) CommitError!usize {
+        if (stage.committed or !std.mem.eql(u8, stage.target_dir, target.common_dir.?))
+            return error.InvalidValue;
+        const Repo = @import("../engine/repo.zig").Repo(GitProcess);
+        const n = try Repo.init(target).adoptFrom(arena, Repo.init(&stage.git));
+        stage.committed = true;
+        return n;
+    }
+
+    pub fn deinit(stage: *Import) void {
+        const io = stage.git.io;
+        const gpa = stage.git.gpa;
+        stage.git.close();
+        Io.Dir.cwd().deleteTree(io, stage.path) catch {};
+        gpa.free(stage.path);
+        gpa.free(stage.target_dir);
+        stage.* = undefined;
+    }
+};
+
+/// Stages an import with the same git, environment and object format.
+/// Publish with Import.commit; deinit always removes its private refs.
+pub fn beginImport(gp: *GitProcess, arena: Allocator) Error!Import {
+    var random: [16]u8 = undefined;
+    gp.randomBytes(&random);
+    const path = try std.fmt.allocPrint(gp.gpa, "{s}/issuez/import-{s}", .{
+        gp.common_dir.?,
+        std.fmt.bytesToHex(random, .lower),
+    });
+    errdefer gp.gpa.free(path);
+    const parent = std.fs.path.dirname(path).?;
+    Io.Dir.cwd().createDirPath(gp.io, parent) catch return error.GitFailed;
+    Io.Dir.cwd().createDir(gp.io, path, .default_dir) catch return error.GitFailed;
+    errdefer Io.Dir.cwd().deleteTree(gp.io, path) catch {};
+    var env = try gp.env.clone(gp.gpa);
+    defer env.deinit();
+    for ([_][]const u8{ "GIT_DIR", "GIT_WORK_TREE", "GIT_COMMON_DIR", "GIT_INDEX_FILE" }) |key|
+        _ = env.swapRemove(key);
+    // Local user config is not present in a fresh bare repo.
+    inline for (.{
+        .{ "user.name", "GIT_AUTHOR_NAME", "GIT_COMMITTER_NAME" },
+        .{ "user.email", "GIT_AUTHOR_EMAIL", "GIT_COMMITTER_EMAIL" },
+    }) |keys| {
+        if (try gp.configGet(arena, keys[0])) |value| {
+            for ([_][]const u8{ keys[1], keys[2] }) |key| if (env.get(key) == null) {
+                try env.put(key, value);
+            };
+        }
+    }
+    const result = try gp.run(arena, &.{ "git", "rev-parse", "--git-path", "objects" }, null);
+    if (!result.ok()) return error.GitFailed;
+    // --git-path is relative to git's cwd, even with an external object store.
+    const cwd = std.process.currentPathAlloc(gp.io, arena) catch return error.GitFailed;
+    const objects = try std.fs.path.resolve(arena, &.{
+        cwd,
+        gp.repo_path,
+        std.mem.trimEnd(u8, result.stdout, "\n"),
+    });
+    try env.put("GIT_OBJECT_DIRECTORY", objects);
+    var init_git = gp.*;
+    init_git.env = env;
+    init_git.repo_path = path;
+    const format_arg = try std.fmt.allocPrint(arena, "--object-format={s}", .{@tagName(gp.format)});
+    const initialized = try init_git.run(
+        arena,
+        &.{ "git", "init", "--bare", format_arg, "." },
+        null,
+    );
+    if (!initialized.ok()) return error.GitFailed;
+    var git = try GitProcess.open(gp.io, gp.gpa, .{
+        .path = path,
+        .environ_map = &env,
+        .git = gp.git_exe,
+        .timeouts = gp.timeouts,
+        .cancel = gp.cancel,
+    });
+    errdefer git.close();
+    return .{ .git = git, .path = path, .target_dir = try gp.gpa.dupe(u8, gp.common_dir.?) };
 }
 
 pub fn close(gp: *GitProcess) void {
@@ -167,6 +318,7 @@ pub fn close(gp: *GitProcess) void {
     if (gp.git_lfs_dir) |d| gp.gpa.free(d);
     gp.env.deinit();
     gp.gpa.free(gp.repo_path);
+    gp.gpa.free(gp.git_exe);
     gp.* = undefined;
 }
 
@@ -194,6 +346,7 @@ pub fn objectFormat(gp: *const GitProcess) ObjectFormat {
 pub fn readObject(gp: *GitProcess, arena: Allocator, oid: Oid) Error!?contract.Object {
     assert(oid.object_format == gp.format);
     const cf = try gp.catFile();
+    cf.reader.cancel = gp.cancel;
     return cf.read(arena, oid, gp.deadline(gp.timeouts.request)) catch |err| {
         // A broken session can't be reused. The next read starts a new one.
         cf.deinit(gp.io, gp.gpa);
@@ -255,6 +408,7 @@ fn writeObjectSession(gp: *GitProcess, kind: ObjectKind, data: []const u8) Error
         };
     }
     defer cwd.deleteFile(gp.io, path) catch {};
+    ho.reader.cancel = gp.cancel;
     return ho.hash(path, gp.deadline(gp.timeouts.request)) catch |err| {
         ho.deinit(gp.io, gp.gpa);
         slot.* = null;
@@ -296,6 +450,7 @@ fn sweepTmp(gp: *GitProcess, dir_path: []const u8) void {
 pub fn resolveRef(gp: *GitProcess, name: []const u8) Error!?Oid {
     assert(contract.isValidRefName(name));
     const cf = try gp.catFile();
+    cf.reader.cancel = gp.cancel;
     const found = cf.resolve(name, gp.deadline(gp.timeouts.request)) catch |err| {
         cf.deinit(gp.io, gp.gpa);
         gp.cat_file = null;
@@ -344,6 +499,11 @@ pub fn updateRefs(
     updates: []const contract.RefUpdate,
 ) (Error || error{RefConflict})!void {
     assert(updates.len > 0);
+    // Never cancelled halfway: a transaction killed mid-commit leaves the
+    // caller unable to tell whether it landed. It's local and quick.
+    const cancel = gp.cancel;
+    gp.cancel = null;
+    defer gp.cancel = cancel;
     var arena_state: std.heap.ArenaAllocator = .init(gp.gpa);
     defer arena_state.deinit();
     const arena = arena_state.allocator();
@@ -432,7 +592,7 @@ pub fn mergeBases(gp: *GitProcess, arena: Allocator, a: Oid, b: Oid) Error![]Oid
     while (lines.next()) |line| {
         try bases.append(arena, Oid.parseHex(gp.format, line) catch return error.GitFailed);
     }
-    std.mem.sort(Oid, bases.items, {}, oidLessThan);
+    stableSort(Oid, bases.items, {}, oidLessThan);
     return bases.toOwnedSlice(arena);
 }
 
@@ -482,11 +642,11 @@ pub fn configUnsetValue(gp: *GitProcess, key: []const u8, value: []const u8) Err
     }
 }
 
-pub const ConfigEntry = struct { key: []const u8, value: []const u8 };
+pub const ConfigEntry = contract.ConfigEntry;
 
 /// Every config entry in git's order, keys as `git config --list` prints
-/// them (section and name lowercase). Not part of the contract: the CLI
-/// reads its settings with it in one git call.
+/// them (section and name lowercase): the contract's optional
+/// `configList`, which reads the settings in one git call.
 pub fn configList(gp: *GitProcess, arena: Allocator) Error![]const ConfigEntry {
     const out = try gp.runOk(arena, &.{ "git", "config", "--list", "-z" }, null);
     var entries: std.ArrayList(ConfigEntry) = .empty;
@@ -516,12 +676,12 @@ pub fn fetch(
     arena: Allocator,
     remote: []const u8,
     refspecs: []const []const u8,
-    prune: bool,
+    options: contract.FetchOptions,
 ) (Error || error{FetchFailed})!void {
-    assert(contract.isValidRemoteName(remote));
+    assert(contract.isValidRemoteTarget(remote));
     var argv: std.ArrayList([]const u8) = .empty;
     try argv.appendSlice(arena, &.{ "git", "fetch", "--no-tags", "--no-write-fetch-head" });
-    if (prune) try argv.append(arena, "--prune");
+    if (options.prune) try argv.append(arena, "--prune");
     try argv.appendSlice(arena, &.{ "--refmap=", "--quiet", "--", remote });
     try argv.appendSlice(arena, refspecs);
     const result = try gp.runWithin(arena, argv.items, null, gp.timeouts.network);
@@ -538,9 +698,9 @@ pub fn push(
     arena: Allocator,
     remote: []const u8,
     refspecs: []const []const u8,
-    atomic: bool,
+    options: contract.PushOptions,
 ) (Error || error{PushFailed})!contract.PushResult {
-    assert(contract.isValidRemoteName(remote));
+    assert(contract.isValidRemoteTarget(remote));
     assert(refspecs.len > 0);
     var argv: std.ArrayList([]const u8) = .empty;
     // Hooks run like for any push, so the user's pre-push policies apply.
@@ -550,17 +710,58 @@ pub fn push(
     try gp.env.put("GIT_LFS_SKIP_PUSH", "1");
     defer _ = gp.env.swapRemove("GIT_LFS_SKIP_PUSH");
     try argv.appendSlice(arena, &.{ "git", "push", "--porcelain" });
-    if (atomic) try argv.append(arena, "--atomic");
+    if (options.atomic) try argv.append(arena, "--atomic");
     try argv.appendSlice(arena, &.{ "--", remote });
     try argv.appendSlice(arena, refspecs);
     const result = try gp.runWithin(arena, argv.items, null, gp.timeouts.network);
-    if (atomic and !result.ok() and std.mem.find(
+    if (options.atomic and !result.ok() and std.mem.find(
         u8,
         result.stderr,
         "does not support --atomic",
     ) != null) {
-        return gp.push(arena, remote, refspecs, false);
+        return gp.push(arena, remote, refspecs, .{});
     }
+    return gp.pushResult(arena, result);
+}
+
+/// `git push --atomic --force-with-lease=<dst>:<expect> <src>:<dst>`, or
+/// `:<dst>` to delete. Not `+<src>`: that would force past the lease. No
+/// fallback without `--atomic`: a partial purge would leave the remote half
+/// rewritten.
+pub fn pushLeased(
+    gp: *GitProcess,
+    arena: Allocator,
+    remote: []const u8,
+    updates: []const contract.LeasedRef,
+) (Error || error{PushFailed})!contract.PushResult {
+    assert(contract.isValidRemoteTarget(remote));
+    assert(updates.len > 0);
+    var argv: std.ArrayList([]const u8) = .empty;
+    try gp.env.put("GIT_LFS_SKIP_PUSH", "1");
+    defer _ = gp.env.swapRemove("GIT_LFS_SKIP_PUSH");
+    try argv.appendSlice(arena, &.{ "git", "push", "--porcelain", "--atomic" });
+    for (updates) |u| {
+        assert(contract.isValidRefName(u.dst));
+        const hex = if (u.expect) |e| e.hex() else null;
+        try argv.append(arena, try std.fmt.allocPrint(arena, "--force-with-lease={s}:{s}", .{
+            u.dst,
+            if (hex) |*h| h.slice() else "",
+        }));
+    }
+    try argv.appendSlice(arena, &.{ "--", remote });
+    for (updates) |u| try argv.append(arena, if (u.src) |src|
+        try std.fmt.allocPrint(arena, "{s}:{s}", .{ src, u.dst })
+    else
+        try std.fmt.allocPrint(arena, ":{s}", .{u.dst}));
+    const result = try gp.runWithin(arena, argv.items, null, gp.timeouts.network);
+    return gp.pushResult(arena, result);
+}
+
+fn pushResult(
+    gp: *GitProcess,
+    arena: Allocator,
+    result: anytype,
+) (Error || error{PushFailed})!contract.PushResult {
     // "<flag>\t<src>:<dst>\t<summary>" per ref
     var refs: std.ArrayList(contract.PushedRef) = .empty;
     var refused = false;
@@ -571,16 +772,11 @@ pub fn push(
         const spec = fields.next() orelse continue;
         const colon = std.mem.findScalar(u8, spec, ':') orelse continue;
         const status: contract.PushedRef.Status = switch (line[0]) {
-            ' ', '*', '+' => .ok,
+            ' ', '*', '+', '-' => .ok,
             '=' => .up_to_date,
             else => .rejected,
         };
-        // "[rejected]" comes from git itself: the remote moved. "[remote
-        // rejected]" is the server refusing (a hook, permissions), which
-        // no retry fixes, unless it only failed with another ref.
-        const summary = fields.next() orelse "";
-        if (std.mem.startsWith(u8, summary, "[remote rejected]") and
-            std.mem.find(u8, summary, "atomic push fail") == null) refused = true;
+        if (refusedBy(fields.next() orelse "")) refused = true;
         try refs.append(arena, .{ .name = spec[colon + 1 ..], .status = status });
     }
     if (refused or (!result.ok() and refs.items.len == 0)) {
@@ -588,6 +784,37 @@ pub fn push(
         return error.PushFailed;
     }
     return .{ .refs = refs.items };
+}
+
+/// Whether a ref's push summary is the server refusing it for good.
+/// "[rejected]" comes from git itself: the remote moved. "[remote
+/// rejected]" is the server refusing (a hook, permissions), which no
+/// retry fixes, unless the ref only failed with another one, or the
+/// remote moved while it received the push (its ref transaction lost the
+/// race to another writer).
+fn refusedBy(summary: []const u8) bool {
+    if (!std.mem.startsWith(u8, summary, "[remote rejected]")) return false;
+    const moved = [_][]const u8{
+        "atomic push fail",
+        // The ref changed between the advertisement and the update, with
+        // --atomic and without.
+        "atomic transaction failed",
+        "failed to update ref",
+        "cannot lock ref",
+    };
+    for (moved) |m| if (std.mem.find(u8, summary, m) != null) return false;
+    return true;
+}
+
+test refusedBy {
+    try std.testing.expect(!refusedBy("[rejected] (non-fast-forward)"));
+    try std.testing.expect(!refusedBy("[rejected] (stale info)"));
+    try std.testing.expect(!refusedBy("[remote rejected] (atomic push failure)"));
+    try std.testing.expect(!refusedBy("[remote rejected] (atomic transaction failed)"));
+    try std.testing.expect(!refusedBy("[remote rejected] (failed to update ref)"));
+    try std.testing.expect(refusedBy("[remote rejected] (pre-receive hook declined)"));
+    try std.testing.expect(refusedBy("[remote rejected] (deny updating a hidden ref)"));
+    try std.testing.expect(!refusedBy("[new branch]"));
 }
 
 fn splitLines(arena: Allocator, text: []const u8) Error![]const []const u8 {
@@ -698,7 +925,12 @@ fn hashes(data: []const u8, sha256: []const u8) bool {
     return std.mem.eql(u8, &hex, sha256);
 }
 
-fn readStore(gp: *GitProcess, arena: Allocator, store: Store, sha256: []const u8) Error!?[]const u8 {
+fn readStore(
+    gp: *GitProcess,
+    arena: Allocator,
+    store: Store,
+    sha256: []const u8,
+) Error!?[]const u8 {
     const path = try lfsPath(arena, try gp.lfsObjectsDir(arena, store), sha256);
     // The limit fails once reached, and a maximal object is valid.
     const limit: Io.Limit = .limited(attachment_fmt.max_object_bytes + 1);
@@ -755,7 +987,7 @@ pub fn lfsPush(
     remote: []const u8,
     shas: []const []const u8,
 ) (Error || contract.LfsTransportError)!void {
-    assert(contract.isValidRemoteName(remote));
+    assert(contract.isValidRemoteTarget(remote));
     try gp.requireGitLfs(arena);
     for (shas) |s| {
         assert(isSha256Hex(s));
@@ -788,7 +1020,7 @@ pub fn lfsFetch(
     remote: []const u8,
     local_refs: []const []const u8,
 ) (Error || contract.LfsTransportError)!void {
-    assert(contract.isValidRemoteName(remote));
+    assert(contract.isValidRemoteTarget(remote));
     try gp.requireGitLfs(arena);
     // The first failing batch's output, which later batches would clear.
     var failure: ?[]const u8 = null;
@@ -864,7 +1096,7 @@ pub fn lfsList(gp: *GitProcess, arena: Allocator) Error![]const []const u8 {
             }
         }
     }
-    std.mem.sort([]const u8, out.items, {}, struct {
+    stableSort([]const u8, out.items, {}, struct {
         fn lt(_: void, x: []const u8, y: []const u8) bool {
             return std.mem.lessThan(u8, x, y);
         }
@@ -921,7 +1153,7 @@ fn runWithin(
         while (rest.len > 0) {
             // A writable pipe takes this much without blocking, so the
             // deadline holds while git isn't reading.
-            const done = try operateBy(io, .{ .file_write_streaming = .{
+            const done = try operateBy(io, gp.cancel, .{ .file_write_streaming = .{
                 .file = child.stdin.?,
                 .data = &.{rest[0..@min(rest.len, pipe_buf)]},
             } }, by);
@@ -954,29 +1186,66 @@ fn deadline(gp: *GitProcess, limit: Io.Duration) Io.Timeout {
     return t.toDeadline(gp.io);
 }
 
-/// One operation that fails with `GitTimedOut` at `by`.
-fn operateBy(io: Io, op: Io.Operation, by: Io.Timeout) Error!Io.Operation.Result {
+/// One operation that fails with `GitTimedOut` at `by`, or `Canceled`
+/// soon after `cancel` reads true.
+fn operateBy(
+    io: Io,
+    cancel: ?*const std.atomic.Value(bool),
+    op: Io.Operation,
+    by: Io.Timeout,
+) Error!Io.Operation.Result {
     var storage: [1]Io.Operation.Storage = undefined;
     var batch: Io.Batch = .init(&storage);
     batch.addAt(0, op);
-    batch.awaitConcurrent(io, by) catch |err| {
-        batch.cancel(io);
-        return switch (err) {
-            error.Timeout => error.GitTimedOut,
-            error.Canceled => error.Canceled,
-            else => error.GitFailed,
+    while (true) {
+        batch.awaitConcurrent(io, waitSlice(io, cancel, by)) catch |err| {
+            const failure: Error = switch (err) {
+                error.Timeout => if (stillWaiting(io, cancel, by)) |why| why else continue,
+                error.Canceled => error.Canceled,
+                else => error.GitFailed,
+            };
+            batch.cancel(io);
+            return failure;
         };
+        return batch.next().?.result;
+    }
+}
+
+/// The next wait: up to `by`, or up to `cancel_poll` while a cancel token
+/// is set.
+fn waitSlice(io: Io, cancel: ?*const std.atomic.Value(bool), by: Io.Timeout) Io.Timeout {
+    if (cancel == null) return by;
+    const soon: Io.Clock.Timestamp = .fromNow(io, .{ .raw = cancel_poll, .clock = .awake });
+    return switch (by) {
+        .deadline => |d| if (soon.durationTo(d).raw.nanoseconds < 0) by else .{ .deadline = soon },
+        else => .{ .deadline = soon },
     };
-    return batch.next().?.result;
+}
+
+/// After a wait slice ran out: why to stop, or null to wait on.
+fn stillWaiting(io: Io, cancel: ?*const std.atomic.Value(bool), by: Io.Timeout) ?Error {
+    if (cancel) |c| if (c.load(.acquire)) return error.Canceled;
+    return switch (by) {
+        .none => null,
+        .deadline => |d| if (d.durationFromNow(io).raw.nanoseconds <= 0)
+            error.GitTimedOut
+        else
+            null,
+        .duration => error.GitTimedOut,
+    };
 }
 
 fn spawn(gp: *GitProcess, argv: []const []const u8, stdin: bool) Error!std.process.Child {
     assert(argv.len > 0 and std.mem.eql(u8, argv[0], "git"));
     // `lastStderr` belongs to the latest command.
     gp.last_stderr_len = 0;
-    if (builtin.os.tag != .windows and gp.no_terminal) return gp.spawnDetached(argv, stdin);
+    // Commands are written with "git" first; run the configured one.
+    const actual = try gp.gpa.dupe([]const u8, argv);
+    defer gp.gpa.free(actual);
+    actual[0] = gp.git_exe;
+    if (builtin.os.tag != .windows and gp.no_terminal) return gp.spawnDetached(actual, stdin);
     return std.process.spawn(gp.io, .{
-        .argv = argv,
+        .argv = actual,
         .cwd = .{ .path = gp.repo_path },
         .environ_map = &gp.env,
         .stdin = if (stdin) .pipe else .ignore,
@@ -1012,10 +1281,18 @@ fn spawnDetached(gp: *GitProcess, argv: []const []const u8, stdin: bool) Error!s
     for (argv, argv_z) |arg, *z| z.* = (try a.dupeZ(u8, arg)).ptr;
     const env = try gp.env.createPosixBlock(a, .{});
     const cwd = try a.dupeZ(u8, gp.repo_path);
-    // Where `git` may be, in PATH order.
+    // Where `git` may be: the configured path itself, else in PATH order.
     var programs: std.ArrayList([*:0]const u8) = .empty;
-    var dirs = std.mem.tokenizeScalar(u8, gp.env.get("PATH") orelse "/usr/bin:/bin", ':');
-    while (dirs.next()) |dir| try programs.append(a, try std.fmt.allocPrintSentinel(a, "{s}/{s}", .{ dir, argv[0] }, 0));
+    if (std.mem.indexOfScalar(u8, argv[0], '/') != null) {
+        try programs.append(a, try a.dupeZ(u8, argv[0]));
+    } else {
+        const path = gp.env.get("PATH") orelse "/usr/bin:/bin";
+        var dirs = std.mem.tokenizeScalar(u8, path, ':');
+        while (dirs.next()) |dir| try programs.append(
+            a,
+            try std.fmt.allocPrintSentinel(a, "{s}/{s}", .{ dir, argv[0] }, 0),
+        );
+    }
 
     const pipe = struct {
         fn make() Error![2]std.posix.fd_t {
@@ -1026,7 +1303,11 @@ fn spawnDetached(gp: *GitProcess, argv: []const []const u8, stdin: bool) Error!s
             _ = sys.close(fds[1]);
         }
     };
-    const null_in = Io.Dir.openFileAbsolute(gp.io, "/dev/null", .{}) catch return error.GitSpawnFailed;
+    const null_in = Io.Dir.openFileAbsolute(
+        gp.io,
+        "/dev/null",
+        .{},
+    ) catch return error.GitSpawnFailed;
     defer null_in.close(gp.io);
     // Once forked, the fds are the child's or `child`'s to close.
     var forked_ok = false;
@@ -1097,14 +1378,15 @@ fn collect(
     mr.init(arena, io, mr_buffer.toStreams(), &.{ child.stdout.?, child.stderr.? });
     defer mr.deinit();
 
-    while (mr.fill(256, by)) |_| {
+    while (true) {
+        mr.fill(256, waitSlice(io, gp.cancel, by)) catch |err| switch (err) {
+            error.EndOfStream => break,
+            error.Timeout => if (stillWaiting(io, gp.cancel, by)) |why| return why else continue,
+            error.Canceled => return error.Canceled,
+            else => return error.GitFailed,
+        };
         if (mr.reader(0).buffered().len > max_stdout_bytes) return error.OutputTooLong;
         if (mr.reader(1).buffered().len > max_stderr_bytes) return error.OutputTooLong;
-    } else |err| switch (err) {
-        error.EndOfStream => {},
-        error.Timeout => return error.GitTimedOut,
-        error.Canceled => return error.Canceled,
-        else => return error.GitFailed,
     }
     mr.checkAnyError() catch return error.GitFailed;
 
@@ -1162,7 +1444,7 @@ const CatFile = struct {
         const cf = try gp.gpa.create(CatFile);
         errdefer gp.gpa.destroy(cf);
         cf.child = std.process.spawn(gp.io, .{
-            .argv = &.{ "git", "cat-file", "--batch" },
+            .argv = &.{ gp.git_exe, "cat-file", "--batch" },
             .cwd = .{ .path = gp.repo_path },
             .environ_map = &gp.env,
             .stdin = .pipe,
@@ -1218,7 +1500,11 @@ const CatFile = struct {
 
     /// What `name` points at. `missing` when there is no such ref or its
     /// object is missing. The object comes along and is skipped.
-    fn resolve(cf: *CatFile, name: []const u8, by: Io.Timeout) Error!union(enum) { oid: Oid, missing } {
+    fn resolve(
+        cf: *CatFile,
+        name: []const u8,
+        by: Io.Timeout,
+    ) Error!union(enum) { oid: Oid, missing } {
         cf.reader.by = by;
         const w = &cf.writer.interface;
         w.print("{s}\n", .{name}) catch return error.GitFailed;
@@ -1262,7 +1548,10 @@ const HashObject = struct {
         errdefer gp.gpa.destroy(ho);
         ho.child = std.process.spawn(gp.io, .{
             .argv = &.{
-                "git", "hash-object", "-w", "-t", @tagName(kind), "--no-filters", "--stdin-paths",
+                gp.git_exe,      "hash-object",
+                "-w",            "-t",
+                @tagName(kind),  "--no-filters",
+                "--stdin-paths",
             },
             .cwd = .{ .path = gp.repo_path },
             .environ_map = &gp.env,
@@ -1305,6 +1594,7 @@ const PipeReader = struct {
     io: Io,
     file: Io.File,
     by: Io.Timeout = .none,
+    cancel: ?*const std.atomic.Value(bool) = null,
     err: ?Error = null,
     interface: Io.Reader,
 
@@ -1337,7 +1627,7 @@ const PipeReader = struct {
         const p: *PipeReader = @alignCast(@fieldParentPtr("interface", r));
         var vecs: [8][]u8 = undefined;
         const dest_n, const data_size = try r.writableVector(&vecs, data);
-        const done = operateBy(p.io, .{ .file_read_streaming = .{
+        const done = operateBy(p.io, p.cancel, .{ .file_read_streaming = .{
             .file = p.file,
             .data = vecs[0..dest_n],
         } }, p.by) catch |err| {
@@ -1364,6 +1654,7 @@ fn oidLessThan(_: void, a: Oid, b: Oid) bool {
     return a.order(b) == .lt;
 }
 
+/// Internal: the library's own plumbing, not API; it may change.
 /// "git version 2.54.0 (Apple Git-157)", "git version 2.45.1.windows.1"
 pub fn parseGitVersion(out: []const u8) ?std.SemanticVersion {
     const prefix = "git version ";

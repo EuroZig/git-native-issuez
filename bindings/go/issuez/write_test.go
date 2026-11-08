@@ -1,0 +1,638 @@
+package issuez_test
+
+import (
+	"context"
+	"errors"
+	"fmt"
+	"strings"
+	"sync"
+	"testing"
+	"time"
+
+	"github.com/EuroZig/git-native-issuez/bindings/go/issuez"
+)
+
+// TestReactions: idempotent, on the issue and a comment, taken back.
+func TestReactions(t *testing.T) {
+	ctx := context.Background()
+	r := newRepo(t)
+	w := create(t, r, "Liked")
+	cw, err := r.Update(ctx, w.ID, new(issuez.Edit).AddComment("Nice"), ada)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := r.Update(ctx, w.ID, new(issuez.Edit).React(":+1:"), ada); err != nil {
+		t.Fatal(err)
+	}
+	again, err := r.Update(ctx, w.ID, new(issuez.Edit).React(":+1:"), ada)
+	if err != nil || again.Wrote {
+		t.Errorf("again: %v %+v", err, again)
+	}
+	if _, err := r.Update(ctx, w.ID, new(issuez.Edit).ReactToComment(cw.Commit, ":heart:"), ada); err != nil {
+		t.Fatal(err)
+	}
+	i, err := r.Load(ctx, w.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(i.Reactions) != 1 || i.Reactions[0].Emoji != ":+1:" || len(i.Reactions[0].Users) != 1 ||
+		i.Reactions[0].Users[0].Email != "ada@example.com" {
+		t.Errorf("issue reactions: %+v", i.Reactions)
+	}
+	if len(i.Comments[0].Reactions) != 1 || i.Comments[0].Reactions[0].Emoji != ":heart:" {
+		t.Errorf("comment reactions: %+v", i.Comments[0].Reactions)
+	}
+	if _, err := r.Update(ctx, w.ID, new(issuez.Edit).Unreact(":+1:"), ada); err != nil {
+		t.Fatal(err)
+	}
+	if i, _ = r.Load(ctx, w.ID); len(i.Reactions) != 0 {
+		t.Errorf("after taking back: %+v", i.Reactions)
+	}
+}
+
+func TestProblemsPointAtOps(t *testing.T) {
+	r := newRepo(t)
+	e := new(issuez.Edit).
+		SetTitle("two\nlines").
+		SetDueDate(issuez.Date{Year: 2026, Month: time.February, Day: 30}).
+		AddLabel("fine")
+	problems, err := e.ValidateCreate()
+	if err != nil || len(problems) != 2 {
+		t.Fatalf("validate: %v %+v", err, problems)
+	}
+	_, err = r.Create(context.Background(), e, ada)
+	var ie *issuez.Error
+	if !errors.Is(err, issuez.ErrInvalidValue) || !errors.As(err, &ie) || len(ie.Problems) != 2 {
+		t.Fatalf("create: %v", err)
+	}
+	if ie.Problems[0].Op != 0 || ie.Problems[0].Kind != issuez.ProblemNewline ||
+		ie.Problems[1].Op != 1 || ie.Problems[1].Field != issuez.FieldDueDate {
+		t.Errorf("problems: %+v", ie.Problems)
+	}
+
+	// A delete is a commit of its own: INVALID_VALUE, saying why.
+	w := create(t, r, "Mixed")
+	_, err = r.Update(context.Background(), w.ID, new(issuez.Edit).SetDeleted(true).AddLabel("x"), ada)
+	if !errors.As(err, &ie) || ie.Code != issuez.CodeInvalidValue || ie.Problems[0].Kind != issuez.ProblemIncompatible {
+		t.Errorf("mixed: %v", err)
+	}
+
+	// Comment, close and a label: one commit.
+	done, err := r.Update(context.Background(), w.ID,
+		new(issuez.Edit).AddComment("Fixed.").SetState("closed").AddLabel("shipped"), ada, issuez.Reload())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if done.Entry.Kind != issuez.EntryComment || !done.Issue.Done || len(done.Issue.Comments) != 1 ||
+		done.Issue.Comments[0].Text != "Fixed." || len(done.Entry.Changes) != 2 {
+		t.Errorf("comment and close: %+v %+v", done.Entry, done.Issue.Comments)
+	}
+}
+
+// One repo from many goroutines: the pool serves them all.
+func TestConcurrentWrites(t *testing.T) {
+	r := newRepo(t, issuez.WithPoolSize(4))
+	var wg sync.WaitGroup
+	errs := make(chan error, 16)
+	for i := range 16 {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			_, err := r.Create(context.Background(), new(issuez.Edit).SetTitle(fmt.Sprintf("Issue %d", i)), ada)
+			errs <- err
+		}()
+	}
+	wg.Wait()
+	close(errs)
+	for err := range errs {
+		if err != nil {
+			t.Error(err)
+		}
+	}
+	if n, err := r.Count(context.Background(), issuez.Query{}); err != nil || n != 16 {
+		t.Errorf("count: %v %d", err, n)
+	}
+}
+
+func TestRepo_Create(t *testing.T) {
+	ctx := t.Context()
+	r := newRepo(t)
+	w, err := r.Create(ctx, new(issuez.Edit).SetTitle("New").AddLabel("x"), ada)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if w.Kind != issuez.KindIssue || len(w.ID) != 36 || !w.Wrote || w.Commit != w.NewTip || !w.OldTip.IsZero() ||
+		w.Entry.Kind != issuez.EntryCreated || w.Issue != nil {
+		t.Errorf("receipt: %+v", w)
+	}
+	if _, err := r.Create(ctx, new(issuez.Edit).AddLabel("no title"), ada); !errors.Is(err, issuez.ErrInvalidValue) {
+		t.Errorf("no title: %v", err)
+	}
+	if _, err := r.Create(ctx, nil, ada); !errors.Is(err, issuez.ErrInvalidValue) {
+		t.Errorf("nil edit: %v", err)
+	}
+	if _, err := r.Create(ctx, new(issuez.Edit).SetTitle("Nobody"), issuez.Actor{Name: "Nobody"}); err == nil {
+		t.Error("an actor without an email")
+	}
+	// A host's user: the UUID comes back on the author and the receipt.
+	grace := issuez.Actor{Name: "Grace", Email: "grace@example.com", UserID: "0c8d7a52-3f1e-4b6a-9d2c-5e4f3a2b1c0d"}
+	g, err := r.Create(ctx, new(issuez.Edit).SetTitle("Hosted"), grace, issuez.Reload())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if g.Entry.Author.UserID != grace.UserID || g.Issue.Author.UserID != grace.UserID {
+		t.Errorf("author UUID: receipt %q, issue %q", g.Entry.Author.UserID, g.Issue.Author.UserID)
+	}
+	grace.UserID = "42"
+	if _, err := r.Create(ctx, new(issuez.Edit).SetTitle("Bad UUID"), grace); err == nil {
+		t.Error("a UserID that isn't a UUID")
+	}
+	// Taken numbers are refused.
+	if _, err := r.Create(ctx, new(issuez.Edit).SetTitle("One").SetNumber(1), ada); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := r.Create(ctx, new(issuez.Edit).SetTitle("Also one").SetNumber(1), ada); err == nil {
+		t.Error("duplicate number")
+	}
+}
+
+func TestRepo_Update(t *testing.T) {
+	ctx := t.Context()
+	r := newRepo(t)
+	w := create(t, r, "Before")
+	u, err := r.Update(ctx, w.ID, new(issuez.Edit).SetTitle("After"), ada, issuez.ExpectTip(w.NewTip))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !u.Wrote || u.OldTip != w.NewTip || u.NewTip == w.NewTip || u.Entry.Kind != issuez.EntryUpdate {
+		t.Errorf("receipt: %+v", u)
+	}
+	// Nothing to change: no commit.
+	same, err := r.Update(ctx, w.ID, new(issuez.Edit).SetTitle("After"), ada)
+	if err != nil || same.Wrote || same.NewTip != u.NewTip {
+		t.Errorf("no-op: %v %+v", err, same)
+	}
+	if same, err := r.Update(ctx, w.ID, new(issuez.Edit).SetState("open").SetLabels(), ada); err != nil || same.Wrote {
+		t.Errorf("same state: %v %+v", err, same)
+	}
+	// A stale Expect is refused, and says so.
+	if _, err := r.Update(ctx, w.ID, new(issuez.Edit).SetTitle("Lost"), ada, issuez.ExpectTip(w.NewTip)); !errors.Is(err, issuez.ErrVersionMismatch) {
+		t.Errorf("stale expect: %v", err)
+	}
+	if _, err := r.Update(ctx, "0b6c4f63-6f5a-4a3e-9c2b-1d2e3f4a5b6c", new(issuez.Edit).SetTitle("x"), ada); !errors.Is(err, issuez.ErrNotFound) {
+		t.Errorf("missing: %v", err)
+	}
+}
+
+func TestReload(t *testing.T) {
+	ctx := t.Context()
+	r := newRepo(t)
+	w, err := r.Create(ctx, new(issuez.Edit).SetTitle("Fresh"), ada, issuez.Reload())
+	if err != nil || w.Issue == nil || w.Issue.Title != "Fresh" || w.Issue.Tip != w.NewTip {
+		t.Fatalf("create: %v %+v", err, w)
+	}
+	u, err := r.Update(ctx, w.ID, new(issuez.Edit).AddLabel("x"), ada, issuez.Reload())
+	if err != nil || u.Issue == nil || len(u.Issue.Labels) != 1 {
+		t.Errorf("update: %v %+v", err, u)
+	}
+	// A milestone write reloads its milestone.
+	m, err := r.CreateMilestone(ctx, new(issuez.MilestoneEdit).SetName("v1"), ada, issuez.Reload())
+	if err != nil || m.Issue != nil || m.Milestone == nil || m.Milestone.Name != "v1" {
+		t.Errorf("milestone: %v %+v", err, m)
+	}
+	if m, err := r.UpdateMilestone(ctx, m.ID, new(issuez.MilestoneEdit).SetName("v2"), ada); err != nil || m.Milestone != nil {
+		t.Errorf("without Reload: %v %+v", err, m)
+	}
+}
+
+// TestExpectTip: every write that has a tip to compare takes the option.
+func TestExpectTip(t *testing.T) {
+	ctx := t.Context()
+	r := newRepo(t)
+	w, c := commented(t, r, "Expected")
+	stale := w.NewTip
+	writes := map[string]func(...issuez.WriteOption) (*issuez.Write, error){
+		"Update": func(o ...issuez.WriteOption) (*issuez.Write, error) {
+			return r.Update(ctx, w.ID, new(issuez.Edit).AddLabel("x"), ada, o...)
+		},
+		"DeleteComment": func(o ...issuez.WriteOption) (*issuez.Write, error) {
+			return r.Update(ctx, w.ID, new(issuez.Edit).DeleteComment(c.Commit), ada, o...)
+		},
+		"RestoreComment": func(o ...issuez.WriteOption) (*issuez.Write, error) {
+			return r.Update(ctx, w.ID, new(issuez.Edit).RestoreComment(c.Commit), ada, o...)
+		},
+		"React": func(o ...issuez.WriteOption) (*issuez.Write, error) {
+			return r.Update(ctx, w.ID, new(issuez.Edit).React("eyes"), ada, o...)
+		},
+	}
+	for _, name := range []string{"Update", "DeleteComment", "RestoreComment", "React"} {
+		_, err := writes[name](issuez.ExpectTip(stale))
+		var e *issuez.Error
+		if !errors.As(err, &e) || e.Code != issuez.CodeVersionMismatch || e.CurrentTip.IsZero() {
+			t.Fatalf("%s, stale: %v", name, err)
+		}
+		if _, err := writes[name](issuez.ExpectTip(e.CurrentTip)); err != nil {
+			t.Fatalf("%s, current: %v", name, err)
+		}
+	}
+	m, err := r.CreateMilestone(ctx, new(issuez.MilestoneEdit).SetName("v1"), ada, issuez.ExpectTip(stale))
+	if err != nil {
+		t.Fatalf("create ignores it: %v", err)
+	}
+	if _, err := r.UpdateMilestone(ctx, m.ID, new(issuez.MilestoneEdit).SetName("v2"), ada, issuez.ExpectTip(stale)); !errors.Is(err, issuez.ErrVersionMismatch) {
+		t.Errorf("milestone, stale: %v", err)
+	}
+	if _, err := r.UpdateMilestone(ctx, m.ID, new(issuez.MilestoneEdit).SetName("v2"), ada, issuez.ExpectTip(m.NewTip)); err != nil {
+		t.Errorf("milestone, current: %v", err)
+	}
+}
+
+func TestRepo_CheckCreate(t *testing.T) {
+	ctx := t.Context()
+	r := newRepo(t)
+	if p, err := r.CheckCreate(ctx, new(issuez.Edit).SetTitle("Fine")); err != nil || p != nil {
+		t.Errorf("fine create: %v %+v", err, p)
+	}
+	p, err := r.CheckCreate(ctx, new(issuez.Edit).AddLabel("no title"))
+	if err != nil || len(p) == 0 || p[0].Field != issuez.FieldTitle {
+		t.Errorf("no title: %v %+v", err, p)
+	}
+	// Reads the repository: a parent that doesn't exist.
+	p, err = r.CheckCreate(ctx, new(issuez.Edit).SetTitle("Child").SetParent("0b6c4f63-6f5a-4a3e-9c2b-1d2e3f4a5b6c"))
+	if err != nil || len(p) != 1 || p[0].Field != issuez.FieldParent {
+		t.Errorf("missing parent: %v %+v", err, p)
+	}
+	if n, _ := r.Count(ctx, issuez.Query{}); n != 0 {
+		t.Error("CheckCreate wrote")
+	}
+}
+
+func TestRepo_CheckUpdate(t *testing.T) {
+	ctx := t.Context()
+	r := newRepo(t)
+	w := create(t, r, "Checked")
+	// A parent that doesn't exist; nothing is written.
+	p, err := r.CheckUpdate(ctx, w.ID, new(issuez.Edit).SetParent("0b6c4f63-6f5a-4a3e-9c2b-1d2e3f4a5b6c"))
+	if err != nil || len(p) != 1 || p[0].Field != issuez.FieldParent {
+		t.Errorf("missing parent: %v %+v", err, p)
+	}
+	if p, err := r.CheckUpdate(ctx, w.ID, new(issuez.Edit).AddLabel("x"), issuez.ExpectTip(w.NewTip)); err != nil || p != nil {
+		t.Errorf("fine update: %v %+v", err, p)
+	}
+	if i, _ := r.Load(ctx, w.ID); i.Tip != w.NewTip {
+		t.Error("CheckUpdate wrote")
+	}
+	if _, err := r.CheckUpdate(ctx, "0b6c4f63-6f5a-4a3e-9c2b-1d2e3f4a5b6c", new(issuez.Edit).AddLabel("x")); !errors.Is(err, issuez.ErrNotFound) {
+		t.Errorf("missing issue: %v", err)
+	}
+	var e *issuez.Error
+	if _, err := r.CheckUpdate(ctx, "", new(issuez.Edit).AddLabel("x")); !errors.As(err, &e) || e.Code != issuez.CodeInvalidArgument {
+		t.Errorf("no id: %v", err)
+	}
+}
+
+// commented creates an issue with one comment and returns both.
+func commented(t *testing.T, r *issuez.Repo, text string) (*issuez.Write, *issuez.Write) {
+	t.Helper()
+	w := create(t, r, "Discussed")
+	c, err := r.Update(t.Context(), w.ID, new(issuez.Edit).AddComment(text), ada)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return w, c
+}
+
+func TestEdit_EditComment_expect(t *testing.T) {
+	ctx := t.Context()
+	r := newRepo(t)
+	w, c := commented(t, r, "Tpyo")
+	e, err := r.Update(ctx, w.ID, new(issuez.Edit).EditComment(c.Commit, "Typo"), ada, issuez.ExpectTip(c.NewTip))
+	if err != nil || e.Entry.Kind != issuez.EntryCommentEdit {
+		t.Fatalf("edit: %v %+v", err, e)
+	}
+	i, _ := r.Load(ctx, w.ID)
+	if got := i.Comments[0]; got.Text != "Typo" || !got.Edited || got.ID != c.Commit {
+		t.Errorf("comment: %+v", got)
+	}
+	if _, err := r.Update(ctx, w.ID, new(issuez.Edit).EditComment(c.Commit, "Again"), ada, issuez.ExpectTip(c.NewTip)); !errors.Is(err, issuez.ErrVersionMismatch) {
+		t.Errorf("stale: %v", err)
+	}
+	if _, err := r.Update(ctx, w.ID, new(issuez.Edit).EditComment(issuez.OID{}, "No comment"), ada); err == nil {
+		t.Error("zero comment")
+	}
+	if _, err := r.Update(ctx, w.ID, new(issuez.Edit).EditComment(w.NewTip, "Not a comment"), ada); err == nil {
+		t.Error("the root isn't a comment")
+	}
+}
+
+func TestCommentDelete(t *testing.T) {
+	ctx := t.Context()
+	r := newRepo(t)
+	w, c := commented(t, r, "Oops")
+	d, err := r.Update(ctx, w.ID, new(issuez.Edit).DeleteComment(c.Commit), ada)
+	if err != nil || d.Entry.Kind != issuez.EntryCommentDelete {
+		t.Fatalf("delete: %v %+v", err, d)
+	}
+	if i, _ := r.Load(ctx, w.ID); !i.Comments[0].Deleted {
+		t.Errorf("not deleted: %+v", i.Comments[0])
+	}
+	if _, err := r.Update(ctx, w.ID, new(issuez.Edit).DeleteComment(c.Commit), ada, issuez.ExpectTip(c.NewTip)); !errors.Is(err, issuez.ErrVersionMismatch) {
+		t.Errorf("stale: %v", err)
+	}
+	if _, err := r.Update(ctx, w.ID, new(issuez.Edit).DeleteComment(issuez.OID{}), ada); err == nil {
+		t.Error("no comment")
+	}
+}
+
+func TestCommentRestore(t *testing.T) {
+	ctx := t.Context()
+	r := newRepo(t)
+	w, c := commented(t, r, "Back")
+	if _, err := r.Update(ctx, w.ID, new(issuez.Edit).DeleteComment(c.Commit), ada); err != nil {
+		t.Fatal(err)
+	}
+	back, err := r.Update(ctx, w.ID, new(issuez.Edit).RestoreComment(c.Commit), ada)
+	if err != nil || back.Entry.Kind != issuez.EntryCommentRestore {
+		t.Fatalf("restore: %v %+v", err, back)
+	}
+	if i, _ := r.Load(ctx, w.ID); i.Comments[0].Deleted || i.Comments[0].Text != "Back" {
+		t.Errorf("not restored: %+v", i.Comments[0])
+	}
+}
+
+func TestRepo_CreateMilestone(t *testing.T) {
+	ctx := t.Context()
+	r := newRepo(t)
+	due := issuez.Date{Year: 2026, Month: time.June, Day: 30}
+	w, err := r.CreateMilestone(ctx, new(issuez.MilestoneEdit).SetName("v1").SetDescription("First.").
+		SetDueDate(due).SetStatus(issuez.MilestoneCompleted), ada)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if w.Kind != issuez.KindMilestone || !w.Wrote || len(w.ID) != 36 {
+		t.Errorf("receipt: %+v", w)
+	}
+	m, err := r.LoadMilestone(ctx, w.ID)
+	if err != nil || m.Name != "v1" || m.Description != "First." || m.DueDate == nil || *m.DueDate != due ||
+		m.Status != issuez.MilestoneCompleted || m.Tip != w.NewTip {
+		t.Errorf("milestone: %v %+v", err, m)
+	}
+	if _, err := r.CreateMilestone(ctx, new(issuez.MilestoneEdit).SetDescription("No name"), ada); !errors.Is(err, issuez.ErrInvalidValue) {
+		t.Errorf("no name: %v", err)
+	}
+}
+
+func TestRepo_UpdateMilestone(t *testing.T) {
+	ctx := t.Context()
+	r := newRepo(t)
+	w, err := r.CreateMilestone(ctx, new(issuez.MilestoneEdit).SetName("v1"), ada)
+	if err != nil {
+		t.Fatal(err)
+	}
+	u, err := r.UpdateMilestone(ctx, w.ID, new(issuez.MilestoneEdit).SetName("v1.0").SetStatus(issuez.MilestoneRetired), ada)
+	if err != nil || !u.Wrote || u.OldTip != w.NewTip {
+		t.Fatalf("update: %v %+v", err, u)
+	}
+	m, _ := r.LoadMilestone(ctx, w.ID)
+	if m.Name != "v1.0" || m.Status != issuez.MilestoneRetired {
+		t.Errorf("milestone: %+v", m)
+	}
+	// As it is: nothing written.
+	if same, err := r.UpdateMilestone(ctx, w.ID, new(issuez.MilestoneEdit).SetName("v1.0"), ada); err != nil || same.Wrote || same.NewTip != u.NewTip {
+		t.Errorf("no-op: %v %+v", err, same)
+	}
+	if _, err := r.UpdateMilestone(ctx, "0b6c4f63-6f5a-4a3e-9c2b-1d2e3f4a5b6c", new(issuez.MilestoneEdit).SetName("x"), ada); !errors.Is(err, issuez.ErrNotFound) {
+		t.Errorf("missing: %v", err)
+	}
+}
+
+func TestRepo_LoadMilestone(t *testing.T) {
+	ctx := t.Context()
+	r := newRepo(t)
+	if _, err := r.LoadMilestone(ctx, "0b6c4f63-6f5a-4a3e-9c2b-1d2e3f4a5b6c"); !errors.Is(err, issuez.ErrNotFound) {
+		t.Errorf("missing: %v", err)
+	}
+	// An issue's ID isn't a milestone's.
+	w := create(t, r, "Issue")
+	if _, err := r.LoadMilestone(ctx, w.ID); !errors.Is(err, issuez.ErrNotFound) {
+		t.Errorf("issue id: %v", err)
+	}
+	at := time.Date(2025, time.March, 4, 5, 6, 7, 0, time.UTC)
+	actor := ada
+	actor.At = at
+	m, err := r.CreateMilestone(ctx, new(issuez.MilestoneEdit).SetName("Plain"), actor)
+	if err != nil {
+		t.Fatal(err)
+	}
+	got, err := r.LoadMilestone(ctx, m.ID)
+	if err != nil || got.ID != m.ID || !got.Created.Equal(at) || got.DueDate != nil ||
+		got.Status != issuez.MilestoneOpen || len(got.Problems) != 0 {
+		t.Errorf("plain: %v %+v", err, got)
+	}
+}
+
+func TestRepo_Milestones(t *testing.T) {
+	ctx := t.Context()
+	r := newRepo(t)
+	if ms, err := r.Milestones(ctx); err != nil || len(ms) != 0 {
+		t.Errorf("none: %v %+v", err, ms)
+	}
+	mk := func(name string, due *issuez.Date) {
+		e := new(issuez.MilestoneEdit).SetName(name)
+		if due != nil {
+			e.SetDueDate(*due)
+		}
+		if _, err := r.CreateMilestone(ctx, e, ada); err != nil {
+			t.Fatal(err)
+		}
+	}
+	mk("b, undated", nil)
+	mk("late", &issuez.Date{Year: 2027, Month: time.January, Day: 1})
+	mk("a, undated", nil)
+	mk("early", &issuez.Date{Year: 2026, Month: time.January, Day: 1})
+	ms, err := r.Milestones(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var names []string
+	for _, m := range ms {
+		names = append(names, m.Name)
+	}
+	if got := strings.Join(names, ","); got != "early,late,a, undated,b, undated" {
+		t.Errorf("order: %s", got)
+	}
+}
+
+func TestEdit_ExpectEdits(t *testing.T) {
+	ctx := t.Context()
+	r := newRepo(t)
+	w, c := commented(t, r, "Versioned")
+	steps := []struct {
+		name string
+		e    *issuez.Edit
+		ok   bool
+	}{
+		{"first edit", new(issuez.Edit).SetDescription("v1").ExpectEdits(0), true},
+		{"stale", new(issuez.Edit).SetDescription("stale").ExpectEdits(0), false},
+		{"another change", new(issuez.Edit).AddLabel("bug"), true},
+		{"second edit", new(issuez.Edit).SetDescription("v2").ExpectEdits(1), true},
+		{"a comment", new(issuez.Edit).EditComment(c.Commit, "edited").ExpectEdits(0), true},
+		{"a stale comment", new(issuez.Edit).EditComment(c.Commit, "stale").ExpectEdits(0), false},
+	}
+	for _, s := range steps {
+		_, err := r.Update(ctx, w.ID, s.e, ada)
+		if s.ok && err != nil || !s.ok && !errors.Is(err, issuez.ErrVersionMismatch) {
+			t.Errorf("%s: %v", s.name, err)
+		}
+	}
+	if _, err := r.Update(ctx, w.ID, new(issuez.Edit).AddLabel("x").ExpectEdits(0), ada); !errors.Is(err, issuez.ErrInvalidValue) {
+		t.Errorf("without a text: %v", err)
+	}
+	i, _ := r.Load(ctx, w.ID)
+	if i.Description != "v2" || i.Edits != 2 || i.Comments[0].Text != "edited" {
+		t.Errorf("issue: %q (%d edits), comment %q", i.Description, i.Edits, i.Comments[0].Text)
+	}
+}
+
+// TestMilestone_times: when a milestone was updated and its status set,
+// and who made it.
+func TestMilestone_times(t *testing.T) {
+	ctx := t.Context()
+	r := newRepo(t)
+	w, err := r.CreateMilestone(ctx, new(issuez.MilestoneEdit).SetName("v1"), ada, issuez.Reload())
+	if err != nil {
+		t.Fatal(err)
+	}
+	m := w.Milestone
+	if m.StatusChanged != nil || !m.Updated.Equal(m.Created) || m.Author.Email != ada.Email {
+		t.Errorf("new: %+v", m)
+	}
+	done := ada
+	done.At = m.Created.Add(time.Hour)
+	u, err := r.UpdateMilestone(ctx, w.ID, new(issuez.MilestoneEdit).SetStatus(issuez.MilestoneCompleted), done, issuez.Reload())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if m := u.Milestone; m.StatusChanged == nil || !m.StatusChanged.Equal(done.At) || !m.Updated.Equal(done.At) {
+		t.Errorf("completed: %+v", m)
+	}
+}
+
+// TestRepo_Update_unchanged: an edit that states values the issue has
+// writes nothing, so a host can state the whole state it wants.
+func TestRepo_Update_unchanged(t *testing.T) {
+	ctx := t.Context()
+	r := newRepo(t)
+	m, err := r.CreateMilestone(ctx, new(issuez.MilestoneEdit).SetName("v1"), ada)
+	if err != nil {
+		t.Fatal(err)
+	}
+	grace := issuez.Person{Email: "grace@example.com", UserID: "0c8d7a52-3f1e-4b6a-9d2c-5e4f3a2b1c0d"}
+	due := issuez.Date{Year: 2026, Month: time.December, Day: 1}
+	state := func() *issuez.Edit {
+		return new(issuez.Edit).SetTitle("Whole").SetDescription("Body").SetLabels("b", "a").
+			SetAssignees(grace).SetMilestone(m.ID).SetDueDate(due).SetRef("main").
+			SetLocked(true, "heated").SetState(issuez.StateClosed)
+	}
+	w, err := r.Create(ctx, new(issuez.Edit).SetTitle("Whole"), ada)
+	if err != nil {
+		t.Fatal(err)
+	}
+	blocker := create(t, r, "Blocker")
+	other := create(t, r, "Other")
+	whole := state
+	state = func() *issuez.Edit { return whole().SetBlockers(blocker.ID, other.ID) }
+	if u, err := r.Update(ctx, w.ID, state(), ada); err != nil || !u.Wrote {
+		t.Fatalf("first: %v %+v", err, u)
+	}
+	// The same sets in another order too.
+	again, err := r.Update(ctx, w.ID, state().SetLabels("a", "b").SetBlockers(other.ID, blocker.ID), ada)
+	if err != nil || again.Wrote {
+		t.Errorf("unchanged: %v, wrote %v, changes %+v", err, again != nil && again.Wrote, again.Entry.Changes)
+	}
+}
+
+// TestEdit_DeleteComment, RestoreComment and React: every write is an
+// Update too.
+func TestEdit_DeleteComment(t *testing.T) {
+	ctx := t.Context()
+	r := newRepo(t)
+	w, c := commented(t, r, "Hidden")
+	if _, err := r.Update(ctx, w.ID, new(issuez.Edit).DeleteComment(c.Commit), ada); err != nil {
+		t.Fatal(err)
+	}
+	if i, _ := r.Load(ctx, w.ID); !i.Comments[0].Deleted {
+		t.Error("not deleted")
+	}
+}
+
+func TestEdit_RestoreComment(t *testing.T) {
+	ctx := t.Context()
+	r := newRepo(t)
+	w, c := commented(t, r, "Back")
+	if _, err := r.Update(ctx, w.ID, new(issuez.Edit).DeleteComment(c.Commit), ada); err != nil {
+		t.Fatal(err)
+	}
+	u, err := r.Update(ctx, w.ID, new(issuez.Edit).RestoreComment(c.Commit), ada, issuez.Reload())
+	if err != nil || u.Issue.Comments[0].Deleted || u.Entry.Kind != issuez.EntryCommentRestore {
+		t.Errorf("restore: %v %+v", err, u)
+	}
+}
+
+func TestEdit_React(t *testing.T) {
+	ctx := t.Context()
+	r := newRepo(t)
+	w, c := commented(t, r, "Liked")
+	if _, err := r.Update(ctx, w.ID, new(issuez.Edit).React(":+1:"), ada); err != nil {
+		t.Fatal(err)
+	}
+	u, err := r.Update(ctx, w.ID, new(issuez.Edit).ReactToComment(c.Commit, "heart"), ada, issuez.Reload())
+	if err != nil || len(u.Issue.Reactions) != 1 || len(u.Issue.Comments[0].Reactions) != 1 {
+		t.Fatalf("react: %v %+v", err, u)
+	}
+	if u, err := r.Update(ctx, w.ID, new(issuez.Edit).Unreact(":+1:"), ada, issuez.Reload()); err != nil || len(u.Issue.Reactions) != 0 {
+		t.Errorf("take back: %v", err)
+	}
+}
+
+func TestEdit_Unreact(t *testing.T) {
+	ctx := t.Context()
+	r := newRepo(t)
+	w := create(t, r, "Liked")
+	if _, err := r.Update(ctx, w.ID, new(issuez.Edit).React("eyes"), ada); err != nil {
+		t.Fatal(err)
+	}
+	u, err := r.Update(ctx, w.ID, new(issuez.Edit).Unreact("eyes"), ada, issuez.Reload())
+	if err != nil || !u.Wrote || len(u.Issue.Reactions) != 0 {
+		t.Fatalf("unreact: %v %+v", err, u)
+	}
+	if again, err := r.Update(ctx, w.ID, new(issuez.Edit).Unreact("eyes"), ada); err != nil || again.Wrote {
+		t.Errorf("again: %v %+v", err, again)
+	}
+}
+
+func TestEdit_ReactToComment(t *testing.T) {
+	ctx := t.Context()
+	r := newRepo(t)
+	w, c := commented(t, r, "Liked")
+	u, err := r.Update(ctx, w.ID, new(issuez.Edit).ReactToComment(c.Commit, "heart"), ada, issuez.Reload())
+	if err != nil || len(u.Issue.Reactions) != 0 || len(u.Issue.Comments[0].Reactions) != 1 {
+		t.Fatalf("react: %v %+v", err, u)
+	}
+	if _, err := r.Update(ctx, w.ID, new(issuez.Edit).ReactToComment(w.NewTip, "heart"), ada); err == nil {
+		t.Error("the root isn't a comment")
+	}
+}
+
+func TestEdit_UnreactToComment(t *testing.T) {
+	ctx := t.Context()
+	r := newRepo(t)
+	w, c := commented(t, r, "Liked")
+	if _, err := r.Update(ctx, w.ID, new(issuez.Edit).ReactToComment(c.Commit, "heart"), ada); err != nil {
+		t.Fatal(err)
+	}
+	u, err := r.Update(ctx, w.ID, new(issuez.Edit).UnreactToComment(c.Commit, "heart"), ada, issuez.Reload())
+	if err != nil || len(u.Issue.Comments[0].Reactions) != 0 {
+		t.Fatalf("unreact: %v %+v", err, u)
+	}
+}

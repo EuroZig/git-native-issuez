@@ -62,7 +62,7 @@ pub fn main(comptime B: type, ctx: *context.Context(B), argv: []const []const u8
         const issues = repo.loadAll(arena) catch |e| return common.repoFailed(B, ctx, e);
         var js = json.begin(w);
         writeJson(&js, remotes, statuses, issues) catch |e| return json.failed(ctx.err, e);
-        json.end(&js);
+        json.end(&js) catch |e| return json.failed(ctx.err, e);
         return common.exit_ok;
     }
     if (remotes.len == 0) w.writeAll("No remotes configured.\n") catch {};
@@ -168,7 +168,7 @@ test "status --json" {
     var world: GitSim.World = .{ .seed = 12, .clones = &.{.{ .name = "a" }} };
     var sim = try GitSim.init(arena, &world, 0);
     const repo = issuez.Repo(GitSim).init(&sim);
-    _ = try repo.create(arena, .{ .title = "Login \xff broken" });
+    _ = try repo.create(arena, .{ .title = "Login \xff broken" }, .{});
     const ref = (try repo.refs(arena))[0];
     var issue = try repo.load(arena, ref);
     issue.conflicts = &.{
@@ -185,14 +185,20 @@ test "status --json" {
                 .reason = null,
                 .kept_local = true,
             },
-            .{ .id = ref.id(), .title = issue.title, .remote_tip = ref.tip, .reason = .rewound, .kept_local = false },
+            .{
+                .id = ref.id(),
+                .title = issue.title,
+                .remote_tip = ref.tip,
+                .reason = .rewound,
+                .kept_local = false,
+            },
         } },
         .{ .pending = &.{}, .quarantined = &.{} },
     };
     var out: std.Io.Writer.Allocating = .init(arena);
     var js = json.begin(&out.writer);
     try writeJson(&js, &.{ "origin", "backup" }, &statuses, &.{issue});
-    json.end(&js);
+    try json.end(&js);
     const v = try std.json.parseFromSliceLeaky(std.json.Value, arena, out.written(), .{});
 
     const keys = struct {

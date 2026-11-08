@@ -16,6 +16,7 @@
 
 const std = @import("std");
 const issuez = @import("issuez");
+const Date = issuez.format.fields.Date;
 const mcp = @import("blitzmcp");
 
 const Allocator = std.mem.Allocator;
@@ -61,6 +62,15 @@ pub const Problem = struct {
 
 pub const Progress = struct { closed: u32, total: u32 };
 
+/// Who closed a done issue, and when (`issuez.view.closure`).
+pub const Closed = struct {
+    author: Person,
+    author_id: ?[]const u8 = null,
+    date: []const u8,
+    /// The commit that set the done state.
+    commit: []const u8,
+};
+
 /// A trailer field, as written.
 pub const Field = struct { key: []const u8, value: []const u8 };
 
@@ -76,6 +86,14 @@ pub const Issue = struct {
     deleted: bool,
     labels: []const []const u8,
     assignee: ?[]const u8 = null,
+    /// Everyone assigned, by email; `assignee` is the first.
+    assignees: []const []const u8 = &.{},
+    /// `#number`, when it has one.
+    number: ?u64 = null,
+    locked: bool = false,
+    lock_reason: ?[]const u8 = null,
+    /// The branch or tag it is about.
+    ref: ?[]const u8 = null,
     priority: ?[]const u8 = null,
     milestone: ?[]const u8 = null,
     milestone_id: ?[]const u8 = null,
@@ -101,6 +119,8 @@ pub const Issue = struct {
     /// An open blocker remains.
     blocked: bool = false,
     problems: []const Problem = &.{},
+    /// Null for an issue that isn't done, or was created done.
+    closed: ?Closed = null,
 };
 
 pub const Comment = struct {
@@ -116,7 +136,16 @@ pub const Comment = struct {
     state_change: ?[]const u8 = null,
     merge: bool,
     edited: bool,
+    /// A purge took its text, attachments and origin.
+    purged: bool = false,
+    /// Where imported text came from.
+    original_author: ?[]const u8 = null,
+    original_id: ?[]const u8 = null,
+    reactions: []const Reaction = &.{},
 };
+
+/// Everyone who reacted with one emoji, by email.
+pub const Reaction = struct { emoji: []const u8, users: []const []const u8 };
 
 pub const IssueList = struct {
     /// Matching issues, before `limit`.
@@ -127,6 +156,11 @@ pub const IssueList = struct {
 pub const IssueDetail = struct {
     issue: Issue,
     description: []const u8,
+    /// Reactions on the issue itself; a comment's are with the comment.
+    reactions: []const Reaction = &.{},
+    /// Where an imported issue came from.
+    original_author: ?[]const u8 = null,
+    original_id: ?[]const u8 = null,
     /// Every commit after the first apart from events, oldest first:
     /// comments and updates (`kind`). Deleted comments are left out.
     comments: []const Comment,
@@ -172,6 +206,12 @@ pub const Edited = struct {
     changes: []const []const u8,
 };
 
+pub const Reacted = struct {
+    id: []const u8,
+    /// The new tip; null when nothing changed (already so).
+    version: ?[]const u8 = null,
+};
+
 pub const StateChanged = struct {
     id: []const u8,
     version: []const u8,
@@ -194,13 +234,15 @@ pub const ListArgs = struct {
     repo: ?[]const u8 = null,
 
     pub const descriptions = .{
-        .state = "open, closed, another state, or all. Default: every issue that isn't done (closed or a state in git config issue.doneStates).",
+        .state = "open, closed, another state, or all. Default: every issue that isn't done " ++
+            "(closed or a state in git config issue.doneStates).",
         .label = "Only issues with this label.",
         .assignee = "Only issues assigned to this email. Empty: unassigned issues.",
         .priority = "Only issues with this priority.",
         .sort = "Newest, highest or not done first; reverse flips it.",
         .reverse = "Reverse the order.",
-        .problems = "Only issues with problems (missing or looping parents or blockers, invalid values, ...), in any state unless state is given.",
+        .problems = "Only issues with problems (missing or looping parents or blockers, invalid " ++
+            "values, ...), in any state unless state is given.",
         .conflicts = "Only issues with fields edited concurrently.",
         .deleted = "Only deleted issues.",
         .limit = "At most this many issues (total counts them all).",
@@ -229,7 +271,8 @@ pub const SearchArgs = struct {
     repo: ?[]const u8 = null,
 
     pub const descriptions = .{
-        .text = "A fixed string, searched in titles, fields (as 'Key: value', State included), descriptions and comments.",
+        .text = "A fixed string, searched in titles, fields (as 'Key: value', State included), " ++
+            "descriptions and comments.",
         .state = "open, closed, another state, or all (the default).",
         .ignore_case = "Ignore ASCII case.",
         .limit = "At most this many issues, newest first (total counts them all).",
@@ -252,6 +295,8 @@ pub const CreateArgs = struct {
     description: []const u8 = "",
     labels: []const []const u8 = &.{},
     assignee: ?[]const u8 = null,
+    assignees: []const []const u8 = &.{},
+    number: ?u64 = null,
     priority: ?core.Priority = null,
     milestone: ?[]const u8 = null,
     milestone_id: ?[]const u8 = null,
@@ -262,6 +307,9 @@ pub const CreateArgs = struct {
     due: ?[]const u8 = null,
     estimate: ?[]const u8 = null,
     workflow: ?[]const u8 = null,
+    fields: []const Field = &.{},
+    original_author: ?[]const u8 = null,
+    original_id: ?[]const u8 = null,
     repo: ?[]const u8 = null,
 
     pub const descriptions = .{
@@ -269,19 +317,32 @@ pub const CreateArgs = struct {
         .description = "Markdown. Its last paragraph must not look like `Key: value` lines.",
         .labels = "Labels, without commas.",
         .assignee = "An email.",
+        .assignees = "More emails to assign.",
+        .number = number_description,
         .priority = "The priority.",
         .milestone = milestone_description,
         .milestone_id = milestone_id_description,
         .milestone_mode = milestone_mode_description,
         .parent = "The parent issue (ID or unique prefix).",
         .blocked_by = "Issues that block this one (IDs or unique prefixes).",
-        .start = "Start date: YYYY-MM-DD, or relative to today in the user's time zone: today, tomorrow, +3d, -1w, +2m, fri, eom, eow.",
-        .due = "Due date: YYYY-MM-DD, or relative to today in the user's time zone: today, tomorrow, +3d, -1w, +2m, fri, eom, eow.",
+        .start = "Start date: YYYY-MM-DD, or relative to today in the user's time zone: today, " ++
+            "tomorrow, +3d, -1w, +2m, fri, eom, eow.",
+        .due = "Due date: YYYY-MM-DD, or relative to today in the user's time zone: today, " ++
+            "tomorrow, +3d, -1w, +2m, fri, eom, eow.",
         .estimate = "Minutes, or a duration like 2h, 90m, 1h30m.",
-        .workflow = "A workflow state from git config issue.workflowStates (default backlog, ready, in-progress, review).",
+        .workflow = "A workflow state from git config issue.workflowStates (default backlog, " ++
+            "ready, in-progress, review).",
+        .fields = fields_description,
+        .original_author = original_author_description,
+        .original_id = original_id_description,
         .repo = repo_description,
     };
 };
+
+const fields_description = "A host's own fields, keys starting X- that the format " ++
+    "doesn't use (X-Forgejo-Project). An empty value clears one.";
+const original_author_description = "Imports: who wrote it where it came from.";
+const original_id_description = "Imports: its ID where it came from.";
 
 const milestone_description = "A milestone name. It links the one open catalog milestone " ++
     "with exactly this name (see list_milestones); otherwise it is written as plain text.";
@@ -294,18 +355,24 @@ pub const MilestoneMode = issuez.format.fields.MilestoneMode;
 pub const CommentArgs = struct {
     id: []const u8,
     text: []const u8,
+    original_author: ?[]const u8 = null,
+    original_id: ?[]const u8 = null,
     expect_version: ?[]const u8 = null,
     repo: ?[]const u8 = null,
 
     pub const descriptions = .{
         .id = "The issue ID or a unique prefix.",
         .text = "Markdown. The first line is the subject.",
+        .original_author = original_author_description,
+        .original_id = original_id_description,
         .expect_version = expect_description,
         .repo = repo_description,
     };
 };
 
 const expect_description = "Fail if the issue's version is no longer this one.";
+const number_description = "The issue's number (#n), unique in this repository.";
+const comment_description = "A comment in the same commit (Markdown, first line the subject).";
 
 pub const EditArgs = struct {
     id: []const u8,
@@ -315,6 +382,12 @@ pub const EditArgs = struct {
     add_labels: []const []const u8 = &.{},
     remove_labels: []const []const u8 = &.{},
     assignee: ?[]const u8 = null,
+    add_assignees: []const []const u8 = &.{},
+    remove_assignees: []const []const u8 = &.{},
+    number: ?u64 = null,
+    locked: ?bool = null,
+    lock_reason: ?[]const u8 = null,
+    ref: ?[]const u8 = null,
     priority: ?[]const u8 = null,
     milestone: ?[]const u8 = null,
     milestone_id: ?[]const u8 = null,
@@ -326,7 +399,9 @@ pub const EditArgs = struct {
     due: ?[]const u8 = null,
     estimate: ?[]const u8 = null,
     workflow: ?[]const u8 = null,
+    fields: []const Field = &.{},
     message: ?[]const u8 = null,
+    comment: ?[]const u8 = null,
     expect_version: ?[]const u8 = null,
     repo: ?[]const u8 = null,
 
@@ -337,7 +412,13 @@ pub const EditArgs = struct {
         .labels = "Replaces every label.",
         .add_labels = "Labels to add.",
         .remove_labels = "Labels to remove.",
-        .assignee = "An email. Empty clears it.",
+        .assignee = "An email. Empty unassigns everyone.",
+        .add_assignees = "Emails to assign as well.",
+        .remove_assignees = "Emails to unassign.",
+        .locked = "Lock (true) or unlock (false) the conversation.",
+        .lock_reason = "With locked true: why.",
+        .ref = "The branch or tag it is about. Empty clears it.",
+        .number = number_description ++ " Only when it has none.",
         .priority = "low, medium, high or critical. Empty clears it.",
         .milestone = milestone_description ++ " Empty clears it, and stops inheriting one.",
         .milestone_id = milestone_id_description,
@@ -345,12 +426,33 @@ pub const EditArgs = struct {
         .parent = "The parent issue (ID or unique prefix). Empty clears it.",
         .add_blocked_by = "Issues that now block this one.",
         .remove_blocked_by = "Blockers to remove.",
-        .start = "Start date: YYYY-MM-DD, or relative to today in the user's time zone (today, +3d, fri, eom). Empty clears it.",
-        .due = "Due date: YYYY-MM-DD, or relative to today in the user's time zone (today, +3d, fri, eom). Empty clears it.",
+        .start = "Start date: YYYY-MM-DD, or relative to today in the user's time zone (today, " ++
+            "+3d, fri, eom). Empty clears it.",
+        .due = "Due date: YYYY-MM-DD, or relative to today in the user's time zone (today, +3d, " ++
+            "fri, eom). Empty clears it.",
         .estimate = "Minutes, or a duration like 2h, 90m, 1h30m. Empty clears it.",
         .workflow = "A workflow state from git config issue.workflowStates. Empty clears it.",
+        .fields = fields_description,
         .message = "The commit subject. Default: what changed.",
+        .comment = comment_description ++ " Not with description or message.",
         .expect_version = expect_description,
+        .repo = repo_description,
+    };
+};
+
+pub const ReactArgs = struct {
+    id: []const u8,
+    emoji: []const u8,
+    comment: ?[]const u8 = null,
+    undo: bool = false,
+    repo: ?[]const u8 = null,
+
+    pub const descriptions = .{
+        .id = "The issue ID or a unique prefix.",
+        .emoji = "`:+1:` or the character itself.",
+        .comment = "React to this comment (its ID or a unique prefix, see show_issue) " ++
+            "instead of the issue.",
+        .undo = "Take the reaction back.",
         .repo = repo_description,
     };
 };
@@ -362,6 +464,7 @@ pub const StateArgs = struct {
     fixed_by: ?[]const u8 = null,
     release: ?[]const u8 = null,
     message: ?[]const u8 = null,
+    comment: ?[]const u8 = null,
     expect_version: ?[]const u8 = null,
     repo: ?[]const u8 = null,
 
@@ -372,6 +475,7 @@ pub const StateArgs = struct {
         .fixed_by = "The commit that fixes it.",
         .release = "The release that ships the fix.",
         .message = "The commit subject. Default: Close issue, Reopen issue, ...",
+        .comment = comment_description ++ " Not with message.",
         .expect_version = expect_description,
         .repo = repo_description,
     };
@@ -392,14 +496,16 @@ pub const resources = [_]mcp.types.Resource{
         .uri = issues_uri,
         .name = "issues",
         .title = "Open issues",
-        .description = "The issues that aren't done, newest first, at most 100 (list_issues without arguments).",
+        .description = "The issues that aren't done, newest first, at most 100 (list_issues " ++
+            "without arguments).",
         .mimeType = "application/json",
     },
     .{
         .uri = milestones_uri,
         .name = "milestones",
         .title = "Open milestones",
-        .description = "The open milestones with their progress (list_milestones without arguments).",
+        .description = "The open milestones with their progress (list_milestones without " ++
+            "arguments).",
         .mimeType = "application/json",
     },
 };
@@ -408,7 +514,8 @@ pub const resource_templates = [_]mcp.types.ResourceTemplate{.{
     .uriTemplate = issue_uri_prefix ++ "{id}",
     .name = "issue",
     .title = "An issue",
-    .description = "An issue with its description and comments (show_issue); id is the UUID or a unique prefix.",
+    .description = "An issue with its description and comments (show_issue); id is the UUID or " ++
+        "a unique prefix.",
     .mimeType = "application/json",
 }};
 
@@ -501,7 +608,7 @@ pub const Subscriptions = struct {
         s.mutex.lockUncancelable(io);
         defer s.mutex.unlock(io);
         var out: std.ArrayList([]const u8) = .empty;
-        if (d.empty() and !settings) return out.items;
+        if (d.isEmpty() and !settings) return out.items;
         for (0..s.count) |i| {
             const u = s.at(i);
             const hit = switch (ResourceUri.parse(u) orelse continue) {
@@ -543,11 +650,15 @@ pub fn Handler(comptime Repos: type) type {
             }
 
             fn catalog(s: Session) Catalog {
-                return Catalog.of(s.repo);
+                return Catalog.fromRepo(s.repo);
             }
 
             /// Over `issues`, which must be every issue or `loadAround`'s.
-            fn project(s: Session, arena: Allocator, issues: []const issuez.engine.Issue) !Projection {
+            fn project(
+                s: Session,
+                arena: Allocator,
+                issues: []const issuez.engine.Issue,
+            ) !Projection {
                 return s.catalog().project(arena, issues, .{});
             }
         };
@@ -555,18 +666,16 @@ pub fn Handler(comptime Repos: type) type {
         fn open(h: *Self, ctx: *mcp.Context, repo_path: ?[]const u8) !Session {
             const backend = try h.repos.open(ctx, repo_path);
             errdefer h.repos.close(backend);
-            const settings = issuez.settings.read(ctx.arena, backend) catch |e|
+            const settings = issuez.settings.read(B, ctx.arena, backend) catch |e|
                 return failWith(ctx, e, .{}, issuez.errors.gitDetail(backend, e));
-            if (settings.invalid_done_state) |v| return ctx.fail(
-                error.InvalidDoneStates,
+            var repo = Repo.fromSettings(backend, settings) catch |e| return ctx.fail(
+                e,
                 "git config issue.doneStates has '{s}'; " ++ issuez.settings.done_states_rule,
-                .{v},
+                .{settings.invalid_done_state.?},
             );
-            var repo = Repo.init(backend);
-            settings.apply(&repo);
             // One listing of the issues per call, until a write.
-            repo.listing = try ctx.arena.create(Repo.Listing);
-            repo.listing.?.* = .{};
+            repo.call.listing = try ctx.arena.create(Repo.Listing);
+            repo.call.listing.?.* = .{};
             return .{ .backend = backend, .repo = repo, .settings = settings };
         }
 
@@ -576,14 +685,33 @@ pub fn Handler(comptime Repos: type) type {
 
         /// A date as given (`2026-12-01`, `today`, `+3d`, `fri`, `eom`), as
         /// git stores it; empty stays empty, for clearing.
-        fn date(h: *Self, ctx: *mcp.Context, s: Session, field: []const u8, value: ?[]const u8) !?[]const u8 {
-            const v = value orelse return null;
+        /// A date as typed (`2026-12-01`, `today`, `+3d`, `fri`, `eom`).
+        fn date(
+            h: *Self,
+            ctx: *mcp.Context,
+            s: Session,
+            field: []const u8,
+            value: []const u8,
+        ) !Date {
             const today = h.zone.today(h.now_s orelse issuez.local_time.nowS(ctx.io));
-            return try issuez.format.dates.resolve(ctx.arena, v, today, s.settings.work_days) orelse ctx.fail(
+            return issuez.format.dates.parse(value, today, s.settings.work_days) orelse ctx.fail(
                 error.InvalidValue,
                 "{s} must be a date as YYYY-MM-DD, or like today, +3d, fri, eom, not '{s}'",
-                .{ field, v },
+                .{ field, value },
             );
+        }
+
+        /// "" clears it.
+        fn dateEdit(
+            h: *Self,
+            ctx: *mcp.Context,
+            s: Session,
+            field: []const u8,
+            value: ?[]const u8,
+        ) !?issuez.engine.EditSpec.DateEdit {
+            const v = value orelse return null;
+            if (v.len == 0) return .clear;
+            return .{ .set = try h.date(ctx, s, field, v) };
         }
 
         pub fn listIssues(h: *Self, ctx: *mcp.Context, args: ListArgs) !IssueList {
@@ -601,7 +729,11 @@ pub fn Handler(comptime Repos: type) type {
                 .assignee = args.assignee,
                 .priority = args.priority,
                 .deleted = args.deleted,
-            }, .{ .key = args.sort, .reverse = args.reverse, .done_states = s.settings.done_states });
+            }, .{
+                .key = args.sort,
+                .reverse = args.reverse,
+                .done_states = s.settings.done_states,
+            });
             const proj = s.project(arena, all) catch |e| return s.fail(ctx, e);
 
             var out: std.ArrayList(Issue) = .empty;
@@ -610,7 +742,10 @@ pub fn Handler(comptime Repos: type) type {
                 if (args.conflicts and issue.conflicts.len == 0) continue;
                 if (args.problems and proj.problemsOf(proj.find(issue.id).?).len == 0) continue;
                 total += 1;
-                if (out.items.len < args.limit) try out.append(arena, try issueResult(arena, s, issue, proj));
+                if (out.items.len < args.limit) try out.append(
+                    arena,
+                    try issueResult(arena, s, issue, proj),
+                );
             }
             return .{ .total = total, .issues = out.items };
         }
@@ -644,18 +779,72 @@ pub fn Handler(comptime Repos: type) type {
                     .state_change = if (c.state_change) |st| try text(arena, st.text()) else null,
                     .merge = c.is_merge,
                     .edited = c.edited,
+                    .purged = c.purged,
+                    .original_author = try optionalText(arena, c.original_author),
+                    .original_id = try optionalText(arena, c.original_id),
+                    .reactions = try reactionsOn(arena, issue, c.oid),
                 });
             }
             return .{
                 .issue = try issueResult(arena, s, issue, proj),
                 .description = try text(arena, issue.description),
+                .reactions = try reactionsOn(arena, issue, null),
+                .original_author = try optionalText(arena, issue.original_author),
+                .original_id = try optionalText(arena, issue.original_id),
                 .comments = comments.items,
             };
         }
 
+        pub fn reactIssue(h: *Self, ctx: *mcp.Context, args: ReactArgs) !Reacted {
+            const arena = ctx.arena;
+            if (!issuez.format.fields.isEmoji(args.emoji)) return ctx.fail(
+                error.InvalidValue,
+                "an emoji is 1 to 64 bytes without whitespace or commas, not '{s}'",
+                .{args.emoji},
+            );
+            const s = try h.open(ctx, args.repo);
+            defer h.close(s);
+
+            const ref = try resolveIssue(ctx, s, args.id);
+            var target: ?issuez.engine.Oid = null;
+            if (args.comment) |prefix| {
+                const issue = s.repo.load(arena, ref) catch |e| return s.fail(ctx, e);
+                for (issue.comments) |c| {
+                    if (c.is_merge) continue;
+                    const hex = c.oid.hex();
+                    if (!std.mem.startsWith(u8, hex.slice(), prefix)) continue;
+                    if (target != null) return ctx.fail(
+                        error.InvalidValue,
+                        "comment '{s}' is ambiguous",
+                        .{prefix},
+                    );
+                    target = c.oid;
+                }
+                if (target == null) return ctx.fail(
+                    error.InvalidValue,
+                    "no comment '{s}' on this issue",
+                    .{prefix},
+                );
+            }
+            const tip = s.repo.react(arena, ref.name, .{
+                .target = target,
+                .emoji = args.emoji,
+                .present = !args.undo,
+            }, .{}) catch |e| return s.fail(ctx, e);
+            const version = if (tip.wrote) blk: {
+                const hex = tip.tip.hex();
+                break :blk try arena.dupe(u8, hex.slice());
+            } else null;
+            return .{ .id = ref.id(), .version = version };
+        }
+
         pub fn searchIssues(h: *Self, ctx: *mcp.Context, args: SearchArgs) !SearchResult {
             const arena = ctx.arena;
-            if (args.text.len == 0) return ctx.fail(error.InvalidValue, "text must not be empty", .{});
+            if (args.text.len == 0) return ctx.fail(
+                error.InvalidValue,
+                "text must not be empty",
+                .{},
+            );
             const state = try stateFilter(ctx, args.state orelse "all");
             const s = try h.open(ctx, args.repo);
             defer h.close(s);
@@ -670,7 +859,12 @@ pub fn Handler(comptime Repos: type) type {
             var out: std.ArrayList(SearchHit) = .empty;
             var total: usize = 0;
             for (issues) |issue| {
-                const lines = try query.searchLines(arena, issue, args.text, .{ .ignore_case = args.ignore_case });
+                const lines = try query.searchLines(
+                    arena,
+                    issue,
+                    args.text,
+                    .{ .ignore_case = args.ignore_case },
+                );
                 if (lines.len == 0) continue;
                 total += 1;
                 if (out.items.len == args.limit) continue;
@@ -690,7 +884,11 @@ pub fn Handler(comptime Repos: type) type {
             const cat = s.catalog();
             const all = cat.list(arena) catch |e| return s.fail(ctx, e);
             const issues = s.repo.loadForGuards(arena) catch |e| return s.fail(ctx, e);
-            const proj = cat.project(arena, issues, .{ .milestones = all }) catch |e| return s.fail(ctx, e);
+            const proj = cat.project(
+                arena,
+                issues,
+                .{ .milestones = all },
+            ) catch |e| return s.fail(ctx, e);
             var out: std.ArrayList(Milestone) = .empty;
             for (all) |m| {
                 if (!args.all and m.status != .open) continue;
@@ -714,7 +912,10 @@ pub fn Handler(comptime Repos: type) type {
             defer h.close(s);
 
             var blockers: std.ArrayList([]const u8) = .empty;
-            for (args.blocked_by) |b| try blockers.append(arena, (try resolveIssue(ctx, s, b)).id());
+            for (args.blocked_by) |b| try blockers.append(
+                arena,
+                (try resolveIssue(ctx, s, b)).id(),
+            );
             if (args.workflow) |w| try checkWorkflow(ctx, s.settings, w);
             const ms = try chooseMilestone(ctx, s, .{
                 .name = args.milestone,
@@ -726,22 +927,23 @@ pub fn Handler(comptime Repos: type) type {
                 .title = args.title,
                 .body = args.description,
                 .labels = args.labels,
-                .assignee = args.assignee,
+                .assignees = try people(ctx, args.assignee, args.assignees),
+                .number = args.number,
                 .priority = args.priority,
-                .milestone = ms.text,
-                .milestone_id = ms.id,
-                .milestone_mode = ms.mode,
+                .milestone = ms.edit(),
                 .parent = if (args.parent) |p| (try resolveIssue(ctx, s, p)).id() else null,
                 .blocked_by = blockers.items,
-                .start_date = try h.date(ctx, s, "start", args.start),
-                .due_date = try h.date(ctx, s, "due", args.due),
+                .start_date = if (args.start) |d| try h.date(ctx, s, "start", d) else null,
+                .due_date = if (args.due) |d| try h.date(ctx, s, "due", d) else null,
                 .estimate_minutes = if (args.estimate) |e| try duration(ctx, e) else null,
                 .workflow = args.workflow,
-            }) catch |e| return s.fail(ctx, e);
+                .extra = try hostFields(arena, args.fields),
+                .original = .{ .author = args.original_author, .id = args.original_id },
+            }, .{}) catch |e| return s.fail(ctx, e);
             const hex = created.tip.hex();
             return .{
-                .id = try arena.dupe(u8, created.id.slice()),
-                .short_id = try arena.dupe(u8, created.id.short()),
+                .id = try arena.dupe(u8, created.id),
+                .short_id = try arena.dupe(u8, issuez.shortId(created.id)),
                 .version = try arena.dupe(u8, hex.slice()),
             };
         }
@@ -754,9 +956,10 @@ pub fn Handler(comptime Repos: type) type {
             const ref = try resolveIssue(ctx, s, args.id);
             const tip = s.repo.comment(arena, ref.name, .{
                 .text = args.text,
+                .original = .{ .author = args.original_author, .id = args.original_id },
                 .expect = try expectVersion(ctx, s.backend, args.expect_version),
-            }) catch |e| return s.fail(ctx, e);
-            const hex = tip.hex();
+            }, .{}) catch |e| return s.fail(ctx, e);
+            const hex = tip.tip.hex();
             const version = try arena.dupe(u8, hex.slice());
             return .{ .id = ref.id(), .version = version, .comment_id = version };
         }
@@ -773,11 +976,19 @@ pub fn Handler(comptime Repos: type) type {
                 .set_labels = args.labels,
                 .add_labels = args.add_labels,
                 .remove_labels = args.remove_labels,
-                .assignee = args.assignee,
-                .start_date = try h.date(ctx, s, "start", args.start),
-                .due_date = try h.date(ctx, s, "due", args.due),
-                .workflow = args.workflow,
+                .set_assignees = if (args.assignee) |a| try people(ctx, a, &.{}) else null,
+                .add_assignees = try people(ctx, null, args.add_assignees),
+                .remove_assignees = args.remove_assignees,
+                .number = args.number,
+                .locked = args.locked,
+                .lock_reason = args.lock_reason,
+                .ref = .fromInput(args.ref),
+                .start_date = try h.dateEdit(ctx, s, "start", args.start),
+                .due_date = try h.dateEdit(ctx, s, "due", args.due),
+                .workflow = .fromInput(args.workflow),
                 .message = args.message,
+                .comment = args.comment,
+                .extra = try hostFields(arena, args.fields),
                 .expect = try expectVersion(ctx, s.backend, args.expect_version),
             };
             if (args.priority) |p| spec.priority = if (p.len == 0) .clear else .{
@@ -791,14 +1002,22 @@ pub fn Handler(comptime Repos: type) type {
                 .set = try duration(ctx, e),
             };
             if (args.workflow) |w| if (w.len > 0) try checkWorkflow(ctx, s.settings, w);
-            if (args.parent) |p| spec.parent = if (p.len == 0) "" else (try resolveIssue(ctx, s, p)).id();
+            if (args.parent) |p| spec.parent = if (p.len == 0)
+                .clear
+            else
+                .{ .set = (try resolveIssue(ctx, s, p)).id() };
             var add: std.ArrayList([]const u8) = .empty;
             for (args.add_blocked_by) |b| try add.append(arena, (try resolveIssue(ctx, s, b)).id());
             spec.add_blocked_by = add.items;
             var remove: std.ArrayList([]const u8) = .empty;
-            for (args.remove_blocked_by) |b| try remove.append(arena, (try resolveIssue(ctx, s, b)).id());
+            for (args.remove_blocked_by) |b| try remove.append(
+                arena,
+                (try resolveIssue(ctx, s, b)).id(),
+            );
             spec.remove_blocked_by = remove.items;
-            if (args.milestone != null or args.milestone_id != null or args.milestone_mode != null) {
+            const milestone_set = args.milestone != null or args.milestone_id != null or
+                args.milestone_mode != null;
+            if (milestone_set) {
                 const current = s.repo.load(arena, ref) catch |e| return s.fail(ctx, e);
                 const ms = try chooseMilestone(ctx, s, .{
                     .name = args.milestone,
@@ -807,16 +1026,18 @@ pub fn Handler(comptime Repos: type) type {
                     .current = current,
                     .parent_given = args.parent != null and args.parent.?.len > 0,
                 });
-                spec.milestone = ms.text;
-                spec.milestone_id = ms.id;
-                spec.milestone_mode = ms.mode;
+                spec.milestone = ms.edit();
             }
 
-            const result = s.repo.edit(arena, ref.name, spec) catch |e| return s.fail(ctx, e);
+            const result = s.repo.edit(arena, ref.name, spec, .{}) catch |e| return s.fail(ctx, e);
             const changes = try arena.alloc([]const u8, result.changes.len);
             for (result.changes, changes) |c, *out| out.* = c.name();
             const hex = result.tip.hex();
-            return .{ .id = ref.id(), .version = try arena.dupe(u8, hex.slice()), .changes = changes };
+            return .{
+                .id = ref.id(),
+                .version = try arena.dupe(u8, hex.slice()),
+                .changes = changes,
+            };
         }
 
         pub fn @"resources/list"() mcp.types.ListResourcesResult {
@@ -837,13 +1058,22 @@ pub fn Handler(comptime Repos: type) type {
             const json = switch (uri) {
                 .issues => try resourceJson(ctx, try h.listIssues(ctx, .{})),
                 .milestones => try resourceJson(ctx, try h.listMilestones(ctx, .{})),
-                .issue => |id| try resourceJson(ctx, h.showIssue(ctx, .{ .id = id }) catch |e| switch (e) {
-                    error.IssueNotFound => return ctx.fail(error.ResourceNotFound, "no issue '{s}'", .{id}),
+                .issue => |id| try resourceJson(ctx, h.showIssue(
+                    ctx,
+                    .{ .id = id },
+                ) catch |e| switch (e) {
+                    error.IssueNotFound => return ctx.fail(
+                        error.ResourceNotFound,
+                        "no issue '{s}'",
+                        .{id},
+                    ),
                     else => return e,
                 }),
             };
             const contents = try ctx.arena.alloc(mcp.types.ResourceContents, 1);
-            contents[0] = .{ .text = .{ .uri = params.uri, .mimeType = "application/json", .text = json } };
+            contents[0] = .{
+                .text = .{ .uri = params.uri, .mimeType = "application/json", .text = json },
+            };
             return .{ .contents = contents };
         }
 
@@ -858,8 +1088,16 @@ pub fn Handler(comptime Repos: type) type {
                 return ctx.fail(error.ResourceNotFound, "no resource '{s}'", .{params.uri});
             if (@hasDecl(Repos, "watch")) try h.repos.watch(ctx, &h.subscriptions);
             h.subscriptions.add(ctx.io, params.uri) catch |e| return switch (e) {
-                error.TooManySubscriptions => ctx.fail(e, "at most {d} subscriptions", .{Subscriptions.max}),
-                error.UriTooLong => ctx.fail(error.ResourceNotFound, "no resource '{s}'", .{params.uri}),
+                error.TooManySubscriptions => ctx.fail(
+                    e,
+                    "at most {d} subscriptions",
+                    .{Subscriptions.max},
+                ),
+                error.UriTooLong => ctx.fail(
+                    error.ResourceNotFound,
+                    "no resource '{s}'",
+                    .{params.uri},
+                ),
             };
             return .{};
         }
@@ -874,7 +1112,11 @@ pub fn Handler(comptime Repos: type) type {
         }
 
         fn resourceJson(ctx: *mcp.Context, value: anytype) ![]const u8 {
-            return std.json.Stringify.valueAlloc(ctx.arena, value, .{ .emit_null_optional_fields = false });
+            return std.json.Stringify.valueAlloc(
+                ctx.arena,
+                value,
+                .{ .emit_null_optional_fields = false },
+            );
         }
 
         pub fn setIssueState(h: *Self, ctx: *mcp.Context, args: StateArgs) !StateChanged {
@@ -889,6 +1131,24 @@ pub fn Handler(comptime Repos: type) type {
 
             const ref = try resolveIssue(ctx, s, args.id);
             const state = core.State.parse(args.state);
+            const expect = try expectVersion(ctx, s.backend, args.expect_version);
+            if (args.comment) |comment_text| {
+                const result = s.repo.edit(arena, ref.name, .{
+                    .state = state,
+                    .fixed_by = args.fixed_by,
+                    .release = args.release,
+                    .reason = args.reason,
+                    .comment = comment_text,
+                    .message = args.message,
+                    .expect = expect,
+                }, .{}) catch |e| return s.fail(ctx, e);
+                const hex = result.tip.hex();
+                return .{
+                    .id = ref.id(),
+                    .version = try arena.dupe(u8, hex.slice()),
+                    .state = state.text(),
+                };
+            }
             const tip = s.repo.setState(arena, ref.name, .{
                 .state = state,
                 .message = args.message,
@@ -896,13 +1156,21 @@ pub fn Handler(comptime Repos: type) type {
                 .release = args.release,
                 .reason = args.reason,
                 .expect = try expectVersion(ctx, s.backend, args.expect_version),
-            }) catch |e| return s.fail(ctx, e);
-            const hex = tip.hex();
-            return .{ .id = ref.id(), .version = try arena.dupe(u8, hex.slice()), .state = state.text() };
+            }, .{}) catch |e| return s.fail(ctx, e);
+            const hex = tip.tip.hex();
+            return .{
+                .id = ref.id(),
+                .version = try arena.dupe(u8, hex.slice()),
+                .state = state.text(),
+            };
         }
 
         /// `Catalog.choose`, refusals as tool errors.
-        fn chooseMilestone(ctx: *mcp.Context, s: Session, spec: Catalog.ChoiceSpec) !Catalog.Choice {
+        fn chooseMilestone(
+            ctx: *mcp.Context,
+            s: Session,
+            spec: Catalog.ChoiceSpec,
+        ) !Catalog.Choice {
             const chosen = s.catalog().choose(ctx.arena, spec) catch |e| return s.fail(ctx, e);
             const r = switch (chosen) {
                 .ok => |c| return c,
@@ -911,19 +1179,47 @@ pub fn Handler(comptime Repos: type) type {
             const e = error.InvalidMilestone;
             return switch (r) {
                 .id_with_name => ctx.fail(e, "give milestone or milestone_id, not both", .{}),
-                .id_with_mode => |m| ctx.fail(e, "milestone_id doesn't go with milestone_mode {t}", .{m}),
-                .explicit_needs_milestone => ctx.fail(e, "milestone_mode explicit needs a milestone", .{}),
-                .explicit_needs_id => ctx.fail(e, "milestone_mode explicit needs a milestone (milestone_id)", .{}),
-                .no_such_milestone => |k| ctx.fail(e, "no milestone '{s}' (see list_milestones with all)", .{k}),
-                .retired_name => |m| ctx.fail(e, "milestone '{s}' is retired; name it by its ID ({s})", .{ m.name, uuid.shortId(m.id) }),
-                .ambiguous_id => |ms| ctx.fail(e, "'{s}' matches several milestones: {s}", .{ spec.id.?, try milestoneNames(ctx.arena, ms) }),
+                .id_with_mode => |m| ctx.fail(
+                    e,
+                    "milestone_id doesn't go with milestone_mode {t}",
+                    .{m},
+                ),
+                .explicit_needs_milestone => ctx.fail(
+                    e,
+                    "milestone_mode explicit needs a milestone",
+                    .{},
+                ),
+                .explicit_needs_id => ctx.fail(
+                    e,
+                    "milestone_mode explicit needs a milestone (milestone_id)",
+                    .{},
+                ),
+                .no_such_milestone => |k| ctx.fail(
+                    e,
+                    "no milestone '{s}' (see list_milestones with all)",
+                    .{k},
+                ),
+                .retired_name => |m| ctx.fail(
+                    e,
+                    "milestone '{s}' is retired; name it by its ID ({s})",
+                    .{ m.name, uuid.shortId(m.id) },
+                ),
+                .ambiguous_id => |ms| ctx.fail(
+                    e,
+                    "'{s}' matches several milestones: {s}",
+                    .{ spec.id.?, try milestoneNames(ctx.arena, ms) },
+                ),
                 .not_open => |m| ctx.fail(e, "milestone '{s}' is {t}{s}", .{
                     m.name,
                     m.status,
                     if (m.status == .completed) "; reopen it first" else "",
                 }),
                 .no_open_named => |n| ctx.fail(e, "no open milestone is named '{s}'", .{n}),
-                .ambiguous_name => |ms| ctx.fail(e, "several open milestones are named '{s}' ({s}); give milestone_id instead", .{ ms[0].name, try milestoneNames(ctx.arena, ms) }),
+                .ambiguous_name => |ms| ctx.fail(
+                    e,
+                    "several open milestones are named '{s}' ({s}); give milestone_id instead",
+                    .{ ms[0].name, try milestoneNames(ctx.arena, ms) },
+                ),
             };
         }
 
@@ -947,7 +1243,11 @@ pub fn Handler(comptime Repos: type) type {
                         if (i > 0) try ids.appendSlice(ctx.arena, ", ");
                         try ids.appendSlice(ctx.arena, uuid.shortId(m.id()));
                     }
-                    return ctx.fail(error.AmbiguousId, "'{s}' matches several issues ({s}); give more of the ID", .{ prefix, ids.items });
+                    return ctx.fail(
+                        error.AmbiguousId,
+                        "'{s}' matches several issues ({s}); give more of the ID",
+                        .{ prefix, ids.items },
+                    );
                 },
             }
         }
@@ -955,10 +1255,19 @@ pub fn Handler(comptime Repos: type) type {
         fn expectVersion(ctx: *mcp.Context, backend: *B, version: ?[]const u8) !?Oid {
             const v = version orelse return null;
             return Oid.parseHex(backend.objectFormat(), v) catch
-                ctx.fail(error.InvalidValue, "expect_version must be a full commit ID (an issue's version), not '{s}'", .{v});
+                ctx.fail(
+                    error.InvalidValue,
+                    "expect_version must be a full commit ID (an issue's version), not '{s}'",
+                    .{v},
+                );
         }
 
-        fn issueResult(arena: Allocator, s: Session, i: issuez.engine.Issue, proj: Projection) !Issue {
+        fn issueResult(
+            arena: Allocator,
+            s: Session,
+            i: issuez.engine.Issue,
+            proj: Projection,
+        ) !Issue {
             const hex = i.tip.hex();
             var out: Issue = .{
                 .id = try text(arena, i.id),
@@ -969,16 +1278,27 @@ pub fn Handler(comptime Repos: type) type {
                 .done = s.repo.isDone(i),
                 .deleted = i.deleted,
                 .labels = try texts(arena, i.labels),
-                .assignee = try optionalText(arena, if (i.ext.assignee) |a| a.email else i.field("Assignee")),
+                .assignee = try optionalText(
+                    arena,
+                    if (i.assignee) |a| a.email else i.field("Assignee"),
+                ),
+                .assignees = try assigneeEmails(arena, i),
+                .number = i.number,
+                .locked = i.locked,
+                .lock_reason = try optionalText(arena, i.lock_reason),
+                .ref = try optionalText(arena, i.ref),
                 .priority = try optionalText(arena, i.field("Priority")),
-                .milestone = try optionalText(arena, i.field("Milestone")),
-                .milestone_id = try optionalText(arena, i.ext.milestone_id),
-                .parent = try optionalText(arena, i.ext.parent),
-                .blocked_by = try texts(arena, i.ext.blocked_by),
-                .start = if (i.ext.start_date) |d| try std.fmt.allocPrint(arena, "{f}", .{d}) else null,
-                .due = if (i.ext.due_date) |d| try std.fmt.allocPrint(arena, "{f}", .{d}) else null,
-                .estimate_minutes = i.ext.estimate_minutes,
-                .workflow = try optionalText(arena, i.ext.workflow),
+                .milestone = try optionalText(arena, i.milestone),
+                .milestone_id = try optionalText(arena, i.milestone_id),
+                .parent = try optionalText(arena, i.parent),
+                .blocked_by = try texts(arena, i.blocked_by),
+                .start = if (i.start_date) |d|
+                    try std.fmt.allocPrint(arena, "{f}", .{d})
+                else
+                    null,
+                .due = if (i.due_date) |d| try std.fmt.allocPrint(arena, "{f}", .{d}) else null,
+                .estimate_minutes = i.estimate_minutes,
+                .workflow = try optionalText(arena, i.workflow),
                 .author = try person(arena, i.author),
                 .created = try time(arena, i.created, i.author.tz_offset_minutes),
                 .updated = try time(arena, i.updated, i.updated_tz_offset_minutes),
@@ -986,17 +1306,29 @@ pub fn Handler(comptime Repos: type) type {
                 .conflicts = try conflicts(arena, i.conflicts),
                 .attachments = i.attachments.len,
             };
+            if (issuez.view.closure(i, s.repo.doneStates())) |c| {
+                const commit = c.commit.hex();
+                out.closed = .{
+                    .author = try person(arena, c.at),
+                    .author_id = try optionalText(arena, c.author_id),
+                    .date = try time(arena, c.at.time, c.at.tz_offset_minutes),
+                    .commit = try arena.dupe(u8, commit.slice()),
+                };
+            }
             if (proj.find(i.id)) |idx| {
                 out.effective_milestone_id = try optionalText(arena, proj.milestone[idx]);
                 out.effective_workflow = try optionalText(arena, proj.workflow(idx));
-                if (proj.progress(idx)) |p| out.progress = .{ .closed = p.closed, .total = p.total };
+                if (proj.progress(idx)) |p| out.progress = .{
+                    .closed = p.closed,
+                    .total = p.total,
+                };
                 out.blocked = proj.activelyBlocked(idx);
                 const problems = proj.problemsOf(idx);
                 const list = try arena.alloc(Problem, problems.len);
                 for (problems, list) |p, *o| o.* = .{
                     .kind = @tagName(p.kind),
                     .other = try optionalText(arena, p.other),
-                    .description = try text(arena, try p.describe(arena)),
+                    .description = try text(arena, try std.fmt.allocPrint(arena, "{f}", .{p})),
                 };
                 out.problems = list;
             }
@@ -1037,14 +1369,16 @@ pub fn Server(comptime Repos: type, comptime version: []const u8) type {
             .{
                 .name = "search_issues",
                 .title = "Search issues",
-                .description = "Issues whose title, fields, description or comments contain a text, with the matching lines.",
+                .description = "Issues whose title, fields, description or comments contain a " ++
+                    "text, with the matching lines.",
                 .annotations = read_only,
                 .call = H.searchIssues,
             },
             .{
                 .name = "list_milestones",
                 .title = "List milestones",
-                .description = "The milestone catalog with each milestone's progress (done and total leaf issues).",
+                .description = "The milestone catalog with each milestone's progress (done and " ++
+                    "total leaf issues).",
                 .annotations = read_only,
                 .call = H.listMilestones,
             },
@@ -1065,14 +1399,24 @@ pub fn Server(comptime Repos: type, comptime version: []const u8) type {
             .{
                 .name = "edit_issue",
                 .title = "Edit an issue",
-                .description = "Changes an issue's title, description or fields, in one commit. Fields left out stay as they are.",
+                .description = "Changes an issue's title, description or fields, in one commit. " ++
+                    "Fields left out stay as they are.",
                 .annotations = write,
                 .call = H.editIssue,
             },
             .{
+                .name = "react_issue",
+                .title = "React to an issue or a comment",
+                .description = "Adds an emoji reaction (or takes it back) on an issue or one of " ++
+                    "its comments. Reacting the same way twice changes nothing.",
+                .annotations = write,
+                .call = H.reactIssue,
+            },
+            .{
                 .name = "set_issue_state",
                 .title = "Close, reopen or change an issue's state",
-                .description = "Sets an issue's state: closed, open, or another state. Closing fails while sub-issues are open.",
+                .description = "Sets an issue's state: closed, open, or another state. Closing " ++
+                    "fails while sub-issues are open.",
                 .annotations = write,
                 .call = H.setIssueState,
             },
@@ -1087,10 +1431,34 @@ fn stateFilter(ctx: *mcp.Context, value: ?[]const u8) !StateFilter {
     if (std.mem.eql(u8, v, "all")) return .{ .given = true };
     if (!core.isState(v)) return ctx.fail(
         error.InvalidValue,
-        "state must be open, closed, another state (letters, digits, '-' and '_') or all, not '{s}'",
+        "state must be open, closed, another state (letters, digits, '-' and '_') or all, not " ++
+            "'{s}'",
         .{v},
     );
     return .{ .state = core.State.parse(v), .given = true };
+}
+
+/// `first`, then `rest`, each an email (or `<uuid> <email>`); empty ones
+/// are left out.
+fn people(
+    ctx: *mcp.Context,
+    first: ?[]const u8,
+    rest: []const []const u8,
+) ![]const issuez.format.fields.Assignee {
+    var out: std.ArrayList(issuez.format.fields.Assignee) = .empty;
+    const all = try std.mem.concat(ctx.arena, []const u8, &.{
+        if (first) |f| &.{f} else &.{},
+        rest,
+    });
+    for (all) |v| {
+        if (v.len == 0) continue;
+        try out.append(ctx.arena, issuez.format.fields.Assignee.parse(v) orelse return ctx.fail(
+            error.InvalidValue,
+            "an assignee is an email, not '{s}'",
+            .{v},
+        ));
+    }
+    return out.items;
 }
 
 fn duration(ctx: *mcp.Context, value: []const u8) !u32 {
@@ -1120,14 +1488,20 @@ fn checkWorkflow(ctx: *mcp.Context, settings: issuez.Settings, state: []const u8
 /// Reports a library error with what it means (`issuez.errors`), for the
 /// model to act on. `detail` is git's own error output, if any. Before a
 /// repo exists, `limits` are the ones `Repo.init` gives (`.{}`).
-pub fn failWith(ctx: *mcp.Context, e: anyerror, limits: issuez.engine.Limits, detail: ?[]const u8) anyerror {
+pub fn failWith(
+    ctx: *mcp.Context,
+    e: anyerror,
+    limits: issuez.engine.Limits,
+    detail: ?[]const u8,
+) anyerror {
     if (e == error.OutOfMemory or e == error.Canceled) return e;
     const description: issuez.errors.Description = .{ .err = e, .limits = limits };
     if (!description.known()) return e;
     const msg: []const u8 = switch (e) {
         error.VersionMismatch => "the issue changed since expect_version; read it again",
         error.NothingToEdit => "nothing to change: give at least one field",
-        error.MessageHasBody => "with description, message is only the commit subject: no blank lines",
+        error.MessageHasBody => "with description, message is only the commit subject: no blank " ++
+            "lines",
         error.CorruptIssue => "issue data is damaged (run 'git issue fsck')",
         else => try std.fmt.allocPrint(ctx.arena, "{f}", .{description}),
     };
@@ -1137,6 +1511,15 @@ pub fn failWith(ctx: *mcp.Context, e: anyerror, limits: issuez.engine.Limits, de
 
 /// Text as a JSON string must be UTF-8; git allows any bytes. Others become
 /// U+FFFD.
+fn assigneeEmails(
+    arena: Allocator,
+    i: issuez.model.issue.Issue,
+) Allocator.Error![]const []const u8 {
+    const out = try arena.alloc([]const u8, i.assignees.len);
+    for (i.assignees, out) |a, *o| o.* = try text(arena, a.email);
+    return out;
+}
+
 fn text(arena: Allocator, s: []const u8) Allocator.Error![]const u8 {
     if (std.unicode.utf8ValidateSlice(s)) return s;
     return std.fmt.allocPrint(arena, "{f}", .{std.unicode.fmtUtf8(s)});
@@ -1152,21 +1535,60 @@ fn texts(arena: Allocator, list: []const []const u8) Allocator.Error![]const []c
     return out;
 }
 
+fn hostFields(
+    arena: Allocator,
+    list: []const Field,
+) Allocator.Error![]const issuez.engine.HostField {
+    const out = try arena.alloc(issuez.engine.HostField, list.len);
+    for (list, out) |f, *o| o.* = .{ .key = f.key, .value = f.value };
+    return out;
+}
+
+/// The reactions on `target` (null: the issue itself).
+fn reactionsOn(
+    arena: Allocator,
+    issue: issuez.engine.Issue,
+    target: ?issuez.engine.Oid,
+) Allocator.Error![]const Reaction {
+    var out: std.ArrayList(Reaction) = .empty;
+    for (issue.reactions) |r| {
+        const same = if (r.target) |t| (target != null and t.eql(target.?)) else target == null;
+        if (!same) continue;
+        const users = try arena.alloc([]const u8, r.users.len);
+        for (r.users, users) |u, *o| o.* = try text(arena, u.email);
+        try out.append(arena, .{ .emoji = try text(arena, r.emoji), .users = users });
+    }
+    return out.items;
+}
+
 fn person(arena: Allocator, sig: issuez.engine.Signature) Allocator.Error!Person {
     return .{ .name = try text(arena, sig.name), .email = try text(arena, sig.email) };
 }
 
 fn time(arena: Allocator, t: i64, tz: i16) Allocator.Error![]const u8 {
-    return std.fmt.allocPrint(arena, "{f}", .{issuez.format.time.IsoDate{ .time = t, .tz = tz, .rfc3339 = true }});
+    return std.fmt.allocPrint(
+        arena,
+        "{f}",
+        .{issuez.format.time.IsoDate{ .time = t, .tz = tz, .rfc3339 = true }},
+    );
 }
 
-fn fieldList(arena: Allocator, list: []const issuez.model.issue.Field) Allocator.Error![]const Field {
+fn fieldList(
+    arena: Allocator,
+    list: []const issuez.model.issue.Field,
+) Allocator.Error![]const Field {
     const out = try arena.alloc(Field, list.len);
-    for (list, out) |f, *o| o.* = .{ .key = try text(arena, f.key), .value = try text(arena, f.value) };
+    for (list, out) |f, *o| o.* = .{
+        .key = try text(arena, f.key),
+        .value = try text(arena, f.value),
+    };
     return out;
 }
 
-fn conflicts(arena: Allocator, list: []const issuez.model.issue.Conflict) Allocator.Error![]const Conflict {
+fn conflicts(
+    arena: Allocator,
+    list: []const issuez.model.issue.Conflict,
+) Allocator.Error![]const Conflict {
     const out = try arena.alloc(Conflict, list.len);
     for (list, out) |c, *o| o.* = .{
         .field = switch (c.target) {

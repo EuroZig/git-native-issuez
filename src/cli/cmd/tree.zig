@@ -1,6 +1,7 @@
 //! `git issue tree [<issue-id>] [--all]`
 
 const std = @import("std");
+const stableSort = @import("issuez").sort.stable;
 const context = @import("../context.zig");
 const common = @import("../common.zig");
 const ext_flags = @import("../ext_flags.zig");
@@ -68,7 +69,7 @@ pub fn main(comptime B: type, ctx: *context.Context(B), argv: []const []const u8
     if (as_json) {
         var s = json.begin(ctx.out);
         printer.jsonNodes(&s, top) catch |e| return json.failed(ctx.err, e);
-        json.end(&s);
+        json.end(&s) catch |e| return json.failed(ctx.err, e);
         return common.exit_ok;
     }
     if (proj.issues.len == 0) {
@@ -197,7 +198,11 @@ const Printer = struct {
                 var lead: []const u8 = "";
                 var child_lead: []const u8 = "";
                 if (base) |b| {
-                    lead = try std.mem.concat(arena, u8, &.{ b, if (last) last_branch else branch });
+                    lead = try std.mem.concat(
+                        arena,
+                        u8,
+                        &.{ b, if (last) last_branch else branch },
+                    );
                     child_lead = try std.mem.concat(arena, u8, &.{ b, if (last) gap else pipe });
                 }
                 try l.p.line(i, lead, child_lead);
@@ -246,15 +251,15 @@ test "tree --json nodes" {
     var world: GitSim.World = .{ .seed = 11, .clones = &.{.{ .name = "a" }} };
     var sim = try GitSim.init(arena, &world, 0);
     const repo = issuez.Repo(GitSim).init(&sim);
-    const root = try repo.create(arena, .{ .title = "Root" });
+    const root = try repo.create(arena, .{ .title = "Root" }, .{});
     for ([_][]const u8{ "Open", "Done", "Gone" }) |t| {
-        _ = try repo.create(arena, .{ .title = t, .parent = root.id.slice() });
+        _ = try repo.create(arena, .{ .title = t, .parent = root.id }, .{});
     }
     const gone = for (try repo.loadAll(arena)) |i| {
         if (std.mem.eql(u8, i.title, "Gone")) break i.id;
     } else unreachable;
-    _ = try repo.create(arena, .{ .title = "Orphan", .parent = gone });
-    _ = try repo.create(arena, .{ .title = "Old" });
+    _ = try repo.create(arena, .{ .title = "Orphan", .parent = gone }, .{});
+    _ = try repo.create(arena, .{ .title = "Old" }, .{});
     const issues = try repo.loadAll(arena);
     for (issues) |*i| {
         if (std.mem.eql(u8, i.title, "Done") or std.mem.eql(u8, i.title, "Old")) i.state = .closed;
@@ -294,7 +299,7 @@ test "tree --json nodes" {
                 });
             }
             // The projection's order isn't the point here.
-            std.mem.sort(Node, list.items, {}, struct {
+            stableSort(Node, list.items, {}, struct {
                 fn lt(_: void, x: Node, y: Node) bool {
                     return std.mem.lessThan(u8, x.title, y.title);
                 }
