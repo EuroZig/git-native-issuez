@@ -126,6 +126,49 @@ test "issuez_resolve_one: one, none, several" {
     );
 }
 
+test "issuez_resolve_one: a ref that is no UUID is no candidate" {
+    var r = try fixture.Repo.init(.{});
+    defer r.deinit();
+    const one = try fixture.titled(r.handle, "One");
+    // Its name starts like the issue's, and is far longer than a UUID.
+    const long = try std.fmt.allocPrint(
+        r.arena(),
+        "refs/issues/{s}{s}",
+        .{ one.idSlice()[0..4], "x" ** 200 },
+    );
+    const ref = try std.fmt.allocPrint(r.arena(), "refs/issues/{s}", .{one.idSlice()});
+    _ = try r.git(&.{ "update-ref", long, ref });
+    var buf: [37 + 8]u8 = @splat('x');
+    try expect.code(
+        c.ISSUEZ_OK,
+        c.issuez_resolve_one(
+            r.handle,
+            c.ISSUEZ_KIND_ISSUE,
+            fixture.str(one.idSlice()[0..4]),
+            null,
+            &buf,
+            null,
+        ),
+        null,
+    );
+    try testing.expectEqualStrings(one.idSlice(), std.mem.sliceTo(&buf, 0));
+    try testing.expectEqualStrings("x" ** 8, buf[37..]);
+    // Matched alone, it isn't written into the buffer either.
+    try expect.code(
+        c.ISSUEZ_E_NOT_FOUND,
+        c.issuez_resolve_one(
+            r.handle,
+            c.ISSUEZ_KIND_ISSUE,
+            fixture.str(long["refs/issues/".len..][0..12]),
+            null,
+            &buf,
+            null,
+        ),
+        null,
+    );
+    try testing.expectEqualStrings("x" ** 8, buf[37..]);
+}
+
 fn take(repo: *c.issuez_repo) !*c.issuez_snapshot {
     var s: ?*c.issuez_snapshot = null;
     try expect.code(c.ISSUEZ_OK, c.issuez_snapshot_take(repo, null, &s, null), null);

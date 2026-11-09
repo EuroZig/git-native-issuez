@@ -86,8 +86,12 @@ the on-disk format only grew.
   refuses non-fast-forwards, deletes, local-only refs, histories that fail
   `fsck` or have another `Format-Version`, client numbers, other people's
   commits (by policy), tombstones without leave to purge and attachment
-  refs that aren't derived; it reports issues without a number and commits
-  to locked issues. Reads git's quarantine and writes nothing.
+  refs that aren't derived commits of their issue, purged text under any
+  UUID (a tombstone's purged comments and purged issue roots) and an
+  `X-Rewritten-From` that names a commit of the history; it reports issues
+  without a number and commits to locked issues. Sync merges are checked
+  within a budget (`Policy.max_merge_work`), past which none is exempt.
+  One update per line on stdin. Reads git's quarantine and writes nothing.
   `PushCheck(B)` in the library, `issuez_push_check` with
   `ISSUEZ_OPT_ALLOW_PURGE` in the C API, `Repo.PushCheck` in the Go
   binding.
@@ -96,7 +100,9 @@ the on-disk format only grew.
   removes an issue, or one comment's text, attachments and origin, from
   history. A comment purge rewrites the issue deterministically from that
   commit on (`X-Purged`, `X-Rewritten-From`), so every clone gets the same
-  commits. A tombstone, `refs/issuez-purged/<uuid>`, syncs with the
+  commits; an `X-Rewritten-From` naming a commit still in the history is
+  ignored. A tombstone, `refs/issuez-purged/<uuid>` (an issue's names its
+  root, `X-Purged-Root`), syncs with the
   issues; merge and push apply it and replace or delete the remote's copy
   with the one push that isn't a fast-forward, leased on what was fetched.
   `purged` per comment in `--json`; `Purge(B)` in the library, the backend
@@ -111,13 +117,15 @@ the on-disk format only grew.
 - Host fields and import provenance ([docs/format.md](docs/format.md) §2):
   `X-` keys the format doesn't use are fields of a host's own
   (`X-Forgejo-Project`), and `X-Original-Author` / `X-Original-Id` say
-  where imported text came from, per commit. `create`/`edit --field
+  where imported text came from, per commit; a commit that only sets host
+  fields reads as an update. `create`/`edit --field
   KEY=VALUE`, `--original-author`, `--original-id` (also on `comment`);
   `original_author`/`original_id` in `show --json`; `CreateSpec.extra`,
   `EditSpec.extra`, `.original` on create, edit and comment specs.
 - Locks and refs: `X-Locked` with `X-Lock-Reason` (information for hosts,
   which decide who may still comment) and `X-Ref`, the branch or tag an
-  issue is about ([docs/format.md](docs/format.md) §3). `edit --lock`,
+  issue is about, a name `git check-ref-format --allow-onelevel` takes
+  ([docs/format.md](docs/format.md) §3). `edit --lock`,
   `--lock-reason`, `--unlock`, `--ref`; `locked`, `lock_reason` and `ref`
   in `--json` and the MCP server; `EditSpec.locked`, `.lock_reason`, `.ref`.
 - Issue numbers: `X-Number` ([docs/format.md](docs/format.md) §3), the
@@ -131,7 +139,8 @@ the on-disk format only grew.
 - Several assignees: `X-Assignees` ([docs/format.md](docs/format.md) §3),
   written beside `Assignee` (the first) only when there are two or more,
   so one assignee stays format 1 as it is; upstream's own `Assignee` edit
-  sets them to that one. `create`/`edit --add-assignee`, `edit
+  sets them to that one. After concurrent edits `Assignee` is the newest
+  one still assigned, else the first. `create`/`edit --add-assignee`, `edit
   --unassign`, `assignees` in `--json` and the MCP server, `ls -a`
   matching anyone assigned; `CreateSpec.assignees`,
   `EditSpec.set_assignees`/`add_assignees`/`remove_assignees` and
@@ -164,7 +173,9 @@ the on-disk format only grew.
   builds `libissuez.a` with `issuez.h`, both generated from one description
   (`src/capi/api.zig`), and `docs/issuez-api.json` for binding generators.
   Op lists instead of builders, typed problems that point at the op they
-  came from, cancel tokens, a thread-safe repo with a pool of git sessions.
+  came from, cancel tokens, a thread-safe repo with a pool of git sessions
+  (a call in flight keeps it open). An actor or committer git can't sign
+  with is refused.
   An issue's and a milestone's single values come as one record
   (`issuez_issue_info_of`, `issuez_milestone_info_of`) that grows only at
   the end; lists and lookups have their own calls.

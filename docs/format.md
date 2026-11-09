@@ -113,7 +113,7 @@ Format-Version: 1
 | `X-Number` | scalar | the issue's number in its host (`#12`): decimal from 1, no leading zeros, at most 2^53 |
 | `X-Locked` | scalar | `true` or `false` |
 | `X-Lock-Reason` | scalar | text, why it is locked; cleared when unlocking |
-| `X-Ref` | scalar | the branch or tag the issue is about (`main`, `refs/tags/v1`): a valid git ref name |
+| `X-Ref` | scalar | the branch or tag the issue is about (`main`, `refs/tags/v1`): a ref name `git check-ref-format --allow-onelevel` accepts, not starting with `-` |
 | `X-Assignees` | set | several assignees, each as `Assignee`, comma-separated |
 | `Priority` | scalar | `low`, `medium`, `high`, `critical` |
 | `Milestone` | scalar | free text |
@@ -140,16 +140,21 @@ Format-Version: 1
   `Assignee` with the first assignee (empty for none), and `X-Assignees`
   with all of them only when there are two or more: one alone is format 1
   as it is. Removing one by email removes the `<uuid> <email>` member too.
+- The assignee (the one `Assignee` names) is the newest `Assignee` while it
+  is one of the assignees, else the first assignee, none when there are
+  none. Concurrent edits can remove the newest one from the assignees (an
+  upstream edit on one side, `X-Assignees` on the other); merges restate
+  `Assignee` with the assignee, so upstream shows one of them too.
 - An `Assignee` whose first word isn't a UUID is an email as a whole, as
-  format 1 reads it.
+  format 1 reads it. The UUID form names a person independently of their
+  address; upstream shows the whole value.
 - A lock is information for hosts, which decide who may still comment;
   this tool doesn't refuse writes to a locked issue.
 - `X-Number` is written once: writers refuse to change it, and to give a
   number another issue in the clone has. Two clones can still give the
   same number (or two numbers to one issue, which §4 resolves); readers
   report duplicates (`ls --problems`). `#12` names an issue by number
-  wherever an ID is taken. The UUID form names a person independently of their
-  address; upstream shows the whole value.
+  wherever an ID is taken.
 - References (`X-Parent`, `X-Blocked-By`, `X-Milestone-Id`) are full UUIDs.
   Whether the target exists, cycles and depth are questions across issues,
   answered when reading (the projection, `ls --problems`, `tree`), never by
@@ -432,11 +437,12 @@ resolves it like an issue.
   resolves it.
 
 `git issue push <remote>` first fetches the remote's issue refs to see
-what it has (`sync` reuses the merge's fetch), then pushes the local issues and milestones that differ, in
-atomic batches and never with force. When the remote moved, it merges and
-tries again, a bounded number of times. A ref the remote refuses (a hook,
-permissions) fails the push with the remote's message. `git issue sync` is
-merge, then push.
+what it has (`sync` reuses the merge's fetch), then pushes the local
+issues and milestones that differ, in atomic batches and as
+fast-forwards; only a tombstone lets a push replace history (§10). When
+the remote moved, it merges and tries again, a bounded number of times. A
+ref the remote refuses (a hook, permissions) fails the push with the
+remote's message. `git issue sync` is merge, then push.
 
 Derived attachment refs (§7) are fetched into `.../seen/attachments/` but
 never merged. After the merge,
@@ -513,7 +519,9 @@ rewrites history.
   fetch updates.
 - **A comment**: its commit loses its text, attachments and origin, and
   the issue's history is rewritten from there by the rule below. Its
-  fields stay. The derived attachment ref is rebuilt with no history, and
+  fields stay, free-text ones too (`Title`, `Reason`, `Milestone`,
+  `X-Lock-Reason`, `Release`, `Fixed-By`): only purging the issue removes
+  those. The derived attachment ref is rebuilt with no history, and
   the local refs under `refs/remotes/` and `refs/issuez-sync/` that name
   the issue are deleted, `seen/` again excepted. The root (title and
   description) can't be purged this way: purge the issue.
@@ -545,7 +553,11 @@ causal order, an event after the comment it targets:
 
 `X-Rewritten-From` is the commit's ID before any purge, and a rewrite keeps
 it. Tombstones name comments by that first ID, so a purge recorded after
-another one moved the comment finds it in every clone.
+another one moved the comment finds it in every clone. A rewrite replaces
+the commit it names, so an `X-Rewritten-From` that names a commit still in
+the history (the root, another comment) is ignored and the commit's first
+ID is its own: anyone can write the trailer, and purging such a commit
+would otherwise purge the one it names.
 
 The tombstone `refs/issuez-purged/<uuid>` is a chain of empty-tree commits,
 one per purge, by the purger:
@@ -558,8 +570,11 @@ X-Purged-Commit: 5186cff79af42ee5c6a80d822eec95a842832b34
 Reason: abuse
 ```
 
-`X-Purge: issue` purges the whole issue and has no `X-Purged-Commit`.
-`Reason` is optional. A tombstone says what its whole history says: the
+`X-Purge: issue` purges the whole issue. It has no `X-Purged-Commit` but
+`X-Purged-Root`, the ID of the issue's root commit, which every commit of
+its history reaches: the history can't come back under another UUID
+(§11). Tombstones written before `X-Purged-Root` existed have none, and
+still purge the issue they name. `Reason` is optional. A tombstone says what its whole history says: the
 issue is purged if any commit says so, and the purged comments are the
 union. Commits that don't read as purges are ignored, and a chain is read
 up to its first 100,000 commits: a longer one can't stop a sync.
@@ -632,13 +647,22 @@ those the old tip doesn't have:
   exempt, since sync writes them: the subject of §4, §6 or `Merge purges`,
   no text, and for an issue at most what the parents resolve to (sets in
   any order), `X-Number` and `X-Rewritten-From`. The identity alone proves
-  nothing.
+  nothing. Resolving what a merge's parents hold walks their history, so a
+  push has a budget for it, 1,000,000 commits by default, spent update by
+  update in order: when an update's merges would walk more than is left,
+  none of them is exempt and the verdict says so.
 - **Locks.** The verdict says when new commits go to an issue locked at
   its old tip.
-- **Purges.** An issue that a tombstone purges can't be created or
-  updated, and a new tip whose history the tombstone's comments would
-  still rewrite (§10) is rejected. The tombstones are the repo's together
-  with the ones in the same push.
+- **Rewrites.** A new commit's `X-Rewritten-From` (§10) may not name a
+  commit of the new history, nor be another commit's there: purging it
+  would purge that one. Merges are no exception.
+- **Purges.** The ref of an issue that its tombstone purges can't be
+  created or updated, and a new tip whose history the tombstone's comments
+  would still rewrite (§10) is rejected. Nor may any history pushed under
+  `refs/issues/`, `refs/milestones/` or `refs/attachments/`, whatever its
+  UUID, have a commit that any tombstone names: a purged comment as it was
+  (`X-Purged-Commit`) or a purged issue's root (`X-Purged-Root`). The
+  tombstones are the repo's together with the ones in the same push.
 
 A tombstone update is rejected unless the host lets the pusher purge. It
 must be a fast-forward, and every new commit has the empty tree and reads
@@ -657,7 +681,13 @@ exactly what §7 derives: message `Regenerate attachments` with
 `X-Issue: <uuid>` and `X-Issue-Tip`, which names a commit in the issue's
 history after the push; identity `git-issue <git-issue@invalid>` dated
 like that commit, offset `+0000`; parents sorted; and a tree that is the
-pointers of the attachments present at that commit. The other new commits
-need only hold pointers: every entry `<uuid>.<png|jpg|webp>`, an LFS
-pointer blob (they may name tips a replaced history dropped). The LFS
+pointers of the attachments present at that commit. Every other new
+commit must be one §7 writes for the same issue: identity
+`git-issue <git-issue@invalid>`, message `Regenerate attachments` with
+`X-Issue: <uuid>` and an `X-Issue-Tip` that is a full ID, nothing else,
+and a tree that holds only pointers: every entry `<uuid>.<png|jpg|webp>`,
+an LFS pointer blob. Its issue tip and date aren't checked: it may name
+a tip a replaced history dropped. So no other commit, an issue's own
+included, can ride along under a derived tip. A derived ref's history is
+checked against the tombstones like an issue's. The LFS
 bytes are not checked: they are the host's LFS server's.

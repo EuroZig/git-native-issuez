@@ -15,9 +15,13 @@ pub const Authors = enum { any, warn, enforce };
 
 pub const Policy = struct {
     pusher_emails: []const []const u8 = &.{},
+    /// The pusher's host UUIDs, for `X-Author-Id`.
+    pusher_ids: []const []const u8 = &.{},
     authors: Authors = .any,
     allow_numbers: bool = false,
     allow_purge: bool = false,
+    /// Commits of history the push may walk for merges (format.md §11).
+    max_merge_work: usize = 1_000_000,
 };
 
 /// Hex IDs; null for no ref.
@@ -99,6 +103,18 @@ fn classify(ref: []const u8) struct { Ours, []const u8 } {
     return .{ .other, "" };
 }
 
+/// Lowercase hex, hyphenated 8-4-4-4-12: what an `X-Author-Id` must be
+/// to count.
+fn isCanonicalId(s: []const u8) bool {
+    if (s.len != 36) return false;
+    for (s, 0..) |ch, i| {
+        const dash = i == 8 or i == 13 or i == 18 or i == 23;
+        if (dash != (ch == '-')) return false;
+        if (!dash and !std.ascii.isDigit(ch) and !(ch >= 'a' and ch <= 'f')) return false;
+    }
+    return true;
+}
+
 /// Lowercase, hyphenated, version 4, RFC variant.
 fn isUuid(s: []const u8) bool {
     if (s.len != 36) return false;
@@ -135,6 +151,10 @@ const Run = struct {
     tombs: std.StringHashMapUnmanaged(purge.Tomb) = .empty,
     /// Per update index: the number it newly gives.
     given: []?[]const u8,
+    merge_work_left: usize,
+    /// What any tombstone purged, as hex: comments as they were, and the
+    /// roots of purged issues.
+    purged: std.StringHashMapUnmanaged(void) = .empty,
 };
 
 pub fn expect(
@@ -148,6 +168,7 @@ pub fn expect(
         .policy = policy,
         .updates = updates,
         .given = try arena.alloc(?[]const u8, updates.len),
+        .merge_work_left = policy.max_merge_work,
     };
     @memset(run.given, null);
     for (c.clone.refs) |r| {
@@ -168,7 +189,13 @@ pub fn expect(
         try run.tombs.put(arena, id, .{
             .issue = old.issue or t.issue,
             .comments = try unionText(arena, old.comments, t.comments),
+            .roots = try unionText(arena, old.roots, t.roots),
         });
+    }
+    var tombs = run.tombs.valueIterator();
+    while (tombs.next()) |t| {
+        for (t.comments) |x| try run.purged.put(arena, x, {});
+        for (t.roots) |x| try run.purged.put(arena, x, {});
     }
     for (updates, out, 0..) |u, *e, i| {
         const kind, const id = classify(u.ref);
@@ -220,6 +247,45 @@ fn unionText(
     return out.items;
 }
 
+/// format.md §11: no history under our refs has a commit a tombstone
+/// purged, whichever issue the tombstone names.
+fn purgedIn(
+    r: *Run,
+    h: std.StringArrayHashMapUnmanaged(object.Commit),
+    k: *Kinds,
+) Allocator.Error!void {
+    for (h.keys()) |hex| if (r.purged.contains(hex)) return k.add("purged");
+}
+
+/// format.md §11: a new commit's `X-Rewritten-From` names no commit of
+/// the history, nor another commit's first ID.
+fn rewrittenFrom(
+    c: commands.Clone,
+    fresh: []const Fresh,
+    h: std.StringArrayHashMapUnmanaged(object.Commit),
+    k: *Kinds,
+) Allocator.Error!void {
+    for (fresh) |f| {
+        const was = (try claimOf(c, f.commit)) orelse continue;
+        if (h.contains(was)) {
+            try k.add("invalid_history");
+            continue;
+        }
+        var n: usize = 0;
+        for (h.values()) |cm| {
+            const other = (try claimOf(c, cm)) orelse continue;
+            if (std.mem.eql(u8, other, was)) n += 1;
+        }
+        if (n > 1) try k.add("invalid_history");
+    }
+}
+
+fn claimOf(c: commands.Clone, cm: object.Commit) Allocator.Error!?[]const u8 {
+    const block = try commands.trailersOf(c.arena, cm.message);
+    const was = trailers.lastValue(block, "X-Rewritten-From") orelse return null;
+    return if (c.isFullHex(was)) was else null;
+}
+
 fn deleteOf(r: *Run, kind: Ours, id: []const u8) Allocator.Error!Expect {
     var k: Kinds = .{ .arena = r.c.arena };
     const purged = if (r.tombs.get(id)) |t| t.issue else false;
@@ -229,36 +295,50 @@ fn deleteOf(r: *Run, kind: Ours, id: []const u8) Allocator.Error!Expect {
     return k.done("delete");
 }
 
+const Shape = enum { no, yes, resolve };
+
 /// format.md §11: a merge under the tool's identity is exempt when it adds
 /// nothing: its subject, and at most what its parents resolve to, a kept
-/// number and `X-Rewritten-From`.
-fn mergeAddsNothing(r: *Run, cm: object.Commit, ours: Ours) Allocator.Error!bool {
-    if (cm.parents.len < 2 or !std.mem.eql(u8, cm.author.email, merge_email)) return false;
-    const arena = r.c.arena;
-    switch (ours) {
-        .tombstone => return std.mem.eql(u8, cm.message, "Merge purges\n"),
-        .milestone => return std.mem.eql(u8, cm.message, "Merge milestone\n"),
-        .issue => {},
-        else => return false,
-    }
+/// number and `X-Rewritten-From`. `.resolve` when that takes its parents.
+fn shapeOf(r: *Run, cm: object.Commit, ours: Ours) Allocator.Error!Shape {
+    if (cm.parents.len < 2 or !std.mem.eql(u8, cm.author.email, merge_email)) return .no;
+    const exact = switch (ours) {
+        .tombstone => "Merge purges\n",
+        .milestone => "Merge milestone\n",
+        .issue => "",
+        else => return .no,
+    };
+    if (exact.len > 0) return if (std.mem.eql(u8, cm.message, exact)) .yes else .no;
     const rest = std.mem.trimEnd(u8, cm.message, "\n");
-    if (std.mem.eql(u8, rest, "Merge issue")) return true;
-    if (!std.mem.startsWith(u8, rest, "Merge issue\n\n")) return false;
+    if (std.mem.eql(u8, rest, "Merge issue")) return .yes;
+    if (!std.mem.startsWith(u8, rest, "Merge issue\n\n")) return .no;
     const lines = rest["Merge issue\n\n".len..];
-    if (std.mem.find(u8, lines, "\n\n") != null) return false;
+    if (std.mem.find(u8, lines, "\n\n") != null) return .no;
+    const block = try commands.trailersOf(r.c.arena, cm.message);
+    if (block.first_line == null) return .no;
+    for (block.trailers) |t| if (!saysNothing(t.key)) return .resolve;
+    return .yes;
+}
+
+fn saysNothing(key: []const u8) bool {
+    return std.ascii.eqlIgnoreCase(key, "X-Number") or
+        std.ascii.eqlIgnoreCase(key, "X-Rewritten-From");
+}
+
+/// The trailers are what the parents resolve to. Fails closed: a history
+/// the oracle has no rule for isn't exempt.
+fn restatesParents(r: *Run, cm: object.Commit) Allocator.Error!bool {
+    const arena = r.c.arena;
     const block = try commands.trailersOf(arena, cm.message);
-    if (block.first_line == null) return false;
     var parents: std.ArrayList([]const u8) = .empty;
     for (cm.parents) |p| try parents.append(arena, try p.hexAlloc(arena));
     const n = r.c.naiveAt(parents.items) catch |e| switch (e) {
         error.OutOfMemory => return error.OutOfMemory,
-        // No rule for this history: don't judge it.
-        else => return true,
+        else => return false,
     };
     const want = try commands.restatedBy(arena, n);
     for (block.trailers) |t| {
-        if (std.ascii.eqlIgnoreCase(t.key, "X-Number") or
-            std.ascii.eqlIgnoreCase(t.key, "X-Rewritten-From")) continue;
+        if (saysNothing(t.key)) continue;
         const same = for (want.items) |w| {
             if (!std.ascii.eqlIgnoreCase(w.key, t.key)) continue;
             break try sameSet(arena, w.key, w.value, t.value);
@@ -266,6 +346,16 @@ fn mergeAddsNothing(r: *Run, cm: object.Commit, ours: Ours) Allocator.Error!bool
         if (!same) return false;
     }
     return true;
+}
+
+/// The commits a merge's parents reach, themselves included.
+fn ancestorCount(r: *Run, cm: object.Commit) Allocator.Error!usize {
+    var all: std.StringHashMapUnmanaged(void) = .empty;
+    for (cm.parents) |p| {
+        var it = (try r.c.reach(try p.hexAlloc(r.c.arena))).keyIterator();
+        while (it.next()) |k| try all.put(r.c.arena, k.*, {});
+    }
+    return all.count();
 }
 
 /// Equal values; `Labels` and `X-Blocked-By` in any order.
@@ -288,14 +378,40 @@ fn sameSet(arena: Allocator, key: []const u8, a: []const u8, b: []const u8) Allo
 
 fn authors(r: *Run, fresh: []const Fresh, ours: Ours, k: *Kinds) Allocator.Error!void {
     if (r.policy.authors == .any) return;
-    for (fresh) |f| {
+    const rejects = r.policy.authors == .enforce;
+    // Resolving merges is paid for from the push's budget, update by
+    // update: past it, none of this update's is exempt.
+    const shapes = try r.c.arena.alloc(Shape, fresh.len);
+    var cost: usize = 0;
+    for (fresh, shapes) |f, *s| {
+        s.* = try shapeOf(r, f.commit, ours);
+        if (s.* == .resolve) cost += try ancestorCount(r, f.commit);
+    }
+    const over = cost > r.merge_work_left;
+    if (over) {
+        if (rejects) try k.add("author_mismatch") else try k.flag("author_mismatch");
+    } else r.merge_work_left -= cost;
+    for (fresh, shapes) |f, s| {
         const cm = f.commit;
-        if (try mergeAddsNothing(r, cm, ours)) continue;
+        const exempt = switch (s) {
+            .no => false,
+            .yes => true,
+            .resolve => !over and try restatesParents(r, cm),
+        };
+        if (exempt) continue;
+        // An `X-Author-Id` names a host's user, whatever the email says.
+        const block = try commands.trailersOf(r.c.arena, cm.message);
+        if (trailers.lastValue(block, "X-Author-Id")) |aid| if (isCanonicalId(aid)) {
+            const mine = for (r.policy.pusher_ids) |p| {
+                if (std.ascii.eqlIgnoreCase(p, aid)) break true;
+            } else false;
+            if (!mine) try k.addAt("author_mismatch", f.hex, rejects);
+        };
         const own = for (r.policy.pusher_emails) |e| {
             if (std.ascii.eqlIgnoreCase(e, cm.author.email)) break true;
         } else false;
         if (own) continue;
-        try k.addAt("author_mismatch", f.hex, r.policy.authors == .enforce);
+        try k.addAt("author_mismatch", f.hex, rejects);
     }
 }
 
@@ -411,6 +527,7 @@ fn issueOrMilestone(
         try k.add("invalid_history");
         return k.done(action);
     };
+    try purgedIn(r, h, &k);
 
     // fsck, by the oracle's reading: empty trees, one root with its keys.
     const empty = object.emptyTree(c.format);
@@ -424,7 +541,7 @@ fn issueOrMilestone(
             if (!trailers.has(block, key)) try k.add("invalid_history");
         }
     }
-    if (k.rejects.items.len > 0) return k.done(action);
+    if (commands.containsText(k.rejects.items, "invalid_history")) return k.done(action);
     {
         const block = try commands.trailersOf(a, root.?.message);
         const v = trailers.lastValue(block, "Format-Version") orelse "";
@@ -453,6 +570,7 @@ fn issueOrMilestone(
         }
     }
     const fresh = try freshOf(r, h, base);
+    if (kind == .issue) try rewrittenFrom(c, fresh, h, &k);
 
     if (tomb) |t| if (t.comments.len > 0) {
         const rw = try purge.rewrite(c, new, t.comments);
@@ -524,6 +642,7 @@ fn attachments(r: *Run, u: Update, id: []const u8) (Allocator.Error || error{NoR
         try k.add("invalid_history");
         return k.done(action);
     };
+    try purgedIn(r, h, &k);
     if (std.mem.eql(u8, action, "rewrite")) {
         if (r.tombs.get(id) == null) {
             try k.add("non_fast_forward");
@@ -533,17 +652,36 @@ fn attachments(r: *Run, u: Update, id: []const u8) (Allocator.Error || error{NoR
     const fresh = try freshOf(r, h, base);
     const issue_tip = try issueTipAfter(r, id);
     const issue_h = if (issue_tip) |t| try history(c, t) else null;
-    // Only the tip must be exactly derived; earlier commits hold pointers.
+    // Only the tip must be exactly derived; earlier commits are this
+    // issue's derived commits for any tip, and hold pointers.
     for (fresh) |f| {
         const ok = if (std.mem.eql(u8, f.hex, u.new.?))
             try isDerived(c, id, f, issue_h)
         else
-            try pointersOnly(c, f.commit);
+            try isRegenerate(c, id, f.commit) and try pointersOnly(c, f.commit);
         if (!ok) try k.addAt("not_derived", f.hex, true);
     }
     var e = try k.done(action);
     e.new_count = fresh.len;
     return e;
+}
+
+/// §7's message for issue `id` and some full issue tip, by `git-issue
+/// <git-issue@invalid>`.
+fn isRegenerate(c: commands.Clone, id: []const u8, cm: object.Commit) Allocator.Error!bool {
+    for ([_]object.Signature{ cm.author, cm.committer }) |sig| {
+        if (!std.mem.eql(u8, sig.name, "git-issue") or !std.mem.eql(u8, sig.email, merge_email))
+            return false;
+    }
+    const head = try std.fmt.allocPrint(
+        c.arena,
+        "Regenerate attachments\n\nX-Issue: {s}\nX-Issue-Tip: ",
+        .{id},
+    );
+    if (!std.mem.startsWith(u8, cm.message, head)) return false;
+    const rest = cm.message[head.len..];
+    if (rest.len == 0 or rest[rest.len - 1] != '\n') return false;
+    return c.isFullHex(rest[0 .. rest.len - 1]);
 }
 
 fn pointersOnly(c: commands.Clone, cm: object.Commit) Allocator.Error!bool {

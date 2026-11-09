@@ -294,7 +294,8 @@ fn checkPurge(
             "purge succeeded on a comment that isn't there",
             .{},
         );
-        first = try purge.firstId(b, hex);
+        const history = try b.reach(tip);
+        first = try purge.firstId(b, &history, hex);
         if (old_tomb) |ot| if ((try purge.read(b, ot)).covers(first.?)) {
             // Purged and recorded already: nothing to write.
             const block = try commands.trailersOf(arena, b.commit(hex).?.message);
@@ -319,6 +320,14 @@ fn checkPurge(
         .{ .key = "X-Purge", .value = if (first == null) "issue" else "comment" },
     );
     if (first) |f| try want.append(arena, .{ .key = "X-Purged-Commit", .value = f });
+    // A whole issue is named by its root, whatever its UUID.
+    if (first == null) {
+        var walk = try b.walk(tip);
+        const root = while (try walk.next()) |w| {
+            if (w.commit.parents.len == 0) break w.hex;
+        } else return error.NoRule;
+        try want.append(arena, .{ .key = "X-Purged-Root", .value = root });
+    }
     if (x.reason) |r| if (r.len > 0) try want.append(arena, .{ .key = "Reason", .value = r });
     try expectBlock(report, "purge", try commands.trailersOf(arena, tc.message), want.items);
 
@@ -833,7 +842,13 @@ fn checkNewMerges(
                 try kept.append(arena, t);
             block.trailers = kept.items;
         }
-        // A set: the oracle doesn't model member order.
+        // A set: the oracle doesn't model member order, nor so which
+        // assignee stands for a newest `Assignee` that isn't one.
+        if (trailers.lastValue(block, "Assignee")) |got| {
+            if (n.assignee_any and commands.isAssignee(n, got)) for (want.items) |*t| {
+                if (std.mem.eql(u8, t.key, "Assignee")) t.value = got;
+            };
+        }
         if (trailers.lastValue(block, "X-Blocked-By")) |got| {
             if (sameMembers(try splitSet(arena, got), n.blocked_by)) for (want.items) |*t| {
                 if (std.mem.eql(u8, t.key, "X-Blocked-By")) t.value = got;
@@ -871,7 +886,6 @@ fn sameNaive(a: commands.NaiveIssue, b: commands.NaiveIssue) bool {
     const scalars = [_][2][]const u8{
         .{ a.state, b.state },
         .{ a.title, b.title },
-        .{ a.assignee, b.assignee },
         .{ a.priority, b.priority },
         .{ a.milestone, b.milestone },
         .{ a.parent, b.parent },
@@ -884,7 +898,12 @@ fn sameNaive(a: commands.NaiveIssue, b: commands.NaiveIssue) bool {
         .{ a.deleted, b.deleted },
     };
     for (scalars) |s| if (!eql(u8, s[0], s[1])) return false;
-    return sameMembers(a.labels, b.labels) and sameMembers(a.blocked_by, b.blocked_by);
+    const same_assignee = if (a.assignee_any)
+        b.assignee_any and sameMembers(a.assignees, b.assignees)
+    else
+        commands.isAssignee(b, a.assignee);
+    return same_assignee and sameMembers(a.labels, b.labels) and
+        sameMembers(a.blocked_by, b.blocked_by);
 }
 
 /// Same members, in any order. Members are unique.

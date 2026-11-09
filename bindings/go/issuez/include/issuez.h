@@ -95,7 +95,10 @@
  * Threads
  *   An issuez_repo is safe to use from any number of threads at once; it
  *   keeps a pool of git sessions. Loaded objects are immutable and can be
- *   read from any thread.
+ *   read from any thread. issuez_repo_close may come while other threads'
+ *   calls on the repo run: each holds the repo until it returns. It must
+ *   not race a call's start: a call made after it, or at the same time,
+ *   uses a freed repo.
  *
  * Blocking, cancellation and signals
  *   Calls that touch git block. They take an `issuez_cancel *` (may be
@@ -103,7 +106,12 @@
  *   ISSUEZ_E_CANCELLED within about 50 ms, killing a git request that is
  *   running. Writes are atomic: a write that returns
  *   CANCELLED didn't happen (a ref update, once started, isn't
- *   interrupted), and one whose commit landed returns OK. The library
+ *   interrupted), and one whose commit landed returns OK, memory left
+ *   or not: its receipt is allocated first, and its entry may then
+ *   lack its changes and author. Two exceptions, where a failed call
+ *   may have written: GIT when git's answer to the ref update couldn't
+ *   be read, and an issuez_purge_comment that can't read the issue
+ *   back. Reload to see which. The library
  *   installs no signal handlers. It writes to
  *   pipes, so a host must not die of SIGPIPE: ignore it, or handle it as
  *   the Go runtime does.
@@ -234,7 +242,9 @@ typedef struct issuez_person {
 
 /*
  * The acting user of a write: the commit's author. The committer is the
- * identity the repo was opened with.
+ * identity the repo was opened with. Name and email can't hold <, >, a newline
+ * or a NUL, and the time zone is less than a day off UTC: else the write fails
+ * with INVALID_ARGUMENT.
  */
 typedef struct issuez_actor {
     issuez_str name;
@@ -286,7 +296,7 @@ const issuez_problems *issuez_error_problems(const issuez_error *err);
 /*
  * A write that failed after its commit landed: its receipt, borrowed from err.
  * NULL in this version: a cancelled write didn't happen, and one whose commit
- * landed returns OK.
+ * landed returns OK (see Blocking, cancellation and signals).
  */
 const issuez_write *issuez_error_write(const issuez_error *err);
 
@@ -317,7 +327,8 @@ typedef enum issuez_problem_kind {
     ISSUEZ_PROBLEM_CONFLICT = 23, /* concurrent setters disagree (reads) */
     ISSUEZ_PROBLEM_INVALID_STORED_VALUE = 24, /* a stored value that doesn't parse (reads) */
     ISSUEZ_PROBLEM_PENDING_EVENT = 25, /* an event whose comment hasn't arrived (reads) */
-    ISSUEZ_PROBLEM_INVALID_HISTORY = 26, /* fails fsck or can't be read (push check) */
+    /* fails fsck, can't be read, or has an X-Rewritten-From that names one of its commits (push check) */
+    ISSUEZ_PROBLEM_INVALID_HISTORY = 26,
     ISSUEZ_PROBLEM_UNSUPPORTED_FORMAT = 27, /* a Format-Version other than 1 (push check) */
     ISSUEZ_PROBLEM_NON_FAST_FORWARD = 28, /* the new tip doesn't contain the old (push check) */
     ISSUEZ_PROBLEM_REF_DELETED = 29, /* a delete no purge allows (push check) */
@@ -459,7 +470,8 @@ typedef enum issuez_opt {
     ISSUEZ_OPT_GIT_PATH = 768, /* open: str. Default "git" from PATH */
     /* open: SET name=str; CLEAR without name starts empty. Default: the process environment */
     ISSUEZ_OPT_ENV = 769,
-    ISSUEZ_OPT_COMMITTER = 770, /* open: person (name, email). Default: git's identity */
+    /* open: person (name, email), without <, >, newline or NUL. Default: git's identity */
+    ISSUEZ_OPT_COMMITTER = 770,
     ISSUEZ_OPT_DONE_STATE = 771, /* open: ADD str; overrides git config issue.doneStates */
     ISSUEZ_OPT_WORKFLOW_STATE = 772, /* open: ADD str; overrides issue.workflowStates */
     /* open: ADD str; one "scope/x" label per issue: adding one takes the others off, two in one write are refused */

@@ -3415,8 +3415,7 @@ fn appendAssignees(
 
 fn checkHostFields(list: []const HostField) error{ InvalidValue, InvalidText }!void {
     for (list) |f| {
-        const namespaced = f.key.len > 2 and std.ascii.startsWithIgnoreCase(f.key, "X-");
-        if (!trailers.isValidKey(f.key) or !namespaced or issue_model.isFormatKey(f.key))
+        if (!trailers.isValidKey(f.key) or !issue_model.isHostKey(f.key))
             return error.InvalidValue;
         if (std.mem.findAny(u8, f.value, "\r\n") != null) return error.InvalidText;
     }
@@ -3734,9 +3733,10 @@ test "a new issue can start locked and about a ref" {
     try testing.expect(issue.locked);
     try testing.expectEqualStrings("heated", issue.lock_reason.?);
     try testing.expectEqualStrings("refs/tags/v1", issue.ref.?);
-    try testing.expectError(
+    // What git refuses as a ref name, also inside a component.
+    for ([_][]const u8{ "a b", "@", "a/.b", "a.lock/b" }) |bad| try testing.expectError(
         error.InvalidValue,
-        repo.create(arena, .{ .title = "Bad ref", .ref = "a b" }, .{}),
+        repo.create(arena, .{ .title = "Bad ref", .ref = bad }, .{}),
     );
 }
 
@@ -4079,6 +4079,16 @@ test "host fields and provenance" {
         .text = "Thanks",
         .original = .{ .author = "hubot", .id = "github:o/r#c-2" },
     }, .{});
+    // A host field alone is an update, as any field is (format.md §2).
+    const moved = try repo.edit(
+        arena,
+        ref,
+        .{ .extra = &.{.{ .key = "X-Forgejo-Project", .value = "8" }} },
+        .{},
+    );
+    const after_move = try repo.load(arena, .{ .name = ref, .tip = moved.tip });
+    try testing.expectEqualStrings("8", after_move.field("X-Forgejo-Project").?);
+    try testing.expectEqual(issue_model.Comment.Kind.update, after_move.comments[1].kind);
     const edited = try repo.edit(
         arena,
         ref,
@@ -4088,6 +4098,7 @@ test "host fields and provenance" {
     _ = commented;
     const issue = try repo.load(arena, .{ .name = ref, .tip = edited.tip });
     try testing.expect(issue.field("X-Forgejo-Project") == null);
+    try testing.expectEqual(issue_model.Comment.Kind.update, issue.comments[2].kind);
     try testing.expectEqualStrings("octocat", issue.original_author.?);
     try testing.expectEqualStrings("github:o/r#1", issue.original_id.?);
     try testing.expect(issue.field("X-Original-Author") == null);

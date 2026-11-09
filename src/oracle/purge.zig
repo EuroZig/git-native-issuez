@@ -16,6 +16,8 @@ pub const Tomb = struct {
     issue: bool = false,
     /// First IDs, as hex.
     comments: []const []const u8 = &.{},
+    /// Roots of purged issues, as hex (`X-Purged-Root`).
+    roots: []const []const u8 = &.{},
 
     pub fn covers(t: Tomb, first: []const u8) bool {
         return commands.containsText(t.comments, first);
@@ -27,20 +29,24 @@ pub fn read(c: commands.Clone, tip: []const u8) Allocator.Error!Tomb {
     const arena = c.arena;
     var out: Tomb = .{};
     var comments: std.ArrayList([]const u8) = .empty;
+    var roots: std.ArrayList([]const u8) = .empty;
     var walk = try c.walk(tip);
     while (try walk.next()) |x| {
         const block = try commands.trailersOf(arena, x.commit.message);
         const kind = trailers.lastValue(block, "X-Purge") orelse continue;
-        if (std.mem.eql(u8, kind, "issue")) out.issue = true;
-        if (!std.mem.eql(u8, kind, "comment")) continue;
+        const is_issue = std.mem.eql(u8, kind, "issue");
+        if (is_issue) out.issue = true;
+        if (!is_issue and !std.mem.eql(u8, kind, "comment")) continue;
+        const key = if (is_issue) "X-Purged-Root" else "X-Purged-Commit";
+        const list = if (is_issue) &roots else &comments;
         for (block.trailers) |t| {
-            if (!std.ascii.eqlIgnoreCase(t.key, "X-Purged-Commit")) continue;
+            if (!std.ascii.eqlIgnoreCase(t.key, key)) continue;
             if (!c.isFullHex(t.value)) continue;
-            if (!commands.containsText(comments.items, t.value))
-                try comments.append(arena, t.value);
+            if (!commands.containsText(list.items, t.value)) try list.append(arena, t.value);
         }
     }
     out.comments = comments.items;
+    out.roots = roots.items;
     return out;
 }
 
@@ -51,20 +57,26 @@ pub fn of(c: commands.Clone, id: []const u8) Allocator.Error!?Tomb {
     return try read(c, tip);
 }
 
-/// The commit's ID before any purge.
-pub fn firstId(c: commands.Clone, hex: []const u8) Allocator.Error![]const u8 {
+/// The commit's ID before any purge: its `X-Rewritten-From`, unless that
+/// names a commit of `history`, which a rewrite would have replaced.
+pub fn firstId(
+    c: commands.Clone,
+    history: *const std.StringHashMapUnmanaged(void),
+    hex: []const u8,
+) Allocator.Error![]const u8 {
     const cm = c.commit(hex) orelse return hex;
     const block = try commands.trailersOf(c.arena, cm.message);
     const was = trailers.lastValue(block, "X-Rewritten-From") orelse return hex;
-    return if (c.isFullHex(was)) was else hex;
+    return if (c.isFullHex(was) and !history.contains(was)) was else hex;
 }
 
 /// Whether the history of `tip` still has text a purge took: a commit
 /// whose first ID is purged and that isn't marked `X-Purged: true`.
 pub fn leaks(c: commands.Clone, tip: []const u8, t: Tomb) Allocator.Error!?[]const u8 {
+    const history = try c.reach(tip);
     var walk = try c.walk(tip);
     while (try walk.next()) |x| {
-        if (!t.covers(try firstId(c, x.hex))) continue;
+        if (!t.covers(try firstId(c, &history, x.hex))) continue;
         const block = try commands.trailersOf(c.arena, x.commit.message);
         const marked = trailers.lastValue(block, "X-Purged") orelse "";
         if (!std.mem.eql(u8, marked, "true")) return x.hex;
@@ -118,7 +130,7 @@ const Rewriter = struct {
     history: *const std.StringHashMapUnmanaged(void),
 
     fn isPurged(r: Rewriter, hex: []const u8) Allocator.Error!bool {
-        return commands.containsText(r.purged, try firstId(r.c, hex));
+        return commands.containsText(r.purged, try firstId(r.c, r.history, hex));
     }
 
     fn new(r: Rewriter, hex: []const u8) Allocator.Error![]const u8 {
@@ -143,7 +155,7 @@ const Rewriter = struct {
             }
         }
         const block = try commands.trailersOf(arena, cm.message);
-        const first = try firstId(r.c, hex);
+        const first = try firstId(r.c, r.history, hex);
         const target = trailers.lastValue(block, "X-Comment");
         const in_issue = if (target) |t| r.history.contains(t) else false;
         var message = cm.message;

@@ -244,6 +244,8 @@ func TestRepo_Query(t *testing.T) {
 		{"text", with(func(q *issuez.Query) { q.Text = "safari" }), ""},
 		{"text ignoring case", with(func(q *issuez.Query) { q.Text = "safari"; q.TextIgnoreCase = true }), "Login crash"},
 		{"priority order", issuez.Query{Order: issuez.SortPriority}, "Login crash,Dark mode,Child"},
+		{"default order", issuez.Query{}, "Child,Dark mode,Login crash"},
+		{"default order ascending", issuez.Query{Ascending: true}, "Login crash,Dark mode,Child"},
 		{"milestone none", with(func(q *issuez.Query) { q.Milestones = []string{""} }), "Login crash,Dark mode,Child"},
 	}
 	for _, tt := range tests {

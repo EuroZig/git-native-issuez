@@ -153,6 +153,29 @@ test "issuez_repo_open: the process environment as it is at the open" {
     try testing.expectEqualStrings("yes", got);
 }
 
+test "issuez_repo_open: a committer no git signature can hold" {
+    var r = try fixture.Repo.init(.{});
+    defer r.deinit();
+    const people = [_]struct { []const u8, []const u8 }{
+        .{ "Server <x>", "s@example.invalid" },
+        .{ "Server", "s@example.invalid\n" },
+        .{ "S\x00", "s@example.invalid" },
+    };
+    for (people) |person| {
+        var committer = std.mem.zeroes(c.issuez_op);
+        committer.verb = c.ISSUEZ_OP_SET;
+        committer.target = c.ISSUEZ_OPT_COMMITTER;
+        committer.person.name = fixture.str(person[0]);
+        committer.person.email = fixture.str(person[1]);
+        var err: ?*c.issuez_error = null;
+        const res = fixture.tryOpen(r.path, &.{committer}, &err);
+        defer c.issuez_error_free(err);
+        // Like every option's problem.
+        try expect.code(c.ISSUEZ_E_INVALID_VALUE, res[0], err);
+        try testing.expect(res[1] == null);
+    }
+}
+
 test "issuez_repo_open: committer, environment, scopes and host prefixes" {
     var r = try fixture.Repo.init(.{});
     defer r.deinit();

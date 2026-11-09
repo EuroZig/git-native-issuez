@@ -6,12 +6,14 @@ import (
 	"maps"
 	"os"
 	"path/filepath"
+	"runtime"
 	"slices"
 	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
+	"weak"
 
 	"github.com/EuroZig/git-native-issuez/bindings/go/issuez"
 )
@@ -517,6 +519,28 @@ func TestRepo_SetLogger(t *testing.T) {
 	if mine.Load() != n {
 		t.Error("events after LogOff")
 	}
+}
+
+// A forgotten repo whose logger refers to it is still collected, and its
+// cleanup closes it.
+func TestRepo_SetLoggerForgotten(t *testing.T) {
+	dir := initRepo(t)
+	gone := func() weak.Pointer[issuez.Repo] {
+		r, err := issuez.Open(dir)
+		if err != nil {
+			t.Fatal(err)
+		}
+		r.SetLogger(issuez.LogDebug, func(issuez.LogEvent) { _ = r })
+		create(t, r, "Forgotten")
+		return weak.Make(r)
+	}()
+	for range 100 {
+		runtime.GC()
+		if gone.Value() == nil {
+			return
+		}
+	}
+	t.Error("the repo was never collected")
 }
 
 // Replacing a logger while calls run: a call already under way logs through

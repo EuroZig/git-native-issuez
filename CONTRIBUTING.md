@@ -121,7 +121,13 @@ names the tests that cover it. Update [CHANGELOG.md](CHANGELOG.md) under
    and `EuroZig/git-native-issuez-go`, the Go module with the archives
    (`tools/go-module.sh`, deploy key in the secret `GO_MODULE_DEPLOY_KEY`).
    Don't move the Go tags: Go's checksum database remembers a version for good.
-   If only `go-module` or `homebrew` fails, the release is out: rerun that job.
+   If a job fails after the gate, rerun the failed jobs: `release` takes
+   up a release that is already there (it replaces the archives and
+   publishes a draft) and keeps a `bindings/go/vX.Y.Z` tag that is already
+   at the tagged commit. If only `go-module` or `homebrew` fails, the
+   release is out and rerunning that job is enough. `go-module` also works
+   on an empty `EuroZig/git-native-issuez-go`, so the first release
+   creates its `main`.
 
 `zig build release` cross-compiles both flavors for every platform and
 writes the archives and their `SHA256SUMS` to `zig-out/release/`; run it

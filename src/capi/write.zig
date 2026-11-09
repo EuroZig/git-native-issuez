@@ -6,6 +6,7 @@
 //! problem INCOMPATIBLE.
 
 const std = @import("std");
+const assert = std.debug.assert;
 const api = @import("api.zig");
 const rt = @import("rt.zig");
 const repo_mod = @import("repo.zig");
@@ -554,14 +555,17 @@ fn entryChanges(after: *const read.IssueObj, commit: Oid) []const api.Change {
 pub const WriteObj = struct {
     arena: *std.heap.ArenaAllocator,
     repo: *RepoObj,
-    kind: api.Kind,
-    id: Str,
-    wrote: bool,
+    kind: api.Kind = .unknown,
+    id: Str = .{},
+    /// `id`'s bytes: a UUID and its NUL need no allocation once the
+    /// commit landed.
+    id_buf: [37]u8 = @splat(0),
+    wrote: bool = false,
     commit: api.Oid = .{},
     old_tip: api.Oid = .{},
     new_tip: api.Oid = .{},
     retries: u32 = 0,
-    entry: read.EntryObj,
+    entry: read.EntryObj = std.mem.zeroes(read.EntryObj),
 
     fn free(w: *WriteObj) void {
         const r = w.repo;
@@ -585,8 +589,21 @@ fn copyPerson(a: Allocator, p: ?*const api.Person) Allocator.Error!?*const api.P
     return out;
 }
 
+/// A write's receipt, allocated before its commit: one whose commit
+/// landed returns OK, whatever memory is left then.
+fn reserveWrite(c: *Call) Allocator.Error!*WriteObj {
+    const arena = try rt.newArena();
+    errdefer rt.freeArena(arena);
+    const w = try arena.allocator().create(WriteObj);
+    w.* = .{ .arena = arena, .repo = c.repo };
+    return w;
+}
+
+/// Fills a reserved receipt, which can't fail: the entry's changes and
+/// author are left out when there is no memory for them.
 fn makeWrite(
     c: *Call,
+    w: *WriteObj,
     kind: api.Kind,
     id: []const u8,
     given_old_tip: ?Oid,
@@ -594,16 +611,41 @@ fn makeWrite(
     entry_kind: api.EntryKind,
     given_changes: []const api.Change,
     author: Signature,
-) !*WriteObj {
+) *WriteObj {
     // The engine skipped a commit that changed nothing: the tip it returned
     // is the one there was.
     const old_tip = if (c.skipped) given_new_tip orelse given_old_tip else given_old_tip;
     const new_tip = if (c.skipped) null else given_new_tip;
     const changes = if (c.skipped) &.{} else given_changes;
-    const arena = try rt.newArena();
-    errdefer rt.freeArena(arena);
-    const a = arena.allocator();
-    const w = try a.create(WriteObj);
+    const a = w.arena.allocator();
+    const copied = copyChanges(a, changes) catch &.{};
+    const wrote = new_tip != null and (old_tip == null or !old_tip.?.eql(new_tip.?));
+    assert(uuid_fmt.isCanonical(id));
+    @memcpy(w.id_buf[0..36], id);
+    w.kind = kind;
+    w.id = .{ .ptr = &w.id_buf, .len = 36 };
+    w.wrote = wrote;
+    w.retries = c.retries;
+    w.commit = if (wrote) rt.oidOf(new_tip.?) else .{};
+    w.old_tip = if (old_tip) |t| rt.oidOf(t) else .{};
+    w.new_tip = if (new_tip) |t| rt.oidOf(t) else if (old_tip) |t| rt.oidOf(t) else .{};
+    w.entry = .{
+        .public = .{
+            .kind = @intFromEnum(entry_kind),
+            .commit = w.commit,
+            .author = rt.newPerson(a, author, c.author_id) catch null,
+            .at = rt.timeOf(author),
+            .comment = null,
+            .change_count = copied.len,
+            .is_new = true,
+        },
+        .changes = copied.ptr,
+    };
+    c.repo.retain();
+    return w;
+}
+
+fn copyChanges(a: Allocator, changes: []const api.Change) Allocator.Error![]const api.Change {
     const copied = try a.alloc(api.Change, changes.len);
     for (changes, copied) |ch, *o| {
         o.* = .{
@@ -627,32 +669,7 @@ fn makeWrite(
             if (fields_fmt.Date.parse(ch.new_value.slice())) |d| o.new_date = rt.dateOf(d);
         }
     }
-    const wrote = new_tip != null and (old_tip == null or !old_tip.?.eql(new_tip.?));
-    w.* = .{
-        .arena = arena,
-        .repo = c.repo,
-        .kind = kind,
-        .id = try rt.dupeZ(a, id),
-        .wrote = wrote,
-        .retries = c.retries,
-        .commit = if (wrote) rt.oidOf(new_tip.?) else .{},
-        .old_tip = if (old_tip) |t| rt.oidOf(t) else .{},
-        .new_tip = if (new_tip) |t| rt.oidOf(t) else if (old_tip) |t| rt.oidOf(t) else .{},
-        .entry = .{
-            .public = .{
-                .kind = @intFromEnum(entry_kind),
-                .commit = if (wrote) rt.oidOf(new_tip.?) else .{},
-                .author = try rt.newPerson(a, author, c.author_id),
-                .at = rt.timeOf(author),
-                .comment = null,
-                .change_count = copied.len,
-                .is_new = true,
-            },
-            .changes = copied.ptr,
-        },
-    };
-    c.repo.retain();
-    return w;
+    return copied;
 }
 
 fn getWrite(w: ?*const api.Write) ?*WriteObj {
@@ -701,23 +718,21 @@ pub fn issuez_write_load_milestone(
 // ─── Issue writes ──────────────────────────────────────────────────────
 
 /// The actor's signature; its `user_id`, a UUID, goes on the call's
-/// commits as `X-Author-Id`.
-fn signatureOf(c: *Call, actor: ?*const api.Actor) !?Signature {
+/// commits as `X-Author-Id`. Null with an error set when it can't be one.
+fn signatureOf(
+    c: *Call,
+    actor: ?*const api.Actor,
+    out: *?Signature,
+    err: ?*?*api.Error,
+) ?Code {
+    out.* = null;
     const act = actor orelse return null;
-    if (act.email.len == 0 or rt.hasReserved(act.*)) return error.InvalidValue;
-    if (act.user_id.len > 0) {
-        if (!uuid_fmt.isCanonical(act.user_id.slice())) return error.InvalidValue;
-        c.author_id = act.user_id.slice();
+    switch (rt.actorSignature(act.*)) {
+        .bad => |message| return rt.fail(err, .e_invalid_argument, "{s}", .{message}),
+        .sig => |sig| out.* = sig,
     }
-    const time = if (act.at) |t| t.* else api.Time{
-        .unix_seconds = std.Io.Timestamp.now(rt.io(), .real).toSeconds(),
-    };
-    return .{
-        .name = if (act.name.len > 0) act.name.slice() else act.email.slice(),
-        .email = act.email.slice(),
-        .time = time.unix_seconds,
-        .tz_offset_minutes = time.tz_offset_minutes,
-    };
+    if (act.user_id.len > 0) c.author_id = act.user_id.slice();
+    return null;
 }
 
 /// Format problems first, then the plan's; INVALID_VALUE with all of them.
@@ -751,8 +766,25 @@ fn checked(
     return if (problems.items.len > 0) invalid(err, problems.items) else null;
 }
 
-/// What every write starts from: its plan and who writes it.
-const Begun = struct { plan: Plan, author: ?Signature, who: Signature };
+/// What every write starts from: its plan, who writes it, and its receipt.
+const Begun = struct {
+    plan: Plan,
+    author: ?Signature,
+    who: Signature,
+    /// Freed with the call unless the write hands it out.
+    receipt: ?*WriteObj,
+
+    fn discard(b: *Begun) void {
+        if (b.receipt) |w| rt.freeArena(w.arena);
+    }
+
+    fn give(b: *Begun, out: *?*api.Write, w: *WriteObj) Code {
+        assert(b.receipt == w);
+        b.receipt = null;
+        out.* = @ptrCast(w);
+        return .ok;
+    }
+};
 
 /// The start of a write: `out` is set, or the failure's code comes back.
 fn beginWrite(
@@ -770,12 +802,12 @@ fn beginWrite(
         return rt.failError(err, e, .{});
     if (failed) |code| return code;
     if (scopedFailed(c, slice, err)) |code| return code;
-    out.author = signatureOf(c, actor) catch
-        return rt.badArgument(err, "the actor needs an email, and its user_id must be a UUID");
+    if (signatureOf(c, actor, &out.author, err)) |code| return code;
     out.who = out.author orelse who: {
         const identity = c.engine().identity(a, null) catch |e| return c.fail(err, e);
         break :who identity.author;
     };
+    out.receipt = reserveWrite(c) catch return rt.oom(err);
     return null;
 }
 
@@ -961,6 +993,7 @@ pub fn issuez_issue_create(
     defer c.end();
     var w: Begun = undefined;
     if (beginWrite(&c, &w, .issue_create, op_ptr, n, actor, err)) |code| return code;
+    defer w.discard();
     const a = c.arena();
     const p = &w.plan;
     applySets(p);
@@ -977,7 +1010,9 @@ pub fn issuez_issue_create(
     const after = loadObjAt(&c, id, created.tip) catch null;
     const changes = if (after) |x| entryChanges(x, created.tip) else &.{};
 
-    return rt.give(o, makeWrite(&c, .issue, id, null, created.tip, .created, changes, w.who), err);
+    const slot = w.receipt.?;
+    const write = makeWrite(&c, slot, .issue, id, null, created.tip, .created, changes, w.who);
+    return w.give(o, write);
 }
 
 fn loadObj(c: *Call, id: []const u8) !?*read.IssueObj {
@@ -1011,6 +1046,7 @@ pub fn issuez_issue_update(
     defer c.end();
     var w: Begun = undefined;
     if (beginWrite(&c, &w, .issue_update, op_ptr, n, actor, err)) |code| return code;
+    defer w.discard();
     const a = c.arena();
     const p = &w.plan;
     const engine = c.engine();
@@ -1081,8 +1117,9 @@ pub fn issuez_issue_update(
 
     // After a retry the commit's parent isn't the tip read first.
     const parent = if (new_tip) |t| parentOf(&c, t) orelse old_tip else old_tip;
-    const write = makeWrite(&c, .issue, ident, parent, new_tip, entry_kind, changes, w.who);
-    return rt.give(o, write, err);
+    const slot = w.receipt.?;
+    const write = makeWrite(&c, slot, .issue, ident, parent, new_tip, entry_kind, changes, w.who);
+    return w.give(o, write);
 }
 
 /// The first parent of `commit`, when it can be read.
@@ -1120,6 +1157,7 @@ pub fn issuez_milestone_create(
     defer c.end();
     var w: Begun = undefined;
     if (beginWrite(&c, &w, .milestone_create, op_ptr, n, actor, err)) |code| return code;
+    defer w.discard();
     const a = c.arena();
     const p = &w.plan;
     const catalog = c.catalog();
@@ -1137,13 +1175,19 @@ pub fn issuez_milestone_create(
         .op = @intFromEnum(Verb.set),
         .old_value = .{},
         .new_value = Str.of(p.milestone.name.?),
-    }) catch return rt.oom(err);
+    }) catch {};
 
-    return rt.give(
-        o,
-        makeWrite(&c, .milestone, created.id, null, created.tip, .created, changes.items, w.who),
-        err,
-    );
+    return w.give(o, makeWrite(
+        &c,
+        w.receipt.?,
+        .milestone,
+        created.id,
+        null,
+        created.tip,
+        .created,
+        changes.items,
+        w.who,
+    ));
 }
 
 pub fn issuez_milestone_update(
@@ -1163,6 +1207,7 @@ pub fn issuez_milestone_update(
     defer c.end();
     var w: Begun = undefined;
     if (beginWrite(&c, &w, .milestone_update, op_ptr, n, actor, err)) |code| return code;
+    defer w.discard();
     const a = c.arena();
     const p = &w.plan;
     const catalog = c.catalog();
@@ -1215,11 +1260,17 @@ pub fn issuez_milestone_update(
         }) catch {};
     };
 
-    return rt.give(
-        o,
-        makeWrite(&c, .milestone, ident, before.tip, tip, .update, changes.items, w.who),
-        err,
-    );
+    return w.give(o, makeWrite(
+        &c,
+        w.receipt.?,
+        .milestone,
+        ident,
+        before.tip,
+        tip,
+        .update,
+        changes.items,
+        w.who,
+    ));
 }
 
 comptime {

@@ -531,8 +531,13 @@ func (q *Query) ops() []op {
 	if q.Text != "" {
 		ops = append(ops, op{verb: VerbSet, target: C.ISSUEZ_OPT_Q_TEXT, str: q.Text, num: b2i(q.TextIgnoreCase)})
 	}
-	if q.Order != 0 {
-		ops = append(ops, op{verb: VerbSet, target: C.ISSUEZ_OPT_Q_ORDER, num: int64(q.Order), num2: b2i(q.Ascending)})
+	if q.Order != 0 || q.Ascending {
+		// The library's default order is SortCreated.
+		order := q.Order
+		if order == 0 {
+			order = SortCreated
+		}
+		ops = append(ops, op{verb: VerbSet, target: C.ISSUEZ_OPT_Q_ORDER, num: int64(order), num2: b2i(q.Ascending)})
 	}
 	if q.Limit > 0 {
 		ops = append(ops, op{verb: VerbSet, target: C.ISSUEZ_OPT_Q_LIMIT, num: int64(q.Limit)})

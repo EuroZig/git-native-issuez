@@ -61,6 +61,8 @@ pub const Cache = struct {
     ) ![]Issue {
         const io = rt.io();
         var out: std.ArrayList(Issue) = try .initCapacity(arena, refs.len);
+        // Room first: an entry is retained only once it can be held.
+        try held.ensureUnusedCapacity(arena, refs.len);
         var misses: std.ArrayList(issuez.engine.IssueRef) = .empty;
         const generation = generation: {
             c.mutex.lockUncancelable(io);
@@ -77,10 +79,7 @@ pub const Cache = struct {
                 }
                 e.generation = c.generation;
                 e.retain();
-                held.append(arena, e) catch |err| {
-                    e.release();
-                    return err;
-                };
+                held.appendAssumeCapacity(e);
                 out.appendAssumeCapacity(e.issue);
             }
             c.hits += refs.len - misses.items.len;
@@ -110,7 +109,7 @@ pub const Cache = struct {
                 return err;
             };
             e.retain();
-            try held.append(arena, e);
+            held.appendAssumeCapacity(e);
             out.appendAssumeCapacity(e.issue);
         }
 
@@ -171,4 +170,59 @@ test "loadAll: running out of memory doesn't leave the cache locked" {
     );
     try std.testing.expect(cache.mutex.tryLock());
     cache.mutex.unlock(rt.io());
+}
+
+test "loadAll: running out of memory leaves no entry retained by no one" {
+    const io = rt.io();
+    const Spy = struct {
+        /// Retained once more here, so it outlives the call.
+        loaded: ?*Entry = null,
+
+        fn load(spy: *@This(), ea: Allocator, ref: issuez.engine.IssueRef) !Issue {
+            const arena: *std.heap.ArenaAllocator = @ptrCast(@alignCast(ea.ptr));
+            const e: *Entry = @fieldParentPtr("arena", arena);
+            e.retain();
+            spy.loaded = e;
+            return std.mem.zeroInit(Issue, .{ .id = ref.id(), .state = .open });
+        }
+    };
+    const never = struct {
+        fn f(_: anyerror) bool {
+            return false;
+        }
+    }.f;
+    const refs = [_]issuez.engine.IssueRef{.{
+        .name = "refs/issues/0c8d7a52-3f1e-4b6a-9d2c-5e4f3a2b1c0d",
+        .tip = .{ .object_format = .sha1, .bytes = @splat(1) },
+    }};
+    for (0..8) |fail_index| {
+        var arena_state: std.heap.ArenaAllocator = .init(std.testing.allocator);
+        defer arena_state.deinit();
+        var failing: std.testing.FailingAllocator = .init(
+            arena_state.allocator(),
+            .{ .fail_index = fail_index },
+        );
+        var cache: Cache = .{};
+        var held: std.ArrayList(*Entry) = .empty;
+        var skipped: std.ArrayList([]const u8) = .empty;
+        var spy: Spy = .{};
+        const engine = struct {
+            spy: *Spy,
+            fn load(self: @This(), ea: Allocator, ref: issuez.engine.IssueRef) !Issue {
+                return self.spy.load(ea, ref);
+            }
+        }{ .spy = &spy };
+        _ = cache.loadAll(failing.allocator(), engine, &refs, &held, &skipped, &never) catch {};
+        if (spy.loaded) |e| {
+            var holders: u32 = 1;
+            for (held.items) |h| holders += @intFromBool(h == e);
+            cache.mutex.lockUncancelable(io);
+            if (cache.map.get(e.issue.id)) |m| holders += @intFromBool(m == e);
+            cache.mutex.unlock(io);
+            try std.testing.expectEqual(holders, e.refs.load(.monotonic));
+            e.release();
+        }
+        for (held.items) |e| e.release();
+        cache.deinit();
+    }
 }

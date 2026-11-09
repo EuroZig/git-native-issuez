@@ -40,6 +40,29 @@ test "issuez_purge_issue: the actor's user_id is on the tombstone, and must be a
     try testing.expect(std.mem.find(u8, message, "X-Author-Id: " ++ uuid) != null);
 }
 
+test "issuez_purge_issue, issuez_purge_comment: an actor no git signature can hold" {
+    var r = try fixture.Repo.init(.{});
+    defer r.deinit();
+    const h = r.handle;
+    const x = try fixture.titled(h, "Doxxing");
+    for (&fixture.unsignable, 0..) |*who, i| {
+        errdefer std.debug.print("unsignable actor {d}\n", .{i});
+        for (0..2) |call| {
+            var pr: ?*c.issuez_purge_result = null;
+            var err: ?*c.issuez_error = null;
+            const rc = if (call == 0)
+                c.issuez_purge_issue(h, x.idStr(), who, fixture.str(""), null, &pr, &err)
+            else
+                c.issuez_purge_comment(h, x.idStr(), &x.tip, who, fixture.str(""), null, &pr, &err);
+            defer c.issuez_error_free(err);
+            try expect.code(c.ISSUEZ_E_INVALID_ARGUMENT, rc, err);
+            try testing.expect(pr == null);
+        }
+    }
+    const issue = try fixture.load(h, x.idStr());
+    c.issuez_issue_free(issue);
+}
+
 test "issuez_purge_result_exposed_remote_at: a remote synced by URL" {
     var r = try fixture.Repo.init(.{});
     defer r.deinit();
@@ -306,4 +329,33 @@ test "issuez_purge_result_attachment_count: the attachments a purge takes" {
     try expect.str(shot, c.issuez_purge_result_attachment_at(pr, 0));
     c.issuez_purge_result_free(pr);
     try testing.expectEqual(@as(usize, 0), c.issuez_purge_result_attachment_count(null));
+}
+
+test "issuez_purge_issue: one that landed returns OK, out of memory or not" {
+    var r = try fixture.Repo.init(.{});
+    defer r.deinit();
+    const h = r.handle;
+    const x = try fixture.titled(h, "Doxxing");
+    // Each run fails one allocation later, until one doesn't fail.
+    var n: i64 = 0;
+    while (true) : (n += 1) {
+        errdefer std.debug.print("allocation {d}\n", .{n});
+        const before = try r.git(&.{ "for-each-ref", "--format=%(refname) %(objectname)" });
+        var pr: ?*c.issuez_purge_result = null;
+        var err: ?*c.issuez_error = null;
+        fixture.failAllocation(n);
+        const no_reason = fixture.str("");
+        const rc = c.issuez_purge_issue(h, x.idStr(), &fixture.ada, no_reason, null, &pr, &err);
+        fixture.failAllocation(-1);
+        defer c.issuez_error_free(err);
+        if (rc == c.ISSUEZ_OK) {
+            try testing.expectEqual(@as(u8, 0), c.issuez_purge_result_new_tip(pr).len);
+            c.issuez_purge_result_free(pr);
+            break;
+        }
+        try testing.expect(pr == null);
+        const after = try r.git(&.{ "for-each-ref", "--format=%(refname) %(objectname)" });
+        // Git may have moved the refs when its answer couldn't be read.
+        if (rc != c.ISSUEZ_E_GIT) try testing.expectEqualStrings(before, after);
+    }
 }

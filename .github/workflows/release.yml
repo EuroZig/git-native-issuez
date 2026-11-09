@@ -196,20 +196,38 @@ jobs:
             fi
           done
 
+      # On a rerun the release may be there already, a draft if an upload
+      # failed: its archives are replaced and it is published. Nothing after
+      # this job has used them yet.
       - name: Publish
         env:
           GH_TOKEN: ${{ github.token }}
-        run: >
-          gh release create "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" --verify-tag
-          --title "v$VERSION" --notes-file notes.md
-          zig-out/release/*.tar.gz zig-out/release/*.zip zig-out/release/SHA256SUMS
+        run: |
+          set -- zig-out/release/*.tar.gz zig-out/release/*.zip zig-out/release/SHA256SUMS
+          if gh release view "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" > /dev/null 2>&1; then
+            gh release upload "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" --clobber "$@"
+            gh release edit "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" --draft=false
+          else
+            gh release create "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" --verify-tag \
+              --title "v$VERSION" --notes-file notes.md "$@"
+          fi
 
       # The version of the Go module. Only now: Go's checksum database
-      # remembers a version for good, so this tag can't move.
+      # remembers a version for good, so this tag can't move. A rerun finds
+      # it at this commit and leaves it.
       - name: Tag the Go module
         run: |
-          git tag "bindings/go/v$VERSION"
-          git push origin "refs/tags/bindings/go/v$VERSION"
+          tag="bindings/go/v$VERSION"
+          got=$(git ls-remote --tags origin | awk -v ref="refs/tags/$tag" '$2 == ref || $2 == ref "^{}" { sha = $1 } END { print sha }')
+          if [ "$got" = "$(git rev-parse HEAD)" ]; then
+            echo "$tag is already at this commit"
+          elif [ -n "$got" ]; then
+            echo "::error::$tag is at $got, not at this commit, and can't move"
+            exit 1
+          else
+            git tag "$tag"
+            git push origin "refs/tags/$tag"
+          fi
 
   # Writes the Go module with the archives (EuroZig/git-native-issuez-go) for
   # the new release, from what was published. Pushes straight to its main with
@@ -226,11 +244,20 @@ jobs:
       - uses: actions/checkout@v7
         with:
           path: source
-      - uses: actions/checkout@v7
-        with:
-          repository: EuroZig/git-native-issuez-go
-          ssh-key: ${{ secrets.GO_MODULE_DEPLOY_KEY }}
-          path: module
+      # Cloned by hand: git clones an empty repository, as the module's is
+      # before its first release, where actions/checkout may fail.
+      - name: Clone the module
+        env:
+          DEPLOY_KEY: ${{ secrets.GO_MODULE_DEPLOY_KEY }}
+        run: |
+          key="$RUNNER_TEMP/go-module-key"
+          (umask 077 && printf '%s\n' "$DEPLOY_KEY" > "$key")
+          # GitHub's published host key.
+          known="$RUNNER_TEMP/known_hosts"
+          echo 'github.com ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIOMqqnkVzrm0SdG6UOoqKLsabgH5C9okWi0dh2l9GKJl' > "$known"
+          ssh="ssh -i $key -o IdentitiesOnly=yes -o UserKnownHostsFile=$known"
+          GIT_SSH_COMMAND="$ssh" git clone git@github.com:EuroZig/git-native-issuez-go.git module
+          git -C module config core.sshCommand "$ssh"
       - uses: actions/setup-go@v6
         with:
           go-version: '1.26'
@@ -255,7 +282,8 @@ jobs:
           git -c user.name=github-actions -c user.email=github-actions@users.noreply.github.com \
             commit -m "git-native-issuez $VERSION"
           git tag "v$VERSION"
-          git push --atomic origin HEAD:main "refs/tags/v$VERSION"
+          # refs/heads/main in full: the first push creates it.
+          git push --atomic origin HEAD:refs/heads/main "refs/tags/v$VERSION"
 
   # Points the Homebrew tap at the new release. Pushes straight to the tap's
   # main with a deploy key, after the formula installs and passes its test on

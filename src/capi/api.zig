@@ -197,7 +197,8 @@ pub const ProblemKind = enum(u32) {
     invalid_stored_value,
     /// an event whose comment hasn't arrived (reads)
     pending_event,
-    /// fails fsck or can't be read (push check)
+    /// fails fsck, can't be read, or has an X-Rewritten-From that
+    /// names one of its commits (push check)
     invalid_history,
     /// a Format-Version other than 1 (push check)
     unsupported_format,
@@ -388,7 +389,7 @@ pub const Opt = enum(u32) {
     git_path = 0x300,
     /// open: SET name=str; CLEAR without name starts empty. Default: the process environment
     env,
-    /// open: person (name, email). Default: git's identity
+    /// open: person (name, email), without <, >, newline or NUL. Default: git's identity
     committer,
     /// open: ADD str; overrides git config issue.doneStates
     done_state,
@@ -1170,7 +1171,10 @@ pub const preamble =
     \\Threads
     \\  An issuez_repo is safe to use from any number of threads at once; it
     \\  keeps a pool of git sessions. Loaded objects are immutable and can be
-    \\  read from any thread.
+    \\  read from any thread. issuez_repo_close may come while other threads'
+    \\  calls on the repo run: each holds the repo until it returns. It must
+    \\  not race a call's start: a call made after it, or at the same time,
+    \\  uses a freed repo.
     \\
     \\Blocking, cancellation and signals
     \\  Calls that touch git block. They take an `issuez_cancel *` (may be
@@ -1178,7 +1182,12 @@ pub const preamble =
     \\  ISSUEZ_E_CANCELLED within about 50 ms, killing a git request that is
     \\  running. Writes are atomic: a write that returns
     \\  CANCELLED didn't happen (a ref update, once started, isn't
-    \\  interrupted), and one whose commit landed returns OK. The library
+    \\  interrupted), and one whose commit landed returns OK, memory left
+    \\  or not: its receipt is allocated first, and its entry may then
+    \\  lack its changes and author. Two exceptions, where a failed call
+    \\  may have written: GIT when git's answer to the ref update couldn't
+    \\  be read, and an issuez_purge_comment that can't read the issue
+    \\  back. Reload to see which. The library
     \\  installs no signal handlers. It writes to
     \\  pipes, so a host must not die of SIGPIPE: ignore it, or handle it as
     \\  the Go runtime does.
@@ -1245,7 +1254,9 @@ pub const items = [_]Item{
     .{ .prose = "A person as stored in git." },
     .{ .type = Person },
     .{ .prose = "The acting user of a write: the commit's author. The committer is the " ++
-        "identity the repo was opened with." },
+        "identity the repo was opened with. Name and email can't hold <, >, a newline or " ++
+        "a NUL, and the time zone is less than a day off UTC: else the write fails with " ++
+        "INVALID_ARGUMENT." },
     .{ .type = Actor },
 
     .{ .section = .{ "Errors and problems", "" } },
@@ -1294,7 +1305,7 @@ pub const items = [_]Item{
         &.{"err"},
         "A write that failed after its commit landed: its receipt, borrowed from " ++
             "err. NULL in this version: a cancelled write didn't happen, and one " ++
-            "whose commit landed returns OK.",
+            "whose commit landed returns OK (see Blocking, cancellation and signals).",
     ),
     .{ .type = ProblemKind },
     .{ .type = Field },

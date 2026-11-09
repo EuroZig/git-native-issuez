@@ -11,9 +11,13 @@ pub const help =
     \\
     \\Remove an issue, or one comment's text and images, from history for
     \\good: for abuse or a legal request. Unlike delete, nothing can bring
-    \\it back. A comment's later commits are rewritten; its fields stay. A
-    \\tombstone records the purge, and sync takes it to the remote and to
-    \\every clone, which purge the same way.
+    \\it back. A comment's later commits are rewritten. A tombstone records
+    \\the purge, and sync takes it to the remote and to every clone, which
+    \\purge the same way.
+    \\
+    \\A purged comment keeps the fields it set, and some of them are free
+    \\text: Title, Reason, Milestone, X-Lock-Reason, Release and Fixed-By.
+    \\Only purging the whole issue removes those.
     \\
     \\Options:
     \\   --comment <id>         Purge this comment only (see show --ids)

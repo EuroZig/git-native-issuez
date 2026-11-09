@@ -129,8 +129,10 @@ func b2i(b bool) int64 {
 // Edit is one commit's worth of changes to an issue, for Create and
 // Update (MilestoneEdit is a milestone's). The zero
 // value is an empty edit; methods chain. Nothing is checked until the
-// call, which then reports every problem (Problem.Op is the method call's
-// position, counting from 0).
+// call, which then reports every problem. Problem.Op indexes the edit's
+// ops, not its method calls: SetLabels, SetAssignees, SetBlockers,
+// EditComment and SetOriginal add several. Len before a call is the index
+// of its first.
 //
 // Setters of optional fields clear them when given the zero value, so a
 // host can pass what it has: "" for SetWorkflowState, SetMilestone,

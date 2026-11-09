@@ -373,3 +373,27 @@ test "issuez_query_run: the cache loads only what changed, and sees every change
     _ = try countAll(uncached);
     try testing.expect(reads.load(.monotonic) > 0);
 }
+
+test "issuez_query_run: out of memory at any allocation holds nothing" {
+    var r = try fixture.Repo.init(.{});
+    defer r.deinit();
+    for (0..3) |_| _ = try fixture.titled(r.handle, "Paged");
+    const page = [_]c.issuez_op{c.issuez_q_limit(2)};
+    // Each run fails one allocation later, until one doesn't fail.
+    var n: i64 = 0;
+    while (true) : (n += 1) {
+        var list: ?*c.issuez_issue_list = null;
+        var err: ?*c.issuez_error = null;
+        fixture.failAllocation(n);
+        const rc = c.issuez_query_run(r.handle, &page, 1, null, &list, &err);
+        fixture.failAllocation(-1);
+        if (rc == c.ISSUEZ_OK) {
+            try testing.expect(c.issuez_issue_list_next_cursor(list).len > 0);
+            c.issuez_issue_list_free(list);
+            break;
+        }
+        try testing.expect(list == null);
+        c.issuez_error_free(err);
+    }
+    try testing.expect(n > 0);
+}

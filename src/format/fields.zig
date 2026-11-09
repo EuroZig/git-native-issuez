@@ -397,17 +397,22 @@ pub fn parseNumber(s: []const u8) ?u64 {
 }
 
 /// `X-Ref`: a branch or tag, as git names it (`main`, `refs/tags/v1`):
-/// no spaces, controls, `..` or what else git refuses in a ref name.
+/// what `git check-ref-format --allow-onelevel` accepts, and no leading
+/// `-`, which would read as an option.
 pub fn isRefName(s: []const u8) bool {
-    if (s.len == 0 or s.len > 255) return false;
-    if (s[0] == '-' or s[0] == '/' or s[s.len - 1] == '/') return false;
-    if (std.mem.endsWith(u8, s, ".lock") or std.mem.endsWith(u8, s, ".")) return false;
-    if (std.mem.indexOf(u8, s, "..") != null or std.mem.indexOf(u8, s, "//") != null or
-        std.mem.indexOf(u8, s, "@{") != null) return false;
+    if (s.len == 0 or s.len > 255 or s[0] == '-') return false;
+    if (std.mem.eql(u8, s, "@") or std.mem.endsWith(u8, s, ".")) return false;
+    if (std.mem.indexOf(u8, s, "..") != null or std.mem.indexOf(u8, s, "@{") != null)
+        return false;
     for (s) |c| switch (c) {
         0...0x20, 0x7f, '~', '^', ':', '?', '*', '[', '\\' => return false,
         else => {},
     };
+    // Rejects a leading, trailing or doubled `/` too: an empty component.
+    var components = std.mem.splitScalar(u8, s, '/');
+    while (components.next()) |c| {
+        if (c.len == 0 or c[0] == '.' or std.mem.endsWith(u8, c, ".lock")) return false;
+    }
     return true;
 }
 
@@ -586,6 +591,17 @@ test Date {
     var w: std.Io.Writer = .fixed(&buf);
     try w.print("{f}", .{Date.parse("2026-12-01").?});
     try testing.expectEqualStrings("2026-12-01", w.buffered());
+}
+
+test isRefName {
+    for ([_][]const u8{ "main", "refs/tags/v1", "feature/a.b", "v1.0", "a@b", "caf\u{e9}" }) |r| {
+        try testing.expect(isRefName(r));
+    }
+    for ([_][]const u8{
+        "",    "@",      "-x",       "/a",   "a/",    "a//b", "a/.b",   ".a",
+        "a.",  "a.lock", "a.lock/b", "a..b", "a@{1}", "a b",  "a~1",    "a^",
+        "a:b", "a?",     "a*",       "a[b",  "a\\b",  "a\tb", "a\x7fb",
+    }) |r| try testing.expect(!isRefName(r));
 }
 
 test "minutes and durations" {

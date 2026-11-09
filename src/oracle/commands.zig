@@ -33,9 +33,15 @@ pub const NaiveIssue = struct {
     title_override: ?[]const u8,
     state: []const u8,
     labels: []const []const u8,
+    /// The newest `Assignee` when it is one of `assignees`, "" when there
+    /// are none.
     assignee: []const u8,
     /// Every member as written, by the oracle's own reading of format.md §3.
     assignees: []const []const u8 = &.{},
+    /// The newest `Assignee` isn't one of `assignees`: the first of them
+    /// stands for it, and since the oracle doesn't model member order, any
+    /// of them may (`isAssignee`).
+    assignee_any: bool = false,
     /// `X-Number` as written, "" when unset.
     number: []const u8 = "",
     /// Present reactions as `<comment hex or -> <emoji> <email>`, by the
@@ -596,7 +602,6 @@ const Dag = struct {
         // Of the fields a merge restates.
         for ([_][]const u8{
             "Title",
-            "Assignee",
             "Priority",
             "Milestone",
             "X-Parent",
@@ -618,6 +623,14 @@ const Dag = struct {
                 break;
             };
         }
+        // format.md §3: the assignees decide; `Assignee` names one of them.
+        const assignees = try d.set("X-Assignees");
+        const newest = try d.scalar("Assignee");
+        const assignee: []const u8 = if (newest) |v|
+            (if (contains(assignees, v)) v else "")
+        else
+            "";
+        if (assignees.len == 0 and newest != null) try cleared.append(d.arena, "Assignee");
         return .{
             .cleared = cleared.items,
             .title = if (title != null and title.?.len > 0) title.? else try trailers.subject(
@@ -627,8 +640,9 @@ const Dag = struct {
             .title_override = if (title != null and title.?.len > 0) title.? else null,
             .state = if (state != null and state.?.len > 0) state.? else "open",
             .labels = try d.set("Labels"),
-            .assignee = (try d.scalar("Assignee")) orelse "",
-            .assignees = try d.set("X-Assignees"),
+            .assignee = assignee,
+            .assignees = assignees,
+            .assignee_any = assignee.len == 0 and assignees.len > 0,
             .number = (try d.scalar("X-Number")) orelse "",
             .locked = (try d.scalar("X-Locked")) orelse "",
             .lock_reason = (try d.scalar("X-Lock-Reason")) orelse "",
@@ -780,6 +794,12 @@ const Dag = struct {
         return out.items;
     }
 };
+
+/// Whether `got`, as written, is the assignee `n` resolves to.
+pub fn isAssignee(n: NaiveIssue, got: []const u8) bool {
+    if (n.assignee_any) return contains(n.assignees, got);
+    return std.mem.eql(u8, got, n.assignee);
+}
 
 pub fn sameSet(a: []const []const u8, b: []const []const u8) bool {
     if (a.len != b.len) return false;
@@ -1280,7 +1300,8 @@ pub fn restatedBy(arena: Allocator, n: NaiveIssue) Allocator.Error!std.ArrayList
         .{ .key = "Labels", .value = try std.mem.join(arena, ", ", n.labels) },
     ) else if (was(n, "Labels")) try want.append(arena, .{ .key = "Labels", .value = "" });
     for ([_]Trailer{
-        .{ .key = "Assignee", .value = n.assignee },
+        // Any assignee may stand in (`isAssignee`): the first here.
+        .{ .key = "Assignee", .value = if (n.assignee_any) n.assignees[0] else n.assignee },
         .{ .key = "Priority", .value = n.priority },
         .{ .key = "Milestone", .value = n.milestone },
     }) |t| if (t.value.len > 0 or was(n, t.key)) try want.append(arena, t);

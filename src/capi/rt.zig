@@ -21,6 +21,8 @@ var counting: Counting = .{};
 /// `c_allocator` that counts live allocations.
 const Counting = struct {
     live: std.atomic.Value(i64) = .init(0),
+    /// Allocations that succeed before one fails; negative: none fails.
+    fail_in: std.atomic.Value(i64) = .init(-1),
 
     fn allocator(c: *Counting) Allocator {
         return .{ .ptr = c, .vtable = &.{
@@ -36,6 +38,9 @@ const Counting = struct {
     }
 
     fn alloc(ctx: *anyopaque, n: usize, a: std.mem.Alignment, ra: usize) ?[*]u8 {
+        const c = of(ctx);
+        if (c.fail_in.load(.monotonic) >= 0 and c.fail_in.fetchSub(1, .monotonic) == 0)
+            return null;
         const p = std.heap.c_allocator.rawAlloc(n, a, ra) orelse return null;
         _ = of(ctx).live.fetchAdd(1, .monotonic);
         return p;
@@ -58,6 +63,12 @@ const Counting = struct {
 /// Live allocations, in `-Dcapi-debug` builds.
 pub fn liveAllocations() i64 {
     return counting.live.load(.monotonic);
+}
+
+/// In `-Dcapi-debug` builds, the allocation after the next `n` fails
+/// (once); negative: none does.
+pub fn failAllocation(n: i64) void {
+    counting.fail_in.store(n, .monotonic);
 }
 
 var threaded: std.Io.Threaded = undefined;
@@ -336,6 +347,33 @@ pub fn oidFrom(oid: api.Oid) ?issuez.backend.object.Oid {
 
 pub fn timeOf(sig: issuez.backend.object.Signature) api.Time {
     return .{ .unix_seconds = sig.time, .tz_offset_minutes = sig.tz_offset_minutes };
+}
+
+/// The commits' author for a call's actor, or why it can't be one: git's
+/// signature has no room for `<`, `>`, a newline or a NUL, nor for a time
+/// zone a day or more off UTC.
+pub fn actorSignature(act: api.Actor) union(enum) {
+    sig: issuez.backend.object.Signature,
+    bad: []const u8,
+} {
+    if (hasReserved(act)) return .{ .bad = "reserved fields must be zero" };
+    if (act.email.len == 0) return .{ .bad = "the actor needs an email" };
+    if (act.user_id.len > 0 and !issuez.format.uuid.isCanonical(act.user_id.slice()))
+        return .{ .bad = "the actor's user_id must be a UUID" };
+    const time = if (act.at) |t| t.* else api.Time{
+        .unix_seconds = std.Io.Timestamp.now(io(), .real).toSeconds(),
+    };
+    const sig: issuez.backend.object.Signature = .{
+        .name = if (act.name.len > 0) act.name.slice() else act.email.slice(),
+        .email = act.email.slice(),
+        .time = time.unix_seconds,
+        .tz_offset_minutes = time.tz_offset_minutes,
+    };
+    if (!sig.isValid()) return .{
+        .bad = "the actor's name and email can't hold <, >, a newline or a NUL, " ++
+            "and its time zone is less than a day off UTC",
+    };
+    return .{ .sig = sig };
 }
 
 /// A commit's author: its signature, and its `X-Author-Id` when it has

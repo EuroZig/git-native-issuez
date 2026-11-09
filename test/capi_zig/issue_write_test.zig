@@ -755,3 +755,76 @@ test "issuez_issue_update: EXPECT_EDITS, a text's version that other changes don
     try expect.str("v1", c.issuez_issue_info_of(i).*.description);
     try expect.str("c1", fixture.findComment(i, said.commit).?.text);
 }
+
+test "issue and milestone writes: an actor no git signature can hold" {
+    var r = try fixture.Repo.init(.{});
+    defer r.deinit();
+    const h = r.handle;
+    const x = try fixture.titled(h, "Signed");
+    const m = try fixture.milestone(h, "v1");
+    const title = [_]c.issuez_op{c.issuez_set_title(fixture.str("T"))};
+    const name = [_]c.issuez_op{c.issuez_set_name(fixture.str("v2"))};
+    for (&fixture.unsignable, 0..) |*who, i| {
+        errdefer std.debug.print("unsignable actor {d}\n", .{i});
+        for (0..4) |call| {
+            var w: ?*c.issuez_write = null;
+            var err: ?*c.issuez_error = null;
+            const rc = switch (call) {
+                0 => c.issuez_issue_create(h, &title, 1, who, null, &w, &err),
+                1 => c.issuez_issue_update(h, x.idStr(), &title, 1, who, null, &w, &err),
+                2 => c.issuez_milestone_create(h, &name, 1, who, null, &w, &err),
+                else => c.issuez_milestone_update(h, m.idStr(), &name, 1, who, null, &w, &err),
+            };
+            defer c.issuez_error_free(err);
+            try expect.code(c.ISSUEZ_E_INVALID_ARGUMENT, rc, err);
+            try testing.expect(w == null);
+        }
+    }
+    // Nothing was written.
+    const refs = try r.git(&.{ "for-each-ref", "--format=%(refname)" });
+    try testing.expectEqual(@as(usize, 2), std.mem.count(u8, refs, "\n") + 1);
+}
+
+test "issue and milestone writes: one whose commit landed returns OK, out of memory or not" {
+    var r = try fixture.Repo.init(.{});
+    defer r.deinit();
+    const h = r.handle;
+    const x = try fixture.titled(h, "Written");
+    const m = try fixture.milestone(h, "v1");
+    const title = [_]c.issuez_op{c.issuez_set_title(fixture.str("Retitled"))};
+    const name = [_]c.issuez_op{c.issuez_set_name(fixture.str("v2"))};
+    for (0..4) |call| {
+        // Each run fails one allocation later, until one doesn't fail.
+        var n: i64 = 0;
+        while (true) : (n += 1) {
+            errdefer std.debug.print("call {d}, allocation {d}\n", .{ call, n });
+            const before = try r.git(&.{ "for-each-ref", "--format=%(refname) %(objectname)" });
+            var w: ?*c.issuez_write = null;
+            var err: ?*c.issuez_error = null;
+            fixture.failAllocation(n);
+            const ada = &fixture.ada;
+            const rc = switch (call) {
+                0 => c.issuez_issue_create(h, &title, 1, ada, null, &w, &err),
+                1 => c.issuez_issue_update(h, x.idStr(), &title, 1, ada, null, &w, &err),
+                2 => c.issuez_milestone_create(h, &name, 1, ada, null, &w, &err),
+                else => c.issuez_milestone_update(h, m.idStr(), &name, 1, ada, null, &w, &err),
+            };
+            fixture.failAllocation(-1);
+            if (rc == c.ISSUEZ_OK) {
+                // Its id with no allocation; nothing else may be left.
+                try testing.expectEqual(@as(usize, 36), c.issuez_write_id(w).len);
+                c.issuez_write_free(w);
+                break;
+            }
+            defer c.issuez_error_free(err);
+            errdefer std.debug.print("{s}: {s}\n", .{
+                std.mem.span(c.issuez_code_name(rc)),
+                fixture.slice(c.issuez_error_message(err)),
+            });
+            try testing.expect(w == null);
+            const after = try r.git(&.{ "for-each-ref", "--format=%(refname) %(objectname)" });
+            // Git may have moved the ref when its answer couldn't be read.
+            if (rc != c.ISSUEZ_E_GIT) try testing.expectEqualStrings(before, after);
+        }
+    }
+}

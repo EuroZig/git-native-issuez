@@ -6,6 +6,7 @@
 //! what it needs to decide (a missing number, commits to a locked issue).
 
 const std = @import("std");
+const assert = std.debug.assert;
 const Allocator = std.mem.Allocator;
 const object = @import("../backend/object.zig");
 const trailers = @import("../format/trailers.zig");
@@ -40,6 +41,10 @@ pub const Policy = struct {
     /// The pusher may push tombstones, and the rewrites and deletes they
     /// allow.
     allow_purge: bool = false,
+    /// Commits of history the push may walk to resolve merges by this
+    /// tool's identity (each merge walks its own). Past it, no merge of the
+    /// update is exempt from the author policy.
+    max_merge_work: u32 = 1_000_000,
 };
 
 /// One line of the pre-receive hook's input.
@@ -72,7 +77,9 @@ pub const ProblemKind = enum {
     bad_ref_name,
     non_fast_forward,
     deleted,
-    /// Fails fsck, or can't be read within the limits.
+    /// Fails fsck, can't be read within the limits, or has an
+    /// `X-Rewritten-From` that names one of its commits or another
+    /// commit's first ID.
     invalid_history,
     format_version,
     /// A new commit carries `X-Number` and clients may not number.
@@ -161,6 +168,50 @@ fn reachable(arena: Allocator, commits: []const CommitInput, start: Oid) Allocat
     return out;
 }
 
+/// The ancestors of merges in one history: an index built once, and walks
+/// that stamp a mark per commit, so none clears anything.
+const Ancestry = struct {
+    history: []const CommitInput,
+    index: std.AutoHashMapUnmanaged([Oid.max_byte_len]u8, usize),
+    marks: []u32,
+    epoch: u32 = 0,
+    stack: std.ArrayList(usize) = .empty,
+
+    fn init(arena: Allocator, history: []const CommitInput) Allocator.Error!Ancestry {
+        var index: std.AutoHashMapUnmanaged([Oid.max_byte_len]u8, usize) = .empty;
+        try index.ensureTotalCapacity(arena, @intCast(history.len));
+        for (history, 0..) |c, i| index.putAssumeCapacity(c.oid.bytes, i);
+        const marks = try arena.alloc(u32, history.len);
+        @memset(marks, 0);
+        return .{ .history = history, .index = index, .marks = marks };
+    }
+
+    /// The indices of the commits `parents` reach, themselves included,
+    /// into `out`. False once there are more than `cap`.
+    fn walk(
+        a: *Ancestry,
+        arena: Allocator,
+        parents: []const Oid,
+        cap: usize,
+        out: *std.ArrayList(usize),
+    ) Allocator.Error!bool {
+        a.epoch += 1;
+        out.clearRetainingCapacity();
+        a.stack.clearRetainingCapacity();
+        for (parents) |p| if (a.index.get(p.bytes)) |i| try a.stack.append(arena, i);
+        while (a.stack.pop()) |i| {
+            if (a.marks[i] == a.epoch) continue;
+            a.marks[i] = a.epoch;
+            if (out.items.len == cap) return false;
+            try out.append(arena, i);
+            for (a.history[i].parents) |p| if (a.index.get(p.bytes)) |j| {
+                if (a.marks[j] != a.epoch) try a.stack.append(arena, j);
+            };
+        }
+        return true;
+    }
+};
+
 fn contains(commits: []const CommitInput, oid: Oid) bool {
     for (commits) |c| if (c.oid.eql(oid)) return true;
     return false;
@@ -215,6 +266,11 @@ pub fn PushCheck(comptime B: type) type {
             /// Per issue: the tombstone after the push.
             tombs: std.StringHashMapUnmanaged(purge_mod.Tombstone) = .empty,
             numbers: ?std.AutoHashMapUnmanaged(u64, std.ArrayList(repo_mod.IssueRef)) = null,
+            /// What is left of `Policy.max_merge_work`.
+            merge_work_left: usize,
+            /// Every tombstone's purged commits, whatever issue it names:
+            /// true for a purged issue's root.
+            purged: std.AutoHashMapUnmanaged([Oid.max_byte_len]u8, bool) = .empty,
 
             fn b(r: *Run) *B {
                 return r.check.repo.backend;
@@ -232,7 +288,13 @@ pub fn PushCheck(comptime B: type) type {
             updates: []const Update,
             policy: Policy,
         ) Error![]Verdict {
-            var run: Run = .{ .check = self, .arena = arena, .policy = policy, .updates = updates };
+            var run: Run = .{
+                .check = self,
+                .arena = arena,
+                .policy = policy,
+                .updates = updates,
+                .merge_work_left = policy.max_merge_work,
+            };
             const verdicts = try arena.alloc(Verdict, updates.len);
             // Tombstones first: the issue verdicts read them.
             for (try self.repo.backend.listRefs(arena, prefixes.tombstones)) |e| {
@@ -254,6 +316,11 @@ pub fn PushCheck(comptime B: type) type {
                     t,
                 ) else t;
                 try run.tombs.put(arena, c.id, merged);
+            }
+            var tombs = run.tombs.valueIterator();
+            while (tombs.next()) |t| {
+                for (t.comments) |oid| try run.purged.put(arena, oid.bytes, false);
+                for (t.roots) |oid| try run.purged.put(arena, oid.bytes, true);
             }
             for (updates, verdicts) |u, *v| {
                 const c = classify(u.ref);
@@ -365,6 +432,67 @@ pub fn PushCheck(comptime B: type) type {
             return rw.tip;
         }
 
+        /// Purged text in a history under any of our refs: a purged comment
+        /// as it was, or a commit of a purged issue, which has its root.
+        /// Tombstones name commits, not where they are, so another UUID
+        /// can't bring them back.
+        fn purgedHistory(
+            r: *Run,
+            history: []const CommitInput,
+            problems: *Problems,
+        ) Allocator.Error!void {
+            if (r.purged.count() == 0) return;
+            for (history) |c| if (r.purged.get(c.oid.bytes)) |root| try problems.at(
+                .purged,
+                c.oid,
+                if (root) "a purged issue's history" else "a purged comment",
+            );
+        }
+
+        /// A new commit's `X-Rewritten-From` (§10) names what a purge's
+        /// rewrite replaced, so nothing in the history. One that names a
+        /// commit of it (the root, another's comment), or another commit's
+        /// first ID, would make a purge of the commit purge that one too.
+        fn rewrittenFrom(
+            r: *Run,
+            fresh: []const CommitInput,
+            history: []const CommitInput,
+            problems: *Problems,
+        ) Error!void {
+            const a = r.arena;
+            const claims = try a.alloc(?Oid, fresh.len);
+            var any = false;
+            for (fresh, claims) |c, *claim| {
+                claim.* = try rewrittenFromOf(r, c);
+                if (claim.* != null) any = true;
+            }
+            if (!any) return;
+            var oids: Reach = .empty;
+            for (history) |c| try oids.put(a, c.oid.bytes, {});
+            var firsts: std.AutoHashMapUnmanaged([Oid.max_byte_len]u8, usize) = .empty;
+            for (history) |c| if (try rewrittenFromOf(r, c)) |was| {
+                if (oids.contains(was.bytes)) continue;
+                const e = try firsts.getOrPut(a, was.bytes);
+                e.value_ptr.* = if (e.found_existing) e.value_ptr.* + 1 else 1;
+            };
+            for (fresh, claims) |c, claim| {
+                const was = claim orelse continue;
+                if (oids.contains(was.bytes)) {
+                    try problems.at(.invalid_history, c.oid, "X-Rewritten-From names a commit " ++
+                        "of the history");
+                } else if (firsts.get(was.bytes).? > 1) {
+                    try problems.at(.invalid_history, c.oid, "X-Rewritten-From is another " ++
+                        "commit's too");
+                }
+            }
+        }
+
+        fn rewrittenFromOf(r: *Run, c: CommitInput) Allocator.Error!?Oid {
+            const block = try trailers.parse(r.arena, c.message, .{});
+            const was = trailers.lastValue(block, purge_mod.rewritten_from_key) orelse return null;
+            return Oid.parseHex(r.format(), was) catch null;
+        }
+
         /// The commits `history` has and `base`'s history doesn't.
         fn newCommits(
             r: *Run,
@@ -379,45 +507,66 @@ pub fn PushCheck(comptime B: type) type {
             return out.items;
         }
 
+        const Shape = enum {
+            /// Not a merge sync writes.
+            no,
+            /// Adds nothing whatever its parents hold.
+            yes,
+            /// Adds nothing if its trailers are what its parents resolve to.
+            resolve,
+        };
+
         /// A merge under this tool's identity that adds nothing to its
-        /// parents, as sync writes them (format.md §4, §6, §10). The identity
-        /// proves nothing: anyone can write it.
-        fn mergeAddsNothing(
-            r: *Run,
-            c: CommitInput,
-            kind: Kind,
-            id: []const u8,
-            history: []const CommitInput,
-        ) Error!bool {
-            if (!isSyncMerge(c)) return false;
-            const a = r.arena;
-            switch (kind) {
-                .tombstone => return std.mem.eql(u8, c.message, purge_mod.merge_subject ++ "\n"),
-                .milestone => return std.mem.eql(u8, c.message, "Merge milestone\n"),
-                .issue => {},
-                else => return false,
-            }
+        /// parents, as sync writes them (format.md §4, §6, §10), as far as
+        /// its message alone tells. The identity proves nothing: anyone can
+        /// write it.
+        fn mergeShape(a: Allocator, c: CommitInput, kind: Kind) Error!Shape {
+            if (!isSyncMerge(c)) return .no;
+            const exact = switch (kind) {
+                .tombstone => purge_mod.merge_subject ++ "\n",
+                .milestone => "Merge milestone\n",
+                .issue => "",
+                else => return .no,
+            };
+            if (exact.len > 0) return if (std.mem.eql(u8, c.message, exact)) .yes else .no;
             const subject = @import("sync.zig").merge_subject;
             const block = try trailers.parse(a, c.message, .{});
             if (block.first_line) |line| {
                 // The subject, a blank line, the trailers.
                 if (line != 2 or !std.mem.eql(u8, std.mem.sliceTo(c.message, '\n'), subject))
-                    return false;
+                    return .no;
             } else if (!std.mem.eql(u8, std.mem.trimEnd(u8, c.message, "\n"), subject)) {
-                return false;
+                return .no;
             }
-            var reach: Reach = .empty;
-            for (c.parents) |p| {
-                var from = try reachable(a, history, p);
-                var keys = from.keyIterator();
-                while (keys.next()) |k| try reach.put(a, k.*, {});
+            for (block.trailers) |t| {
+                if (!saysNothing(t.key)) return .resolve;
             }
-            var before: std.ArrayList(CommitInput) = .empty;
-            for (history) |h| if (reach.contains(h.oid.bytes)) try before.append(a, h);
+            return .yes;
+        }
+
+        /// Says nothing, or has its own check (§11).
+        fn saysNothing(key: []const u8) bool {
+            return std.ascii.eqlIgnoreCase(key, "X-Number") or
+                std.ascii.eqlIgnoreCase(key, purge_mod.rewritten_from_key);
+        }
+
+        /// Whether merge `c`'s trailers are what its parents resolve to,
+        /// `ancestors` the indices in `history` of the commits they reach.
+        fn restatesParents(
+            scratch: Allocator,
+            c: CommitInput,
+            id: []const u8,
+            history: []const CommitInput,
+            ancestors: []usize,
+        ) Error!bool {
+            const subject = @import("sync.zig").merge_subject;
+            std.mem.sortUnstable(usize, ancestors, {}, std.sort.asc(usize));
+            const before = try scratch.alloc(CommitInput, ancestors.len);
+            for (before, ancestors) |*x, i| x.* = history[i];
             const resolved = issue_model.resolveMerge(
-                a,
+                scratch,
                 id,
-                before.items,
+                before,
                 c.parents,
                 c.author,
                 subject ++ "\n",
@@ -425,18 +574,79 @@ pub fn PushCheck(comptime B: type) type {
                 error.OutOfMemory => return error.OutOfMemory,
                 else => return false,
             };
-            const restated = try issue_model.restatedTrailers(a, resolved);
+            const restated = try issue_model.restatedTrailers(scratch, resolved);
+            const block = try trailers.parse(scratch, c.message, .{});
             for (block.trailers) |t| {
-                // Says nothing, or has its own check (§11).
-                if (std.ascii.eqlIgnoreCase(t.key, "X-Number") or
-                    std.ascii.eqlIgnoreCase(t.key, purge_mod.rewritten_from_key)) continue;
+                if (saysNothing(t.key)) continue;
                 const same = for (restated.items) |want| {
                     if (!std.ascii.eqlIgnoreCase(want.key, t.key)) continue;
-                    break try sameRestated(a, want, t.value);
+                    break try sameRestated(scratch, want, t.value);
                 } else false;
                 if (!same) return false;
             }
             return true;
+        }
+
+        const Exemptions = struct {
+            /// Per commit.
+            exempt: []const bool,
+            /// The push's merge budget ran out: none was resolved.
+            over: bool,
+        };
+
+        /// Which of `commits` are merges that add nothing. Resolving a merge
+        /// walks its history, so a push of many merges could cost the square
+        /// of its commits: the walks are counted against the push's budget
+        /// first, and past it the update's merges are all judged as
+        /// commits. Each resolution gets a scratch arena of its own.
+        fn exemptMerges(
+            r: *Run,
+            commits: []const CommitInput,
+            kind: Kind,
+            id: []const u8,
+            history: []const CommitInput,
+        ) Error!Exemptions {
+            const a = r.arena;
+            const exempt = try a.alloc(bool, commits.len);
+            var pending: std.ArrayList(usize) = .empty;
+            for (commits, exempt, 0..) |c, *e, i| {
+                const shape = try mergeShape(a, c, kind);
+                e.* = shape == .yes;
+                if (shape == .resolve) try pending.append(a, i);
+            }
+            if (pending.items.len == 0) return .{ .exempt = exempt, .over = false };
+
+            var ancestry = try Ancestry.init(a, history);
+            var ancestors: std.ArrayList(usize) = .empty;
+            var cost: usize = 0;
+            for (pending.items) |i| {
+                const left = r.merge_work_left - cost;
+                if (!try ancestry.walk(a, commits[i].parents, left, &ancestors))
+                    return .{ .exempt = exempt, .over = true };
+                cost += ancestors.items.len;
+            }
+            r.merge_work_left -= cost;
+
+            var scratch_state: std.heap.ArenaAllocator = .init(std.heap.page_allocator);
+            defer scratch_state.deinit();
+            for (pending.items) |i| {
+                _ = scratch_state.reset(.retain_capacity);
+                const all = try ancestry.walk(
+                    a,
+                    commits[i].parents,
+                    std.math.maxInt(usize),
+                    &ancestors,
+                );
+                assert(all);
+                exempt[i] = try restatesParents(
+                    scratch_state.allocator(),
+                    commits[i],
+                    id,
+                    history,
+                    ancestors.items,
+                );
+            }
+            return .{ .exempt = exempt, .over = false };
         }
 
         fn authors(
@@ -449,8 +659,19 @@ pub fn PushCheck(comptime B: type) type {
         ) Error!void {
             if (r.policy.author_policy == .any) return;
             const rejects = r.policy.author_policy == .enforce;
-            for (commits) |c| {
-                if (try mergeAddsNothing(r, c, kind, issue_id, history)) continue;
+            const merges = try exemptMerges(r, commits, kind, issue_id, history);
+            if (merges.over) try problems.list.append(r.arena, .{
+                .kind = .author_mismatch,
+                .rejects = rejects,
+                .message = try std.fmt.allocPrint(
+                    r.arena,
+                    "too many merges to check in this push (over {d} commits of their " ++
+                        "history): none of this ref's is exempt",
+                    .{r.policy.max_merge_work},
+                ),
+            });
+            for (commits, merges.exempt) |c, exempt| {
+                if (exempt) continue;
                 // A host's UUID names its user whatever the email says.
                 if (try issue_model.authorIdOf(r.arena, c.message)) |id| {
                     const own = for (r.policy.pusher_ids) |p| {
@@ -561,6 +782,7 @@ pub fn PushCheck(comptime B: type) type {
             const history = (try historyOf(r, new, &problems)) orelse
                 return verdictOf(u, kind, id, try actionOf(r, u, null), &problems);
             const action = try actionOf(r, u, history);
+            try purgedHistory(r, history, &problems);
             const name = u.ref;
             const root_keys: []const []const u8 = if (kind == .issue)
                 &.{ "State", "Format-Version" }
@@ -588,7 +810,9 @@ pub fn PushCheck(comptime B: type) type {
                         .unreadable => "history unreadable",
                     },
                 });
-            if (problems.list.items.len > 0) return verdictOf(u, kind, id, action, &problems);
+            for (problems.list.items) |p| {
+                if (p.kind == .invalid_history) return verdictOf(u, kind, id, action, &problems);
+            }
             for (history) |c| if (c.parents.len == 0) {
                 const block = try trailers.parse(a, c.message, .{});
                 const v = trailers.lastValue(block, "Format-Version") orelse "";
@@ -635,6 +859,7 @@ pub fn PushCheck(comptime B: type) type {
                 }
             }
             const fresh = try newCommits(r, history, base);
+            if (kind == .issue) try rewrittenFrom(r, fresh, history, &problems);
 
             if (tomb) |t| if (t.comments.len > 0) {
                 const rw = try purgedTip(r, history, new, t.comments);
@@ -734,6 +959,7 @@ pub fn PushCheck(comptime B: type) type {
             }
             const base = if (u.old) |o| r.check.repo.loadCommits(a, o) catch null else null;
             const fresh = try newCommits(r, history, base);
+            try purgedHistory(r, history, &problems);
 
             const issue_tip = try issueTipAfter(r, id);
             const issue_history: []const CommitInput = if (issue_tip) |t|
@@ -741,21 +967,43 @@ pub fn PushCheck(comptime B: type) type {
             else
                 &.{};
             const att = attachments_mod.Attachments(B).fromRepo(r.check.repo);
-            // The tip is what the issue derives; what led there need only
-            // hold pointers (it may name tips a replaced history dropped).
+            // The tip is what the issue derives; what led there is derived
+            // commits of this issue that hold pointers (they may name tips
+            // a replaced history dropped), and nothing else.
             for (fresh) |c| {
                 const ok = if (c.oid.eql(new))
                     try isDerived(r, att, id, c, issue_history)
                 else
-                    try pointersOnly(r, c);
+                    try isRegenerate(r, id, c) and try pointersOnly(r, c);
                 if (!ok) try problems.at(.not_derived, c.oid, if (c.oid.eql(new))
                     "not what the issue's attachments derive"
                 else
-                    "a tree that isn't LFS pointers");
+                    "not a derived commit of this issue holding LFS pointers");
             }
             var v = verdictOf(u, .attachments, id, action, &problems);
             v.new_commits = fresh;
             return v;
+        }
+
+        /// A commit §7 writes for issue `id`, for some issue tip: its
+        /// message and identity, whatever its date.
+        fn isRegenerate(r: *Run, id: []const u8, c: CommitInput) Error!bool {
+            const a = r.arena;
+            for ([_]object.Signature{ c.author, c.committer }) |sig| {
+                if (!std.mem.eql(u8, sig.name, attachments_mod.derived_identity_name) or
+                    !std.mem.eql(u8, sig.email, attachments_mod.derived_identity_email))
+                    return false;
+            }
+            const block = try trailers.parse(a, c.message, .{});
+            const hex = trailers.lastValue(block, "X-Issue-Tip") orelse return false;
+            const tip = Oid.parseHex(r.format(), hex) catch return false;
+            const tip_hex = tip.hex();
+            const want = try std.fmt.allocPrint(
+                a,
+                "{s}\n\nX-Issue: {s}\nX-Issue-Tip: {s}\n",
+                .{ attachments_mod.derived_subject, id, tip_hex.slice() },
+            );
+            return std.mem.eql(u8, c.message, want);
         }
 
         /// Every entry `<uuid>.<png|jpg|webp>`, a blob that is an LFS pointer.
@@ -1099,6 +1347,72 @@ test "authors: only a merge that adds nothing is exempt" {
     try testing.expect(!try verdict(s, arena, ref, tip, other, "Merge issue\n"));
 }
 
+test "authors: many merges cost the push's budget, not the square of the history" {
+    var arena_state: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const s = try TestServer.init(arena, 11);
+    const sync = @import("sync.zig");
+    const ours: object.Signature = .{
+        .name = sync.merge_identity_name,
+        .email = sync.merge_identity_email,
+        .time = 1_700_000_000,
+        .tz_offset_minutes = 0,
+    };
+    const me: object.Signature = .{
+        .name = "m",
+        .email = "m@x",
+        .time = 1,
+        .tz_offset_minutes = 0,
+    };
+    const created = try s.repo.create(arena, .{ .title = "T" }, .{});
+    const ref = try s.issueRef(created.id);
+    // Each merge restates a field, so each needs its parents resolved.
+    const merges = 300;
+    var tip = created.tip;
+    for (0..merges) |i| {
+        var sides: [2]Oid = undefined;
+        for (&sides, 0..) |*side, j| side.* = try s.repo.writeCommit(
+            arena,
+            &.{tip},
+            .{ .author = me, .committer = me },
+            try std.fmt.allocPrint(arena, "Side {d}.{d}\n", .{ i, j }),
+        );
+        tip = try s.repo.writeCommit(
+            arena,
+            &sides,
+            .{ .author = ours, .committer = ours },
+            "Merge issue\n\nState: open\n",
+        );
+    }
+    try s.set(ref, null);
+    const up: Update = .{ .ref = ref, .old = null, .new = tip };
+    const policy: Policy = .{
+        .pusher_emails = &.{ "m@x", "sim@example.invalid" },
+        .author_policy = .enforce,
+    };
+
+    const before = arena_state.queryCapacity();
+    const ok = try s.check(&.{up}, policy);
+    // The square of 901 commits, materialized, is gigabytes.
+    try testing.expect(arena_state.queryCapacity() - before < 64 << 20);
+    try testing.expect(ok[0].accept);
+    try testing.expectEqual(@as(usize, 1 + 3 * merges), ok[0].new_commits.len);
+
+    // Past the budget no merge is exempt, and the verdict says why.
+    var tight = policy;
+    tight.max_merge_work = 1000;
+    const over = try s.check(&.{up}, tight);
+    try testing.expect(!over[0].accept);
+    const said = for (over[0].problems) |p| {
+        if (p.commit == null and p.kind == .author_mismatch) break true;
+    } else false;
+    try testing.expect(said);
+    // Under warn it only flags.
+    tight.author_policy = .warn;
+    try testing.expect((try s.check(&.{up}, tight))[0].accept);
+}
+
 test "authors: an X-Author-Id must be the pusher's, whatever the email" {
     var arena_state: std.heap.ArenaAllocator = .init(testing.allocator);
     defer arena_state.deinit();
@@ -1209,6 +1523,116 @@ test "purges: tombstones need leave, and allow the rewrite and delete" {
     try testing.expect(hasProblem(plain[0], .deleted));
 }
 
+test "purges: purged text can't come back under another UUID" {
+    var arena_state: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const s = try TestServer.init(arena, 12);
+    const purge = purge_mod.Purge(GitSim).fromRepo(s.repo);
+    const fresh = "aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee";
+    const fresh_ref = try s.issueRef(fresh);
+
+    // A purged comment, as it was, under a new issue.
+    const created = try s.repo.create(arena, .{ .title = "Doxxing" }, .{});
+    const ref = try s.issueRef(created.id);
+    const bad = try s.repo.comment(arena, ref, .{ .text = "Address: 5 Foo St" }, .{});
+    _ = try purge.comment(arena, ref, bad.tip, .{}, .{});
+    const copy = try s.check(&.{.{ .ref = fresh_ref, .old = null, .new = bad.tip }}, .{});
+    try testing.expect(!copy[0].accept and hasProblem(copy[0], .purged));
+    try testing.expect(copy[0].problems[0].commit.?.eql(bad.tip));
+
+    // A purged issue, any commit of it.
+    const doomed = try s.repo.create(arena, .{ .title = "Doxx" }, .{});
+    const dref = try s.issueRef(doomed.id);
+    const later = try s.repo.comment(arena, dref, .{ .text = "More" }, .{});
+    _ = try purge.issue(arena, dref, .{}, .{});
+    const again = try s.check(&.{.{ .ref = fresh_ref, .old = null, .new = later.tip }}, .{});
+    try testing.expect(!again[0].accept and hasProblem(again[0], .purged));
+    // Nor as a milestone, nor under a derived ref.
+    for ([_][]const u8{ "refs/milestones/", "refs/attachments/" }) |prefix| {
+        const name = try std.fmt.allocPrint(arena, "{s}{s}", .{ prefix, fresh });
+        const v = try s.check(&.{.{ .ref = name, .old = null, .new = later.tip }}, .{});
+        try testing.expect(!v[0].accept and hasProblem(v[0], .purged));
+    }
+
+    // A tombstone in the same push counts too.
+    const third = try s.repo.create(arena, .{ .title = "Third" }, .{});
+    const tref = try s.issueRef(third.id);
+    _ = try purge.issue(arena, tref, .{}, .{});
+    const tomb_ref = try purge_mod.refName(arena, third.id);
+    const tomb = (try s.sim.resolveRef(tomb_ref)).?;
+    try s.set(tomb_ref, null);
+    const both = try s.check(&.{
+        .{ .ref = tomb_ref, .old = null, .new = tomb },
+        .{ .ref = fresh_ref, .old = null, .new = third.tip },
+    }, .{ .allow_purge = true });
+    try testing.expect(both[0].accept);
+    try testing.expect(!both[1].accept and hasProblem(both[1], .purged));
+    // Other issues are untouched.
+    const fine = try s.repo.create(arena, .{ .title = "Fine" }, .{});
+    const kept = try s.check(&.{.{ .ref = fresh_ref, .old = null, .new = fine.tip }}, .{});
+    try testing.expect(kept[0].accept);
+}
+
+test "rewrites: a new X-Rewritten-From names no commit of the history" {
+    var arena_state: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const s = try TestServer.init(arena, 13);
+    const created = try s.repo.create(arena, .{ .title = "Important", .body = "Body" }, .{});
+    const ref = try s.issueRef(created.id);
+    const bob = try s.repo.comment(arena, ref, .{ .text = "Bob" }, .{});
+    const purge = purge_mod.Purge(GitSim).fromRepo(s.repo);
+    // A comment the purge of an earlier one rewrote: its first ID is taken.
+    const bad = try s.repo.comment(arena, ref, .{ .text = "Bad" }, .{});
+    _ = try s.repo.comment(arena, ref, .{ .text = "After" }, .{});
+    const purged = try purge.comment(arena, ref, bad.tip, .{}, .{});
+    const who = try s.repo.identity(arena, null);
+    const sync = @import("sync.zig");
+    const ours: object.Signature = .{
+        .name = sync.merge_identity_name,
+        .email = sync.merge_identity_email,
+        .time = 1_700_000_000,
+        .tz_offset_minutes = 0,
+    };
+    const tip = purged.tip.?;
+    try s.set(ref, tip);
+    // The comment after the purged one was rewritten: its old ID is its
+    // rewrite's first ID.
+    const rewritten = for (purged.moved) |m| {
+        if (!m.old.eql(bad.tip)) break m.old;
+    } else unreachable;
+    for ([_]Oid{ created.tip, bob.tip, rewritten }) |claimed| {
+        const hex = claimed.hex();
+        const message = try std.fmt.allocPrint(arena, "Spam\n\nX-Rewritten-From: {s}\n", .{
+            hex.slice(),
+        });
+        const spam = try s.repo.writeCommit(arena, &.{tip}, who, message);
+        const v = try s.check(&.{.{ .ref = ref, .old = tip, .new = spam }}, .{});
+        try testing.expect(!v[0].accept and hasProblem(v[0], .invalid_history));
+        // A merge that adds nothing is no exception.
+        const side = try s.repo.writeCommit(arena, &.{tip}, who, "Side\n");
+        const merge = try s.repo.writeCommit(
+            arena,
+            &.{ side, tip },
+            .{ .author = ours, .committer = ours },
+            try std.fmt.allocPrint(arena, "Merge issue\n\nX-Rewritten-From: {s}\n", .{
+                hex.slice(),
+            }),
+        );
+        const m = try s.check(&.{.{ .ref = ref, .old = tip, .new = merge }}, .{});
+        try testing.expect(!m[0].accept and hasProblem(m[0], .invalid_history));
+    }
+    // One that names nothing here is a rewrite's own business.
+    const fine = try s.repo.writeCommit(
+        arena,
+        &.{tip},
+        who,
+        "Moved\n\nX-Rewritten-From: 0123456789abcdef0123456789abcdef01234567\n",
+    );
+    try testing.expect((try s.check(&.{.{ .ref = ref, .old = tip, .new = fine }}, .{}))[0].accept);
+}
+
 test "attachments refs must be derived" {
     var arena_state: std.heap.ArenaAllocator = .init(testing.allocator);
     defer arena_state.deinit();
@@ -1246,4 +1670,56 @@ test "attachments refs must be derived" {
         .{ .ref = dname, .old = null, .new = fake },
     }, .{});
     try testing.expect(hasProblem(bad[1], .not_derived));
+
+    // Under a derived tip, only derived commits of this issue: not the
+    // issue's own commits, which a purge may have taken.
+    const tip_time = for (try s.repo.loadCommits(arena, added.tip)) |h| {
+        if (h.oid.eql(added.tip)) break h.committer.time;
+    } else unreachable;
+    const issue = try s.repo.load(arena, .{ .name = ref, .tip = added.tip });
+    const tree = try att.derivedTree(arena, issue.attachments);
+    const over = struct {
+        fn f(
+            server: TestServer,
+            a: Allocator,
+            issue_id: []const u8,
+            tip: Oid,
+            time: i64,
+            tree_oid: Oid,
+            parent: Oid,
+        ) !Oid {
+            const commit = try attachments_mod.derivedCommitOf(
+                a,
+                issue_id,
+                tip,
+                time,
+                tree_oid,
+                &.{parent},
+            );
+            return server.sim.writeObject(.commit, try commit.serializeAlloc(a));
+        }
+    }.f;
+    const on_issue = try over(s, arena, created.id, added.tip, tip_time, tree, created.tip);
+    const carried = try s.check(&.{
+        .{ .ref = ref, .old = created.tip, .new = added.tip },
+        .{ .ref = dname, .old = null, .new = on_issue },
+    }, .{});
+    try testing.expect(!carried[1].accept and hasProblem(carried[1], .not_derived));
+    try testing.expect(carried[1].problems[0].commit.?.eql(created.tip));
+    // On an earlier derived commit, of this issue, it passes; another
+    // issue's doesn't.
+    const on_derived = try over(s, arena, created.id, added.tip, tip_time, tree, dtip);
+    const chained = try s.check(&.{
+        .{ .ref = ref, .old = created.tip, .new = added.tip },
+        .{ .ref = dname, .old = null, .new = on_derived },
+    }, .{});
+    try testing.expect(chained[1].accept);
+    const stranger = "aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee";
+    const theirs = try over(s, arena, stranger, added.tip, tip_time, tree, created.tip);
+    const on_theirs = try over(s, arena, created.id, added.tip, tip_time, tree, theirs);
+    const foreign = try s.check(&.{
+        .{ .ref = ref, .old = created.tip, .new = added.tip },
+        .{ .ref = dname, .old = null, .new = on_theirs },
+    }, .{});
+    try testing.expect(!foreign[1].accept and hasProblem(foreign[1], .not_derived));
 }

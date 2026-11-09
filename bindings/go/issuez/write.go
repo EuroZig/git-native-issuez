@@ -193,7 +193,7 @@ type AttachmentSpec struct {
 // An empty id picks a UUID before the host stores bytes or builds text links.
 func (r *Repo) PrepareAttachment(ctx context.Context, id, name string, data []byte) (AttachmentSpec, error) {
 	return fetch(ctx, r, func(a cArgs, p **C.issuez_prepared_attachment) C.issuez_code {
-		return C.issuez_attachment_prepare(a.repo, cStr(id), cStr(name), cStr(string(data)), a.tok, p, a.cerr)
+		return C.issuez_attachment_prepare(a.repo, cStr(id), cStr(name), cBytes(data), a.tok, p, a.cerr)
 	}, func(p *C.issuez_prepared_attachment) AttachmentSpec {
 		defer C.issuez_prepared_attachment_free(p)
 		info := C.issuez_prepared_attachment_info(p)

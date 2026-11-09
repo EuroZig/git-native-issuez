@@ -726,6 +726,8 @@ pub fn materialize(
     var fields: std.ArrayList(Field) = .empty;
     var cleared: std.ArrayList([]const u8) = .empty;
     var conflicts: std.ArrayList(Conflict) = .empty;
+    const assignees = try setMembers(arena, final, "X-Assignees");
+    const assignee = resolvedAssignee(final, assignees);
     const keys = try arena.dupe([]const u8, final.scalars.keys());
     stableSort([]const u8, keys, {}, lessThan);
     for (keys) |k| {
@@ -737,6 +739,7 @@ pub fn materialize(
         });
         if (isInternalKey(k)) continue;
         if (std.mem.eql(u8, k, "State") or std.mem.eql(u8, k, "Format-Version")) continue;
+        if (std.mem.eql(u8, k, "Assignee")) continue;
         if (c.value.len == 0) {
             try cleared.append(arena, k);
             continue;
@@ -744,6 +747,11 @@ pub fn materialize(
         if (std.mem.eql(u8, k, "Title")) continue;
         try fields.append(arena, .{ .key = k, .value = c.value });
     }
+    if (assignee) |v| {
+        var at: usize = 0;
+        while (at < fields.items.len and lessThan({}, fields.items[at].key, "Assignee")) at += 1;
+        try fields.insert(arena, at, .{ .key = "Assignee", .value = v });
+    } else if (final.scalars.contains("Assignee")) try cleared.append(arena, "Assignee");
 
     const labels = try setMembers(arena, final, "Labels");
     const blocked_by = try setMembers(arena, final, "X-Blocked-By");
@@ -755,12 +763,7 @@ pub fn materialize(
 
     const state_value = core_fmt.State.parse(nonEmpty(final.scalars.get("State")) orelse "open");
 
-    const ext = try extensions(
-        arena,
-        final,
-        blocked_by,
-        try setMembers(arena, final, "X-Assignees"),
-    );
+    const ext = try extensions(arena, final, blocked_by, assignee, assignees);
     var issue: Issue = .{
         .id = id,
         .tip = tip,
@@ -1021,6 +1024,12 @@ pub fn isFormatKey(key: []const u8) bool {
         std.ascii.eqlIgnoreCase(key, attachment_fmt.remove_key)) return true;
     for (scalar_keys) |k| if (std.ascii.eqlIgnoreCase(k, key)) return true;
     return false;
+}
+
+/// A host's own field (format.md §2): an `X-` key the format doesn't use.
+pub fn isHostKey(key: []const u8) bool {
+    const namespaced = key.len > 2 and std.ascii.startsWithIgnoreCase(key, "X-");
+    return namespaced and !isFormatKey(key);
 }
 
 fn isPerCommitKey(key: []const u8) bool {
@@ -1371,6 +1380,7 @@ fn extensions(
     arena: Allocator,
     s: FoldState,
     blocked_by: []const []const u8,
+    assignee: ?[]const u8,
     assignees: []const []const u8,
 ) Allocator.Error!Extensions {
     var ext: Extensions = .{};
@@ -1381,7 +1391,7 @@ fn extensions(
             return if (c.value.len == 0) null else c.value;
         }
     }.of;
-    if (value(s, "Assignee")) |v| {
+    if (assignee) |v| {
         if (fields_fmt.Assignee.parse(v)) |a| ext.assignee = a else {
             try invalid.append(arena, .{ .key = "Assignee", .value = v });
         }
@@ -1460,6 +1470,16 @@ fn extensions(
     return ext;
 }
 
+/// format.md §3: the newest `Assignee` while it is one of the assignees,
+/// else the first of them. Concurrent edits can remove the newest one from
+/// the set (an upstream edit on one side, `X-Assignees` on the other), and
+/// then the set is what is assigned.
+fn resolvedAssignee(s: FoldState, assignees: []const []const u8) ?[]const u8 {
+    const newest = if (s.scalars.get("Assignee")) |c| c.value else "";
+    if (newest.len > 0 and labels_fmt.contains(assignees, newest)) return newest;
+    return if (assignees.len > 0) assignees[0] else null;
+}
+
 fn setMembers(arena: Allocator, s: FoldState, key: []const u8) Allocator.Error![]const []const u8 {
     const set = s.sets.get(key) orelse return &.{};
     var out: std.ArrayList([]const u8) = .empty;
@@ -1509,10 +1529,11 @@ fn canonicalKey(key: []const u8) []const u8 {
     return key;
 }
 
-/// A trailer that a write of this tool or upstream's makes: a field, or an
-/// export record. A comment's last paragraph can parse as trailers too
-/// (`Version: 2.3.1`); those are none of these.
+/// A trailer that a write of this tool or upstream's makes: a field (a
+/// host's too), or an export record. A comment's last paragraph can parse
+/// as trailers too (`Version: 2.3.1`); those are none of these.
 fn isToolKey(key: []const u8) bool {
+    if (isHostKey(key)) return true;
     for (scalar_keys ++ set_keys ++ [_][]const u8{"Exported-Commit"}) |k| {
         if (std.ascii.eqlIgnoreCase(k, key)) return true;
     }
@@ -2256,6 +2277,16 @@ test "invalid extension values" {
     try testing.expectEqual(@as(usize, 2), cleared.invalid_fields.len);
 }
 
+test "an X-Ref git refuses reads as invalid, kept as written" {
+    var d: TestDag = .{};
+    defer d.deinit();
+    const root = try d.add(&.{}, 100, "T\n\nState: open\nX-Ref: a/.b\nFormat-Version: 1\n");
+    const i = try d.issue(root);
+    try testing.expect(i.ref == null);
+    try testing.expectEqualStrings("X-Ref", i.invalid_fields[0].key);
+    try testing.expectEqualStrings("a/.b", i.field("X-Ref").?);
+}
+
 test "blocked-by merges per member" {
     var d: TestDag = .{};
     defer d.deinit();
@@ -2453,6 +2484,43 @@ test "assignees: upstream's Assignee sets them to one, a merge's restatement doe
     i = try d.issue(up);
     try testing.expectEqual(@as(usize, 1), i.assignees.len);
     try testing.expectEqualStrings("c@e.x", i.assignees[0].email);
+}
+
+test "assignees: the assignee is one of them after concurrent edits" {
+    var d: TestDag = .{};
+    defer d.deinit();
+    const root = try d.add(&.{}, 100, "T\n\nState: open\nAssignee: a@e.x\nFormat-Version: 1\n");
+    // Upstream's edit on one side, an added assignee on the newer other.
+    const up = try d.add(&.{root}, 200, "Update assignee\n\nAssignee: c@e.x\n");
+    const add = try d.add(
+        &.{root},
+        300,
+        "Update assignees\n\nAssignee: a@e.x\nX-Assignees: a@e.x, b@e.x\n",
+    );
+    const m = try d.add(&.{ up, add }, 300, "Merge issue\n\nState: open\n");
+    const i = try d.issue(m);
+    try testing.expectEqual(@as(usize, 2), i.assignees.len);
+    const emails = [_][]const u8{ i.assignees[0].email, i.assignees[1].email };
+    try testing.expect(labels_fmt.contains(&emails, "b@e.x"));
+    try testing.expect(labels_fmt.contains(&emails, "c@e.x"));
+    // Not the newest `Assignee` (a, removed by the upstream side): the first.
+    try testing.expectEqualStrings(i.assignees[0].email, i.assignee.?.email);
+    try testing.expectEqualStrings(i.assignees[0].email, i.field("Assignee").?);
+    // A merge restates it, so upstream shows one of them too.
+    const restated = try restatedTrailers(d.arena(), i);
+    const v = for (restated.items) |t| {
+        if (std.mem.eql(u8, t.key, "Assignee")) break t.value;
+    } else return error.TestUnexpectedResult;
+    try testing.expectEqualStrings(i.assignees[0].email, v);
+
+    // Every assignee removed on one side: none, and the merge restates it empty.
+    const none = try d.add(&.{root}, 200, "Update assignee\n\nAssignee: \n");
+    const kept = try d.add(&.{root}, 300, "Update\n\nAssignee: a@e.x\nPriority: high\n");
+    const m2 = try d.add(&.{ none, kept }, 300, "Merge issue\n\nState: open\n");
+    const j = try d.issue(m2);
+    try testing.expectEqual(@as(usize, 0), j.assignees.len);
+    try testing.expect(j.assignee == null and j.field("Assignee") == null);
+    try testing.expect(labels_fmt.contains(j.cleared, "Assignee"));
 }
 
 test "event text with a divider line, and a lowercase description trailer" {

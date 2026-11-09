@@ -159,3 +159,29 @@ test "threads: the logger is called from several threads at once" {
     try testing.expectEqual(@as(u32, 0), w.failures.load(.monotonic));
     try testing.expect(logged.load(.monotonic) > 0);
 }
+
+fn takeSnapshot(h: *c.issuez_repo, code: *c.issuez_code) void {
+    var out: ?*c.issuez_snapshot = null;
+    code.* = c.issuez_snapshot_take(h, null, &out, null);
+    c.issuez_snapshot_free(out);
+}
+
+test "threads: issuez_repo_close while another thread's call runs" {
+    var r = try fixture.Repo.init(.{});
+    defer r.deinit();
+    _ = try fixture.titled(r.handle, "Listed");
+    // Listing refs takes a while: long enough to close the repo meanwhile.
+    const late = try fixture.script(r.arena(), r.root, "late-git",
+        \\#!/bin/sh
+        \\for a; do [ "$a" = for-each-ref ] && sleep 0.5; done
+        \\exec git "$@"
+        \\
+    );
+    const h = try r.open(&.{c.issuez_opt_git_path(fixture.str(late))});
+    var code: c.issuez_code = c.ISSUEZ_E_INTERNAL;
+    const t = try std.Thread.spawn(.{}, takeSnapshot, .{ h, &code });
+    std.Io.sleep(testing.io, .fromMilliseconds(150), .awake) catch {};
+    c.issuez_repo_close(h);
+    t.join();
+    try expect.code(c.ISSUEZ_OK, code, null);
+}

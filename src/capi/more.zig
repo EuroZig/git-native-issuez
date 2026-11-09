@@ -263,6 +263,8 @@ pub const PurgeResultObj = struct {
     exposed: []const Str,
     /// UUIDs of the attachments the purge took out of history.
     removed_attachments: []const Str = &.{},
+    /// Every attachment the issue had; the removed ones end up first.
+    had: []Str = &.{},
 };
 
 pub fn issuez_purge_issue(
@@ -307,21 +309,10 @@ fn purge(
     const ident = id.slice();
     if (!uuid_fmt.isCanonical(ident)) return rt.badArgument(err, "not a full issue UUID");
     var author: ?issuez.backend.object.Signature = null;
-    if (actor) |act| {
-        if (rt.hasReserved(act.*)) return rt.badArgument(err, "reserved fields must be zero");
-        if (act.email.len == 0) return rt.badArgument(err, "the actor needs an email");
-        const time = if (act.at) |t| t.* else api.Time{
-            .unix_seconds = std.Io.Timestamp.now(rt.io(), .real).toSeconds(),
-        };
-        author = .{
-            .name = if (act.name.len > 0) act.name.slice() else act.email.slice(),
-            .email = act.email.slice(),
-            .time = time.unix_seconds,
-            .tz_offset_minutes = time.tz_offset_minutes,
-        };
-        if (act.user_id.len > 0 and !uuid_fmt.isCanonical(act.user_id.slice()))
-            return rt.badArgument(err, "the actor's user_id must be a UUID");
-    }
+    if (actor) |act| switch (rt.actorSignature(act.*)) {
+        .bad => |message| return rt.fail(err, .e_invalid_argument, "{s}", .{message}),
+        .sig => |sig| author = sig,
+    };
     var c = Call.begin(repo, cancel) catch |e| return rt.failError(err, e, .{});
     defer c.end();
     if (actor) |act| {
@@ -334,6 +325,12 @@ fn purge(
     // and the attachments it had.
     const exposed = exposedRemotes(a, backend, ident) catch |e| return c.fail(err, e);
     const had = attachmentIds(&c, ref_name, null) catch |e| return c.fail(err, e);
+    // The result before the purge: once it landed, filling it in needs no
+    // memory. The attachments it removes are some of those it had.
+    const made = rt.owned(PurgeResultObj, makePurgeResult, .{ exposed, had }) catch |e|
+        return rt.failError(err, e, .{});
+    var given = false;
+    defer if (!given) rt.freeArena(made.arena);
     const purger = issuez.purge.Purge(repo_mod.Backend).fromRepo(c.engine());
     const spec: issuez.purge.Spec = .{ .reason = reason.slice(), .author = author };
     const result = (if (comment) |cm|
@@ -346,19 +343,25 @@ fn purge(
     // It happened: the host needs the receipt, and cancelling can't stop it now.
     c.session.backend.cancel = null;
     c.session.git.cancel = null;
+    // The one way a purge that landed fails: its issue can't be read back.
     const kept = if (result.tip) |t|
         attachmentIds(&c, ref_name, t) catch |e| return c.fail(err, e)
     else
         &.{};
-    var removed: std.ArrayList([]const u8) = .empty;
-    for (had) |id_| {
+    made.new_tip = if (result.tip) |t| rt.oidOf(t) else .{};
+    var removed: usize = 0;
+    for (made.had) |id_| {
         const still = for (kept) |k| {
-            if (std.mem.eql(u8, k, id_)) break true;
+            if (std.mem.eql(u8, k, id_.slice())) break true;
         } else false;
-        if (!still) removed.append(a, id_) catch return rt.oom(err);
+        if (still) continue;
+        made.had[removed] = id_;
+        removed += 1;
     }
-    const args = .{ result, exposed, removed.items };
-    return rt.give(o, rt.owned(PurgeResultObj, makePurgeResult, args), err);
+    made.removed_attachments = made.had[0..removed];
+    given = true;
+    o.* = @ptrCast(made);
+    return .ok;
 }
 
 /// The UUIDs of every attachment the issue has at tip (null: its ref's),
@@ -412,15 +415,16 @@ fn exposedRemotes(arena: Allocator, backend: anytype, id: []const u8) ![]const [
 
 fn makePurgeResult(
     a: Allocator,
-    result: issuez.purge.Result,
     exposed: []const []const u8,
-    removed: []const []const u8,
+    had: []const []const u8,
 ) !PurgeResultObj {
+    const ids = try a.alloc(Str, had.len);
+    for (had, ids) |id, *o| o.* = try rt.dupeZ(a, id);
     return .{
         .arena = undefined,
-        .new_tip = if (result.tip) |t| rt.oidOf(t) else .{},
+        .new_tip = .{},
         .exposed = try rt.strs(a, exposed),
-        .removed_attachments = try rt.strs(a, removed),
+        .had = ids,
     };
 }
 

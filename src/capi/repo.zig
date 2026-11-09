@@ -391,6 +391,9 @@ pub const Call = struct {
         rt.ensure();
         const r = rt.obj(RepoObj, repo) orelse return error.NullHandle;
         if (rt.cancelled(cancel)) return error.Canceled;
+        // Held to the end: issuez_repo_close may come while the call runs.
+        r.retain();
+        errdefer r.release();
         const s = try r.acquire(cancel);
         const outer = rt.scoped;
         rt.scoped = rt.readScoped(&r.logger);
@@ -403,6 +406,8 @@ pub const Call = struct {
         rt.ensure();
         const r = rt.obj(RepoObj, repo) orelse return error.NullHandle;
         if (rt.cancelled(cancel)) return error.Canceled;
+        r.retain();
+        errdefer r.release();
         const s = try r.openPrivate(cancel, vars);
         const outer = rt.scoped;
         rt.scoped = rt.readScoped(&r.logger);
@@ -423,6 +428,7 @@ pub const Call = struct {
             c.session.git.close();
             rt.gpa.destroy(c.session);
         } else c.repo.putBack(c.session);
+        c.repo.release();
     }
 
     pub fn arena(c: *Call) Allocator {
@@ -496,9 +502,22 @@ fn applyOptions(r: *RepoObj, arena: Allocator, ops: []const api.Op, problems: *r
                 },
                 else => try r.env.put(op.name.slice(), s),
             },
-            .committer => r.committer = .{
-                .name = try arena.dupe(u8, op.person.name.slice()),
-                .email = try arena.dupe(u8, op.person.email.slice()),
+            .committer => {
+                // Every commit is signed with it, at UTC.
+                const sig: issuez.backend.object.Signature = .{
+                    .name = op.person.name.slice(),
+                    .email = op.person.email.slice(),
+                    .time = 0,
+                    .tz_offset_minutes = 0,
+                };
+                if (!sig.isValid()) {
+                    try check.add(.bad_format, "a committer can't hold <, >, a newline or a NUL");
+                    continue;
+                }
+                r.committer = .{
+                    .name = try arena.dupe(u8, sig.name),
+                    .email = try arena.dupe(u8, sig.email),
+                };
             },
             .done_state => try done.append(arena, try arena.dupe(u8, s)),
             .workflow_state => try workflow.append(arena, try arena.dupe(u8, s)),

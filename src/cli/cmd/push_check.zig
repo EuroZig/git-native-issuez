@@ -77,24 +77,37 @@ pub fn main(comptime B: type, ctx: *context.Context(B), argv: []const []const u8
     );
 
     const repo = common.openRepo(B, ctx) orelse return common.exit_fatal;
+    var triples: std.ArrayList([3][]const u8) = .empty;
     if (words.items.len == 0) {
-        const input = ctx.readStdin(16 << 20) catch
-            return common.fail(ctx.err, "error: can't read the updates from stdin\n");
-        var lines = std.mem.tokenizeAny(u8, input, "\r\n");
-        while (lines.next()) |line| {
-            var fields = std.mem.tokenizeScalar(u8, line, ' ');
-            while (fields.next()) |f| words.append(arena, f) catch return common.oom(ctx.err);
+        const input = ctx.readStdin(max_input) catch |e| return common.fail(
+            ctx.err,
+            if (e == error.FileTooLarge)
+                "error: the updates on stdin are over 16 MiB\n"
+            else
+                "error: can't read the updates from stdin\n",
+        );
+        switch (splitLines(arena, input, &triples) catch return common.oom(ctx.err)) {
+            .ok => {},
+            .bad => |line| {
+                ctx.err.print("error: not <old> <new> <ref>: '{s}'\n", .{line}) catch {};
+                return common.exit_error;
+            },
         }
+    } else {
+        if (words.items.len % 3 != 0) return common.fail(
+            ctx.err,
+            "error: updates are <old> <new> <ref> triples\n",
+        );
+        var i: usize = 0;
+        while (i < words.items.len) : (i += 3) triples.append(
+            arena,
+            words.items[i..][0..3].*,
+        ) catch return common.oom(ctx.err);
     }
-    if (words.items.len % 3 != 0) return common.fail(
-        ctx.err,
-        "error: updates are <old> <new> <ref> triples\n",
-    );
     const format = repo.backend.objectFormat();
-    const updates = arena.alloc(check_mod.Update, words.items.len / 3) catch
+    const updates = arena.alloc(check_mod.Update, triples.items.len) catch
         return common.oom(ctx.err);
-    for (updates, 0..) |*u, i| {
-        const w = words.items[i * 3 ..][0..3];
+    for (updates, triples.items) |*u, w| {
         u.* = .{
             .ref = w[2],
             .old = parseOid(format, w[0]) orelse return badOid(ctx, w[0]),
@@ -129,14 +142,65 @@ pub fn main(comptime B: type, ctx: *context.Context(B), argv: []const []const u8
     return common.exit_ok;
 }
 
-/// Null for git's all-zero ID, which stands for no ref.
+/// The hook's input, as git sends it, fits well within this.
+const max_input = 16 << 20;
+
+/// One update per line, exactly `<old> <new> <ref>`; empty lines are
+/// skipped. `.bad` holds the first line that isn't one.
+fn splitLines(
+    arena: std.mem.Allocator,
+    input: []const u8,
+    out: *std.ArrayList([3][]const u8),
+) std.mem.Allocator.Error!union(enum) { ok, bad: []const u8 } {
+    var lines = std.mem.splitScalar(u8, input, '\n');
+    while (lines.next()) |raw| {
+        const line = std.mem.trimEnd(u8, raw, "\r");
+        if (line.len == 0) continue;
+        var fields = std.mem.splitScalar(u8, line, ' ');
+        var triple: [3][]const u8 = undefined;
+        for (&triple) |*f| f.* = fields.next() orelse return .{ .bad = line };
+        if (fields.next() != null) return .{ .bad = line };
+        for (triple) |f| if (f.len == 0) return .{ .bad = line };
+        try out.append(arena, triple);
+    }
+    return .ok;
+}
+
+/// Null for git's all-zero ID, which stands for no ref: as many zeros as
+/// the repo's IDs have digits.
 fn parseOid(format: issuez.backend.object.ObjectFormat, s: []const u8) ??issuez.engine.Oid {
-    if (s.len > 0 and std.mem.trimStart(u8, s, "0").len == 0) return @as(?issuez.engine.Oid, null);
     if (s.len != format.hexLen()) return null;
+    if (std.mem.trimStart(u8, s, "0").len == 0) return @as(?issuez.engine.Oid, null);
     return @as(?issuez.engine.Oid, issuez.engine.Oid.parseHex(format, s) catch return null);
 }
 
 fn badOid(ctx: anytype, s: []const u8) u8 {
     ctx.err.print("error: not an object ID: '{s}'\n", .{s}) catch {};
     return common.exit_error;
+}
+
+test "the hook's input: one update per line, three fields each" {
+    var arena_state: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var out: std.ArrayList([3][]const u8) = .empty;
+    const ok = try splitLines(arena, "a b refs/issues/x\r\n\nc d refs/heads/main\n", &out);
+    try std.testing.expect(ok == .ok);
+    try std.testing.expectEqual(@as(usize, 2), out.items.len);
+    try std.testing.expectEqualStrings("refs/heads/main", out.items[1][2]);
+    // Words that add up to triples across lines are no update.
+    for ([_][]const u8{ "a b\nrefs/issues/x c d\n", "a b c d\n", "a  b c\n" }) |input| {
+        out.clearRetainingCapacity();
+        try std.testing.expect(try splitLines(arena, input, &out) != .ok);
+    }
+}
+
+test "the zero ID has as many digits as the repo's IDs" {
+    const sha1: issuez.backend.object.ObjectFormat = .sha1;
+    try std.testing.expect(parseOid(sha1, "0" ** 40).? == null);
+    for ([_][]const u8{ "0", "00", "0" ** 39, "0" ** 64, "" }) |s|
+        try std.testing.expect(parseOid(sha1, s) == null);
+    const sha256: issuez.backend.object.ObjectFormat = .sha256;
+    try std.testing.expect(parseOid(sha256, "0" ** 64).? == null);
+    try std.testing.expect(parseOid(sha256, "0" ** 40) == null);
 }

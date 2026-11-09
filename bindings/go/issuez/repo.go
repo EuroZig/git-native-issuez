@@ -27,11 +27,19 @@ type Repo struct {
 	c       *C.issuez_repo
 	cleanup runtime.Cleanup
 	// SetLogger's function. Calls under way keep the handle they started
-	// with, so it stays valid until Close, which waits for them. Allocated
-	// apart: the handle must not keep a forgotten Repo from its cleanup.
+	// with, so it stays valid until Close, which waits for them, or the
+	// cleanup, which deletes it too. The handle holds logFn weakly: a
+	// function that refers to the Repo must not keep a forgotten one from
+	// its cleanup.
 	logMu     sync.Mutex
 	logFn     *atomic.Pointer[func(LogEvent)]
-	logHandle cgo.Handle
+	logHandle *cgo.Handle
+}
+
+// What a forgotten Repo's cleanup frees.
+type repoGone struct {
+	c         *C.issuez_repo
+	logHandle *cgo.Handle
 }
 
 // Option configures Open. Each is one ISSUEZ_OPT_* op.
@@ -169,8 +177,13 @@ func Open(path string, opts ...Option) (*Repo, error) {
 }
 
 func wrapRepo(c *C.issuez_repo) *Repo {
-	r := &Repo{c: c}
-	r.cleanup = runtime.AddCleanup(r, func(c *C.issuez_repo) { C.issuez_repo_close(c) }, c)
+	r := &Repo{c: c, logHandle: new(cgo.Handle)}
+	r.cleanup = runtime.AddCleanup(r, func(g repoGone) {
+		C.issuez_repo_close(g.c)
+		if *g.logHandle != 0 {
+			g.logHandle.Delete()
+		}
+	}, repoGone{c, r.logHandle})
 	return r
 }
 
@@ -185,9 +198,9 @@ func (r *Repo) Close() error {
 		r.c = nil
 		r.logMu.Lock()
 		defer r.logMu.Unlock()
-		if r.logHandle != 0 {
+		if *r.logHandle != 0 {
 			r.logHandle.Delete()
-			r.logHandle = 0
+			*r.logHandle = 0
 		}
 	}
 	return nil

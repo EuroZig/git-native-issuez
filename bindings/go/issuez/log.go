@@ -13,6 +13,7 @@ import (
 	"sync/atomic"
 	"time"
 	"unsafe"
+	"weak"
 )
 
 // LogLevel is how much the library tells the logger.
@@ -66,9 +67,11 @@ func deliverLog(event unsafe.Pointer) {
 }
 
 func deliverRepoLog(h uintptr, event unsafe.Pointer) {
-	if r, ok := cgo.Handle(h).Value().(*atomic.Pointer[func(LogEvent)]); ok {
-		if fn := r.Load(); fn != nil {
-			(*fn)(goLogEvent(event))
+	if w, ok := cgo.Handle(h).Value().(weak.Pointer[atomic.Pointer[func(LogEvent)]]); ok {
+		if r := w.Value(); r != nil {
+			if fn := r.Load(); fn != nil {
+				(*fn)(goLogEvent(event))
+			}
 		}
 	}
 }
@@ -91,10 +94,10 @@ func (r *Repo) SetLogger(level LogLevel, fn func(LogEvent)) {
 		}
 		if r.logFn == nil {
 			r.logFn = new(atomic.Pointer[func(LogEvent)])
-			r.logHandle = cgo.NewHandle(r.logFn)
+			*r.logHandle = cgo.NewHandle(weak.Make(r.logFn))
 		}
 		r.logFn.Store(&fn)
-		C.issuez_go_set_repo_logger(c, C.issuez_log_level(level), C.uintptr_t(r.logHandle))
+		C.issuez_go_set_repo_logger(c, C.issuez_log_level(level), C.uintptr_t(*r.logHandle))
 		return nil
 	})
 }

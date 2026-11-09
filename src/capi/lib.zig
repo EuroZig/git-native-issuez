@@ -16,13 +16,18 @@ const impls = .{
 
 comptime {
     // For the Zig suite's leak check; never in the header.
-    if (@import("capi_options").debug) @export(&debugLiveAllocations, .{
-        .name = "issuez__debug_live_allocations",
-    });
+    if (@import("capi_options").debug) {
+        @export(&debugLiveAllocations, .{ .name = "issuez__debug_live_allocations" });
+        @export(&debugFailAllocation, .{ .name = "issuez__debug_fail_allocation" });
+    }
 }
 
 fn debugLiveAllocations() callconv(.c) i64 {
     return rt.liveAllocations();
+}
+
+fn debugFailAllocation(n: i64) callconv(.c) void {
+    rt.failAllocation(n);
 }
 
 comptime {

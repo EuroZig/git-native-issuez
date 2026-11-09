@@ -7,11 +7,18 @@ pub const c = @import("c");
 pub const Allocator = std.mem.Allocator;
 
 extern fn issuez__debug_live_allocations() i64;
+extern fn issuez__debug_fail_allocation(n: i64) void;
 
 /// Live allocations in the library: the same before a test and after it
 /// freed what it got.
 pub fn live() i64 {
     return issuez__debug_live_allocations();
+}
+
+/// The library's allocation after the next `n` fails, once; negative:
+/// none does.
+pub fn failAllocation(n: i64) void {
+    issuez__debug_fail_allocation(n);
 }
 
 /// `defer leaks.check()` after `const leaks = Leaks.start();`. A `Repo` does
@@ -167,6 +174,25 @@ pub const ada: c.issuez_actor = .{
     .user_id = .{},
     .at = null,
     .reserved = .{ 0, 0, 0, 0 },
+};
+
+const tz_1500: c.issuez_time = .{ .unix_seconds = 0, .tz_offset_minutes = 1500 };
+const tz_minus_1440: c.issuez_time = .{ .unix_seconds = 0, .tz_offset_minutes = -1440 };
+
+fn actorOf(fields: anytype) c.issuez_actor {
+    return std.mem.zeroInit(c.issuez_actor, fields);
+}
+
+/// Actors no git signature can hold: every write refuses them.
+pub const unsignable = [_]c.issuez_actor{
+    actorOf(.{ .name = str("Ada <x>"), .email = ada.email }),
+    actorOf(.{ .name = str("Ada\nB"), .email = ada.email }),
+    actorOf(.{ .name = c.issuez_str{ .ptr = "A\x00a", .len = 3 }, .email = ada.email }),
+    actorOf(.{ .name = ada.name, .email = str("ada>@example.invalid") }),
+    // No name: the email is the name too.
+    actorOf(.{ .email = str("a<da@example.invalid") }),
+    actorOf(.{ .name = ada.name, .email = ada.email, .at = &tz_1500 }),
+    actorOf(.{ .name = ada.name, .email = ada.email, .at = &tz_minus_1440 }),
 };
 
 pub const Created = struct {

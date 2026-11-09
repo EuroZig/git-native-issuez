@@ -83,6 +83,14 @@ func cStr(s string) C.issuez_str {
 	return C.issuez_str{ptr: (*C.char)(unsafe.Pointer(unsafe.StringData(s))), len: C.size_t(len(s))}
 }
 
+// cBytes is cStr for a slice, without copying it.
+func cBytes(b []byte) C.issuez_str {
+	if len(b) == 0 {
+		return C.issuez_str{}
+	}
+	return C.issuez_str{ptr: (*C.char)(unsafe.Pointer(&b[0])), len: C.size_t(len(b))}
+}
+
 func pinStr(p *runtime.Pinner, s string) C.issuez_str {
 	if s != "" {
 		p.Pin(unsafe.StringData(s))

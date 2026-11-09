@@ -24,6 +24,7 @@ const Signature = object.Signature;
 pub const ref_prefix = "refs/issuez-purged/";
 pub const purge_key = "X-Purge";
 pub const purged_commit_key = "X-Purged-Commit";
+pub const purged_root_key = "X-Purged-Root";
 pub const purged_marker_key = "X-Purged";
 pub const rewritten_from_key = "X-Rewritten-From";
 pub const merge_subject = "Merge purges";
@@ -35,6 +36,9 @@ pub const Tombstone = struct {
     issue: bool,
     /// Comment commits whose text is gone, by their original IDs.
     comments: []const Oid,
+    /// The root commits of the purged issues, from `X-Purged-Root`:
+    /// tombstones older than it name none. Sorted.
+    roots: []const Oid = &.{},
 };
 
 /// Trailers a purged comment loses: its text's, its images', its origin's.
@@ -69,6 +73,7 @@ pub fn readAt(arena: Allocator, backend: anytype, tip: Oid) !Tombstone {
 fn readUpTo(arena: Allocator, backend: anytype, tip: Oid, limit: usize) !Tombstone {
     var out: Tombstone = .{ .tip = tip, .issue = false, .comments = &.{} };
     var comments: std.ArrayList(Oid) = .empty;
+    var roots: std.ArrayList(Oid) = .empty;
     var seen: std.AutoHashMapUnmanaged([Oid.max_byte_len]u8, void) = .empty;
     var stack: std.ArrayList(Oid) = .empty;
     try stack.append(arena, tip);
@@ -83,21 +88,32 @@ fn readUpTo(arena: Allocator, backend: anytype, tip: Oid, limit: usize) !Tombsto
         for (c.parents) |p| try stack.append(arena, p);
         const block = try trailers.parse(arena, c.message, .{});
         const kind = trailers.lastValue(block, purge_key) orelse continue;
-        if (std.mem.eql(u8, kind, "issue")) out.issue = true;
-        if (!std.mem.eql(u8, kind, "comment")) continue;
+        const list, const key = if (std.mem.eql(u8, kind, "issue")) blk: {
+            out.issue = true;
+            break :blk .{ &roots, purged_root_key };
+        } else if (std.mem.eql(u8, kind, "comment"))
+            .{ &comments, purged_commit_key }
+        else
+            continue;
         for (block.trailers) |t| {
-            if (!std.ascii.eqlIgnoreCase(t.key, purged_commit_key)) continue;
+            if (!std.ascii.eqlIgnoreCase(t.key, key)) continue;
             const target = Oid.parseHex(backend.objectFormat(), t.value) catch continue;
-            if (!containsOid(comments.items, target)) try comments.append(arena, target);
+            if (!containsOid(list.items, target)) try list.append(arena, target);
         }
     }
-    stableSort(Oid, comments.items, {}, struct {
+    sortOids(comments.items);
+    sortOids(roots.items);
+    out.comments = comments.items;
+    out.roots = roots.items;
+    return out;
+}
+
+fn sortOids(list: []Oid) void {
+    stableSort(Oid, list, {}, struct {
         fn lt(_: void, a: Oid, b: Oid) bool {
             return a.order(b) == .lt;
         }
     }.lt);
-    out.comments = comments.items;
-    return out;
 }
 
 fn containsOid(list: []const Oid, oid: Oid) bool {
@@ -113,12 +129,29 @@ pub const Rewritten = struct {
     map: []const Moved,
 };
 
+const Index = std.AutoHashMapUnmanaged([Oid.max_byte_len]u8, usize);
+
 /// The ID a commit had before any purge: its `X-Rewritten-From`, or its own.
 /// Tombstones name comments by it, so a purge recorded after another one
 /// rewrote the comment still finds it on clones that rewrote differently.
-fn firstId(format: object.ObjectFormat, oid: Oid, block: trailers.Block) Oid {
+/// Anyone can write the trailer: one that names a commit still in the
+/// history (the root, another's comment) is ignored, or purging this
+/// commit would purge that one too. A rewrite replaces what it names.
+fn firstId(
+    format: object.ObjectFormat,
+    oid: Oid,
+    block: trailers.Block,
+    history: *const Index,
+) Oid {
     const was = trailers.lastValue(block, rewritten_from_key) orelse return oid;
-    return Oid.parseHex(format, was) catch oid;
+    const first = Oid.parseHex(format, was) catch return oid;
+    return if (history.contains(first.bytes)) oid else first;
+}
+
+fn indexOf(arena: Allocator, commits: []const issue_model.CommitInput) Allocator.Error!Index {
+    var index: Index = .empty;
+    for (commits, 0..) |c, i| try index.put(arena, c.oid.bytes, i);
+    return index;
 }
 
 /// Internal: the library's own plumbing, not API; it may change.
@@ -139,13 +172,12 @@ pub fn rewrite(
 ) !Rewritten {
     const format = backend.objectFormat();
     const n = commits.len;
-    var index: std.AutoHashMapUnmanaged([Oid.max_byte_len]u8, usize) = .empty;
-    for (commits, 0..) |c, i| try index.put(arena, c.oid.bytes, i);
+    const index = try indexOf(arena, commits);
     const blocks = try arena.alloc(trailers.Block, n);
     const is_purged = try arena.alloc(bool, n);
     for (commits, blocks, is_purged) |c, *b, *x| {
         b.* = try trailers.parse(arena, c.message, .{});
-        x.* = containsOid(purged, firstId(format, c.oid, b.*));
+        x.* = containsOid(purged, firstId(format, c.oid, b.*, &index));
     }
     const new = try arena.alloc(?Oid, n);
     @memset(new, null);
@@ -186,7 +218,7 @@ pub fn rewrite(
                     continue;
                 }
             }
-            const first = firstId(format, c.oid, block);
+            const first = firstId(format, c.oid, block, &index);
             var message = c.message;
             // purgedMessage writes `X-Rewritten-From` itself.
             var stamped = trailers.lastValue(block, rewritten_from_key) != null;
@@ -403,22 +435,21 @@ fn purgedMessage(
     return trailers.build(arena, subject, body, list.items);
 }
 
-/// The message of one tombstone commit.
+/// The message of one tombstone commit: `purged` is the comment's first
+/// ID, or the issue's root.
 fn tombstoneMessage(
     arena: Allocator,
     kind: enum { issue, comment },
-    comment: ?Oid,
+    purged: Oid,
     reason: []const u8,
 ) ![]const u8 {
     var list: std.ArrayList(trailers.Trailer) = .empty;
     try list.append(arena, .{ .key = purge_key, .value = @tagName(kind) });
-    if (comment) |c| {
-        const hex = c.hex();
-        try list.append(
-            arena,
-            .{ .key = purged_commit_key, .value = try arena.dupe(u8, hex.slice()) },
-        );
-    }
+    const hex = purged.hex();
+    try list.append(arena, .{
+        .key = if (kind == .issue) purged_root_key else purged_commit_key,
+        .value = try arena.dupe(u8, hex.slice()),
+    });
     if (reason.len > 0) try list.append(arena, .{ .key = "Reason", .value = reason });
     const subject = if (kind == .issue) "Purge issue" else "Purge comment";
     return trailers.build(arena, subject, "", list.items);
@@ -530,14 +561,16 @@ pub fn Purge(comptime B: type) type {
                 var new_tip: ?Oid = null;
                 var moved: []const Moved = &.{};
                 var first: ?Oid = null;
+                var root: ?Oid = null;
                 if (if (whole) null else target) |t| {
                     const c = for (current.comments) |c| {
                         if (c.oid.eql(t) and !c.is_merge) break c;
                     } else return error.CommentNotFound;
                     const commits = try self.repo.loadCommits(arena, tip);
+                    const index = try indexOf(arena, commits);
                     for (commits) |ci| if (ci.oid.eql(t)) {
                         const block = try trailers.parse(arena, ci.message, .{});
-                        first = firstId(backend.objectFormat(), ci.oid, block);
+                        first = firstId(backend.objectFormat(), ci.oid, block, &index);
                     };
                     if (c.purged) if (old_tomb) |ot| {
                         // Already purged here: only a tombstone that lacks
@@ -584,6 +617,9 @@ pub fn Purge(comptime B: type) type {
                         );
                     }
                 } else {
+                    // Its root names it in the tombstone, so its history
+                    // can't come back under another UUID either.
+                    root = current.root;
                     try ops.append(arena, .{ .name = ref_name, .op = .{ .delete = tip } });
                     const guard = try self.repo.readGuardRef(arena, id);
                     if (guard.old) |old| try ops.append(
@@ -608,7 +644,7 @@ pub fn Purge(comptime B: type) type {
                 const message = try self.repo.stampAuthor(arena, try tombstoneMessage(
                     arena,
                     if (whole) .issue else .comment,
-                    first,
+                    (if (whole) root else first) orelse return error.CorruptIssue,
                     spec.reason,
                 ));
                 const parents: []const Oid = if (old_tomb) |o| &.{o} else &.{};
@@ -752,12 +788,17 @@ pub fn unionOf(arena: Allocator, a: Tombstone, b: Tombstone) Allocator.Error!Tom
     var comments: std.ArrayList(Oid) = .empty;
     try comments.appendSlice(arena, a.comments);
     for (b.comments) |c| if (!containsOid(comments.items, c)) try comments.append(arena, c);
-    stableSort(Oid, comments.items, {}, struct {
-        fn lt(_: void, x: Oid, y: Oid) bool {
-            return x.order(y) == .lt;
-        }
-    }.lt);
-    return .{ .tip = b.tip, .issue = a.issue or b.issue, .comments = comments.items };
+    sortOids(comments.items);
+    var roots: std.ArrayList(Oid) = .empty;
+    try roots.appendSlice(arena, a.roots);
+    for (b.roots) |c| if (!containsOid(roots.items, c)) try roots.append(arena, c);
+    sortOids(roots.items);
+    return .{
+        .tip = b.tip,
+        .issue = a.issue or b.issue,
+        .comments = comments.items,
+        .roots = roots.items,
+    };
 }
 
 /// `.../issues/<id>`, `.../attachments/<id>`, or one of sync's
@@ -993,7 +1034,16 @@ test "purging an issue deletes it and its refs" {
     try std.testing.expect(try sim.resolveRef("refs/issuez-guard/number-7") == null);
     const t = (try purge.tombstone(arena, created.id)).?;
     try std.testing.expect(t.issue);
+    // The root names the issue's history whatever its UUID.
+    try std.testing.expectEqual(@as(usize, 1), t.roots.len);
+    try std.testing.expect(t.roots[0].eql(created.tip));
     try std.testing.expectError(error.IssueDisappeared, purge.issue(arena, ref, .{}, .{}));
+
+    // A tombstone written before roots were recorded still purges.
+    const who = try repo.identity(arena, null);
+    const old = try repo.writeCommit(arena, &.{}, who, "Purge issue\n\nX-Purge: issue\n");
+    const back = try readAt(arena, sim, old);
+    try std.testing.expect(back.issue and back.roots.len == 0);
 }
 
 test "a purged issue that came back is purged again, even by a comment purge" {
@@ -1010,6 +1060,41 @@ test "a purged issue that came back is purged again, even by a comment purge" {
     try std.testing.expect(r.tip == null);
     try std.testing.expect(try sim.resolveRef(ref) == null);
     try std.testing.expect((try purge.tombstone(arena, created.id)).?.issue);
+}
+
+test "a forged X-Rewritten-From purges only its own commit" {
+    var fx: TestRepo = .{};
+    defer fx.deinit();
+    const arena, _, const repo = try fx.open(9);
+    const created, const ref = try fx.issue(.{ .title = "Important", .body = "Body" });
+    const bob = try repo.comment(arena, ref, .{ .text = "Bob's comment" }, .{});
+    const who = try repo.identity(arena, null);
+    // Spam that claims to be the root once, Bob's comment once.
+    var spam: [2]Oid = undefined;
+    var tip = bob.tip;
+    for ([_]Oid{ created.tip, bob.tip }, &spam) |claimed, *out| {
+        const hex = claimed.hex();
+        const message = try std.fmt.allocPrint(arena, "Spam\n\n{s}: {s}\n", .{
+            rewritten_from_key,
+            hex.slice(),
+        });
+        tip = try repo.writeCommit(arena, &.{tip}, who, message);
+        out.* = tip;
+    }
+    const op: contract.RefUpdate.Op = .{ .update = .{ .new = tip, .old = bob.tip } };
+    try fx.sim.updateRefs(&.{.{ .name = ref, .op = op }});
+    const purge = Purge(GitSim).fromRepo(repo);
+    _ = try purge.comment(arena, ref, spam[0], .{}, .{});
+    const now = (try fx.sim.resolveRef(ref)).?;
+    const issue = try repo.load(arena, .{ .name = ref, .tip = now });
+    try std.testing.expectEqual(spam[0], (try purge.tombstone(arena, created.id)).?.comments[0]);
+    const r = try purge.comment(arena, ref, issue.comments[2].oid, .{}, .{});
+    const after = try repo.load(arena, .{ .name = ref, .tip = r.tip.? });
+    try std.testing.expectEqualStrings("Important", after.title);
+    try std.testing.expectEqualStrings("Body", after.description);
+    try std.testing.expect(!after.comments[0].purged);
+    try std.testing.expectEqualStrings("Bob's comment", after.comments[0].subject);
+    try std.testing.expect(after.comments[1].purged and after.comments[2].purged);
 }
 
 test "a purged comment loses its origin, keeps its fields" {

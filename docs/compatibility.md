@@ -200,8 +200,10 @@ are installed.
 ## Commands upstream doesn't have
 
 - `push <remote>`: fetches to see what the remote has, then pushes the
-  issues and milestones that differ, never with force. When the remote
-  moved, it merges first and retries. When the remote refuses a ref (a
+  issues and milestones that differ, as fast-forwards. The one exception
+  is a purge: when the remote still has purged history, the push replaces
+  it, leased on the tip just fetched ([format.md](format.md) §10). When
+  the remote moved, it merges first and retries. When the remote refuses a ref (a
   hook, permissions), it stops with the remote's message. Attachment
   bytes are uploaded with `git lfs push` before any ref. If that fails,
   or there are bytes to upload and git-lfs isn't installed, nothing is
@@ -228,6 +230,18 @@ are installed.
 - `quarantine <remote> --accept-remote|--keep-local <id>`: resolves a
   quarantined issue or milestone. Nothing is force-pushed and no version
   is dropped: the replaced local tip stays under `refs/issuez-sync/`.
+- `react <id> <emoji> [--on <comment>] [--undo]`: a reaction on an issue
+  or a comment, or taking it back ([format.md](format.md) §5). Upstream
+  shows the reaction's commit as an update.
+- `purge <id> [--comment <id>] [--reason <text>] --yes`: removes an issue,
+  or one comment's text and images, from history for good, and records
+  it in a tombstone that sync takes to every clone ([format.md](format.md)
+  §10). Upstream doesn't read tombstones, so its clones keep what they
+  have.
+- `push-check`: for a server's pre-receive hook, checks the issues,
+  milestones, attachment refs and tombstones a push brings, and refuses
+  what the format doesn't allow ([format.md](format.md) §11). It writes
+  nothing.
 
 `fsck` notes quarantined issues on stderr without counting them as errors.
 

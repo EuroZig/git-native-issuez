@@ -1427,7 +1427,7 @@ fn crossCheckModel(arena: Allocator, world: *World, clone_index: usize) CaseErro
         const ok = std.mem.eql(u8, issue.title, n.title) and
             std.mem.eql(u8, issue.state.text(), n.state) and
             commands.sameSet(issue.labels, n.labels) and
-            std.mem.eql(u8, issue.field("Assignee") orelse "", n.assignee) and
+            commands.isAssignee(n, issue.field("Assignee") orelse "") and
             std.mem.eql(u8, issue.field("Priority") orelse "", n.priority) and
             std.mem.eql(u8, issue.field("Milestone") orelse "", n.milestone) and
             std.mem.eql(u8, issue.field("X-Parent") orelse "", n.parent) and
@@ -2021,14 +2021,18 @@ fn sameAssignees(
     n: commands.NaiveIssue,
 ) Allocator.Error!bool {
     const assignee = o.get("assignee") orelse return false;
-    if (n.assignee.len == 0) {
+    if (n.assignee.len == 0 and !n.assignee_any) {
         if (assignee != .null) return false;
     } else {
         if (assignee != .string) return false;
-        const raw = try utf8(arena, n.assignee);
-        if (!std.mem.eql(u8, assignee.string, raw) and
-            !std.mem.endsWith(u8, raw, try std.fmt.allocPrint(arena, " {s}", .{assignee.string})))
-            return false;
+        const candidates: []const []const u8 = if (n.assignee_any) n.assignees else &.{n.assignee};
+        const found = for (candidates) |c| {
+            const raw = try utf8(arena, c);
+            const suffix = try std.fmt.allocPrint(arena, " {s}", .{assignee.string});
+            if (std.mem.eql(u8, assignee.string, raw) or std.mem.endsWith(u8, raw, suffix))
+                break true;
+        } else false;
+        if (!found) return false;
     }
     const assignees = asArray(o.get("assignees")) orelse return false;
     if (assignees.len != n.assignees.len) return false;
@@ -2308,11 +2312,19 @@ const PushChecker = struct {
             if (r.boolean()) c.identity else try std.ascii.allocUpperString(arena, c.identity),
         );
         if (r.boolean()) try emails.append(arena, "mallory@example.invalid");
+        var ids: std.ArrayList([]const u8) = .empty;
+        for (author_ids) |id| if (r.boolean()) try ids.append(
+            arena,
+            if (r.boolean()) id else try std.ascii.allocUpperString(arena, id),
+        );
         return .{
             .pusher_emails = emails.items,
+            .pusher_ids = ids.items,
             .author_policy = @enumFromInt(r.uintLessThan(u8, 3)),
             .allow_numbers = r.boolean(),
             .allow_purge = r.boolean(),
+            // Now and then a budget for merges that runs out.
+            .max_merge_work = if (oneIn(r, 4)) r.intRangeAtMost(u32, 1, 40) else 1_000_000,
         };
     }
 
@@ -2349,9 +2361,11 @@ const PushChecker = struct {
         const view = try hubView(arena, q);
         const want = oracle.push_check.expect(view, oups, .{
             .pusher_emails = engine_policy.pusher_emails,
+            .pusher_ids = engine_policy.pusher_ids,
             .authors = @enumFromInt(@intFromEnum(engine_policy.author_policy)),
             .allow_numbers = engine_policy.allow_numbers,
             .allow_purge = engine_policy.allow_purge,
+            .max_merge_work = engine_policy.max_merge_work,
         }) catch |e| switch (e) {
             error.OutOfMemory => return error.OutOfMemory,
             error.NoRule => return countSkip("push check of a history the oracle can't read"),
@@ -2469,6 +2483,12 @@ const PushChecker = struct {
 
 var push_checker: ?*PushChecker = null;
 
+/// Host UUIDs forged commits claim and policies give the pusher.
+const author_ids = [_][]const u8{
+    "0c8d7a52-3f1e-4b6a-9d2c-5e4f3a2b1c0d",
+    "1d9e8b63-4a2f-4c7b-8e3d-6f5a4b3c2d1e",
+};
+
 /// A push that never happens: the clone's refs and some mischief (deletes,
 /// rewinds, local-only and misnamed refs) checked against the hub.
 fn pushCheckStep(
@@ -2575,7 +2595,7 @@ fn forge(
         try issues.append(arena, r);
     };
     const empty = object.emptyTree(world.format);
-    const kind = rand.uintLessThan(u8, 6);
+    const kind = rand.uintLessThan(u8, 9);
     if (kind == 2 or issues.items.len == 0) {
         countOutcome("(push check forged: new format)", true);
         const oid = try f.commit(empty, &.{}, try std.fmt.allocPrint(
@@ -2590,6 +2610,45 @@ fn forge(
     const tip = Oid.parseHex(world.format, target.oid) catch return;
     switch (kind) {
         4 => return forgeDerived(f, rand, clone, target, tip),
+        8 => {
+            // A comment by a host user, maybe not the pusher, maybe no
+            // UUID at all.
+            countOutcome("(push check forged: author id)", true);
+            const ids = author_ids ++ [_][]const u8{ "0C8D7A52-3F1E-4B6A-9D2C-5E4F3A2B1C0D", "x" };
+            const message = try std.fmt.allocPrint(arena, "Hello\n\nX-Author-Id: {s}\n", .{
+                pick(rand, &ids),
+            });
+            _ = try f.update(target.name, try f.commit(empty, &.{tip}, message));
+        },
+        7 => {
+            // A comment that claims to be a rewrite of a commit still in
+            // the history, of what another commit was, or of nothing here.
+            countOutcome("(push check forged: rewritten from)", true);
+            const tip_obj = (try q.readObject(arena, tip)) orelse return;
+            const tip_commit = object.Commit.parse(arena, world.format, tip_obj.data) catch return;
+            const claimed: []const u8 = switch (rand.uintLessThan(u8, 3)) {
+                0 => try tip.hexAlloc(arena),
+                1 => if (std.mem.find(u8, tip_commit.message, "X-Rewritten-From: ")) |at|
+                    std.mem.sliceTo(tip_commit.message[at + "X-Rewritten-From: ".len ..], '\n')
+                else
+                    try tip.hexAlloc(arena),
+                else => try object.hashObject(world.format, .blob, "elsewhere").hexAlloc(arena),
+            };
+            const message = try std.fmt.allocPrint(
+                arena,
+                "Spam\n\nX-Rewritten-From: {s}\n",
+                .{claimed},
+            );
+            _ = try f.update(target.name, try f.commit(empty, &.{tip}, message));
+        },
+        6 => {
+            // An issue's history under another UUID: purged text must not
+            // come back that way.
+            countOutcome("(push check forged: copy)", true);
+            const name = try issueRef(arena, try randomUuid(arena, rand));
+            const copied = (try purgedOnHub(arena, rand, q)) orelse tip;
+            return updates.append(arena, .{ .name = name, .old = null, .new = copied });
+        },
         5 => {
             // Two issues given one number in one push.
             countOutcome("(push check forged: numbers)", true);
@@ -2624,6 +2683,20 @@ fn forge(
     }
 }
 
+/// A commit some tombstone on the hub purged, if the hub still has one.
+fn purgedOnHub(arena: Allocator, rand: std.Random, q: *GitSim) Allocator.Error!?Oid {
+    var found: std.ArrayList(Oid) = .empty;
+    for (q.refs.keys(), q.refs.values()) |name, oid| {
+        if (!std.mem.startsWith(u8, name, "refs/issuez-purged/")) continue;
+        const t = issuez.purge.readAt(arena, q, oid) catch continue;
+        for ([_][]const Oid{ t.comments, t.roots }) |list| for (list) |x| {
+            if (q.objects.contains(x)) try found.append(arena, x);
+        };
+    }
+    if (found.items.len == 0) return null;
+    return found.items[rand.uintLessThan(usize, found.items.len)];
+}
+
 /// A commit under the derived tip: pointers or not.
 fn forgeDerived(
     f: Forger,
@@ -2652,8 +2725,13 @@ fn forgeDerived(
     };
     var under = d;
     under.tree = junk_tree;
-    under.message = "Regenerate attachments\n";
-    const j = try f.q.writeObject(.commit, try under.serializeAlloc(arena));
+    // This issue's derived message, a bare subject, or the issue's own tip.
+    const choice = rand.uintLessThan(u8, 3);
+    if (choice == 1) under.message = "Regenerate attachments\n";
+    const j = if (choice == 2)
+        tip
+    else
+        try f.q.writeObject(.commit, try under.serializeAlloc(arena));
     var top = d;
     top.parents = try arena.dupe(Oid, &.{j});
     const oid = try f.q.writeObject(.commit, try top.serializeAlloc(arena));

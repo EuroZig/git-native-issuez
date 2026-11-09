@@ -647,15 +647,25 @@ pub const ListObj = struct {
     held: []const *cache_mod.Entry = &.{},
 };
 
+/// Everything the list needs memory for; the caller retains `held` once
+/// the list is made, so a failure here holds nothing.
 fn makeList(
     a: Allocator,
     issues: []const Issue,
     skipped: []const []const u8,
+    next: ?usize,
+    held: []const *cache_mod.Entry,
     ctx: Context,
 ) !ListObj {
     const objs = try a.alloc(IssueObj, issues.len);
     for (issues, objs) |i, *o| o.* = try build(a, i, ctx);
-    return .{ .arena = undefined, .issues = objs, .skipped = try rt.strs(a, skipped) };
+    return .{
+        .arena = undefined,
+        .issues = objs,
+        .skipped = try rt.strs(a, skipped),
+        .next = if (next) |n| try rt.dupeZ(a, try std.fmt.allocPrint(a, "o:{d}", .{n})) else .{},
+        .held = try a.dupe(*cache_mod.Entry, held),
+    };
 }
 
 /// Every issue that loads; the damaged ones by ID.
@@ -932,18 +942,12 @@ pub fn issuez_query_run(
         .failed => |code| return code,
         .list => |l| {
             const ctx: Context = .of(c.repo);
-            const list = rt.owned(ListObj, makeList, .{ l.matched, l.skipped, ctx }) catch |e|
-                return rt.failError(err, e, .{});
-            list.held = list.arena.allocator().dupe(*cache_mod.Entry, c.held.items) catch {
-                rt.freeArena(list.arena);
-                return rt.oom(err);
-            };
+            const list = rt.owned(
+                ListObj,
+                makeList,
+                .{ l.matched, l.skipped, l.next, c.held.items, ctx },
+            ) catch |e| return rt.failError(err, e, .{});
             for (list.held) |e| e.retain();
-            if (l.next) |next| {
-                const text = std.fmt.allocPrint(list.arena.allocator(), "o:{d}", .{next}) catch
-                    return rt.oom(err);
-                list.next = rt.dupeZ(list.arena.allocator(), text) catch return rt.oom(err);
-            }
             o.* = @ptrCast(list);
             return .ok;
         },
@@ -952,6 +956,8 @@ pub fn issuez_query_run(
 
 // ─── Resolve ───────────────────────────────────────────────────────────
 
+/// Only full UUIDs: a ref named `refs/issues/<anything>` is no issue, and
+/// its name may not fit the host's `ISSUEZ_UUID_BUFSIZE` buffer.
 fn resolveIds(c: *Call, kind: api.Kind, input: []const u8) ![]const []const u8 {
     const a = c.arena();
     var out: std.ArrayList([]const u8) = .empty;
@@ -960,18 +966,22 @@ fn resolveIds(c: *Call, kind: api.Kind, input: []const u8) ![]const []const u8 {
             // `#12` goes through the engine's number lookup (the cache).
             switch (try c.engine().resolve(a, input)) {
                 .none => {},
-                .one => |r| try out.append(a, r.id()),
-                .many => |rs| for (rs) |r| try out.append(a, r.id()),
+                .one => |r| try appendId(a, &out, r.id()),
+                .many => |rs| for (rs) |r| try appendId(a, &out, r.id()),
             }
         },
         .milestone => switch (try c.catalog().resolve(a, input)) {
             .none, .retired_name => {},
-            .one => |m| try out.append(a, m.id),
-            .many => |ms| for (ms) |m| try out.append(a, m.id),
+            .one => |m| try appendId(a, &out, m.id),
+            .many => |ms| for (ms) |m| try appendId(a, &out, m.id),
         },
         else => return error.UnknownKind,
     }
     return out.items;
+}
+
+fn appendId(a: std.mem.Allocator, out: *std.ArrayList([]const u8), id: []const u8) !void {
+    if (uuid_fmt.isCanonical(id)) try out.append(a, id);
 }
 
 pub fn issuez_resolve_one(
@@ -991,8 +1001,9 @@ pub fn issuez_resolve_one(
     switch (ids.len) {
         0 => return rt.notFound(err, input.slice(), "nothing matches"),
         1 => {
-            @memcpy(buf[0..ids[0].len], ids[0]);
-            buf[ids[0].len] = 0;
+            // A canonical UUID: 36 bytes, the NUL makes 37.
+            @memcpy(buf[0..36], ids[0][0..36]);
+            buf[36] = 0;
             return .ok;
         },
         else => return rt.failWith(

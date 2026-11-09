@@ -68,7 +68,7 @@ Conventions:
 
 - `assignee` is the email, also for the `<uuid> <email>` form.
   `assignees` lists everyone assigned, by email (format.md §3); `assignee`
-  is the first.
+  is one of them, usually the first, `null` when there are none.
 - `milestone` is the readable text. `milestone_id` is the catalog link as
   written; `effective_milestone_id` follows `inherit` up the parent chain.
 - `number` is the issue's number in its host (`X-Number`), `null` when it

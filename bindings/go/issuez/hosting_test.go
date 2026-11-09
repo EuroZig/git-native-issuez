@@ -162,6 +162,9 @@ func TestRepo_PrepareAttachment(t *testing.T) {
 	}
 	// Refused the way a write refuses them.
 	var e *issuez.Error
+	if _, err := r.PrepareAttachment(t.Context(), "", "a.png", nil); !errors.As(err, &e) || e.Code != issuez.CodeInvalidValue {
+		t.Errorf("no bytes: %v", err)
+	}
 	if _, err := r.PrepareAttachment(t.Context(), "", "a.gif", []byte("GIF89a")); !errors.As(err, &e) || e.Code != issuez.CodeInvalidValue {
 		t.Errorf("gif: %v", err)
 	}

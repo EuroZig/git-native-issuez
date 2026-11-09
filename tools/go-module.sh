@@ -21,7 +21,9 @@ old_path=github.com/EuroZig/git-native-issuez/bindings/go
 new_path=github.com/EuroZig/git-native-issuez-go
 main_repo=https://github.com/EuroZig/git-native-issuez
 
-# Everything but .git goes, so that what bindings/go dropped goes here too.
+# Everything but .git goes: the module repository is generated, nothing in it
+# is kept from one release to the next, and what bindings/go dropped goes here
+# too.
 find "$module" -mindepth 1 -maxdepth 1 ! -name .git -exec rm -rf {} +
 cp -R "$root/bindings/go/." "$module/"
 cp "$root/LICENSE" "$root/THIRD_PARTY_LICENSES" "$module/"
@@ -65,10 +67,37 @@ find "$module" -type f \( -name '*.go' -o -name go.mod -o -name '*.md' \) \
 # The generators read docs/, which is in the main repository.
 find "$module/issuez" -type f -name '*.go' -exec perl -ni -e 'print unless m{^//go:generate }' {} +
 
+# The package doc, but for how the package finds libissuez.a: its paragraph
+# that starts so, up to the next blank comment line.
+package_doc=$(mktemp)
+doc_out=$(mktemp)
+trap 'rm -f "$package_doc" "$doc_out"' EXIT
+cat > "$package_doc" <<EOF
+// It links libissuez.a, which this module has for macOS (arm64, amd64) and
+// Linux (amd64, arm64 and arm, with glibc or musl), so builds need cgo and a
+// C compiler and nothing else. Linux builds for musl need -tags musl. The tag
+// issuez_debug needs the archive that counts its allocations, from a checkout
+// of $main_repo.
+EOF
+awk -v doc="$package_doc" '
+    /^\/\/ It links libissuez\.a/ { while ((getline line < doc) > 0) print line; skip = 1; found = 1; next }
+    skip && /^\/\/$/ { skip = 0 }
+    !skip { print }
+    END { exit !found }
+' "$module/issuez/issuez.go" > "$doc_out" || {
+    echo "$0: issuez.go's package doc has no paragraph on linking libissuez.a" >&2
+    exit 1
+}
+cat "$doc_out" > "$module/issuez/issuez.go"
+if grep -q CGO_LDFLAGS "$module/issuez/issuez.go"; then
+    echo "$0: issuez.go's package doc still names CGO_LDFLAGS" >&2
+    exit 1
+fi
+
 # The README, but for how to get the archives. The docs are in the main
 # repository.
 archives_section=$(mktemp)
-trap 'rm -f "$archives_section"' EXIT
+trap 'rm -f "$package_doc" "$doc_out" "$archives_section"' EXIT
 cat > "$archives_section" <<EOF
 ## Archives
 
@@ -102,7 +131,7 @@ unset CGO_LDFLAGS
 export CGO_ENABLED=1 GOWORK=off
 (cd "$module" && go vet ./... && go test -count=1 ./...)
 consumer=$(mktemp -d)
-trap 'rm -f "$archives_section"; rm -rf "$consumer"' EXIT
+trap 'rm -f "$package_doc" "$doc_out" "$archives_section"; rm -rf "$consumer"' EXIT
 cat > "$consumer/main.go" <<EOF
 package main
 
