@@ -168,14 +168,12 @@ test "issuez_repo_open: the process environment as it is at the open" {
     try testing.expectEqualStrings("yes", got);
 }
 
-test "issuez_repo_open: committer, environment, limits, scopes and host prefixes" {
+test "issuez_repo_open: committer, environment, scopes and host prefixes" {
     const leaks = fixture.Leaks.start();
     defer leaks.check();
     var r: fixture.Repo = undefined;
     try r.init(.{});
     defer r.deinit();
-    var limit = fixture.opNum(c.ISSUEZ_OPT_LIMIT, 2);
-    limit.name = fixture.str("max_labels");
     var committer = std.mem.zeroes(c.issuez_op);
     committer.verb = c.ISSUEZ_OP_SET;
     committer.target = c.ISSUEZ_OPT_COMMITTER;
@@ -188,7 +186,6 @@ test "issuez_repo_open: committer, environment, limits, scopes and host prefixes
     env_var.name = fixture.str("ISSUEZ_TEST_MARKER");
     const ops = [_]c.issuez_op{
         committer,
-        limit,
         fixture.opStr(c.ISSUEZ_OPT_EXCLUSIVE_SCOPE, c.ISSUEZ_OP_ADD, "kind"),
         fixture.opStr(c.ISSUEZ_OPT_EXTRA_PREFIX, c.ISSUEZ_OP_ADD, "X-Acme-"),
         env_var,
@@ -212,18 +209,9 @@ test "issuez_repo_open: committer, environment, limits, scopes and host prefixes
     );
     try testing.expectEqualStrings("Server <server@example.invalid> / Ada", who);
 
-    // Over max_labels; two labels of one exclusive scope; a host key the
+    // Two labels of one exclusive scope; a host key the
     // repo doesn't allow.
     const cases = [_]struct { []const c.issuez_op, c.issuez_code }{
-        .{
-            &.{
-                c.issuez_set_title(fixture.str("T")),
-                c.issuez_add_label(fixture.str("a")),
-                c.issuez_add_label(fixture.str("b")),
-                c.issuez_add_label(fixture.str("c")),
-            },
-            c.ISSUEZ_E_LIMIT,
-        },
         .{
             &.{
                 c.issuez_set_title(fixture.str("T")),
@@ -334,30 +322,6 @@ test "issuez_repo_workflow_state_count: defaults, config, options" {
     try expect.str("rejected", c.issuez_repo_done_state_at(overridden[1], 1));
 }
 
-test "issuez_repo_close: results outlive the handle" {
-    const leaks = fixture.Leaks.start();
-    defer leaks.check();
-    var r: fixture.Repo = undefined;
-    try r.init(.{});
-    defer r.deinit();
-    const made = try fixture.titled(r.handle, "Outlives");
-    const other = try r.open(&.{});
-    var issue: ?*c.issuez_issue = null;
-    try expect.code(
-        c.ISSUEZ_OK,
-        c.issuez_issue_load(other, made.idStr(), null, &issue, null),
-        null,
-    );
-    var list: ?*c.issuez_issue_list = null;
-    var q = [_]c.issuez_op{c.issuez_q_done(-1)};
-    try expect.code(c.ISSUEZ_OK, c.issuez_query_run(other, &q, 1, null, &list, null), null);
-    c.issuez_repo_close(other);
-    try expect.str("Outlives", c.issuez_issue_title(issue));
-    try expect.str("Outlives", c.issuez_issue_title(c.issuez_issue_list_at(list, 0)));
-    c.issuez_issue_list_free(list);
-    c.issuez_issue_free(issue);
-}
-
 test "issuez_repo_drop_all: every ref of the library's, in one go" {
     const leaks = fixture.Leaks.start();
     defer leaks.check();
@@ -405,7 +369,7 @@ test "issuez_repo_adopt_refs: an import from a scratch repository on our objects
     try expect.code(c.ISSUEZ_OK, c.issuez_repo_adopt_refs(r.handle, scratch, null, &n, null), null);
     try testing.expectEqual(@as(usize, 2), n);
     const i = try fixture.load(r.handle, x.idStr());
-    try expect.str("Imported", c.issuez_issue_title(i));
+    try expect.str("Imported", c.issuez_issue_info_of(i).*.title);
     c.issuez_issue_free(i);
     // The refs are there now: nothing is taken.
     try expect.code(

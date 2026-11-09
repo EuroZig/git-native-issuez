@@ -93,6 +93,7 @@ test "issuez_sync: pushed, new, fast-forward, merged" {
     try testing.expect(!c.issuez_sync_report_ok(null));
 }
 
+// covers: issuez_error_git_stderr
 test "issuez_sync: merge only, a hub that refuses, options" {
     const leaks = fixture.Leaks.start();
     defer leaks.check();
@@ -124,6 +125,7 @@ test "issuez_sync: merge only, a hub that refuses, options" {
     try testing.expect(
         std.mem.find(u8, fixture.slice(c.issuez_error_git_stderr(err)), "no issues here") != null,
     );
+    try expect.terminated(c.issuez_error_git_stderr(err));
     c.issuez_error_free(err);
     err = null;
     const bad = [_]c.issuez_op{c.issuez_set_title(fixture.str("x"))};
@@ -207,7 +209,7 @@ test "issuez_quarantine_resolve: a rewound hub, take theirs, keep ours" {
         err,
     );
     const took = try fixture.load(p.b, x.idStr());
-    try expect.str("Started over", c.issuez_issue_title(took));
+    try expect.str("Started over", c.issuez_issue_info_of(took).*.title);
     c.issuez_issue_free(took);
     try expect.code(
         c.ISSUEZ_OK,
@@ -223,7 +225,7 @@ test "issuez_quarantine_resolve: a rewound hub, take theirs, keep ours" {
         err,
     );
     const kept = try fixture.load(p.b, y.idStr());
-    try expect.str("Also", c.issuez_issue_title(kept));
+    try expect.str("Also", c.issuez_issue_info_of(kept).*.title);
     c.issuez_issue_free(kept);
     try expect.code(
         c.ISSUEZ_E_NOT_FOUND,

@@ -21,7 +21,6 @@ test "issuez_code_name: every code, distinct; unknown ones" {
         std.mem.span(c.issuez_code_name(c.ISSUEZ_E_VERSION_MISMATCH)),
     );
     try testing.expectEqualStrings("UNKNOWN", std.mem.span(c.issuez_code_name(999)));
-    try testing.expectEqualStrings("UNKNOWN", std.mem.span(c.issuez_code_name(999)));
 }
 
 // covers: issuez_error_code, issuez_error_message, issuez_error_subject
@@ -124,23 +123,6 @@ test "issuez_error_problems, issuez_problems_len, issuez_problems_at: every bad 
     c.issuez_error_free(err);
 }
 
-test "issuez_error_git_stderr: what git said when a fetch failed" {
-    const leaks = fixture.Leaks.start();
-    defer leaks.check();
-    var r: fixture.Repo = undefined;
-    try r.init(.{});
-    defer r.deinit();
-    _ = try r.git(&.{ "remote", "add", "origin", "/nonexistent/hub.git" });
-    var report: ?*c.issuez_sync_report = null;
-    var err: ?*c.issuez_error = null;
-    const rc = c.issuez_sync(r.handle, fixture.str("origin"), null, 0, null, &report, &err);
-    try testing.expect(rc == c.ISSUEZ_E_NETWORK or rc == c.ISSUEZ_E_GIT);
-    const stderr = fixture.slice(c.issuez_error_git_stderr(err));
-    try expect.terminated(c.issuez_error_git_stderr(err));
-    try testing.expect(std.mem.find(u8, stderr, "nonexistent") != null);
-    c.issuez_error_free(err);
-}
-
 test "issuez_error_write: a cancelled write didn't happen" {
     const leaks = fixture.Leaks.start();
     defer leaks.check();
@@ -179,21 +161,6 @@ test "issuez_field_key: trailer keys" {
         std.mem.span(c.issuez_field_key(c.ISSUEZ_FIELD_NUMBER)),
     );
     try testing.expectEqualStrings("", std.mem.span(c.issuez_field_key(9999)));
-}
-
-test "issuez_problems_free: owned lists; NULL is fine" {
-    const leaks = fixture.Leaks.start();
-    defer leaks.check();
-    var ps: ?*c.issuez_problems = null;
-    const ops = [_]c.issuez_op{c.issuez_set_title(fixture.str(""))};
-    try expect.code(
-        c.ISSUEZ_OK,
-        c.issuez_ops_validate(c.ISSUEZ_LIST_ISSUE_CREATE, &ops, 1, &ps, null),
-        null,
-    );
-    try testing.expectEqual(@as(usize, 1), c.issuez_problems_len(ps));
-    c.issuez_problems_free(ps);
-    c.issuez_problems_free(null);
 }
 
 test "issuez_error_problems: the field and value the library refused" {

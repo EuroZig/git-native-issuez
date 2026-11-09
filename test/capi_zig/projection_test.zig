@@ -132,7 +132,7 @@ test "issuez_projection_build, issuez_projection_free, issuez_projection_issues:
     // It outlives later writes.
     _ = try fixture.titled(t.r.handle, "Later");
     try testing.expectEqual(@as(usize, 10), c.issuez_issue_list_len(list));
-    try expect.terminated(c.issuez_issue_title(c.issuez_issue_list_at(list, 0)));
+    try expect.terminated(c.issuez_issue_info_of(c.issuez_issue_list_at(list, 0)).*.title);
     c.issuez_projection_free(p);
     c.issuez_projection_free(null);
     try testing.expect(c.issuez_projection_issues(null) == null);

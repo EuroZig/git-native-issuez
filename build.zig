@@ -1341,6 +1341,38 @@ const repack_script =
     \\"$zig" ar rcs --format="$format" "$out" ./*.o
 ;
 
+/// A C file compiled with the system compiler and linked with the archive.
+fn compileC(
+    b: *std.Build,
+    source: []const u8,
+    header: std.Build.LazyPath,
+    archive: std.Build.LazyPath,
+    flags: []const []const u8,
+) std.Build.LazyPath {
+    const cc = b.addSystemCommand(&.{ "cc", "-std=c11", "-Wall", "-Wextra", "-Werror" });
+    cc.addArgs(flags);
+    // The archive is built for the exact host version; linking for an
+    // older one makes ld warn, and a step that writes to stderr fails.
+    if (b.graph.host.result.os.tag == .macos) {
+        const v = b.graph.host.result.os.version_range.semver.min;
+        cc.addArg(b.fmt("-mmacosx-version-min={d}.{d}.{d}", .{ v.major, v.minor, v.patch }));
+    }
+    cc.addPrefixedDirectoryArg("-I", header.dirname());
+    cc.addFileArg(b.path(source));
+    cc.addFileArg(archive);
+    cc.addArgs(&.{ "-lpthread", "-o" });
+    return cc.addOutputFileArg(std.fs.path.stem(source));
+}
+
+/// Sets up a command that runs the Go toolchain on the binding.
+fn goCommand(b: *std.Build, run: *std.Build.Step.Run, committed: *std.Build.Step) void {
+    run.setCwd(b.path("bindings/go"));
+    run.setEnvironmentVariable("CGO_ENABLED", "1");
+    // A go.work above this checkout (an embedder's) isn't ours.
+    run.setEnvironmentVariable("GOWORK", "off");
+    run.step.dependOn(committed);
+}
+
 fn addCapi(
     b: *std.Build,
     target: std.Build.ResolvedTarget,
@@ -1490,21 +1522,12 @@ fn addCapi(
     const go_debug_archive = go_debug_lib orelse archive;
 
     // The C smoke test, with the system compiler so ASan is available.
-    const cc = b.addSystemCommand(&.{ "cc", "-std=c11", "-Wall", "-Wextra", "-Werror", "-g" });
-    cc.addArgs(&.{ "-fsanitize=address,undefined", "-fno-omit-frame-pointer" });
-    // The archive is built for the exact host version; linking for an
-    // older one makes ld warn, and a step that writes to stderr fails.
-    if (b.graph.host.result.os.tag == .macos) {
-        const v = b.graph.host.result.os.version_range.semver.min;
-        cc.addArg(b.fmt("-mmacosx-version-min={d}.{d}.{d}", .{ v.major, v.minor, v.patch }));
-    }
-    cc.addPrefixedDirectoryArg("-I", header.dirname());
-    cc.addFileArg(b.path("test/capi/smoke.c"));
-    cc.addFileArg(archive);
-    cc.addArgs(&.{ "-lpthread", "-o" });
-    const smoke = cc.addOutputFileArg("smoke");
     const run_smoke = std.Build.Step.Run.create(b, "run C smoke test");
-    run_smoke.addFileArg(smoke);
+    run_smoke.addFileArg(compileC(b, "test/capi/smoke.c", header, archive, &.{
+        "-g",
+        "-fsanitize=address,undefined",
+        "-fno-omit-frame-pointer",
+    }));
     _ = run_smoke.addOutputDirectoryArg("work");
     // LeakSanitizer only exists on Linux; Apple's ASan aborts if asked.
     if (b.graph.host.result.os.tag == .linux) run_smoke.setEnvironmentVariable(
@@ -1516,16 +1539,7 @@ fn addCapi(
     test_capi.dependOn(&run_smoke.step);
 
     // The C quickstart, on a fresh repository; test-capi runs it too.
-    const qcc = b.addSystemCommand(&.{ "cc", "-std=c11", "-Wall", "-Wextra", "-Werror" });
-    if (b.graph.host.result.os.tag == .macos) {
-        const v = b.graph.host.result.os.version_range.semver.min;
-        qcc.addArg(b.fmt("-mmacosx-version-min={d}.{d}.{d}", .{ v.major, v.minor, v.patch }));
-    }
-    qcc.addPrefixedDirectoryArg("-I", header.dirname());
-    qcc.addFileArg(b.path("examples/c/quickstart.c"));
-    qcc.addFileArg(archive);
-    qcc.addArgs(&.{ "-lpthread", "-o" });
-    const quickstart_c = qcc.addOutputFileArg("quickstart");
+    const quickstart_c = compileC(b, "examples/c/quickstart.c", header, archive, &.{});
     const run_quickstart_c = b.addSystemCommand(&.{
         "sh",
         "-c",
@@ -1540,8 +1554,8 @@ fn addCapi(
     test_capi.dependOn(&run_quickstart_c.step);
 
     // gofmt prints nothing, vet passes, then the tests under the race
-    // detector in a random order, with a statement coverage floor, and the
-    // fuzz seeds with the leak check.
+    // detector in a random order, with a statement coverage floor on the
+    // hand-written code, and the fuzz seeds with the leak check.
     const go_test = addQuietCommand(b, &.{
         "sh",
         "-c",
@@ -1552,9 +1566,11 @@ fn addCapi(
         \\if [ -n "$out" ]; then echo "gofmt: $out" >&2; exit 1; fi
         \\go vet ./...
         \\cover=$(mktemp)
-        \\trap 'rm -f "$cover"' EXIT
+        \\hand=$(mktemp)
+        \\trap 'rm -f "$cover" "$hand"' EXIT
         \\go test -race -count=1 -shuffle=on -coverprofile="$cover" ./...
-        \\total=$(go tool cover -func="$cover" | awk '/^total:/ { sub("%", "", $3); print $3 }')
+        \\grep -v '/enums_gen\.go:' "$cover" >"$hand"
+        \\total=$(go tool cover -func="$hand" | awk '/^total:/ { sub("%", "", $3); print $3 }')
         \\if ! awk -v t="$total" -v min="$1" 'BEGIN { exit !(t >= min) }'; then
         \\  echo "Go statement coverage $total% is under $1%" >&2; exit 1
         \\fi
@@ -1563,13 +1579,9 @@ fn addCapi(
         "sh",
         "95",
     });
-    go_test.setCwd(b.path("bindings/go"));
-    go_test.setEnvironmentVariable("CGO_ENABLED", "1");
-    // A go.work above this checkout (an embedder's) isn't ours.
-    go_test.setEnvironmentVariable("GOWORK", "off");
+    goCommand(b, go_test, &update.step);
     go_test.addFileArg(go_test_archive);
     go_test.addFileArg(go_debug_archive);
-    go_test.step.dependOn(&update.step);
     b.step("test-go", "Run the Go binding's tests (needs Go)").dependOn(&go_test.step);
 
     // Each fuzz test in turn, with the leak check.
@@ -1591,12 +1603,8 @@ fn addCapi(
         "sh",
         fuzz_time,
     });
-    go_fuzz.setCwd(b.path("bindings/go"));
-    go_fuzz.setEnvironmentVariable("CGO_ENABLED", "1");
-    // A go.work above this checkout (an embedder's) isn't ours.
-    go_fuzz.setEnvironmentVariable("GOWORK", "off");
+    goCommand(b, go_fuzz, &update.step);
     go_fuzz.addFileArg(go_debug_archive);
-    go_fuzz.step.dependOn(&update.step);
     go_fuzz.stdio = .inherit;
     b.step(
         "fuzz-go",
@@ -1620,13 +1628,9 @@ fn addCapi(
         ,
         "sh",
     });
+    goCommand(b, go_e2e, &update.step);
     go_e2e.addFileArg(go_test_archive);
     go_e2e.addArtifactArg(exe);
-    go_e2e.setCwd(b.path("bindings/go"));
-    go_e2e.setEnvironmentVariable("CGO_ENABLED", "1");
-    // A go.work above this checkout (an embedder's) isn't ours.
-    go_e2e.setEnvironmentVariable("GOWORK", "off");
-    go_e2e.step.dependOn(&update.step);
     b.step("test-go-e2e", "Run the Go binding's end-to-end tests against the CLI (needs Go)")
         .dependOn(&go_e2e.step);
 

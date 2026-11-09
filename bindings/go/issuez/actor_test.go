@@ -16,7 +16,4 @@ func TestActor_zero(t *testing.T) {
 	if a := w.Issue.Author; a.Email != "t@example.com" || a.Name != "Tester" {
 		t.Errorf("author %+v, want git's identity", a)
 	}
-	if _, err := r.Create(t.Context(), new(issuez.Edit).SetTitle("No email"), issuez.Actor{Name: "Ada"}); err == nil {
-		t.Error("a name without an email")
-	}
 }

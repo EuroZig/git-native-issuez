@@ -114,38 +114,6 @@ func TestRepo_ValidateAttachment(t *testing.T) {
 	}
 }
 
-func TestEdit_RemoveAttachment(t *testing.T) {
-	ctx := context.Background()
-	dir := initRepo(t)
-	r := open(t, dir, issuez.WithAttachmentStore(false))
-	const id = "1b4e28ba-2fa1-4d3b-a3f5-ef19b5a7633b"
-	w, err := r.Create(ctx, new(issuez.Edit).SetTitle("Shots").AddAttachment(id, "a.png", png), ada)
-	if err != nil {
-		t.Fatal(err)
-	}
-	// Alone: a commit of its own, as `git issue attach rm` writes it.
-	rw, err := r.Update(ctx, w.ID, new(issuez.Edit).RemoveAttachment(id), ada)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if got := git(t, dir, "log", "-1", "--format=%s", rw.Commit.String()); got != "Remove attachment" {
-		t.Errorf("subject: %q", got)
-	}
-	i, err := r.Load(ctx, w.ID)
-	if err != nil || len(i.Attachments) != 1 || !i.Attachments[0].Removed {
-		t.Fatalf("after: %v %+v", err, i)
-	}
-	var e *issuez.Error
-	if _, err := r.Update(ctx, w.ID, new(issuez.Edit).RemoveAttachment("a.png"), ada); !errors.As(err, &e) ||
-		e.Code != issuez.CodeInvalidValue {
-		t.Errorf("not a UUID: %v", err)
-	}
-	if _, err := r.Create(ctx, new(issuez.Edit).SetTitle("New").RemoveAttachment(id), ada); !errors.As(err, &e) ||
-		e.Code != issuez.CodeInvalidValue {
-		t.Errorf("on create: %v", err)
-	}
-}
-
 func TestEdit_EditComment(t *testing.T) {
 	ctx := context.Background()
 	r := newRepo(t)
@@ -162,7 +130,7 @@ func TestEdit_EditComment(t *testing.T) {
 		t.Errorf("kind: %v", ew.Entry.Kind)
 	}
 	i, err := r.Load(ctx, w.ID)
-	if err != nil || i.Comments[0].Text != "The fix." || !i.Comments[0].Edited {
+	if err != nil || i.Comments[0].Text != "The fix." || !i.Comments[0].Edited || i.Comments[0].ID != cw.Commit {
 		t.Fatalf("after: %v %+v", err, i.Comments)
 	}
 	var e *issuez.Error
@@ -205,9 +173,9 @@ func TestWithAttachmentStore(t *testing.T) {
 	}
 }
 
-// TestEdit_RemoveAttachment_alone: a commit of its own that keeps the
-// text, with the attachment still under its comment.
-func TestEdit_RemoveAttachment_alone(t *testing.T) {
+// TestEdit_RemoveAttachment: a commit of its own that keeps the text, with
+// the attachment still under its comment; not on a create.
+func TestEdit_RemoveAttachment(t *testing.T) {
 	ctx := t.Context()
 	r := open(t, initRepo(t), issuez.WithAttachmentStore(false))
 	w := create(t, r, "Images")
@@ -223,6 +191,11 @@ func TestEdit_RemoveAttachment_alone(t *testing.T) {
 	a := u.Issue.Attachments[0]
 	if !u.Wrote || !a.Removed || a.Comment != cw.Commit || u.Issue.Comments[0].Text != "A photo." {
 		t.Errorf("removed: %+v, comment %q", a, u.Issue.Comments[0].Text)
+	}
+	var e *issuez.Error
+	if _, err := r.Create(ctx, new(issuez.Edit).SetTitle("New").RemoveAttachment(id), ada); !errors.As(err, &e) ||
+		e.Code != issuez.CodeInvalidValue {
+		t.Errorf("on create: %v", err)
 	}
 }
 

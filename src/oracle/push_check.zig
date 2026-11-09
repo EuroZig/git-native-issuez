@@ -116,55 +116,16 @@ fn history(
     tip: []const u8,
 ) Allocator.Error!?std.StringArrayHashMapUnmanaged(object.Commit) {
     var out: std.StringArrayHashMapUnmanaged(object.Commit) = .empty;
-    var stack: std.ArrayList([]const u8) = .empty;
-    try stack.append(c.arena, tip);
-    while (stack.pop()) |hex| {
-        if (out.contains(hex)) continue;
-        const cm = c.commit(hex) orelse return null;
-        try out.put(c.arena, hex, cm);
-        for (cm.parents) |p| try stack.append(c.arena, try p.hexAlloc(c.arena));
-    }
-    return out;
-}
-
-/// Reachable from `tip` inside `within`.
-fn reachIn(
-    arena: Allocator,
-    within: std.StringArrayHashMapUnmanaged(object.Commit),
-    tip: []const u8,
-) Allocator.Error!std.StringHashMapUnmanaged(void) {
-    var out: std.StringHashMapUnmanaged(void) = .empty;
-    var stack: std.ArrayList([]const u8) = .empty;
-    try stack.append(arena, tip);
-    while (stack.pop()) |hex| {
-        const cm = within.get(hex) orelse continue;
-        if ((try out.getOrPut(arena, hex)).found_existing) continue;
-        for (cm.parents) |p| try stack.append(arena, try p.hexAlloc(arena));
-    }
-    return out;
-}
-
-/// Reachable from `tip` as far as the objects go.
-fn reachPartial(
-    c: commands.Clone,
-    tip: []const u8,
-) Allocator.Error!std.StringHashMapUnmanaged(void) {
-    var out: std.StringHashMapUnmanaged(void) = .empty;
-    var stack: std.ArrayList([]const u8) = .empty;
-    try stack.append(c.arena, tip);
-    while (stack.pop()) |hex| {
-        if ((try out.getOrPut(c.arena, hex)).found_existing) continue;
-        const cm = c.commit(hex) orelse continue;
-        for (cm.parents) |p| try stack.append(c.arena, try p.hexAlloc(c.arena));
-    }
-    return out;
+    var walk = try c.walk(tip);
+    while (try walk.next()) |x| try out.put(c.arena, x.hex, x.commit);
+    return if (walk.missing) null else out;
 }
 
 fn actionOf(c: commands.Clone, u: Update) Allocator.Error![]const u8 {
     const old = u.old orelse return "create";
     const new = u.new orelse return "delete";
     if (std.mem.eql(u8, old, new)) return "fast_forward";
-    return if ((try reachPartial(c, new)).contains(old)) "fast_forward" else "rewrite";
+    return if ((try c.reach(new)).contains(old)) "fast_forward" else "rewrite";
 }
 
 const Run = struct {
@@ -235,18 +196,13 @@ pub fn expect(
                 n,
                 m,
             ) or std.mem.eql(u8, own, classify(updates[j].ref)[1])) continue;
-            var k: Kinds = .{ .arena = arena };
-            for (out[i].kinds) |x| {
-                if (commands.containsText(out[i].flags, x)) try k.flag(x) else try k.add(x);
+            out[i].accept = false;
+            if (!commands.containsText(out[i].kinds, "number_taken")) {
+                const taken: []const []const u8 = &.{"number_taken"};
+                const with = try std.mem.concat(arena, []const u8, &.{ out[i].kinds, taken });
+                stableSort([]const u8, with, {}, lessText);
+                out[i].kinds = with;
             }
-            try k.add("number_taken");
-            try k.at.appendSlice(arena, out[i].at);
-            const was = out[i];
-            out[i] = try k.done(was.action);
-            out[i].needs_number = was.needs_number;
-            out[i].touches_locked = was.touches_locked;
-            out[i].new_count = was.new_count;
-            out[i].skip = was.skip;
             break;
         }
     };
@@ -412,15 +368,9 @@ fn isPurge(c: commands.Clone, cm: object.Commit) Allocator.Error!bool {
     if (!std.mem.eql(u8, kind, "comment")) return false;
     for (block.trailers) |t| {
         if (!std.ascii.eqlIgnoreCase(t.key, "X-Purged-Commit")) continue;
-        if (isFullHex(c, t.value)) return true;
+        if (c.isFullHex(t.value)) return true;
     }
     return false;
-}
-
-fn isFullHex(c: commands.Clone, s: []const u8) bool {
-    if (s.len != c.format.hexLen()) return false;
-    for (s) |ch| if (!std.ascii.isDigit(ch) and !(ch >= 'a' and ch <= 'f')) return false;
-    return true;
 }
 
 fn rootOf(h: std.StringArrayHashMapUnmanaged(object.Commit)) struct { usize, ?object.Commit } {
@@ -499,7 +449,7 @@ fn issueOrMilestone(
             const rw = try purge.rewrite(c, u.old.?, tomb.?.comments);
             if (rw == null or !h.contains(rw.?)) {
                 try k.add("non_fast_forward");
-            } else base = try reachIn(a, h, rw.?);
+            } else base = try c.reach(rw.?);
         }
     }
     const fresh = try freshOf(r, h, base);

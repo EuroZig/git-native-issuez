@@ -30,8 +30,8 @@ test "receipt reads stay at their tip after a later write and ref deletion" {
     var loaded: ?*c.issuez_issue = null;
     try expect.code(c.ISSUEZ_OK, c.issuez_write_load_issue(w, null, &loaded, null), null);
     defer c.issuez_issue_free(loaded);
-    try testing.expectEqualStrings("Before", f.slice(c.issuez_issue_title(loaded)));
-    const got_tip = c.issuez_issue_tip(loaded);
+    try testing.expectEqualStrings("Before", f.slice(c.issuez_issue_info_of(loaded).*.title));
+    const got_tip = c.issuez_issue_info_of(loaded).*.tip;
     try testing.expect(c.issuez_oid_eq(&tip, &got_tip));
     _ = try r.git(&.{
         "update-ref",                                                         "-d",
@@ -85,7 +85,7 @@ test "receipt reads stay at their tip after a later write and ref deletion" {
     var m: ?*c.issuez_milestone = null;
     try expect.code(c.ISSUEZ_OK, c.issuez_write_load_milestone(mw, null, &m, null), null);
     defer c.issuez_milestone_free(m);
-    try testing.expectEqualStrings("v1", f.slice(c.issuez_milestone_name(m)));
+    try testing.expectEqualStrings("v1", f.slice(c.issuez_milestone_info_of(m).*.name));
 }
 
 // covers: issuez_repo_begin_import, issuez_repo_commit_import

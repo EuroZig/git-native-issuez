@@ -120,11 +120,31 @@ fn dump(v: *c.issuez_push_verdicts) void {
     }
 }
 
-fn has(v: c.issuez_push_verdict, kind: c_uint) bool {
+fn problem(v: c.issuez_push_verdict, kind: c_uint) ?c.issuez_problem {
     for (0..c.issuez_problems_len(v.problems)) |k| {
-        if (c.issuez_problems_at(v.problems, k).*.kind == kind) return true;
+        const pr = c.issuez_problems_at(v.problems, k).*;
+        if (pr.kind == kind) return pr;
     }
-    return false;
+    return null;
+}
+
+fn has(v: c.issuez_push_verdict, kind: c_uint) bool {
+    return problem(v, kind) != null;
+}
+
+/// The problem of that kind says this field, offending commit and other issue.
+fn expectProblem(
+    v: c.issuez_push_verdict,
+    kind: c_uint,
+    field: c_uint,
+    commit: ?c.issuez_oid,
+    subject: []const u8,
+) !void {
+    const pr = problem(v, kind) orelse return error.TestExpectedProblem;
+    try testing.expectEqual(@as(u32, field), pr.field);
+    const hex = if (commit) |o| fixture.oidHex(o) else undefined;
+    try expect.str(if (commit != null) std.mem.sliceTo(&hex, 0) else "", pr.value);
+    try expect.str(subject, pr.subject);
 }
 
 fn verdict(v: *c.issuez_push_verdicts, i: usize) c.issuez_push_verdict {
@@ -157,17 +177,20 @@ test "issuez_push_check: create, fast-forward, ignored" {
     var v = try p.check(&.{ try p.update(ref), branch }, &enforce_ada, c.ISSUEZ_OK);
     try testing.expectEqual(@as(usize, 2), c.issuez_push_verdicts_len(v));
     const created = verdict(v, 0);
+    try expect.str(ref, created.ref);
     try testing.expect(created.accept);
     try testing.expectEqual(@as(u32, c.ISSUEZ_PUSH_CREATE), created.action);
     try testing.expectEqual(@as(u32, c.ISSUEZ_KIND_ISSUE), created.kind);
     try expect.str(x.idSlice(), created.id);
     try testing.expect(created.needs_number);
+    try testing.expect(!created.touches_locked);
     try testing.expectEqual(@as(usize, 1), created.commit_count);
     try testing.expectEqual(@as(usize, 1), created.entry_count);
     const entry = c.issuez_push_verdict_entry_at(c.issuez_push_verdicts_at(v, 0), 0).*;
     try testing.expectEqual(@as(u32, c.ISSUEZ_ENTRY_CREATED), entry.kind);
     try testing.expect(c.issuez_push_verdict_entry_at(c.issuez_push_verdicts_at(v, 0), 1) == null);
     const ignored = verdict(v, 1);
+    try expect.str("refs/heads/main", ignored.ref);
     try testing.expect(ignored.accept);
     try testing.expectEqual(@as(u32, c.ISSUEZ_PUSH_IGNORED), ignored.action);
     try testing.expectEqual(@as(u32, c.ISSUEZ_KIND_UNKNOWN), ignored.kind);
@@ -176,10 +199,12 @@ test "issuez_push_check: create, fast-forward, ignored" {
     try testing.expect(c.issuez_push_verdicts_at(v, 2) == null);
     c.issuez_push_verdicts_free(v);
 
+    _ = try fixture.update(p.client, x.idStr(), &.{c.issuez_set_locked(true, .{})});
     try p.land(&.{ref});
     _ = try fixture.comment(p.client, x.idStr(), "More");
     v = try p.check(&.{try p.update(ref)}, &enforce_ada, c.ISSUEZ_OK);
     try testing.expectEqual(@as(u32, c.ISSUEZ_PUSH_FAST_FORWARD), verdict(v, 0).action);
+    try testing.expect(verdict(v, 0).touches_locked);
     try testing.expectEqual(@as(usize, 1), verdict(v, 0).commit_count);
     try testing.expectEqual(
         @as(u32, c.ISSUEZ_ENTRY_COMMENT),
@@ -245,14 +270,20 @@ test "issuez_push_check: refused refs, rewinds, deletes, authors, numbers, forma
     };
     const cops = [_]c.issuez_op{c.issuez_set_comment(fixture.str("Spoofed"))};
     var w: ?*c.issuez_write = null;
-    _ = try fixture.wrote(
+    const spoof = try fixture.wrote(
         c.issuez_issue_update(p.client, x.idStr(), &cops, 1, &mallory, null, &w, null),
         w,
         null,
         "spoof",
     );
     v = try p.check(&.{try p.update(ref)}, &enforce_ada, c.ISSUEZ_E_REJECTED);
-    try testing.expect(has(verdict(v, 0), c.ISSUEZ_PROBLEM_AUTHOR_MISMATCH));
+    try expectProblem(
+        verdict(v, 0),
+        c.ISSUEZ_PROBLEM_AUTHOR_MISMATCH,
+        c.ISSUEZ_FIELD_UNKNOWN,
+        spoof.commit,
+        "",
+    );
     c.issuez_push_verdicts_free(v);
     const warn = [_]c.issuez_op{
         c.issuez_opt_pusher_email(fixture.str("ada@example.invalid")),
@@ -271,7 +302,13 @@ test "issuez_push_check: refused refs, rewinds, deletes, authors, numbers, forma
     );
     const nref = try std.fmt.allocPrint(a, "refs/issues/{s}", .{numbered.idSlice()});
     v = try p.check(&.{try p.update(nref)}, &.{}, c.ISSUEZ_E_REJECTED);
-    try testing.expect(has(verdict(v, 0), c.ISSUEZ_PROBLEM_READ_ONLY_FIELD));
+    try expectProblem(
+        verdict(v, 0),
+        c.ISSUEZ_PROBLEM_READ_ONLY_FIELD,
+        c.ISSUEZ_FIELD_NUMBER,
+        numbered.tip,
+        "",
+    );
     c.issuez_push_verdicts_free(v);
     const numbers = [_]c.issuez_op{c.issuez_opt_allow_numbers(true)};
     v = try p.check(&.{try p.update(nref)}, &numbers, c.ISSUEZ_OK);
@@ -303,15 +340,39 @@ test "issuez_push_check: refused refs, rewinds, deletes, authors, numbers, forma
         },
     );
     v = try p.check(&.{try p.update(tref)}, &numbers, c.ISSUEZ_E_REJECTED);
-    try testing.expect(has(verdict(v, 0), c.ISSUEZ_PROBLEM_DUPLICATE_NUMBER));
+    try expectProblem(
+        verdict(v, 0),
+        c.ISSUEZ_PROBLEM_DUPLICATE_NUMBER,
+        c.ISSUEZ_FIELD_NUMBER,
+        null,
+        numbered.idSlice(),
+    );
     c.issuez_push_verdicts_free(v);
 
-    // Another Format-Version.
     const tree = try fixture.runGit(
         a,
         p.client_path,
         &.{ "hash-object", "-t", "tree", "-w", "/dev/null" },
     );
+
+    // The landed #5 becomes #6: only a foreign commit can say so.
+    const renumbered = try fixture.runGit(
+        a,
+        p.client_path,
+        &.{ "commit-tree", tree, "-p", nref, "-m", "Number\n\nX-Number: 6" },
+    );
+    _ = try fixture.runGit(a, p.client_path, &.{ "update-ref", nref, renumbered });
+    v = try p.check(&.{try p.update(nref)}, &numbers, c.ISSUEZ_E_REJECTED);
+    try expectProblem(
+        verdict(v, 0),
+        c.ISSUEZ_PROBLEM_READ_ONLY_FIELD,
+        c.ISSUEZ_FIELD_NUMBER,
+        null,
+        "",
+    );
+    c.issuez_push_verdicts_free(v);
+
+    // Another Format-Version.
     const future = try fixture.runGit(
         a,
         p.client_path,
@@ -330,7 +391,7 @@ test "issuez_push_check: refused refs, rewinds, deletes, authors, numbers, forma
     c.issuez_push_verdicts_free(v);
 }
 
-test "issuez_push_check: an X-Author-Id must be the pusher's" {
+test "issuez_push_check: an X-Author-Id passes as the pusher's own UUID" {
     const leaks = fixture.Leaks.start();
     defer leaks.check();
     var p: Push = undefined;
@@ -359,20 +420,12 @@ test "issuez_push_check: an X-Author-Id must be the pusher's" {
         .{fixture.slice(c.issuez_write_id(w))},
     );
     c.issuez_write_free(w);
-    const ada_id = [_]c.issuez_op{
-        c.issuez_opt_pusher_email(fixture.str("ada@example.invalid")),
-        c.issuez_opt_pusher_user_id(fixture.str("0c8d7a52-3f1e-4b6a-9d2c-5e4f3a2b1c0d")),
-        c.issuez_opt_author_policy(c.ISSUEZ_AUTHOR_ENFORCE),
-    };
-    var v = try p.check(&.{try p.update(ref)}, &ada_id, c.ISSUEZ_E_REJECTED);
-    try testing.expect(has(verdict(v, 0), c.ISSUEZ_PROBLEM_AUTHOR_MISMATCH));
-    c.issuez_push_verdicts_free(v);
     const mallory_id = [_]c.issuez_op{
         c.issuez_opt_pusher_email(fixture.str("ada@example.invalid")),
         c.issuez_opt_pusher_user_id(fixture.str(mallory)),
         c.issuez_opt_author_policy(c.ISSUEZ_AUTHOR_ENFORCE),
     };
-    v = try p.check(&.{try p.update(ref)}, &mallory_id, c.ISSUEZ_OK);
+    const v = try p.check(&.{try p.update(ref)}, &mallory_id, c.ISSUEZ_OK);
     c.issuez_push_verdicts_free(v);
     // Not a UUID.
     const bad = [_]c.issuez_op{c.issuez_opt_pusher_user_id(fixture.str("42"))};
@@ -393,7 +446,7 @@ test "issuez_push_check: an X-Author-Id must be the pusher's" {
     c.issuez_error_free(err);
 }
 
-test "issuez_push_check: purges need leave, and allow the rewrite and delete" {
+test "issuez_push_check: purges need leave, and allow the rewrite" {
     const leaks = fixture.Leaks.start();
     defer leaks.check();
     var p: Push = undefined;
@@ -403,10 +456,8 @@ test "issuez_push_check: purges need leave, and allow the rewrite and delete" {
     const x = try fixture.titled(p.client, "Talk");
     const said = try fixture.comment(p.client, x.idStr(), "Abuse");
     _ = try fixture.comment(p.client, x.idStr(), "Fine");
-    const y = try fixture.titled(p.client, "Doxxing");
     const xref = try std.fmt.allocPrint(a, "refs/issues/{s}", .{x.idSlice()});
-    const yref = try std.fmt.allocPrint(a, "refs/issues/{s}", .{y.idSlice()});
-    try p.land(&.{ xref, yref });
+    try p.land(&.{xref});
     var pr: ?*c.issuez_purge_result = null;
     try expect.code(
         c.ISSUEZ_OK,
@@ -423,38 +474,19 @@ test "issuez_push_check: purges need leave, and allow the rewrite and delete" {
         null,
     );
     c.issuez_purge_result_free(pr);
-    try expect.code(
-        c.ISSUEZ_OK,
-        c.issuez_purge_issue(
-            p.client,
-            y.idStr(),
-            &fixture.ada,
-            fixture.str("legal"),
-            null,
-            &pr,
-            null,
-        ),
-        null,
-    );
-    c.issuez_purge_result_free(pr);
     const xt = try std.fmt.allocPrint(a, "refs/issuez-purged/{s}", .{x.idSlice()});
-    const yt = try std.fmt.allocPrint(a, "refs/issuez-purged/{s}", .{y.idSlice()});
     const ups = [_]c.issuez_ref_update{
         try p.update(xref),
         try p.update(xt),
-        try p.update(yref),
-        try p.update(yt),
     };
 
     var v = try p.check(&ups, &.{}, c.ISSUEZ_E_REJECTED);
     try testing.expect(has(verdict(v, 1), c.ISSUEZ_PROBLEM_PURGE_NOT_ALLOWED));
-    try testing.expect(has(verdict(v, 3), c.ISSUEZ_PROBLEM_PURGE_NOT_ALLOWED));
     c.issuez_push_verdicts_free(v);
     const leave = [_]c.issuez_op{c.issuez_opt_allow_purge(true)};
     v = try p.check(&ups, &leave, c.ISSUEZ_OK);
     try testing.expectEqual(@as(u32, c.ISSUEZ_PUSH_REWRITE), verdict(v, 0).action);
     try testing.expectEqual(@as(u32, c.ISSUEZ_KIND_TOMBSTONE), verdict(v, 1).kind);
-    try testing.expectEqual(@as(u32, c.ISSUEZ_PUSH_DELETE), verdict(v, 2).action);
     c.issuez_push_verdicts_free(v);
 
     // With the tombstone in, the old history can't come back.

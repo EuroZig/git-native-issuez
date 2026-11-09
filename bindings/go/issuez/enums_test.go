@@ -26,13 +26,8 @@ func TestEnumsGenerated(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	wantTest, err := enumgen.GenerateTest(files)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if string(want) != string(files["enums_gen.go"]) ||
-		string(wantTest) != string(files["enums_gen_test.go"]) {
-		t.Fatal("enums_gen.go or its test is stale: run go generate in bindings/go/issuez")
+	if string(want) != string(files["enums_gen.go"]) {
+		t.Fatal("enums_gen.go is stale: run go generate in bindings/go/issuez")
 	}
 }
 
@@ -47,33 +42,42 @@ func wantString(t *testing.T, v fmt.Stringer, want string) {
 	}
 }
 
-func TestAuthorPolicy_String(t *testing.T) {
-	wantString(t, AuthorEnforce, "enforce")
-	wantString(t, AuthorPolicy(99), "AuthorPolicy(99)")
+// TestEnumNames: one name of each enum, written by hand, as a check on the
+// generator: TestEnumsGenerated only says enums_gen.go is what it writes.
+//
+// covers: AuthorPolicy_String, ChangeKind_String, EntryKind_String, FsckKind_String, Kind_String
+// covers: LogLevel_String, MilestoneStatus_String, Priority_String, ProblemKind_String
+// covers: PushAction_String, QuarantineReason_String, RevisionKind_String, Sort_String
+// covers: SyncOutcome_String, Tri_String, Verb_String
+func TestEnumNames(t *testing.T) {
+	for _, c := range []struct {
+		v    fmt.Stringer
+		want string
+	}{
+		{AuthorEnforce, "enforce"},
+		{AuthorPolicy(99), "AuthorPolicy(99)"},
+		{ChangeRemoved, "removed"},
+		{EntryCommentEdit, "comment_edit"},
+		{FsckQuarantined, "quarantined"},
+		{KindMilestone, "milestone"},
+		{LogWarn, "warn"},
+		{MilestoneCompleted, "completed"},
+		{PriorityNone, "none"},
+		{PriorityCritical, "critical"},
+		{ProblemTooLong, "too_long"},
+		{PushFastForward, "fast_forward"},
+		{QuarantineUnrelatedHistory, "unrelated_history"},
+		{RevisionEdit, "edit"},
+		{SortDueDate, "due_date"},
+		{SyncUpToDate, "up_to_date"},
+		{TriAny, "any"},
+		{VerbInherit, "inherit"},
+	} {
+		if got := c.v.String(); got != c.want || fmt.Sprint(c.v) != c.want {
+			t.Errorf("%T: String() = %q, %%v = %q, want %q", c.v, got, fmt.Sprint(c.v), c.want)
+		}
+	}
 }
-
-func TestChangeKind_String(t *testing.T) { wantString(t, ChangeRemoved, "removed") }
-func TestEntryKind_String(t *testing.T)  { wantString(t, EntryCommentEdit, "comment_edit") }
-func TestFsckKind_String(t *testing.T)   { wantString(t, FsckQuarantined, "quarantined") }
-func TestKind_String(t *testing.T)       { wantString(t, KindMilestone, "milestone") }
-func TestLogLevel_String(t *testing.T)   { wantString(t, LogWarn, "warn") }
-func TestMilestoneStatus_String(t *testing.T) {
-	wantString(t, MilestoneCompleted, "completed")
-}
-func TestPriority_String(t *testing.T) {
-	wantString(t, PriorityNone, "none")
-	wantString(t, PriorityCritical, "critical")
-}
-func TestProblemKind_String(t *testing.T) { wantString(t, ProblemTooLong, "too_long") }
-func TestPushAction_String(t *testing.T)  { wantString(t, PushFastForward, "fast_forward") }
-func TestQuarantineReason_String(t *testing.T) {
-	wantString(t, QuarantineUnrelatedHistory, "unrelated_history")
-}
-func TestRevisionKind_String(t *testing.T) { wantString(t, RevisionEdit, "edit") }
-func TestSort_String(t *testing.T)         { wantString(t, SortDueDate, "due_date") }
-func TestSyncOutcome_String(t *testing.T)  { wantString(t, SyncUpToDate, "up_to_date") }
-func TestTri_String(t *testing.T)          { wantString(t, TriAny, "any") }
-func TestVerb_String(t *testing.T)         { wantString(t, VerbInherit, "inherit") }
 
 func TestWatchChange_String(t *testing.T) {
 	wantString(t, WatchNone, "none")

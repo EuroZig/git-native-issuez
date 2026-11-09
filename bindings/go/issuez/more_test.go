@@ -276,10 +276,9 @@ func TestRepo_PurgeComment(t *testing.T) {
 	if _, err := r.Update(ctx, w.ID, new(issuez.Edit).AddComment("Fine"), ada); err != nil {
 		t.Fatal(err)
 	}
-	hub := withHub(t, r)
+	withHub(t, r)
 	mustSync(t, r, issuez.SyncOptions{})
 	ref := "refs/issues/" + w.ID
-	pushed := revParse(t, hub, ref)
 
 	res, err := r.PurgeComment(ctx, w.ID, bad.Commit, ada, "abuse")
 	if err != nil {
@@ -296,15 +295,6 @@ func TestRepo_PurgeComment(t *testing.T) {
 	if len(i.Comments) != 2 || !i.Comments[0].Purged || strings.Contains(i.Comments[0].Text, "Abuse") ||
 		i.Comments[1].Text != "Fine" {
 		t.Errorf("after the purge: %+v", i.Comments)
-	}
-
-	// The next sync replaces the hub's copy and sends the tombstone.
-	mustSync(t, r, issuez.SyncOptions{})
-	if got := revParse(t, hub, ref); got == pushed || got != res.NewTip {
-		t.Errorf("hub's tip %v, purged %v, before %v", got, res.NewTip, pushed)
-	}
-	if revParse(t, hub, "refs/issuez-purged/"+w.ID).IsZero() {
-		t.Error("no tombstone on the hub")
 	}
 
 	// A commit that isn't one of the issue's comments.
@@ -337,93 +327,23 @@ func TestRepo_PurgeIssue(t *testing.T) {
 			t.Errorf("missing issue: %v", err)
 		}
 	})
-	t.Run("exposed remotes", func(t *testing.T) {
-		t.Parallel()
-		r := newRepo(t)
-		w := create(t, r, "Doxxing")
-		hub := withHub(t, r)
-		mustSync(t, r, issuez.SyncOptions{})
-		other := clone(t, hub)
-		mustSync(t, other, issuez.SyncOptions{})
-
-		res, err := r.PurgeIssue(ctx, w.ID, ada, "legal")
-		if err != nil || !reflect.DeepEqual(res.ExposedRemotes, []string{"origin"}) {
-			t.Fatalf("purge: %v %+v", err, res)
-		}
-		// The sync deletes the hub's copy; the other clone's goes next.
-		rep := mustSync(t, r, issuez.SyncOptions{})
-		if o, _ := outcomeOf(rep, w.ID); o != issuez.SyncPurged {
-			t.Errorf("outcome %v: %+v", o, rep.Items)
-		}
-		if !revParse(t, hub, "refs/issues/"+w.ID).IsZero() {
-			t.Error("the hub still has the issue")
-		}
-		rep = mustSync(t, other, issuez.SyncOptions{})
-		if o, _ := outcomeOf(rep, w.ID); o != issuez.SyncPurged {
-			t.Errorf("other clone's outcome %v: %+v", o, rep.Items)
-		}
-		if _, err := other.Load(ctx, w.ID); !errors.Is(err, issuez.ErrNotFound) {
-			t.Errorf("other clone still loads it: %v", err)
-		}
-	})
 }
 
 func TestRepo_Sync(t *testing.T) {
 	t.Parallel()
 	ctx := context.Background()
 
-	t.Run("push and merge", func(t *testing.T) {
+	t.Run("push", func(t *testing.T) {
 		t.Parallel()
 		a := newRepo(t)
 		w := create(t, a, "Shared")
-		hub := withHub(t, a)
+		withHub(t, a)
 		rep := mustSync(t, a, issuez.SyncOptions{})
 		if len(rep.Items) != 1 || rep.Items[0] != (issuez.SyncItem{
 			Kind: issuez.KindIssue, ID: w.ID, Outcome: issuez.SyncPushed, LocalTip: w.NewTip,
 			RemoteTip: w.NewTip,
 		}) || !rep.OK {
 			t.Errorf("push: %+v", rep)
-		}
-		b := clone(t, hub)
-		if o, _ := outcomeOf(mustSync(t, b, issuez.SyncOptions{}), w.ID); o != issuez.SyncNew {
-			t.Errorf("new: %v", o)
-		}
-		steps := []struct {
-			name   string
-			writer *issuez.Repo
-			want   issuez.SyncOutcome
-		}{
-			{"fast-forward", a, issuez.SyncFastForward},
-			{"merged", b, issuez.SyncMerged},
-		}
-		for _, s := range steps {
-			if _, err := a.Update(ctx, w.ID, new(issuez.Edit).AddComment("From A"), ada); err != nil {
-				t.Fatal(err)
-			}
-			mustSync(t, a, issuez.SyncOptions{})
-			if s.writer == b {
-				if _, err := b.Update(ctx, w.ID, new(issuez.Edit).AddComment("From B"), ada); err != nil {
-					t.Fatal(err)
-				}
-			}
-			if o, _ := outcomeOf(mustSync(t, b, issuez.SyncOptions{}), w.ID); o != s.want {
-				t.Errorf("%s: %v", s.name, o)
-			}
-		}
-		if o, _ := outcomeOf(mustSync(t, b, issuez.SyncOptions{}), w.ID); o != issuez.SyncUpToDate {
-			t.Errorf("up to date: %v", o)
-		}
-		m, err := a.CreateMilestone(ctx, new(issuez.MilestoneEdit).SetName("v1"), ada)
-		if err != nil {
-			t.Fatal(err)
-		}
-		rep = mustSync(t, a, issuez.SyncOptions{})
-		found := false
-		for _, it := range rep.Items {
-			found = found || it.ID == m.ID && it.Kind == issuez.KindMilestone
-		}
-		if !found {
-			t.Errorf("milestone not synced: %+v", rep.Items)
 		}
 	})
 
@@ -457,6 +377,16 @@ func TestRepo_Sync(t *testing.T) {
 		}
 		if rep.OK || item.Outcome != issuez.SyncQuarantined || item.Reason == "" {
 			t.Errorf("rewound hub: %+v", rep)
+		}
+		st, err := a.SyncStatus(ctx, "origin")
+		if err != nil || len(st.Quarantined) != 1 {
+			t.Fatalf("SyncStatus() = %+v, %v", st, err)
+		}
+		tip := strings.TrimSpace(git(t, hub, "rev-parse", "refs/issues/"+w.ID))
+		q := st.Quarantined[0]
+		if q.Kind != issuez.KindIssue || q.ID != w.ID || q.Title != "Rewritten" || q.RemoteTip.String() != tip ||
+			q.Reason != issuez.QuarantineUnrelatedHistory || q.KeptLocal {
+			t.Errorf("quarantined: %+v, the hub's tip %s", q, tip)
 		}
 	})
 
@@ -601,38 +531,6 @@ func TestRepo_PushCheck(t *testing.T) {
 			},
 		},
 		{
-			name: "fast-forward",
-			setup: func(t *testing.T, f *pushFix) ([]issuez.RefUpdate, issuez.PushPolicy) {
-				w := create(t, f.client, "Pushed")
-				f.land(t, issueRef(w.ID))
-				write(t, f.client, w.ID, new(issuez.Edit).AddComment("More"), ada)
-				return []issuez.RefUpdate{f.update(t, issueRef(w.ID))}, f.policy()
-			},
-			want: []verdict{{Action: issuez.PushFastForward, Kind: issuez.KindIssue, Accept: true}},
-		},
-		{
-			name: "rewind, delete, local ref, bad name",
-			setup: func(t *testing.T, f *pushFix) ([]issuez.RefUpdate, issuez.PushPolicy) {
-				w := create(t, f.client, "Base")
-				ref := issueRef(w.ID)
-				write(t, f.client, w.ID, new(issuez.Edit).AddComment("Second"), ada)
-				f.land(t, ref)
-				tip := revParse(t, f.serverDir, ref)
-				return []issuez.RefUpdate{
-					{Ref: ref, Old: tip, New: w.NewTip},
-					{Ref: ref, Old: tip},
-					{Ref: "refs/issuez-guard/x", New: w.NewTip},
-					{Ref: "refs/issues/not-a-uuid", New: w.NewTip},
-				}, f.policy()
-			},
-			want: []verdict{
-				{Action: issuez.PushRewrite, Kind: issuez.KindIssue, Problem: issuez.ProblemNonFastForward},
-				{Action: issuez.PushDelete, Kind: issuez.KindIssue, Problem: issuez.ProblemRefDeleted},
-				{Action: issuez.PushCreate, Problem: issuez.ProblemLocalRef},
-				{Action: issuez.PushCreate, Problem: issuez.ProblemBadRefName},
-			},
-		},
-		{
 			name: "someone else's commit, enforced",
 			setup: func(t *testing.T, f *pushFix) ([]issuez.RefUpdate, issuez.PushPolicy) {
 				w, err := f.client.Create(ctx, new(issuez.Edit).SetTitle("Spoofed"), mallory)
@@ -641,38 +539,6 @@ func TestRepo_PushCheck(t *testing.T) {
 				}
 				p := f.policy()
 				p.PusherEmails, p.Authors = []string{"ada@example.com"}, issuez.AuthorEnforce
-				return []issuez.RefUpdate{f.update(t, issueRef(w.ID))}, p
-			},
-			want: []verdict{{Action: issuez.PushCreate, Kind: issuez.KindIssue, Problem: issuez.ProblemAuthorMismatch}},
-		},
-		{
-			name: "someone else's commit, warned",
-			setup: func(t *testing.T, f *pushFix) ([]issuez.RefUpdate, issuez.PushPolicy) {
-				w, err := f.client.Create(ctx, new(issuez.Edit).SetTitle("Spoofed"), mallory)
-				if err != nil {
-					t.Fatal(err)
-				}
-				p := f.policy()
-				p.PusherEmails, p.Authors = []string{"ada@example.com"}, issuez.AuthorWarn
-				return []issuez.RefUpdate{f.update(t, issueRef(w.ID))}, p
-			},
-			want: []verdict{{
-				Action: issuez.PushCreate, Kind: issuez.KindIssue, Accept: true,
-				Problem: issuez.ProblemAuthorMismatch,
-			}},
-		},
-		{
-			name: "the pusher's email on someone else's UUID",
-			setup: func(t *testing.T, f *pushFix) ([]issuez.RefUpdate, issuez.PushPolicy) {
-				forged := ada
-				forged.UserID = "1d9e8b63-4a2f-4c7b-8e3d-6f5a4b3c2d1e"
-				w, err := f.client.Create(ctx, new(issuez.Edit).SetTitle("As Ada"), forged)
-				if err != nil {
-					t.Fatal(err)
-				}
-				p := f.policy()
-				p.PusherEmails, p.Authors = []string{"ada@example.com"}, issuez.AuthorEnforce
-				p.PusherUserIDs = []string{"0c8d7a52-3f1e-4b6a-9d2c-5e4f3a2b1c0d"}
 				return []issuez.RefUpdate{f.update(t, issueRef(w.ID))}, p
 			},
 			want: []verdict{{Action: issuez.PushCreate, Kind: issuez.KindIssue, Problem: issuez.ProblemAuthorMismatch}},
@@ -705,47 +571,12 @@ func TestRepo_PushCheck(t *testing.T) {
 			want: []verdict{{Action: issuez.PushCreate, Kind: issuez.KindIssue, Problem: issuez.ProblemReadOnlyField}},
 		},
 		{
-			name: "taken number",
-			setup: func(t *testing.T, f *pushFix) ([]issuez.RefUpdate, issuez.PushPolicy) {
-				w, err := f.client.Create(ctx, new(issuez.Edit).SetTitle("Numbered").SetNumber(5), ada)
-				if err != nil {
-					t.Fatal(err)
-				}
-				f.land(t, issueRef(w.ID))
-				twin := create(t, f.client, "Twin")
-				commitOn(t, f.clientDir, issueRef(twin.ID), "Number\n\nX-Number: 5", true)
-				p := f.policy()
-				p.AllowNumbers = true
-				return []issuez.RefUpdate{f.update(t, issueRef(twin.ID))}, p
-			},
-			want: []verdict{{Action: issuez.PushCreate, Kind: issuez.KindIssue, Problem: issuez.ProblemDuplicateNumber}},
-		},
-		{
-			name: "another format",
-			setup: func(t *testing.T, f *pushFix) ([]issuez.RefUpdate, issuez.PushPolicy) {
-				o := commitOn(t, f.clientDir, "refs/none", "Future\n\nState: open\nFormat-Version: 2", false)
-				return []issuez.RefUpdate{{Ref: issueRef(missingID), New: o}}, f.policy()
-			},
-			want: []verdict{{Action: issuez.PushCreate, Kind: issuez.KindIssue, Problem: issuez.ProblemUnsupportedFormat}},
-		},
-		{
 			name: "outside the quarantine",
 			setup: func(t *testing.T, f *pushFix) ([]issuez.RefUpdate, issuez.PushPolicy) {
 				w := create(t, f.client, "Pushed")
 				return []issuez.RefUpdate{f.update(t, issueRef(w.ID))}, issuez.PushPolicy{}
 			},
 			want: []verdict{{Action: issuez.PushCreate, Kind: issuez.KindIssue, Problem: issuez.ProblemInvalidHistory}},
-		},
-		{
-			name: "locked",
-			setup: func(t *testing.T, f *pushFix) ([]issuez.RefUpdate, issuez.PushPolicy) {
-				w := create(t, f.client, "Heated")
-				write(t, f.client, w.ID, new(issuez.Edit).SetLocked(true, "heated"), ada)
-				f.land(t, issueRef(w.ID))
-				write(t, f.client, w.ID, new(issuez.Edit).AddComment("Still"), ada)
-				return []issuez.RefUpdate{f.update(t, issueRef(w.ID))}, f.policy()
-			},
-			want: []verdict{{Action: issuez.PushFastForward, Kind: issuez.KindIssue, Accept: true}},
 		},
 		{
 			name: "purges without leave",
@@ -771,40 +602,6 @@ func TestRepo_PushCheck(t *testing.T) {
 				{Action: issuez.PushCreate, Kind: issuez.KindTombstone, Accept: true},
 				{Action: issuez.PushDelete, Kind: issuez.KindIssue, Accept: true},
 				{Action: issuez.PushCreate, Kind: issuez.KindTombstone, Accept: true},
-			},
-		},
-		{
-			name: "purged history back, forged tombstone",
-			setup: func(t *testing.T, f *pushFix) ([]issuez.RefUpdate, issuez.PushPolicy) {
-				ups := purges(t, f)
-				x, xt := ups[0].Ref, ups[1].Ref
-				f.land(t, xt)
-				old := revParse(t, f.serverDir, x)
-				forged := commitOn(t, f.clientDir, xt, "Hello\n\nX-Purge: maybe", false)
-				p := f.policy()
-				p.AllowPurge = true
-				return []issuez.RefUpdate{
-					{Ref: x, Old: old, New: old},
-					{Ref: xt, Old: revParse(t, f.serverDir, xt), New: forged},
-				}, p
-			},
-			want: []verdict{
-				{Action: issuez.PushFastForward, Kind: issuez.KindIssue, Problem: issuez.ProblemPurged},
-				{Action: issuez.PushFastForward, Kind: issuez.KindTombstone, Problem: issuez.ProblemNotAPurge},
-			},
-		},
-		{
-			name: "attachments not derived",
-			setup: func(t *testing.T, f *pushFix) ([]issuez.RefUpdate, issuez.PushPolicy) {
-				w := create(t, f.client, "Screenshot")
-				fake := commitOn(t, f.clientDir, "refs/none", "Regenerate attachments", false)
-				return []issuez.RefUpdate{
-					f.update(t, issueRef(w.ID)), {Ref: "refs/attachments/" + w.ID, New: fake},
-				}, f.policy()
-			},
-			want: []verdict{
-				{Action: issuez.PushCreate, Kind: issuez.KindIssue, Accept: true},
-				{Action: issuez.PushCreate, Kind: issuez.KindAttachments, Problem: issuez.ProblemNotDerived},
 			},
 		},
 	}

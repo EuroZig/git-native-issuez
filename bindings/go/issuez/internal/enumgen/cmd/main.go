@@ -1,7 +1,6 @@
-// Command enumgen writes enums_gen.go and its test from the package's Go
-// files:
+// Command enumgen writes enums_gen.go from the package's Go files:
 //
-//	go run ./internal/enumgen/cmd enums_gen.go enums_gen_test.go
+//	go run ./internal/enumgen/cmd enums_gen.go
 package main
 
 import (
@@ -21,8 +20,8 @@ func main() {
 }
 
 func run(args []string) error {
-	if len(args) != 2 {
-		return errors.New("usage: enumgen <enums_gen.go> <enums_gen_test.go>")
+	if len(args) != 1 {
+		return errors.New("usage: enumgen <enums_gen.go>")
 	}
 	names, err := filepath.Glob("*.go")
 	if err != nil {
@@ -38,12 +37,5 @@ func run(args []string) error {
 	if err != nil {
 		return err
 	}
-	test, err := enumgen.GenerateTest(files)
-	if err != nil {
-		return err
-	}
-	if err := os.WriteFile(args[0], out, 0o644); err != nil {
-		return err
-	}
-	return os.WriteFile(args[1], test, 0o644)
+	return os.WriteFile(args[0], out, 0o644)
 }

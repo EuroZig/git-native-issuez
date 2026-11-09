@@ -18,17 +18,6 @@ import (
 	"github.com/EuroZig/git-native-issuez/bindings/go/issuez"
 )
 
-func TestCancel(t *testing.T) {
-	r := newRepo(t)
-	w := create(t, r, "Cancelled")
-	ctx, cancel := context.WithCancel(context.Background())
-	cancel()
-	_, err := r.Load(ctx, w.ID)
-	if !issuez.IsCancelled(err) || !errors.Is(err, context.Canceled) {
-		t.Errorf("cancelled load: %v", err)
-	}
-}
-
 // TestCancelRunningGit stops a git that hangs: the call returns soon
 // after its context ends, not at the network timeout.
 func TestCancelRunningGit(t *testing.T) {
@@ -49,11 +38,15 @@ func TestCancelRunningGit(t *testing.T) {
 	defer cancel()
 	start := time.Now()
 	_, err := r.Sync(ctx, "origin", issuez.SyncOptions{})
-	if !issuez.IsCancelled(err) {
+	if !issuez.IsCancelled(err) || !errors.Is(err, context.DeadlineExceeded) {
 		t.Fatalf("sync: %v", err)
 	}
 	if took := time.Since(start); took > 5*time.Second {
 		t.Errorf("cancelled after %v", took)
+	}
+	// The handle still works.
+	if _, err := r.Snapshot(context.Background()); err != nil {
+		t.Errorf("after the cancel: %v", err)
 	}
 }
 

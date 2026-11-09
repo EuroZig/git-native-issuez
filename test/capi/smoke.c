@@ -76,9 +76,10 @@ int main(int argc, char **argv) {
     if (ok(issuez_issue_create(repo, ops, ISSUEZ_COUNT(ops), &ada, NULL, &w, &err), err, "create")) {
         issuez_issue *issue = NULL;
         if (ok(issuez_write_load_issue(w, NULL, &issue, &err), err, "load")) {
-            CHECK(str_is(issuez_issue_title(issue), "From C"));
+            const issuez_issue_info *info = issuez_issue_info_of(issue);
+            CHECK(str_is(info->title, "From C"));
             CHECK(issuez_issue_has_label(issue, ISSUEZ_STR("c")));
-            CHECK(issuez_issue_state(issue) == ISSUEZ_STATE_OPEN);
+            CHECK(info->state == ISSUEZ_STATE_OPEN);
             issuez_issue_free(issue);
         }
         issuez_write_free(w);

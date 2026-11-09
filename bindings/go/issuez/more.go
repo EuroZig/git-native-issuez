@@ -31,70 +31,51 @@ type Milestone struct {
 }
 
 func goMilestone(m *C.issuez_milestone) *Milestone {
+	r := C.issuez_milestone_info_of(m)
 	out := &Milestone{
-		ID:          goStr(C.issuez_milestone_id(m)),
-		Tip:         goOID(C.issuez_milestone_tip(m)),
-		Name:        goStr(C.issuez_milestone_name(m)),
-		Description: goStr(C.issuez_milestone_description(m)),
-		Status:      MilestoneStatus(C.issuez_milestone_status_of(m)),
-		Created:     goTime(C.issuez_milestone_created(m)),
-		Updated:     goTime(C.issuez_milestone_updated(m)),
-		Author:      goPerson(C.issuez_milestone_author(m)),
+		ID:          goStr(r.id),
+		Tip:         goOID(r.tip),
+		Name:        goStr(r.name),
+		Description: goStr(r.description),
+		Status:      MilestoneStatus(r.status),
+		DueDate:     goOptDate(r.due_date),
+		Created:     goTime(r.created),
+		Updated:     goTime(r.updated),
+		Author:      goPerson(r.author),
 		Problems:    goProblems(C.issuez_milestone_problems(m)),
 	}
-	var at C.issuez_time
-	if C.issuez_milestone_status_changed(m, &at) {
-		t := goTime(at)
-		out.StatusChanged = &t
-	}
-	var d C.issuez_date
-	if C.issuez_milestone_due_date(m, &d) {
-		v := goDate(d)
-		out.DueDate = &v
+	if r.has_status_changed {
+		out.StatusChanged = new(goTime(r.status_changed))
 	}
 	return out
 }
 
+// takeMilestone copies and frees an owned milestone.
+func takeMilestone(m *C.issuez_milestone) *Milestone {
+	defer C.issuez_milestone_free(m)
+	return goMilestone(m)
+}
+
 // LoadMilestone reads one milestone by full UUID.
 func (r *Repo) LoadMilestone(ctx context.Context, id string) (*Milestone, error) {
-	var m *Milestone
-	err := r.use(func(c *C.issuez_repo) error {
-		var h *C.issuez_milestone
-		var cerr *C.issuez_error
-		rc := call(ctx, func(tok *C.issuez_cancel) C.issuez_code {
-			return C.issuez_milestone_load(c, cStr(id), tok, &h, &cerr)
-		})
-		if rc != C.ISSUEZ_OK {
-			return takeError(ctx, cerr)
-		}
-		defer C.issuez_milestone_free(h)
-		m = goMilestone(h)
-		return nil
-	})
-	return m, err
+	return fetch(ctx, r, func(a cArgs, m **C.issuez_milestone) C.issuez_code {
+		return C.issuez_milestone_load(a.repo, cStr(id), a.tok, m, a.cerr)
+	}, takeMilestone)
 }
 
 // Milestones lists every milestone: by due date, then name.
 func (r *Repo) Milestones(ctx context.Context) ([]*Milestone, error) {
-	var list []*Milestone
-	err := r.use(func(c *C.issuez_repo) error {
-		var l *C.issuez_milestone_list
-		var cerr *C.issuez_error
-		rc := call(ctx, func(tok *C.issuez_cancel) C.issuez_code {
-			return C.issuez_milestone_list_all(c, tok, &l, &cerr)
-		})
-		if rc != C.ISSUEZ_OK {
-			return takeError(ctx, cerr)
-		}
+	return fetch(ctx, r, func(a cArgs, l **C.issuez_milestone_list) C.issuez_code {
+		return C.issuez_milestone_list_all(a.repo, a.tok, l, a.cerr)
+	}, func(l *C.issuez_milestone_list) []*Milestone {
 		defer C.issuez_milestone_list_free(l)
 		n := C.issuez_milestone_list_len(l)
-		list = make([]*Milestone, 0, int(n))
+		list := make([]*Milestone, 0, int(n))
 		for i := C.size_t(0); i < n; i++ {
 			list = append(list, goMilestone(C.issuez_milestone_list_at(l, i)))
 		}
-		return nil
+		return list
 	})
-	return list, err
 }
 
 // ─── Projection ────────────────────────────────────────────────────────
@@ -120,7 +101,7 @@ type Projection struct {
 	Problems          []Problem
 }
 
-// ProjectionOptions shape Projection and OpenProjection.
+// ProjectionOptions shape Projection.
 type ProjectionOptions struct {
 	// Around is an issue's UUID: project only what its answers need (the
 	// issue, its ancestors, descendants and blockers). Cheaper, with the
@@ -131,25 +112,15 @@ type ProjectionOptions struct {
 
 // Projection is a copy of the projection, its handle freed at once.
 func (r *Repo) Projection(ctx context.Context, opts ProjectionOptions) (*Projection, error) {
-	var p *Projection
-	id := opts.Around
-	err := r.use(func(c *C.issuez_repo) error {
-		var h *C.issuez_projection
-		var cerr *C.issuez_error
-		rc := call(ctx, func(tok *C.issuez_cancel) C.issuez_code {
-			if id == "" {
-				return C.issuez_projection_build(c, tok, &h, &cerr)
-			}
-			return C.issuez_projection_around(c, cStr(id), tok, &h, &cerr)
-		})
-		if rc != C.ISSUEZ_OK {
-			return takeError(ctx, cerr)
+	return fetch(ctx, r, func(a cArgs, h **C.issuez_projection) C.issuez_code {
+		if opts.Around == "" {
+			return C.issuez_projection_build(a.repo, a.tok, h, a.cerr)
 		}
+		return C.issuez_projection_around(a.repo, cStr(opts.Around), a.tok, h, a.cerr)
+	}, func(h *C.issuez_projection) *Projection {
 		defer C.issuez_projection_free(h)
-		p = goProjection(h)
-		return nil
+		return goProjection(h)
 	})
-	return p, err
 }
 
 func goProjection(h *C.issuez_projection) *Projection {
@@ -234,7 +205,6 @@ type SyncOptions struct {
 
 // Sync fetches, merges and pushes issues and milestones with a remote.
 func (r *Repo) Sync(ctx context.Context, remote string, opts SyncOptions) (*SyncReport, error) {
-	var rep *SyncReport
 	var ops []op
 	if opts.NoPush {
 		ops = append(ops, op{verb: VerbSet, target: C.ISSUEZ_OPT_SYNC_PUSH, num: 0})
@@ -242,27 +212,20 @@ func (r *Repo) Sync(ctx context.Context, remote string, opts SyncOptions) (*Sync
 	if opts.NoAttachments {
 		ops = append(ops, op{verb: VerbSet, target: C.ISSUEZ_OPT_SYNC_ATTACHMENTS, num: 0})
 	}
-	err := r.use(func(c *C.issuez_repo) error {
-		var pin runtime.Pinner
-		defer pin.Unpin()
-		cops, n := cOps(&pin, ops)
-		var h *C.issuez_sync_report
-		var cerr *C.issuez_error
-		rc := call(ctx, func(tok *C.issuez_cancel) C.issuez_code {
-			return C.issuez_sync(c, cStr(remote), cops, n, tok, &h, &cerr)
-		})
-		if rc != C.ISSUEZ_OK {
-			return takeError(ctx, cerr)
-		}
+	var pin runtime.Pinner
+	defer pin.Unpin()
+	cops, n := cOps(&pin, ops)
+	return fetch(ctx, r, func(a cArgs, h **C.issuez_sync_report) C.issuez_code {
+		return C.issuez_sync(a.repo, cStr(remote), cops, n, a.tok, h, a.cerr)
+	}, func(h *C.issuez_sync_report) *SyncReport {
 		defer C.issuez_sync_report_free(h)
-		rep = &SyncReport{OK: bool(C.issuez_sync_report_ok(h))}
-		for i := C.size_t(0); i < C.issuez_sync_report_len(h); i++ {
-			it := C.issuez_sync_report_at(h, i)
-			rep.Items = append(rep.Items, goSyncItem(it))
+		return &SyncReport{
+			OK: bool(C.issuez_sync_report_ok(h)),
+			Items: goList(C.issuez_sync_report_len(h), func(i C.size_t) SyncItem {
+				return goSyncItem(C.issuez_sync_report_at(h, i))
+			}),
 		}
-		return nil
 	})
-	return rep, err
 }
 
 // ─── Purge ─────────────────────────────────────────────────────────────
@@ -283,43 +246,34 @@ type PurgeResult struct {
 // PurgeIssue removes the issue from history for good, leaving a tombstone
 // that syncs to the remotes and every clone.
 func (r *Repo) PurgeIssue(ctx context.Context, id string, actor Actor, reason string) (*PurgeResult, error) {
-	return r.purge(ctx, func(c *C.issuez_repo, pin *runtime.Pinner, tok *C.issuez_cancel, out **C.issuez_purge_result, cerr **C.issuez_error) C.issuez_code {
-		return C.issuez_purge_issue(c, cStr(id), pinActor(pin, actor), cStr(reason), tok, out, cerr)
-	})
+	var pin runtime.Pinner
+	defer pin.Unpin()
+	return fetch(ctx, r, func(a cArgs, h **C.issuez_purge_result) C.issuez_code {
+		return C.issuez_purge_issue(a.repo, cStr(id), pinActor(&pin, actor), cStr(reason), a.tok, h, a.cerr)
+	}, takePurgeResult)
 }
 
 // PurgeComment takes one comment's text, attachments and origin, and
 // rewrites the issue from there on: later commits get new IDs.
 func (r *Repo) PurgeComment(ctx context.Context, id string, comment OID, actor Actor, reason string) (*PurgeResult, error) {
-	return r.purge(ctx, func(c *C.issuez_repo, pin *runtime.Pinner, tok *C.issuez_cancel, out **C.issuez_purge_result, cerr **C.issuez_error) C.issuez_code {
-		return C.issuez_purge_comment(c, cStr(id), optOID(pin, comment), pinActor(pin, actor), cStr(reason), tok, out, cerr)
-	})
+	var pin runtime.Pinner
+	defer pin.Unpin()
+	return fetch(ctx, r, func(a cArgs, h **C.issuez_purge_result) C.issuez_code {
+		return C.issuez_purge_comment(a.repo, cStr(id), optOID(&pin, comment), pinActor(&pin, actor), cStr(reason), a.tok, h, a.cerr)
+	}, takePurgeResult)
 }
 
-func (r *Repo) purge(ctx context.Context, f func(*C.issuez_repo, *runtime.Pinner, *C.issuez_cancel, **C.issuez_purge_result, **C.issuez_error) C.issuez_code) (*PurgeResult, error) {
-	var res *PurgeResult
-	err := r.use(func(c *C.issuez_repo) error {
-		var pin runtime.Pinner
-		defer pin.Unpin()
-		var h *C.issuez_purge_result
-		var cerr *C.issuez_error
-		rc := call(ctx, func(tok *C.issuez_cancel) C.issuez_code { return f(c, &pin, tok, &h, &cerr) })
-		if rc != C.ISSUEZ_OK {
-			return takeError(ctx, cerr)
-		}
-		defer C.issuez_purge_result_free(h)
-		res = &PurgeResult{
-			NewTip: goOID(C.issuez_purge_result_new_tip(h)),
-			ExposedRemotes: goStrs(C.issuez_purge_result_exposed_remote_count(h), func(i C.size_t) C.issuez_str {
-				return C.issuez_purge_result_exposed_remote_at(h, i)
-			}),
-			RemovedAttachments: goStrs(C.issuez_purge_result_attachment_count(h), func(i C.size_t) C.issuez_str {
-				return C.issuez_purge_result_attachment_at(h, i)
-			}),
-		}
-		return nil
-	})
-	return res, err
+func takePurgeResult(h *C.issuez_purge_result) *PurgeResult {
+	defer C.issuez_purge_result_free(h)
+	return &PurgeResult{
+		NewTip: goOID(C.issuez_purge_result_new_tip(h)),
+		ExposedRemotes: goStrs(C.issuez_purge_result_exposed_remote_count(h), func(i C.size_t) C.issuez_str {
+			return C.issuez_purge_result_exposed_remote_at(h, i)
+		}),
+		RemovedAttachments: goStrs(C.issuez_purge_result_attachment_count(h), func(i C.size_t) C.issuez_str {
+			return C.issuez_purge_result_attachment_at(h, i)
+		}),
+	}
 }
 
 // ─── Push check ────────────────────────────────────────────────────────
@@ -432,45 +386,40 @@ func (r *Repo) PushCheck(ctx context.Context, updates []RefUpdate, policy PushPo
 			pin.Pin(&list[0])
 			cups = &list[0]
 		}
-		var h *C.issuez_push_verdicts
-		var cerr *C.issuez_error
-		rc := call(ctx, func(tok *C.issuez_cancel) C.issuez_code {
-			return C.issuez_push_check(c, cups, C.size_t(len(updates)), cops, n, tok, &h, &cerr)
+		// A rejected push has verdicts too.
+		h, err := invoke(ctx, c, func(a cArgs, h **C.issuez_push_verdicts) C.issuez_code {
+			return C.issuez_push_check(a.repo, cups, C.size_t(len(updates)), cops, n, a.tok, h, a.cerr)
 		})
 		if h != nil {
 			defer C.issuez_push_verdicts_free(h)
-			for i := C.size_t(0); i < C.issuez_push_verdicts_len(h); i++ {
-				v := C.issuez_push_verdicts_at(h, i)
-				out := PushVerdict{
-					Ref:           goStr(v.ref),
-					Kind:          Kind(v.kind),
-					ID:            goStr(v.id),
-					Action:        PushAction(v.action),
-					Accept:        bool(v.accept),
-					Problems:      goProblems(v.problems),
-					NeedsNumber:   bool(v.needs_number),
-					TouchesLocked: bool(v.touches_locked),
-					CommitCount:   int(v.commit_count),
-				}
-				for k := C.size_t(0); k < v.entry_count; k++ {
-					out.Entries = append(out.Entries, goEntry(C.issuez_push_verdict_entry_at(v, k)))
-				}
-				if v.issue_author != nil {
-					p := goPerson(v.issue_author)
-					out.IssueAuthor = &p
-				}
-				for k := C.size_t(0); k < v.attachment_count; k++ {
-					out.Attachments = append(out.Attachments, goAttachment(C.issuez_push_verdict_attachment_at(v, k)))
-				}
-				verdicts = append(verdicts, out)
-			}
+			verdicts = goList(C.issuez_push_verdicts_len(h), func(i C.size_t) PushVerdict {
+				return goPushVerdict(C.issuez_push_verdicts_at(h, i))
+			})
 		}
-		if rc != C.ISSUEZ_OK {
-			return takeError(ctx, cerr)
-		}
-		return nil
+		return err
 	})
 	return verdicts, err
+}
+
+func goPushVerdict(v *C.issuez_push_verdict) PushVerdict {
+	return PushVerdict{
+		Ref:           goStr(v.ref),
+		Kind:          Kind(v.kind),
+		ID:            goStr(v.id),
+		Action:        PushAction(v.action),
+		Accept:        bool(v.accept),
+		Problems:      goProblems(v.problems),
+		NeedsNumber:   bool(v.needs_number),
+		TouchesLocked: bool(v.touches_locked),
+		CommitCount:   int(v.commit_count),
+		Entries: goList(v.entry_count, func(k C.size_t) Entry {
+			return goEntry(C.issuez_push_verdict_entry_at(v, k))
+		}),
+		IssueAuthor: goOptPerson(v.issue_author),
+		Attachments: goList(v.attachment_count, func(k C.size_t) Attachment {
+			return goAttachment(C.issuez_push_verdict_attachment_at(v, k))
+		}),
+	}
 }
 
 // ─── Sync status and search ────────────────────────────────────────────
@@ -495,27 +444,19 @@ type SyncStatus struct {
 
 // SyncStatus says what is quarantined from remote and not pushed to it.
 func (r *Repo) SyncStatus(ctx context.Context, remote string) (*SyncStatus, error) {
-	var st *SyncStatus
-	err := r.use(func(c *C.issuez_repo) error {
-		var h *C.issuez_sync_status
-		var cerr *C.issuez_error
-		if rc := call(ctx, func(tok *C.issuez_cancel) C.issuez_code {
-			return C.issuez_sync_status_take(c, cStr(remote), tok, &h, &cerr)
-		}); rc != C.ISSUEZ_OK {
-			return takeError(ctx, cerr)
-		}
+	return fetch(ctx, r, func(a cArgs, h **C.issuez_sync_status) C.issuez_code {
+		return C.issuez_sync_status_take(a.repo, cStr(remote), a.tok, h, a.cerr)
+	}, func(h *C.issuez_sync_status) *SyncStatus {
 		defer C.issuez_sync_status_free(h)
-		st = &SyncStatus{}
-		for i := C.size_t(0); i < C.issuez_sync_status_quarantined_count(h); i++ {
-			q := C.issuez_sync_status_quarantined_at(h, i)
-			st.Quarantined = append(st.Quarantined, goQuarantined(q))
+		return &SyncStatus{
+			Quarantined: goList(C.issuez_sync_status_quarantined_count(h), func(i C.size_t) Quarantined {
+				return goQuarantined(C.issuez_sync_status_quarantined_at(h, i))
+			}),
+			Pending: goStrs(C.issuez_sync_status_pending_count(h), func(i C.size_t) C.issuez_str {
+				return C.issuez_sync_status_pending_at(h, i)
+			}),
 		}
-		st.Pending = goStrs(C.issuez_sync_status_pending_count(h), func(i C.size_t) C.issuez_str {
-			return C.issuez_sync_status_pending_at(h, i)
-		})
-		return nil
 	})
-	return st, err
 }
 
 // SearchOptions shape Search.
@@ -526,23 +467,14 @@ type SearchOptions struct {
 // Search finds the lines of what each live issue says now (title, fields,
 // description, comments) that contain needle, as git issue search does.
 func (r *Repo) Search(ctx context.Context, needle string, opts SearchOptions) ([]SearchHit, error) {
-	var hits []SearchHit
-	err := r.use(func(c *C.issuez_repo) error {
-		var h *C.issuez_search_hits
-		var cerr *C.issuez_error
-		if rc := call(ctx, func(tok *C.issuez_cancel) C.issuez_code {
-			return C.issuez_search(c, cStr(needle), flagIf(opts.IgnoreCase, C.ISSUEZ_SEARCH_FLAG_IGNORE_CASE), tok, &h, &cerr)
-		}); rc != C.ISSUEZ_OK {
-			return takeError(ctx, cerr)
-		}
+	return fetch(ctx, r, func(a cArgs, h **C.issuez_search_hits) C.issuez_code {
+		return C.issuez_search(a.repo, cStr(needle), flagIf(opts.IgnoreCase, C.ISSUEZ_SEARCH_FLAG_IGNORE_CASE), a.tok, h, a.cerr)
+	}, func(h *C.issuez_search_hits) []SearchHit {
 		defer C.issuez_search_hits_free(h)
-		for i := C.size_t(0); i < C.issuez_search_hits_len(h); i++ {
-			x := C.issuez_search_hits_at(h, i)
-			hits = append(hits, goSearchHit(x))
-		}
-		return nil
+		return goList(C.issuez_search_hits_len(h), func(i C.size_t) SearchHit {
+			return goSearchHit(C.issuez_search_hits_at(h, i))
+		})
 	})
-	return hits, err
 }
 
 // ─── Remote setup ──────────────────────────────────────────────────────
@@ -569,37 +501,20 @@ type RemoteSetup struct {
 // issue init picks them: the only remote, else origin, else every remote;
 // none when the repository has none.
 func (r *Repo) DefaultRemotes(ctx context.Context) ([]string, error) {
-	var names []string
-	err := r.use(func(c *C.issuez_repo) error {
-		var m *C.issuez_matches
-		var cerr *C.issuez_error
-		if rc := call(ctx, func(tok *C.issuez_cancel) C.issuez_code { return C.issuez_remote_default(c, tok, &m, &cerr) }); rc != C.ISSUEZ_OK {
-			return takeError(ctx, cerr)
-		}
-		defer C.issuez_matches_free(m)
-		names = goStrs(C.issuez_matches_len(m), func(i C.size_t) C.issuez_str { return C.issuez_matches_at(m, i) })
-		return nil
-	})
-	return names, err
+	return fetch(ctx, r, func(a cArgs, m **C.issuez_matches) C.issuez_code {
+		return C.issuez_remote_default(a.repo, a.tok, m, a.cerr)
+	}, takeMatches)
 }
 
 // ConfigureRemote adds the fetch refspecs that bring remote's issues,
 // milestones and attachment refs into refs/remotes/<remote>/, as git issue
 // init does; idempotent. Sync works without it.
 func (r *Repo) ConfigureRemote(ctx context.Context, remote string, opts RemoteOptions) (RemoteSetup, error) {
-	var setup RemoteSetup
-	err := r.use(func(c *C.issuez_repo) error {
-		var out C.issuez_remote_setup
-		var cerr *C.issuez_error
-		if rc := call(ctx, func(tok *C.issuez_cancel) C.issuez_code {
-			return C.issuez_remote_configure(c, cStr(remote), flagIf(opts.FixUnsafe, C.ISSUEZ_REMOTE_FLAG_FIX_UNSAFE), tok, &out, &cerr)
-		}); rc != C.ISSUEZ_OK {
-			return takeError(ctx, cerr)
-		}
-		setup = RemoteSetup{Configured: bool(out.configured), RemovedUnsafe: bool(out.removed_unsafe), Unsafe: bool(out.unsafe)}
-		return nil
+	return fetch(ctx, r, func(a cArgs, out *C.issuez_remote_setup) C.issuez_code {
+		return C.issuez_remote_configure(a.repo, cStr(remote), flagIf(opts.FixUnsafe, C.ISSUEZ_REMOTE_FLAG_FIX_UNSAFE), a.tok, out, a.cerr)
+	}, func(out C.issuez_remote_setup) RemoteSetup {
+		return RemoteSetup{Configured: bool(out.configured), RemovedUnsafe: bool(out.removed_unsafe), Unsafe: bool(out.unsafe)}
 	})
-	return setup, err
 }
 
 // ─── Fsck ──────────────────────────────────────────────────────────────
@@ -637,51 +552,30 @@ type FsckOptions struct {
 
 // Fsck checks the issue data as git issue fsck does.
 func (r *Repo) Fsck(ctx context.Context, opts FsckOptions) (*FsckReport, error) {
-	var rep *FsckReport
-	err := r.use(func(c *C.issuez_repo) error {
-		var h *C.issuez_fsck_report
-		var cerr *C.issuez_error
-		if rc := call(ctx, func(tok *C.issuez_cancel) C.issuez_code {
-			return C.issuez_fsck(c, flagIf(opts.Repair, C.ISSUEZ_FSCK_FLAG_REPAIR), tok, &h, &cerr)
-		}); rc != C.ISSUEZ_OK {
-			return takeError(ctx, cerr)
-		}
+	return fetch(ctx, r, func(a cArgs, h **C.issuez_fsck_report) C.issuez_code {
+		return C.issuez_fsck(a.repo, flagIf(opts.Repair, C.ISSUEZ_FSCK_FLAG_REPAIR), a.tok, h, a.cerr)
+	}, func(h *C.issuez_fsck_report) *FsckReport {
 		defer C.issuez_fsck_report_free(h)
-		rep = &FsckReport{
+		return &FsckReport{
 			Issues:     int(C.issuez_fsck_report_issue_count(h)),
 			Milestones: int(C.issuez_fsck_report_milestone_count(h)),
 			Errors:     int(C.issuez_fsck_report_error_count(h)),
+			Findings: goList(C.issuez_fsck_report_len(h), func(i C.size_t) FsckFinding {
+				return goFsckFinding(C.issuez_fsck_report_at(h, i))
+			}),
 		}
-		for i := C.size_t(0); i < C.issuez_fsck_report_len(h); i++ {
-			f := C.issuez_fsck_report_at(h, i)
-			rep.Findings = append(rep.Findings, goFsckFinding(f))
-		}
-		return nil
 	})
-	return rep, err
 }
 
 // LoadMilestoneAt reads the milestone at an exact, nonzero historical tip.
 func (r *Repo) LoadMilestoneAt(ctx context.Context, id string, tip OID) (*Milestone, error) {
-	var m *Milestone
 	if tip.IsZero() {
 		return nil, &Error{Code: CodeInvalidArgument, Message: "tip is zero"}
 	}
-	err := r.use(func(c *C.issuez_repo) error {
-		var pin runtime.Pinner
-		defer pin.Unpin()
-		var out *C.issuez_milestone
-		var cerr *C.issuez_error
-		ct := optOID(&pin, tip)
-		rc := call(ctx, func(tok *C.issuez_cancel) C.issuez_code {
-			return C.issuez_milestone_load_at(c, cStr(id), ct, tok, &out, &cerr)
-		})
-		if rc != C.ISSUEZ_OK {
-			return takeError(ctx, cerr)
-		}
-		defer C.issuez_milestone_free(out)
-		m = goMilestone(out)
-		return nil
-	})
-	return m, err
+	var pin runtime.Pinner
+	defer pin.Unpin()
+	ct := optOID(&pin, tip)
+	return fetch(ctx, r, func(a cArgs, m **C.issuez_milestone) C.issuez_code {
+		return C.issuez_milestone_load_at(a.repo, cStr(id), ct, a.tok, m, a.cerr)
+	}, takeMilestone)
 }

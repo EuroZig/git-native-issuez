@@ -13,7 +13,8 @@ import (
 )
 
 // TestEveryExportedSymbolHasATest: every exported function F and method
-// T.M has a TestF / TestT_M or an ExampleF / ExampleT_M.
+// T.M has a TestF / TestT_M or an ExampleF / ExampleT_M, or a test with a
+// `// covers: T_M, F` line right above it that calls it.
 // testdata/untested.txt lists those still
 // waiting; a name both listed and tested fails too, so the list only
 // shrinks.
@@ -26,7 +27,7 @@ func TestEveryExportedSymbolHasATest(t *testing.T) {
 	var exported []string
 	tests := map[string]bool{}
 	for _, f := range files {
-		file, err := parser.ParseFile(fset, f, nil, 0)
+		file, err := parser.ParseFile(fset, f, nil, parser.ParseComments)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -40,6 +41,9 @@ func TestEveryExportedSymbolHasATest(t *testing.T) {
 			if testFile {
 				if strings.HasPrefix(name, "Test") || strings.HasPrefix(name, "Example") {
 					tests[name] = true
+					for _, c := range coveredBy(t, fn) {
+						tests["Test"+c] = true
+					}
 				}
 				continue
 			}
@@ -75,6 +79,33 @@ func TestEveryExportedSymbolHasATest(t *testing.T) {
 	for _, name := range stale {
 		t.Errorf("%s has a test: take it off testdata/untested.txt", name)
 	}
+}
+
+// coveredBy is what fn's `// covers:` lines name; a name fn doesn't call
+// fails the test.
+func coveredBy(t *testing.T, fn *ast.FuncDecl) []string {
+	t.Helper()
+	var names []string
+	if fn.Doc != nil {
+		for _, c := range fn.Doc.List {
+			if list, ok := strings.CutPrefix(c.Text, "// covers: "); ok {
+				names = append(names, strings.Split(list, ", ")...)
+			}
+		}
+	}
+	called := map[string]bool{}
+	ast.Inspect(fn, func(n ast.Node) bool {
+		if id, ok := n.(*ast.Ident); ok {
+			called[id.Name] = true
+		}
+		return true
+	})
+	for _, name := range names {
+		if !called[name[strings.LastIndex(name, "_")+1:]] {
+			t.Errorf("%s covers %s but doesn't call it", fn.Name.Name, name)
+		}
+	}
+	return names
 }
 
 func receiverName(e ast.Expr) string {

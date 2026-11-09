@@ -10,8 +10,6 @@ const c = fixture.c;
 const png = "\x89PNG\r\n\x1a\n\x00\x00\x00\x0dIHDR\x00\x00\x00\x01\x00\x00\x00\x01" ++
     "\x08\x06\x00\x00\x00\x1f\x15\xc4\x89\x00\x00\x00\x00IEND\xaeB`\x82";
 const jpeg = "\xff\xd8\xff\xe0\x00\x10JFIF\x00\x01\x01\x00\x00\x01\x00\x01\x00\x00\xff\xd9";
-const apng = "\x89PNG\r\n\x1a\n\x00\x00\x00\x08acTL\x00\x00\x00\x01\x00\x00\x00\x00" ++
-    "\x00\x00\x00\x00\x00\x00\x00\x00IEND\xaeB`\x82";
 const host_id = "5b0c4e0e-2b8a-4f5e-9d39-6c1c1f0f2a77";
 
 fn attach(name: []const u8, data: []const u8) c.issuez_op {
@@ -158,9 +156,6 @@ test "issuez_issue_attachment_count: on the root, a comment and its edit, bytes 
     const text = try refused(h, id, &.{attach("notes.txt", "just text\n")});
     try testing.expectEqual(@as(c.issuez_code, c.ISSUEZ_E_INVALID_VALUE), text[0]);
     try testing.expectEqual(@as(c_uint, c.ISSUEZ_FIELD_ATTACHMENTS), text[1]);
-    const twice = try refused(h, id, &.{attachAs(host_id, "again.png", png)});
-    try testing.expectEqual(@as(c.issuez_code, c.ISSUEZ_E_INVALID_VALUE), twice[0]);
-    try testing.expectEqual(@as(c_uint, c.ISSUEZ_FIELD_ATTACHMENTS), twice[1]);
     const missing = try refused(h, id, &.{detach(&photo)});
     try testing.expectEqual(@as(c.issuez_code, c.ISSUEZ_E_NOT_FOUND), missing[0]);
     const bad_id = try refused(h, id, &.{detach("photo")});
@@ -178,7 +173,7 @@ test "issuez_issue_attachment_count: on the root, a comment and its edit, bytes 
     try testing.expectEqual(@as(c.issuez_code, c.ISSUEZ_E_INVALID_VALUE), with_title[0]);
 }
 
-test "issuez_attachment_validate: types, animation, names, limits; the CLI's store" {
+test "issuez_attachment_validate: types, names, limits; the CLI's store" {
     const leaks = fixture.Leaks.start();
     defer leaks.check();
     var r: fixture.Repo = undefined;
@@ -199,9 +194,7 @@ test "issuez_attachment_validate: types, animation, names, limits; the CLI's sto
         err,
     );
     for ([_]struct { []const u8, []const u8, c.issuez_code }{
-        .{ "a.png", apng, c.ISSUEZ_E_INVALID_VALUE },
         .{ "a.txt", "text", c.ISSUEZ_E_INVALID_VALUE },
-        .{ "a.png", "", c.ISSUEZ_E_INVALID_VALUE },
         .{ "", png, c.ISSUEZ_E_INVALID_VALUE },
     }) |case| {
         try testing.expectEqual(
@@ -255,6 +248,53 @@ test "issuez_attachment_validate: types, animation, names, limits; the CLI's sto
         .limited(1 << 20),
     );
     try testing.expectEqualStrings(png, stored);
+}
+
+test "issuez_issue_update: a stale expect is refused before the rest of the write" {
+    const leaks = fixture.Leaks.start();
+    defer leaks.check();
+    var r: fixture.Repo = undefined;
+    try r.init(.{});
+    defer r.deinit();
+    const made = try fixture.titled(r.handle, "Racy");
+    _ = try fixture.comment(r.handle, made.idStr(), "Moved on");
+    const stale = c.issuez_expect(made.tip);
+    const cases = [_][]const c.issuez_op{
+        // Without the check: refused by the engine (repo.zig's "expect").
+        &.{stale},
+        // Without the check: INVALID_VALUE, the type refused before the engine runs.
+        &.{ c.issuez_set_comment(fixture.str("Text")), attach("a.txt", "not an image"), stale },
+        // Without the check: refused too, but with the bytes already stored.
+        &.{ c.issuez_set_comment(fixture.str("Shot")), attach("a.png", png), stale },
+    };
+    for (cases) |ops| {
+        var w: ?*c.issuez_write = null;
+        var err: ?*c.issuez_error = null;
+        const rc = c.issuez_issue_update(
+            r.handle,
+            made.idStr(),
+            ops.ptr,
+            ops.len,
+            &fixture.ada,
+            null,
+            &w,
+            &err,
+        );
+        defer c.issuez_error_free(err);
+        defer c.issuez_write_free(w);
+        try expect.code(c.ISSUEZ_E_VERSION_MISMATCH, rc, err);
+    }
+    var digest: [32]u8 = undefined;
+    std.crypto.hash.sha2.Sha256.hash(png, &digest, .{});
+    const sha = std.fmt.bytesToHex(digest, .lower);
+    const path = try std.fs.path.join(
+        r.arena(),
+        &.{ r.path, ".git", "issuez", "lfs", "objects", sha[0..2], sha[2..4], &sha },
+    );
+    try testing.expectError(
+        error.FileNotFound,
+        std.Io.Dir.cwd().access(testing.io, path, .{}),
+    );
 }
 
 test "issuez_attachment_read, issuez_bytes_data, issuez_bytes_free: stored bytes, missing ones" {

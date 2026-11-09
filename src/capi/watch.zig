@@ -42,7 +42,7 @@ pub fn issuez_watch_start(
     const dir = r.git_dir.slice();
     if (!std.fs.path.isAbsolute(dir))
         return rt.fail(err, .e_unsupported, "the git dir isn't an absolute path", .{});
-    const w = rt.gpa.create(WatchObj) catch return rt.fail(err, .e_nomem, "out of memory", .{});
+    const w = rt.gpa.create(WatchObj) catch return rt.oom(err);
     w.* = .{ .watcher = undefined, .repo = r, .cb = callback, .userdata = userdata };
     w.watcher.init(
         rt.io(),

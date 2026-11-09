@@ -66,28 +66,3 @@ func TestCommonPrefix(t *testing.T) {
 		}
 	}
 }
-
-func TestGenerateTest(t *testing.T) {
-	src := map[string][]byte{"a.go": []byte(`package issuez
-
-type Mode uint32
-
-const (
-	ModeFastForward Mode = 1
-	ModeIDLookup    Mode = 2
-)
-`)}
-	out, err := GenerateTest(src)
-	if err != nil {
-		t.Fatal(err)
-	}
-	s := string(out)
-	for _, want := range []string{`func TestEnumStrings(`, `{ModeFastForward, "fast_forward"}`, `{ModeIDLookup, "id_lookup"}`} {
-		if !strings.Contains(s, want) {
-			t.Errorf("missing %s in:\n%s", want, s)
-		}
-	}
-	if _, err := GenerateTest(map[string][]byte{"b.go": []byte("package issuez\n")}); err == nil {
-		t.Error("no enums: no error")
-	}
-}

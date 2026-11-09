@@ -21,20 +21,18 @@ const (
 		t.Fatal(err)
 	}
 	t.Chdir(dir)
-	if err := run([]string{"enums_gen.go", "enums_gen_test.go"}); err != nil {
+	if err := run([]string{"enums_gen.go"}); err != nil {
 		t.Fatal(err)
 	}
-	for _, f := range []string{"enums_gen.go", "enums_gen_test.go"} {
-		if _, err := os.Stat(f); err != nil {
-			t.Fatal(err)
-		}
+	if _, err := os.Stat("enums_gen.go"); err != nil {
+		t.Fatal(err)
 	}
 	if run(nil) == nil {
 		t.Error("no arguments: no error")
 	}
 	empty := t.TempDir()
 	t.Chdir(empty)
-	if run([]string{"x.go", "y.go"}) == nil {
+	if run([]string{"x.go"}) == nil {
 		t.Error("no enums: no error")
 	}
 }

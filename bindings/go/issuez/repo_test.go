@@ -2,6 +2,7 @@ package issuez_test
 
 import (
 	"bytes"
+	"context"
 	"errors"
 	"maps"
 	"os"
@@ -293,8 +294,10 @@ func TestWithNetworkTimeout(t *testing.T) {
 	r := open(t, dir, issuez.WithGit(slow), issuez.WithNetworkTimeout(200*time.Millisecond))
 	start := time.Now()
 	_, err := r.Sync(t.Context(), "origin", issuez.SyncOptions{})
+	// The library's deadline: cancelled, but not by a context.
 	var e *issuez.Error
-	if !errors.As(err, &e) || e.Code != issuez.CodeTimeout {
+	if !errors.As(err, &e) || e.Code != issuez.CodeTimeout || !issuez.IsCancelled(err) ||
+		errors.Is(err, context.DeadlineExceeded) {
 		t.Fatalf("sync: %v", err)
 	}
 	if time.Since(start) > 5*time.Second {

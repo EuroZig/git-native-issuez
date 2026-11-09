@@ -50,7 +50,7 @@ the on-disk format only grew.
 - Go: end-to-end tests (`bindings/go/issuez/e2e`, build tag `e2e`) of the
   binding as a host uses it, against the CLI as clients do: indexing
   pushes, a pre-receive hook in Go, numbers, purges, attachments,
-  concurrent writes, cancellation and upstream's issues.
+  concurrent writes and upstream's issues.
   `zig build test-go-e2e` runs them, `zig build test-bindings` every C API
   and Go test.
 - Go: fuzz tests for `ParseOID`, `Snapshot.UnmarshalBinary` and
@@ -171,7 +171,9 @@ the on-disk format only grew.
   (`src/capi/api.zig`), and `docs/issuez-api.json` for binding generators.
   Op lists instead of builders, typed problems that point at the op they
   came from, cancel tokens, a thread-safe repo with a pool of git sessions.
-  Parts not built yet fail with `ISSUEZ_E_UNSUPPORTED`.
+  An issue's and a milestone's single values come as one record
+  (`issuez_issue_info_of`, `issuez_milestone_info_of`) that grows only at
+  the end; lists and lookups have their own calls.
 - A Go binding, `bindings/go` (cgo, Go 1.26): results copied into Go
   values, contexts for cancellation, `issuez.Edit` and `issuez.Query`
   values for writes and queries. `zig build go-libs`, `test-go`. Each release
@@ -198,7 +200,7 @@ the on-disk format only grew.
   new since a tip a host saw (`issuez_entry.is_new`), by reachability, so
   commits merged in from a clone count even when they sort before it; a
   tip outside the history (a purge rewrote it) sets
-  `issuez_issue_rewritten`. In Go, the load option `Since(tip)`,
+  `issuez_issue_info.rewritten`. In Go, the load option `Since(tip)`,
   `Entry.New`, `Issue.Rewritten` and `Issue.NewEntries`.
 - `issuez_repo_limit` (Go `Repo.Limit`), a limit's effective value, so a
   host checks sizes against the library's limits without restating them;
@@ -219,8 +221,7 @@ the on-disk format only grew.
   other changes to the issue don't touch.
 - Milestones say when they were last changed, when their status was
   set (a completed one's closing time) and who created them
-  (`issuez_milestone_updated`, `issuez_milestone_status_changed`,
-  `issuez_milestone_author`; Go `Milestone.Updated`, `StatusChanged`,
+  (`updated`, `status_changed` and `author` of `issuez_milestone_info`; Go `Milestone.Updated`, `StatusChanged`,
   `Author`; in the library `Milestone.updated`, `status_changed`,
   `author`, `author_id`).
 - Purge results list the attachments the purge took out of history
@@ -300,8 +301,6 @@ the on-disk format only grew.
   `issuez_remove_reaction`, `issuez_reaction_target`), so every write
   to an issue goes through `issuez_issue_update`. Go `Edit.DeleteComment`,
   `Edit.RestoreComment`, `Edit.React`.
-- C API: a comment's reactions from its record,
-  `issuez_comment_reaction_count` and `issuez_comment_reaction_at`.
 - An issue as the documented JSON from the C API (`issuez_issue_json`,
   `issuez_issue_json_many`) and Go (`Repo.LoadJSON`, `Repo.LoadManyJSON`): one
   call for bindings that would rather parse JSON than call every
@@ -331,10 +330,6 @@ the on-disk format only grew.
   the library, a repository opened with its settings and every part over
   it (`milestones`, `sync`, `attachments`, `purge`, `pushCheck`, `fsck`,
   `store`, `configureRemote`). `Sync.fromRepo` keeps a repo's settings.
-- Go: `Repo.OpenProjection` and `ProjectionView` (`Roots`, `Children`,
-  `ActiveBlockers`, `Blocking`, `Progress`, `MilestoneOf`,
-  `MilestoneProgress`), the projection read as asked instead of copied
-  whole as `Projection` does.
 - `closed` in issue JSON (`ls`, `show`, `tree`, `search --json`,
   `issuez_issue_json`, MCP issues): who closed a done issue, when, and
   the commit (`issuez.view.closure`); `null` while it is open.

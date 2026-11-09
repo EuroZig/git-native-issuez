@@ -127,6 +127,29 @@ pub const NaiveMilestone = struct {
     status: []const u8,
 };
 
+pub const Walk = struct {
+    clone: Clone,
+    /// Every ID met so far, missing commits too.
+    seen: std.StringHashMapUnmanaged(void) = .empty,
+    stack: std.ArrayList([]const u8) = .empty,
+    /// One of them wasn't there, or isn't a commit.
+    missing: bool = false,
+
+    pub fn next(w: *Walk) Allocator.Error!?struct { hex: []const u8, commit: object.Commit } {
+        const arena = w.clone.arena;
+        while (w.stack.pop()) |hex| {
+            if ((try w.seen.getOrPut(arena, hex)).found_existing) continue;
+            const cm = w.clone.commit(hex) orelse {
+                w.missing = true;
+                continue;
+            };
+            for (cm.parents) |p| try w.stack.append(arena, try p.hexAlloc(arena));
+            return .{ .hex = hex, .commit = cm };
+        }
+        return null;
+    }
+};
+
 pub const Clone = struct {
     arena: Allocator,
     format: object.ObjectFormat,
@@ -155,6 +178,27 @@ pub const Clone = struct {
         const o = c.objects.get(hex) orelse return null;
         if (o.kind != .commit) return null;
         return object.Commit.parse(c.arena, c.format, o.data) catch null;
+    }
+
+    /// A commit ID in this repository's format, lowercase.
+    pub fn isFullHex(c: Clone, s: []const u8) bool {
+        if (s.len != c.format.hexLen()) return false;
+        for (s) |ch| if (!std.ascii.isDigit(ch) and !(ch >= 'a' and ch <= 'f')) return false;
+        return true;
+    }
+
+    /// The commits reachable from `tip`, each once, as far as the objects go.
+    pub fn walk(c: Clone, tip: []const u8) Allocator.Error!Walk {
+        var w: Walk = .{ .clone = c };
+        try w.stack.append(c.arena, tip);
+        return w;
+    }
+
+    /// What `walk` meets from `tip`, missing commits too.
+    pub fn reach(c: Clone, tip: []const u8) Allocator.Error!std.StringHashMapUnmanaged(void) {
+        var w = try c.walk(tip);
+        while (try w.next()) |_| {}
+        return w.seen;
     }
 
     pub fn matching(c: Clone, prefix: []const u8) Allocator.Error![]const []const u8 {
@@ -617,13 +661,7 @@ const Dag = struct {
     /// commit of this history with one parent that is no event itself.
     fn eventOf(d: Dag, i: usize) ?struct { kind: []const u8, target: ?usize } {
         const n = d.commits[i];
-        var count: usize = 0;
-        var kind: []const u8 = "";
-        for (n.block.trailers) |t| if (std.ascii.eqlIgnoreCase(t.key, "X-Event")) {
-            count += 1;
-            kind = t.value;
-        };
-        if (count != 1) return null;
+        const kind = soleEvent(n.block) orelse return null;
         if (std.mem.eql(u8, kind, "description-edit")) return .{ .kind = "edit", .target = null };
         const name = if (std.mem.eql(u8, kind, "comment-edit"))
             "edit"
@@ -637,6 +675,16 @@ const Dag = struct {
             return .{ .kind = name, .target = ti };
         }
         return null;
+    }
+
+    /// The value of a commit's one `X-Event`; null for none or several.
+    fn soleEvent(block: trailers.Block) ?[]const u8 {
+        var found: ?[]const u8 = null;
+        for (block.trailers) |t| if (std.ascii.eqlIgnoreCase(t.key, "X-Event")) {
+            if (found != null) return null;
+            found = t.value;
+        };
+        return found;
     }
 
     fn hasEvent(d: Dag, i: usize) bool {
@@ -665,13 +713,8 @@ const Dag = struct {
     fn reactionOf(d: Dag, i: usize) Allocator.Error!?struct { member: []const u8, add: bool } {
         const n = d.commits[i];
         if (n.parents.len != 1) return null;
-        var count: usize = 0;
-        var kind: []const u8 = "";
-        for (n.block.trailers) |t| if (std.ascii.eqlIgnoreCase(t.key, "X-Event")) {
-            count += 1;
-            kind = t.value;
-        };
-        if (count != 1 or !std.mem.eql(u8, kind, "reaction")) return null;
+        const kind = soleEvent(n.block) orelse return null;
+        if (!std.mem.eql(u8, kind, "reaction")) return null;
         const r = lastOf(n.block, "X-Reaction") orelse return null;
         if (r.len < 2 or (r[0] != '+' and r[0] != '-')) return null;
         const emoji = r[1..];

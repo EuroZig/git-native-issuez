@@ -89,11 +89,9 @@ int main(int argc, char **argv) {
         goto done;
     printf("\nID       STATE   TITLE\n");
     for (size_t k = 0; k < issuez_issue_list_len(list); k++) {
-        const issuez_issue *i = issuez_issue_list_at(list, k);
-        issuez_str iid = issuez_issue_id(i), state = issuez_issue_state_name(i);
-        issuez_str title = issuez_issue_title(i);
-        printf("%.7s  %-6.*s  %.*s\n", iid.ptr, (int)state.len, state.ptr, (int)title.len,
-               title.ptr);
+        const issuez_issue_info *i = issuez_issue_info_of(issuez_issue_list_at(list, k));
+        printf("%.7s  %-6.*s  %.*s\n", i->id.ptr, (int)i->state_name.len, i->state_name.ptr,
+               (int)i->title.len, i->title.ptr);
     }
     issuez_issue_list_free(list);
 
@@ -101,7 +99,7 @@ int main(int argc, char **argv) {
     issuez_issue *issue = NULL;
     if (failed(issuez_issue_load(repo, id, NULL, &issue, &err), err, "load"))
         goto done;
-    issuez_str title = issuez_issue_title(issue);
+    issuez_str title = issuez_issue_info_of(issue)->title;
     printf("\n%.*s\n", (int)title.len, title.ptr);
     for (size_t k = 0; k < issuez_issue_comment_count(issue); k++) {
         const issuez_comment *c = issuez_issue_comment_at(issue, k);

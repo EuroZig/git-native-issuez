@@ -1,11 +1,12 @@
 //! The C API, described once. `gen.zig` writes `issuez.h` and
 //! `issuez-api.json` from it; `lib.zig` exports every function declared
 //! here, checking at compile time that the implementation has exactly the
-//! declared type, and exports a stub returning ISSUEZ_E_UNSUPPORTED for
-//! each function that has none yet.
+//! declared type.
 //!
 //! The types below are the ABI types themselves: the implementation uses
 //! them directly, so the header can't drift from the code.
+//! A `///` comment on one of their fields or values is its documentation
+//! in the header and the JSON; a `//` comment stays here.
 //!
 //! Records the library owns only ever grow at the end (callers read them
 //! through pointers). Value types and caller-allocated types are frozen;
@@ -39,60 +40,57 @@ pub const Str = extern struct {
 };
 
 pub const Oid = extern struct {
+    /// 20 (SHA-1), 32 (SHA-256), 0: none
     len: u8 = 0,
     bytes: [32]u8 = @splat(0),
 
     pub const c_name = "issuez_oid";
     pub const type_kind: TypeKind = .value;
-    pub const field_docs = .{ .len = "20 (SHA-1), 32 (SHA-256), 0: none" };
 };
 
 pub const Time = extern struct {
     unix_seconds: i64 = 0,
+    /// east of UTC: +0130 is 90
     tz_offset_minutes: i16 = 0,
 
     pub const c_name = "issuez_time";
     pub const type_kind: TypeKind = .value;
-    pub const field_docs = .{ .tz_offset_minutes = "east of UTC: +0130 is 90" };
 };
 
 pub const Date = extern struct {
     year: i16 = 0,
+    /// 1..12
     month: u8 = 0,
+    /// 1..31
     day: u8 = 0,
 
     pub const c_name = "issuez_date";
     pub const type_kind: TypeKind = .value;
-    pub const field_docs = .{ .month = "1..12", .day = "1..31" };
 };
 
 pub const Person = extern struct {
+    /// {NULL,0} for assignees, which store no name
     name: Str = .{},
     email: Str = .{},
+    /// the host's stable identity, a UUID; {NULL,0} when none
     user_id: Str = .{},
 
     pub const c_name = "issuez_person";
     pub const type_kind: TypeKind = .value;
-    pub const field_docs = .{
-        .name = "{NULL,0} for assignees, which store no name",
-        .user_id = "the host's stable identity, a UUID; {NULL,0} when none",
-    };
 };
 
 pub const Actor = extern struct {
     name: Str = .{},
     email: Str = .{},
+    /// optional UUID: X-Author-Id on every commit the call writes
     user_id: Str = .{},
+    /// NULL: now, in UTC
     at: ?*const Time = null,
+    /// zero
     reserved: [4]u64 = @splat(0),
 
     pub const c_name = "issuez_actor";
     pub const type_kind: TypeKind = .input;
-    pub const field_docs = .{
-        .user_id = "optional UUID: X-Author-Id on every commit the call writes",
-        .at = "NULL: now, in UTC",
-        .reserved = "zero",
-    };
 };
 
 pub const Progress = extern struct {
@@ -107,62 +105,60 @@ pub const Progress = extern struct {
 
 pub const Code = enum(c_int) {
     ok = 0,
+    /// header/library mismatch
     e_abi = 1,
+    /// NULL handle, malformed UUID or oid, ...
     e_invalid_argument,
+    /// a value breaks a format rule; see problems
     e_invalid_value,
+    /// over a limit (title bytes, labels, ...)
     e_limit,
     e_not_found,
+    /// resolve: several matches
     e_ambiguous,
+    /// an expected tip didn't match (HTTP 409)
     e_version_mismatch,
+    /// a hierarchy or milestone rule refused it; see problems
     e_guard,
+    /// still racing after the retry budget (limit cas_retries): final
     e_contended,
+    /// the issue was purged; it can't come back
     e_purged,
+    /// history that can't be read as an issue
     e_corrupt,
+    /// sync: remote history was rewritten
     e_quarantined,
+    /// push check refused at least one ref
     e_rejected,
     e_not_a_repository,
+    /// git failed; see the error's git stderr
     e_git,
+    /// git older than 2.30
     e_git_version,
     e_timeout,
     e_cancelled,
+    /// fetch or push to a remote failed
     e_network,
+    /// git-lfs missing or a transfer failed
     e_lfs,
+    /// not in this build, or not possible here
     e_unsupported,
     e_nomem,
+    /// a bug: please report
     e_internal,
     _,
 
     pub const c_name = "issuez_code";
     pub const c_prefix = "ISSUEZ_";
-    pub const value_docs = .{
-        .e_abi = "header/library mismatch",
-        .e_invalid_argument = "NULL handle, malformed UUID or oid, ...",
-        .e_invalid_value = "a value breaks a format rule; see problems",
-        .e_limit = "over a limit (title bytes, labels, ...)",
-        .e_ambiguous = "resolve: several matches",
-        .e_version_mismatch = "an expected tip didn't match (HTTP 409)",
-        .e_guard = "a hierarchy or milestone rule refused it; see problems",
-        .e_contended = "still racing after the retry budget (limit cas_retries): final",
-        .e_purged = "the issue was purged; it can't come back",
-        .e_corrupt = "history that can't be read as an issue",
-        .e_quarantined = "sync: remote history was rewritten",
-        .e_rejected = "push check refused at least one ref",
-        .e_git = "git failed; see the error's git stderr",
-        .e_git_version = "git older than 2.30",
-        .e_network = "fetch or push to a remote failed",
-        .e_lfs = "git-lfs missing or a transfer failed",
-        .e_unsupported = "not built yet, or not in this build",
-        .e_internal = "a bug: please report",
-    };
 };
 
 pub const Kind = enum(u32) {
     unknown = 0,
     issue,
     milestone,
-    /// `refs/attachments/<uuid>`, in push verdicts.
+    // `refs/attachments/<uuid>`, in push verdicts.
     attachments,
-    /// `refs/issuez-purged/<uuid>`, in push verdicts.
+    // `refs/issuez-purged/<uuid>`, in push verdicts.
     tombstone,
     _,
 
@@ -172,75 +168,73 @@ pub const Kind = enum(u32) {
 
 pub const ProblemKind = enum(u32) {
     unknown = 0,
+    /// a title or text that is blank
     empty,
+    /// LF/CR in a single-line value
     newline,
     too_long,
     too_many,
+    /// date, email, state slug, UUID, ...
     bad_format,
+    /// text whose last paragraph would read as trailers
     trailer_body,
     unknown_workflow_state,
+    /// e.g. a number that is already set
     read_only_field,
+    /// target not valid in this op list
     unknown_target,
+    /// e.g. ADD on a scalar
     bad_verb,
+    /// the target's slot is empty
     missing_value,
+    /// these ops can't share one commit
     incompatible,
     self_reference,
     cycle,
     too_deep,
+    /// parent, blocker or milestone not there
     missing_target,
     deleted_target,
+    /// closing or deleting with live sub-issues
     open_children,
+    /// opening work under a closed parent
     closed_ancestor,
+    /// completed or retired
     milestone_closed,
     milestone_open_work,
     duplicate_number,
+    /// concurrent setters disagree (reads)
     conflict,
+    /// a stored value that doesn't parse (reads)
     invalid_stored_value,
+    /// an event whose comment hasn't arrived (reads)
     pending_event,
+    /// fails fsck or can't be read (push check)
     invalid_history,
+    /// a Format-Version other than 1 (push check)
     unsupported_format,
+    /// the new tip doesn't contain the old (push check)
     non_fast_forward,
+    /// a delete no purge allows (push check)
     ref_deleted,
+    /// refs/issuez-* that never leave a clone (push check)
     local_ref,
+    /// not a UUID under an issuez prefix (push check)
     bad_ref_name,
+    /// a new commit not by the pusher (push check)
     author_mismatch,
+    /// purged issue or text coming back (push check)
     purged,
+    /// a purge without ISSUEZ_OPT_ALLOW_PURGE (push check)
     purge_not_allowed,
+    /// a tombstone commit that doesn't read as one (push check)
     not_a_purge,
+    /// an attachments commit that isn't derived (push check)
     not_derived,
     _,
 
     pub const c_name = "issuez_problem_kind";
     pub const c_prefix = "ISSUEZ_PROBLEM_";
-    pub const value_docs = .{
-        .empty = "a title or text that is blank",
-        .newline = "LF/CR in a single-line value",
-        .bad_format = "date, email, state slug, UUID, ...",
-        .trailer_body = "text whose last paragraph would read as trailers",
-        .read_only_field = "e.g. a number that is already set",
-        .unknown_target = "target not valid in this op list",
-        .bad_verb = "e.g. ADD on a scalar",
-        .missing_value = "the target's slot is empty",
-        .incompatible = "these ops can't share one commit",
-        .missing_target = "parent, blocker or milestone not there",
-        .open_children = "closing or deleting with live sub-issues",
-        .closed_ancestor = "opening work under a closed parent",
-        .milestone_closed = "completed or retired",
-        .conflict = "concurrent setters disagree (reads)",
-        .invalid_stored_value = "a stored value that doesn't parse (reads)",
-        .pending_event = "an event whose comment hasn't arrived (reads)",
-        .invalid_history = "fails fsck or can't be read (push check)",
-        .unsupported_format = "a Format-Version other than 1 (push check)",
-        .non_fast_forward = "the new tip doesn't contain the old (push check)",
-        .ref_deleted = "a delete no purge allows (push check)",
-        .local_ref = "refs/issuez-* that never leave a clone (push check)",
-        .bad_ref_name = "not a UUID under an issuez prefix (push check)",
-        .author_mismatch = "a new commit not by the pusher (push check)",
-        .purged = "purged issue or text coming back (push check)",
-        .purge_not_allowed = "a purge without ISSUEZ_OPT_ALLOW_PURGE (push check)",
-        .not_a_purge = "a tombstone commit that doesn't read as one (push check)",
-        .not_derived = "an attachments commit that isn't derived (push check)",
-    };
 };
 
 pub const Field = enum(u32) {
@@ -266,26 +260,24 @@ pub const Field = enum(u32) {
     fixed_by,
     release,
     reason,
+    /// writes: ADD str = the image's bytes, name = its file name, id = its v4 UUID if the caller
+    /// chooses it; REMOVE str = a UUID
     attachments,
+    /// update: ADD str = an emoji, REMOVE str takes it back; alone, with REACTION_TARGET for a
+    /// comment, EXPECT and SUBJECT
     reactions,
+    /// milestones
     name,
     milestone_status,
+    /// a host field (X-Forgejo-*) or another unknown trailer
     extra,
+    /// timeline only: the lock's reason changed (the LOCKED change of the same commit carries it
+    /// too)
     lock_reason,
     _,
 
     pub const c_name = "issuez_field";
     pub const c_prefix = "ISSUEZ_FIELD_";
-    pub const value_docs = .{
-        .attachments = "writes: ADD str = the image's bytes, name = its file name, id = " ++
-            "its v4 UUID if the caller chooses it; REMOVE str = a UUID",
-        .name = "milestones",
-        .reactions = "update: ADD str = an emoji, REMOVE str takes it back; alone, with " ++
-            "REACTION_TARGET for a comment, EXPECT and SUBJECT",
-        .extra = "a host field (X-Forgejo-*) or another unknown trailer",
-        .lock_reason = "timeline only: the lock's reason changed (the LOCKED change of " ++
-            "the same commit carries it too)",
-    };
 
     pub fn key(field: Field) []const u8 {
         return switch (field) {
@@ -323,152 +315,142 @@ pub const Field = enum(u32) {
 
 pub const Verb = enum(u32) {
     unknown = 0,
+    /// scalar or option: the value
     set,
+    /// scalar: none; set: empty; option: default
     clear,
+    /// set or list option: one member
     add,
+    /// set: one member
     remove,
+    /// milestone: follow the parent's
     inherit,
     _,
 
     pub const c_name = "issuez_verb";
     pub const c_prefix = "ISSUEZ_OP_";
-    pub const value_docs = .{
-        .set = "scalar or option: the value",
-        .clear = "scalar: none; set: empty; option: default",
-        .add = "set or list option: one member",
-        .remove = "set: one member",
-        .inherit = "milestone: follow the parent's",
-    };
 };
 
 pub const Opt = enum(u32) {
     unknown = 0,
 
+    /// writes: oid. Fail with VERSION_MISMATCH if the tip isn't this
     expect = 0x100,
+    /// writes: str. Commit subject where the library picks one
     subject,
+    /// writes: str. Provenance for imports; not an issue field
     original_author,
+    /// writes: str
     original_id,
+    /// update: oid. The write edits this comment instead: COMMENT SET is its new text, with
+    /// ATTACHMENTS, EXPECT and SUBJECT
     edit_comment,
+    /// update: num. Fail with VERSION_MISMATCH unless the text the write edits (the description
+    /// with SET DESCRIPTION, the comment with EDIT_COMMENT) was edited exactly this often (its EDIT
+    /// revisions): a form's version of the text, which other changes to the issue don't touch
     expect_edits,
+    /// update: oid. The write hides this comment instead; only EXPECT and SUBJECT go with it
     delete_comment,
+    /// update: oid. The write shows this hidden comment again; only EXPECT and SUBJECT go with it
     restore_comment,
+    /// update: oid. The comment REACTIONS ADD or REMOVE is on; without it, the issue
     reaction_target,
+    /// ADD str: a prepared attachment trailer; external storage only
     prepared_attachment,
 
+    /// query: num 0 not done (default), 1 done, -1 any
     q_done = 0x200,
+    /// query: num 0 (default), 1, -1
     q_deleted,
+    /// query: ADD str; members OR
     q_state,
+    /// query: ADD str; OR
     q_workflow_state,
+    /// query: ADD str; must have all
     q_label,
+    /// query: ADD str; must have none
     q_not_label,
+    /// query: SET
     q_no_labels,
+    /// query: ADD str, an email or user id, "" unassigned; OR
     q_assignee,
+    /// query: ADD str; OR
     q_author,
+    /// query: ADD num (issuez_priority); OR
     q_priority,
+    /// query: ADD str, the effective milestone, "" none; OR
     q_milestone,
+    /// query: SET str
     q_parent,
+    /// query: SET num 1 actively blocked, 0 not
     q_blocked,
+    /// query: SET num after, num2 before (unix; 0 open end)
     q_updated,
+    /// query: SET str, a fixed string; num 1 ignores case
     q_text,
+    /// query: SET num (issuez_sort), num2 1 ascending
     q_order,
+    /// query: SET num (default 100)
     q_limit,
+    /// query: SET str, a cursor from issuez_issue_list_next_cursor
     q_after,
 
+    /// open: str. Default "git" from PATH
     git_path = 0x300,
+    /// open: SET name=str; CLEAR without name starts empty. Default: the process environment
     env,
+    /// open: person (name, email). Default: git's identity
     committer,
+    /// open: ADD str; overrides git config issue.doneStates. settings: ADD str writes the states
+    /// given; CLEAR unsets the key (the defaults)
     done_state,
+    /// open: ADD str; overrides issue.workflowStates
     workflow_state,
+    /// open: ADD str; one "scope/x" label per issue: adding one takes the others off, two in one
+    /// write are refused
     exclusive_scope,
+    /// open: ADD str; allowed EXTRA keys (default "X-Forgejo-")
     extra_prefix,
+    /// open: num; concurrent git sessions (default 4)
     pool_size,
+    /// open: num
     timeout_local_ms,
+    /// open: num
     timeout_network_ms,
+    /// open: name ("max_labels", ...), num
     limit,
+    /// open: num; issues kept loaded for queries (default 10000, 0 off)
     cache_issues,
+    /// open: num 0/1 (default 1). 0: the caller keeps attachment bytes (a host's LFS store); writes
+    /// store none and need no git-lfs
     attachment_store,
 
+    /// sync: num 0/1 (default 1)
     sync_push = 0x400,
+    /// sync: num 0/1 (default 1); 0 pushes refs/attachments but uploads no LFS bytes
     sync_attachments,
 
+    /// push check: person; its user_id counts as pusher_user_id
     pusher = 0x500,
+    /// push check: ADD str, the pusher's other verified emails
     pusher_email,
+    /// push check: num (issuez_author_policy)
     author_policy,
+    /// push check: num 0/1 (default 0)
     allow_numbers,
+    /// push check: str, the quarantine's GIT_OBJECT_DIRECTORY
     object_dir,
+    /// push check: str, GIT_ALTERNATE_OBJECT_DIRECTORIES
     alternate_object_dirs,
+    /// push check: num 0/1 (default 0), the pusher may push tombstones
     allow_purge,
+    /// push check: ADD str, the pusher's UUIDs: under the author policy, a new commit's X-Author-Id
+    /// must be one
     pusher_user_id,
     _,
 
     pub const c_name = "issuez_opt";
     pub const c_prefix = "ISSUEZ_OPT_";
-    pub const value_docs = .{
-        .expect = "writes: oid. Fail with VERSION_MISMATCH if the tip isn't this",
-        .subject = "writes: str. Commit subject where the library picks one",
-        .original_author = "writes: str. Provenance for imports; not an issue field",
-        .original_id = "writes: str",
-        .edit_comment = "update: oid. The write edits this comment instead: COMMENT SET is " ++
-            "its new text, with ATTACHMENTS, EXPECT and SUBJECT",
-        .delete_comment = "update: oid. The write hides this comment instead; only EXPECT and " ++
-            "SUBJECT go with it",
-        .restore_comment = "update: oid. The write shows this hidden comment again; only " ++
-            "EXPECT and SUBJECT go with it",
-        .reaction_target = "update: oid. The comment REACTIONS ADD or REMOVE is on; without " ++
-            "it, the issue",
-        .prepared_attachment = "ADD str: a prepared attachment trailer; external storage only",
-        .expect_edits = "update: num. Fail with VERSION_MISMATCH unless the text the write " ++
-            "edits (the description with SET DESCRIPTION, the comment with EDIT_COMMENT) " ++
-            "was edited exactly this often (its EDIT revisions): a form's version of the " ++
-            "text, which other changes to the issue don't touch",
-        .q_done = "query: num 0 not done (default), 1 done, -1 any",
-        .q_deleted = "query: num 0 (default), 1, -1",
-        .q_state = "query: ADD str; members OR",
-        .q_workflow_state = "query: ADD str; OR",
-        .q_label = "query: ADD str; must have all",
-        .q_not_label = "query: ADD str; must have none",
-        .q_no_labels = "query: SET",
-        .q_assignee = "query: ADD str, an email or user id, \"\" unassigned; OR",
-        .q_author = "query: ADD str; OR",
-        .q_priority = "query: ADD num (issuez_priority); OR",
-        .q_milestone = "query: ADD str, the effective milestone, \"\" none; OR",
-        .q_parent = "query: SET str",
-        .q_blocked = "query: SET num 1 actively blocked, 0 not",
-        .q_updated = "query: SET num after, num2 before (unix; 0 open end)",
-        .q_text = "query: SET str, a fixed string; num 1 ignores case",
-        .q_order = "query: SET num (issuez_sort), num2 1 ascending",
-        .q_limit = "query: SET num (default 100)",
-        .q_after = "query: SET str, a cursor from issuez_issue_list_next_cursor",
-        .git_path = "open: str. Default \"git\" from PATH",
-        .env = "open: SET name=str; CLEAR without name starts empty. " ++
-            "Default: the process environment",
-        .committer = "open: person (name, email). Default: git's identity",
-        .done_state = "open: ADD str; overrides git config issue.doneStates. settings: " ++
-            "ADD str writes the states given; CLEAR unsets the key (the defaults)",
-        .workflow_state = "open: ADD str; overrides issue.workflowStates",
-        .exclusive_scope = "open: ADD str; one \"scope/x\" label per issue: adding one " ++
-            "takes the others off, two in one write are refused",
-        .extra_prefix = "open: ADD str; allowed EXTRA keys (default \"X-Forgejo-\")",
-        .pool_size = "open: num; concurrent git sessions (default 4)",
-        .timeout_local_ms = "open: num",
-        .timeout_network_ms = "open: num",
-        .limit = "open: name (\"max_labels\", ...), num",
-        .cache_issues = "open: num; issues kept loaded for queries (default 10000, 0 off)",
-        .attachment_store = "open: num 0/1 (default 1). 0: the caller keeps attachment " ++
-            "bytes (a host's LFS store); writes store none and need no git-lfs",
-        .sync_push = "sync: num 0/1 (default 1)",
-        .sync_attachments = "sync: num 0/1 (default 1); 0 pushes refs/attachments " ++
-            "but uploads no LFS bytes",
-        .pusher = "push check: person; its user_id counts as pusher_user_id",
-        .pusher_email = "push check: ADD str, the pusher's other verified emails",
-        .author_policy = "push check: num (issuez_author_policy)",
-        .allow_numbers = "push check: num 0/1 (default 0)",
-        .object_dir = "push check: str, the quarantine's GIT_OBJECT_DIRECTORY",
-        .alternate_object_dirs = "push check: str, GIT_ALTERNATE_OBJECT_DIRECTORIES",
-        .allow_purge = "push check: num 0/1 (default 0), the pusher may push tombstones",
-        .pusher_user_id = "push check: ADD str, the pusher's UUIDs: under the author policy, " ++
-            "a new commit's X-Author-Id must be one",
-    };
 };
 
 pub const OpList = enum(u32) {
@@ -493,40 +475,41 @@ pub const LogLevel = enum(u32) {
     @"error",
     warn,
     info,
+    /// one event per git request
     debug,
     trace,
     _,
 
     pub const c_name = "issuez_log_level";
     pub const c_prefix = "ISSUEZ_LOG_";
-    pub const value_docs = .{ .debug = "one event per git request" };
 };
 
 pub const ChangeKind = enum(u32) {
     unknown = 0,
     created,
     updated,
+    /// the ref is gone (purge, or another tool)
     removed,
     _,
 
     pub const c_name = "issuez_change_kind";
     pub const c_prefix = "ISSUEZ_CHANGE_";
-    pub const value_docs = .{ .removed = "the ref is gone (purge, or another tool)" };
 };
 
 pub const State = enum(u32) {
     unknown = 0,
     open,
     closed,
+    /// see issuez_issue_info.state_name
     other,
     _,
 
     pub const c_name = "issuez_state";
     pub const c_prefix = "ISSUEZ_STATE_";
-    pub const value_docs = .{ .other = "see issuez_issue_state_name" };
 };
 
 pub const Priority = enum(u32) {
+    /// also: not set
     unknown = 0,
     low,
     medium,
@@ -536,29 +519,26 @@ pub const Priority = enum(u32) {
 
     pub const c_name = "issuez_priority";
     pub const c_prefix = "ISSUEZ_PRIORITY_";
-    pub const value_docs = .{ .unknown = "also: not set" };
 };
 
 pub const EntryKind = enum(u32) {
     unknown = 0,
     created,
+    /// comment points at it; may carry changes too
     comment,
+    /// field changes only
     update,
     description_edit,
     comment_edit,
     comment_delete,
     comment_restore,
     reaction,
+    /// changes only where it resolved a conflict
     merge,
     _,
 
     pub const c_name = "issuez_entry_kind";
     pub const c_prefix = "ISSUEZ_ENTRY_";
-    pub const value_docs = .{
-        .comment = "comment points at it; may carry changes too",
-        .update = "field changes only",
-        .merge = "changes only where it resolved a conflict",
-    };
 };
 
 pub const Sort = enum(u32) {
@@ -588,126 +568,114 @@ pub const MilestoneStatus = enum(u32) {
 };
 
 pub const QuarantineReason = enum(u32) {
-    /// It no longer applies; the next merge clears it.
+    // It no longer applies; the next merge clears it.
+    /// no longer applies; the next merge clears it
     unknown = 0,
+    /// the remote issue shares no history with the local one
     unrelated_history,
+    /// the remote history was rewritten since the last merge
     rewound,
+    /// the remote issue fails the integrity checks
     invalid_issue,
     _,
 
     pub const c_name = "issuez_quarantine_reason";
     pub const c_prefix = "ISSUEZ_QUARANTINE_";
-    pub const value_docs = .{
-        .unknown = "no longer applies; the next merge clears it",
-        .unrelated_history = "the remote issue shares no history with the local one",
-        .rewound = "the remote history was rewritten since the last merge",
-        .invalid_issue = "the remote issue fails the integrity checks",
-    };
 };
 
 pub const QuarantineChoice = enum(u32) {
     unknown = 0,
+    /// keep ours and stop reporting theirs
     keep_local,
+    /// take theirs; the replaced version is kept
     take_remote,
     _,
 
     pub const c_name = "issuez_quarantine_choice";
     pub const c_prefix = "ISSUEZ_CHOICE_";
-    pub const value_docs = .{
-        .keep_local = "keep ours and stop reporting theirs",
-        .take_remote = "take theirs; the replaced version is kept",
-    };
 };
 
 pub const Quarantined = extern struct {
+    /// issuez_kind: ISSUE or MILESTONE
     kind: u32,
     id: Str,
+    /// the local title, or the remote one when it only exists there
     title: Str,
+    /// the refused remote version
     remote_tip: Oid,
+    /// issuez_quarantine_reason
     reason: u32,
+    /// acknowledged (issuez_quarantine_resolve, ISSUEZ_CHOICE_KEEP_LOCAL)
     kept_local: bool,
 
     pub const c_name = "issuez_quarantined";
     pub const type_kind: TypeKind = .record;
-    pub const field_docs = .{
-        .kind = "issuez_kind: ISSUE or MILESTONE",
-        .title = "the local title, or the remote one when it only exists there",
-        .remote_tip = "the refused remote version",
-        .reason = "issuez_quarantine_reason",
-        .kept_local = "acknowledged (issuez_quarantine_resolve, ISSUEZ_CHOICE_KEEP_LOCAL)",
-    };
 };
 
 pub const FsckKind = enum(u32) {
     unknown = 0,
-    /// Fails one of upstream fsck's checks: an error.
+    // Fails one of upstream fsck's checks: an error.
+    /// error: fails one of upstream fsck's checks
     integrity,
+    /// note: an X-Milestone-Status no reader takes; it reads as open
     milestone_status,
+    /// note: an attachment trailer the history ignores
     attachment_trailer,
+    /// note: an attachment's bytes aren't in this repository
     attachment_missing,
-    /// An error.
+    // An error.
+    /// error: an attachment's stored bytes don't match it
     attachment_corrupt,
+    /// note: refs/attachments/<id> is missing or stale (repair rewrites it)
     derived_ref,
+    /// refs/attachments/<id> was rewritten
     repaired,
-    /// An error.
+    // An error.
+    /// error: checking or repairing attachments failed
     attachments_failed,
+    /// note: without git-lfs the bytes weren't checked
     bytes_unchecked,
+    /// note: stored objects no issue references (failed writes)
     orphans,
+    /// note: remote versions a merge refused, subject the remote
     quarantined,
+    /// note: a hierarchy or blocker problem across issues
     projection,
     _,
 
     pub const c_name = "issuez_fsck_kind";
     pub const c_prefix = "ISSUEZ_FSCK_";
-    pub const value_docs = .{
-        .integrity = "error: fails one of upstream fsck's checks",
-        .milestone_status = "note: an X-Milestone-Status no reader takes; it reads as open",
-        .attachment_trailer = "note: an attachment trailer the history ignores",
-        .attachment_missing = "note: an attachment's bytes aren't in this repository",
-        .attachment_corrupt = "error: an attachment's stored bytes don't match it",
-        .derived_ref = "note: refs/attachments/<id> is missing or stale (repair rewrites it)",
-        .repaired = "refs/attachments/<id> was rewritten",
-        .attachments_failed = "error: checking or repairing attachments failed",
-        .bytes_unchecked = "note: without git-lfs the bytes weren't checked",
-        .orphans = "note: stored objects no issue references (failed writes)",
-        .quarantined = "note: remote versions a merge refused, subject the remote",
-        .projection = "note: a hierarchy or blocker problem across issues",
-    };
 };
 
 pub const FsckFinding = extern struct {
+    /// issuez_fsck_kind
     kind: u32,
+    /// counted as an error; notes aren't
     is_error: bool,
+    /// issuez_kind of subject; UNKNOWN for the repository
     subject_kind: u32,
+    /// an issue or milestone UUID, a remote; {NULL,0} for the repository
     subject: Str,
+    /// one sentence without a front end's commands
     message: Str,
 
     pub const c_name = "issuez_fsck_finding";
     pub const type_kind: TypeKind = .record;
-    pub const field_docs = .{
-        .kind = "issuez_fsck_kind",
-        .is_error = "counted as an error; notes aren't",
-        .subject_kind = "issuez_kind of subject; UNKNOWN for the repository",
-        .subject = "an issue or milestone UUID, a remote; {NULL,0} for the repository",
-        .message = "one sentence without a front end's commands",
-    };
 };
 
 pub const RemoteSetup = extern struct {
+    /// the refspecs were added now; false when they were there
     configured: bool = false,
+    /// upstream's forced refspec was taken out (ISSUEZ_REMOTE_FLAG_FIX_UNSAFE)
     removed_unsafe: bool = false,
+    /// the remote still has upstream's forced refspec: a plain git fetch can overwrite local issue
+    /// refs
     unsafe: bool = false,
+    /// the library fills it; room to grow
     reserved: [2]u64 = @splat(0),
 
     pub const c_name = "issuez_remote_setup";
     pub const type_kind: TypeKind = .value;
-    pub const field_docs = .{
-        .configured = "the refspecs were added now; false when they were there",
-        .removed_unsafe = "upstream's forced refspec was taken out (ISSUEZ_REMOTE_FLAG_FIX_UNSAFE)",
-        .unsafe = "the remote still has upstream's forced refspec: a plain git fetch can " ++
-            "overwrite local issue refs",
-        .reserved = "the library fills it; room to grow",
-    };
 };
 
 pub const SearchHit = extern struct {
@@ -720,126 +688,114 @@ pub const SearchHit = extern struct {
 
 pub const SearchFlag = enum(u32) {
     none = 0,
+    /// bit: ASCII case-insensitive
     ignore_case = 1,
     _,
 
     pub const c_name = "issuez_search_flag";
     pub const c_prefix = "ISSUEZ_SEARCH_FLAG_";
-    pub const value_docs = .{ .ignore_case = "bit: ASCII case-insensitive" };
 };
 
 pub const ShortId = extern struct {
+    /// the full UUID
     id: Str,
+    /// the shortest prefix no other issue's UUID starts with
     prefix: Str,
 
     pub const c_name = "issuez_short_id";
     pub const type_kind: TypeKind = .record;
-    pub const field_docs = .{
-        .id = "the full UUID",
-        .prefix = "the shortest prefix no other issue's UUID starts with",
-    };
 };
 
 pub const JsonFlag = enum(u32) {
     none = 0,
+    /// bit: add the description, comments and history
     full = 1,
     _,
 
     pub const c_name = "issuez_json_flag";
     pub const c_prefix = "ISSUEZ_JSON_FLAG_";
-    pub const value_docs = .{ .full = "bit: add the description, comments and history" };
 };
 
 pub const LoadFlag = enum(u32) {
     none = 0,
+    /// bit: a missing or damaged issue fails the call
     strict = 1,
     _,
 
     pub const c_name = "issuez_load_flag";
     pub const c_prefix = "ISSUEZ_LOAD_FLAG_";
-    pub const value_docs = .{ .strict = "bit: a missing or damaged issue fails the call" };
 };
 
 pub const FsckFlag = enum(u32) {
     none = 0,
+    /// bit: rewrite missing or stale derived attachment refs (needs the attachment store); nothing
+    /// else is written
     repair = 1,
     _,
 
     pub const c_name = "issuez_fsck_flag";
     pub const c_prefix = "ISSUEZ_FSCK_FLAG_";
-    pub const value_docs = .{
-        .repair = "bit: rewrite missing or stale derived attachment refs (needs the " ++
-            "attachment store); nothing else is written",
-    };
 };
 
 pub const RemoteFlag = enum(u32) {
     none = 0,
+    /// bit: take out upstream's forced refspec
     fix_unsafe = 1,
     _,
 
     pub const c_name = "issuez_remote_flag";
     pub const c_prefix = "ISSUEZ_REMOTE_FLAG_";
-    pub const value_docs = .{
-        .fix_unsafe = "bit: take out upstream's forced refspec",
-    };
 };
 
 pub const SyncOutcome = enum(u32) {
     unknown = 0,
     up_to_date,
+    /// came from the remote
     new,
     fast_forward,
     merged,
+    /// ours went to the remote (also new local issues)
     pushed,
+    /// remote history rewritten; see issuez_quarantine_resolve
     quarantined,
+    /// not reported in this version: a push that can't land fails the call
     failed,
+    /// purged by a tombstone; the push deletes the remote's copy
     purged,
     _,
 
     pub const c_name = "issuez_sync_outcome";
     pub const c_prefix = "ISSUEZ_SYNC_";
-    pub const value_docs = .{
-        .new = "came from the remote",
-        .pushed = "ours went to the remote (also new local issues)",
-        .failed = "not reported in this version: a push that can't land fails the call",
-        .quarantined = "remote history rewritten; see issuez_quarantine_resolve",
-        .purged = "purged by a tombstone; the push deletes the remote's copy",
-    };
 };
 
 pub const AuthorPolicy = enum(u32) {
     unknown = 0,
+    /// default
     any,
+    /// accept, flag commits not by the pusher
     warn,
+    /// reject them
     enforce,
     _,
 
     pub const c_name = "issuez_author_policy";
     pub const c_prefix = "ISSUEZ_AUTHOR_";
-    pub const value_docs = .{
-        .any = "default",
-        .warn = "accept, flag commits not by the pusher",
-        .enforce = "reject them",
-    };
 };
 
 pub const PushAction = enum(u32) {
     unknown = 0,
+    /// not an issuez ref: the host's business
     ignored,
     create,
     fast_forward,
+    /// rejected unless a tombstone allows it (ISSUEZ_OPT_ALLOW_PURGE)
     rewrite,
+    /// rejected unless a tombstone allows it (ISSUEZ_OPT_ALLOW_PURGE)
     delete,
     _,
 
     pub const c_name = "issuez_push_action";
     pub const c_prefix = "ISSUEZ_PUSH_";
-    pub const value_docs = .{
-        .ignored = "not an issuez ref: the host's business",
-        .rewrite = "rejected unless a tombstone allows it (ISSUEZ_OPT_ALLOW_PURGE)",
-        .delete = "rejected unless a tombstone allows it (ISSUEZ_OPT_ALLOW_PURGE)",
-    };
 };
 
 // ─── Handles ───────────────────────────────────────────────────────────
@@ -889,46 +845,42 @@ pub const TypeKind = enum {
 };
 
 pub const Problem = extern struct {
+    /// issuez_problem_kind
     kind: u32,
+    /// issuez_field: what the caller should highlight
     field: u32,
+    /// trailer key, for ISSUEZ_FIELD_EXTRA
     key: Str,
+    /// the offending value, when there is one
     value: Str,
+    /// the other issue or milestone UUID involved
     subject: Str,
+    /// human-readable
     message: Str,
+    /// the op that caused it; -1 when not from an op
     op_index: i64,
 
     pub const c_name = "issuez_problem";
     pub const type_kind: TypeKind = .record;
-    pub const field_docs = .{
-        .kind = "issuez_problem_kind",
-        .field = "issuez_field: what the caller should highlight",
-        .key = "trailer key, for ISSUEZ_FIELD_EXTRA",
-        .value = "the offending value, when there is one",
-        .subject = "the other issue or milestone UUID involved",
-        .message = "human-readable",
-        .op_index = "the op that caused it; -1 when not from an op",
-    };
 };
 
 pub const LogEvent = extern struct {
+    /// issuez_log_level
     level: u32,
+    /// "issue.update", "git.cat-file", "sync"
     operation: Str,
     message: Str,
+    /// {NULL,0} when not about a repo
     repo_path: Str,
+    /// issue/milestone UUID or ref, if any
     subject: Str,
+    /// -1 when not a timed step
     duration_ns: i64,
+    /// retry number, 0 for the first
     attempt: u32,
 
     pub const c_name = "issuez_log_event";
     pub const type_kind: TypeKind = .record;
-    pub const field_docs = .{
-        .level = "issuez_log_level",
-        .operation = "\"issue.update\", \"git.cat-file\", \"sync\"",
-        .repo_path = "{NULL,0} when not about a repo",
-        .subject = "issue/milestone UUID or ref, if any",
-        .duration_ns = "-1 when not a timed step",
-        .attempt = "retry number, 0 for the first",
-    };
 };
 
 pub const LogFn = ?*const fn (userdata: ?*anyopaque, event: *const LogEvent) callconv(.c) void;
@@ -937,73 +889,145 @@ pub const WatchFn = ?*const fn (userdata: ?*anyopaque, changes: u32) callconv(.c
 
 pub const WatchChange = enum(u32) {
     none = 0,
+    /// bit: issue, milestone or attachment refs moved: read them again (issuez_snapshot_take and
+    /// issuez_diff_new say what)
     refs = 1,
+    /// bit: the repository's config changed, which has the issue settings
     config = 2,
     _,
 
     pub const c_name = "issuez_watch_change";
     pub const c_prefix = "ISSUEZ_WATCH_";
-    pub const value_docs = .{
-        .refs = "bit: issue, milestone or attachment refs moved: read them again " ++
-            "(issuez_snapshot_take and issuez_diff_new say what)",
-        .config = "bit: the repository's config changed, which has the issue settings",
-    };
 };
 
 pub const DiffEntry = extern struct {
+    /// issuez_kind
     kind: u32,
+    /// issuez_change_kind
     change: u32,
     id: Str,
+    /// len 0 when created
     old_tip: Oid,
+    /// len 0 when removed
     new_tip: Oid,
 
     pub const c_name = "issuez_diff_entry";
     pub const type_kind: TypeKind = .record;
-    pub const field_docs = .{
-        .kind = "issuez_kind",
-        .change = "issuez_change_kind",
-        .old_tip = "len 0 when created",
-        .new_tip = "len 0 when removed",
-    };
+};
+
+pub const IssueInfo = extern struct {
+    id: Str,
+    /// pass as expect
+    tip: Oid,
+    /// false: no number yet, and number is 0
+    has_number: bool,
+    number: u64,
+    format_version: Str,
+    commit_count: u32,
+    title: Str,
+    description: Str,
+    author: ?*const Person,
+    created: Time,
+    updated: Time,
+    /// issuez_state
+    state: u32,
+    /// "open", "closed", "wontfix", ...
+    state_name: Str,
+    /// closed or one of the repo's done states
+    is_done: bool,
+    /// defaulted for open issues; {NULL,0} for done ones
+    workflow_state: Str,
+    /// who last made the issue done; NULL while it isn't
+    closed_by: ?*const Person,
+    /// when closed_by did; zero while it isn't done
+    closed_at: Time,
+    fixed_by: Str,
+    release: Str,
+    reason: Str,
+    is_deleted: bool,
+    is_locked: bool,
+    lock_reason: Str,
+    /// issuez_priority
+    priority: u32,
+    /// direct only; the effective one (through parents) is a projection answer
+    milestone_id: Str,
+    parent_id: Str,
+    /// zero: none
+    start_date: Date,
+    /// zero: none
+    due_date: Date,
+    /// false: no estimate, and estimate_minutes is 0; true with 0 is an estimate of 0
+    has_estimate_minutes: bool,
+    estimate_minutes: u32,
+    /// a branch or tag
+    ref: Str,
+    /// an imported issue's author in the other tracker; {NULL,0} otherwise
+    original_author: Str,
+    original_id: Str,
+    /// issuez_issue_load_since's since isn't in the history; false from other loads
+    rewritten: bool,
+
+    pub const c_name = "issuez_issue_info";
+    pub const type_kind: TypeKind = .record;
+};
+
+pub const MilestoneInfo = extern struct {
+    id: Str,
+    tip: Oid,
+    name: Str,
+    description: Str,
+    /// issuez_milestone_status
+    status: u32,
+    /// zero: none
+    due_date: Date,
+    created: Time,
+    /// of its latest commit
+    updated: Time,
+    /// false: no commit after the root set the status, and status_changed is zero
+    has_status_changed: bool,
+    /// when the status it has was set, by the last commit after the root that set it: a completed
+    /// milestone's closing time
+    status_changed: Time,
+    /// who created it
+    author: ?*const Person,
+
+    pub const c_name = "issuez_milestone_info";
+    pub const type_kind: TypeKind = .record;
 };
 
 pub const Reaction = extern struct {
+    /// ":+1:" or a unicode emoji, as written
     emoji: Str,
+    /// see issuez_reaction_user_at
     user_count: usize,
 
     pub const c_name = "issuez_reaction";
     pub const type_kind: TypeKind = .record;
-    pub const field_docs = .{
-        .emoji = "\":+1:\" or a unicode emoji, as written",
-        .user_count = "see issuez_reaction_user_at",
-    };
 };
 
 pub const Comment = extern struct {
+    /// full commit OID: the comment's stable ID
     id: Oid,
     author: ?*const Person,
     created: Time,
+    /// of the latest edit; = created if none
     updated: Time,
+    /// current text, trailers stripped
     text: Str,
     edited: bool,
+    /// text still readable, for moderators
     deleted: bool,
+    /// see issuez_comment_attachment_at
     attachment_count: usize,
+    /// imported: its author in the other tracker; {NULL,0} otherwise
     original_author: Str,
+    /// imported: its ID in the other tracker
     original_id: Str,
+    /// a purge took its text, attachments and origin; its fields stay
     purged: bool,
 
     pub const c_name = "issuez_comment";
     pub const type_kind: TypeKind = .record;
-    pub const field_docs = .{
-        .id = "full commit OID: the comment's stable ID",
-        .updated = "of the latest edit; = created if none",
-        .text = "current text, trailers stripped",
-        .deleted = "text still readable, for moderators",
-        .attachment_count = "see issuez_comment_attachment_at",
-        .original_author = "imported: its author in the other tracker; {NULL,0} otherwise",
-        .original_id = "imported: its ID in the other tracker",
-        .purged = "a purge took its text, attachments and origin; its fields stay",
-    };
 };
 
 /// Metadata prepared from validated image bytes. All strings belong to its handle.
@@ -1019,228 +1043,207 @@ pub const AttachmentSpec = extern struct {
 };
 
 pub const Attachment = extern struct {
+    /// v4 UUID; links in text are attachment:<id>
     id: Str,
+    /// image/png, image/jpeg or image/webp
     media_type: Str,
     size: u64,
+    /// 64 lowercase hex digits: the LFS object ID
     sha256: Str,
     name: Str,
+    /// the commit that added it: a comment, the root, an edit
     added_in: Oid,
     added_by: ?*const Person,
+    /// hidden by X-Attachment-Removed; its bytes are still referenced
     removed: bool,
+    /// the comment it belongs to: added_in's comment, or the comment it edits; zero for the
+    /// description's (the root, a description edit)
     comment: Oid = .{},
+    /// when added_in was written
     at: Time = .{},
 
     pub const c_name = "issuez_attachment";
     pub const type_kind: TypeKind = .record;
-    pub const field_docs = .{
-        .id = "v4 UUID; links in text are attachment:<id>",
-        .media_type = "image/png, image/jpeg or image/webp",
-        .sha256 = "64 lowercase hex digits: the LFS object ID",
-        .added_in = "the commit that added it: a comment, the root, an edit",
-        .removed = "hidden by X-Attachment-Removed; its bytes are still referenced",
-        .comment = "the comment it belongs to: added_in's comment, or the comment it " ++
-            "edits; zero for the description's (the root, a description edit)",
-        .at = "when added_in was written",
-    };
 };
 
 pub const Change = extern struct {
+    /// issuez_field; one change per field and member, whichever trailers said it
     field: u32,
+    /// trailer key
     key: Str,
+    /// issuez_verb: SET, CLEAR, ADD or REMOVE
     op: u32,
+    /// canonical text: "2026-12-01", "high", a UUID, ...; the value before, also when the trailer
+    /// didn't say it (a first TITLE: the root's subject, a first STATE: "open")
     old_value: Str,
+    /// a cleared TITLE: the root's subject again
     new_value: Str,
+    /// ASSIGNEES: the member removed, parsed; NULL otherwise
     old_person: ?*const Person = null,
+    /// ASSIGNEES: the member added, parsed; NULL otherwise
     new_person: ?*const Person = null,
+    /// START_DATE, DUE_DATE: parsed; zero: none
     old_date: Date = .{},
+    /// START_DATE, DUE_DATE: parsed; zero: none
     new_date: Date = .{},
+    /// STATE: whether the old state is done, by the repo's done states
     old_done: bool = false,
+    /// STATE: whether the new state is done
     new_done: bool = false,
+    /// LOCKED: the lock's reason as of this commit
     reason: Str = .{},
 
     pub const c_name = "issuez_change";
     pub const type_kind: TypeKind = .record;
-    pub const field_docs = .{
-        .field = "issuez_field; one change per field and member, whichever trailers said it",
-        .key = "trailer key",
-        .op = "issuez_verb: SET, CLEAR, ADD or REMOVE",
-        .old_value = "canonical text: \"2026-12-01\", \"high\", a UUID, ...; the value " ++
-            "before, also when the trailer didn't say it (a first TITLE: the root's subject, " ++
-            "a first STATE: \"open\")",
-        .new_value = "a cleared TITLE: the root's subject again",
-        .old_person = "ASSIGNEES: the member removed, parsed; NULL otherwise",
-        .new_person = "ASSIGNEES: the member added, parsed; NULL otherwise",
-        .old_date = "START_DATE, DUE_DATE: parsed; zero: none",
-        .new_date = "START_DATE, DUE_DATE: parsed; zero: none",
-        .old_done = "STATE: whether the old state is done, by the repo's done states",
-        .new_done = "STATE: whether the new state is done",
-        .reason = "LOCKED: the lock's reason as of this commit",
-    };
 };
 
 pub const Entry = extern struct {
+    /// issuez_entry_kind
     kind: u32,
     commit: Oid,
     author: ?*const Person,
     at: Time,
+    /// COMMENT; the target for COMMENT_*; NULL otherwise
     comment: ?*const Comment,
+    /// see issuez_entry_change_at
     change_count: usize,
+    /// not reachable from issuez_issue_load_since's since; true elsewhere
     is_new: bool,
 
     pub const c_name = "issuez_entry";
     pub const type_kind: TypeKind = .record;
-    pub const field_docs = .{
-        .kind = "issuez_entry_kind",
-        .comment = "COMMENT; the target for COMMENT_*; NULL otherwise",
-        .change_count = "see issuez_entry_change_at",
-        .is_new = "not reachable from issuez_issue_load_since's since; true elsewhere",
-    };
 };
 
 pub const RevisionKind = enum(u32) {
     unknown = 0,
+    /// the comment itself, or the issue's root
     original,
     edit,
+    /// text: what it hid
     delete,
+    /// text: what it showed again
     restore,
     _,
 
     pub const c_name = "issuez_revision_kind";
     pub const c_prefix = "ISSUEZ_REVISION_";
-    pub const value_docs = .{
-        .original = "the comment itself, or the issue's root",
-        .delete = "text: what it hid",
-        .restore = "text: what it showed again",
-    };
 };
 
 pub const Revision = extern struct {
+    /// the commit that wrote it: the comment, the root, or an event
     commit: Oid,
     author: ?*const Person,
     at: Time,
+    /// issuez_revision_kind
     kind: u32,
+    /// the whole text after it
     text: Str,
 
     pub const c_name = "issuez_revision";
     pub const type_kind: TypeKind = .record;
-    pub const field_docs = .{
-        .commit = "the commit that wrote it: the comment, the root, or an event",
-        .kind = "issuez_revision_kind",
-        .text = "the whole text after it",
-    };
 };
 
 pub const Op = extern struct {
+    /// issuez_verb
     verb: u32 = 0,
+    /// issuez_field or issuez_opt
     target: u32 = 0,
+    /// EXTRA key, ENV variable, LIMIT name, ATTACHMENTS file name
     name: Str = .{},
     str: Str = .{},
+    /// integers, enums, flags (0/1), unix seconds
     num: i64 = 0,
     num2: i64 = 0,
     date: Date = .{},
     oid: Oid = .{},
     person: Person = .{},
+    /// ADD ATTACHMENTS: the v4 UUID to give it (empty: one is picked)
     id: Str = .{},
+    /// zero
     reserved: [2]u64 = @splat(0),
 
     pub const c_name = "issuez_op";
     pub const type_kind: TypeKind = .input;
-    pub const field_docs = .{
-        .verb = "issuez_verb",
-        .target = "issuez_field or issuez_opt",
-        .name = "EXTRA key, ENV variable, LIMIT name, ATTACHMENTS file name",
-        .id = "ADD ATTACHMENTS: the v4 UUID to give it (empty: one is picked)",
-        .num = "integers, enums, flags (0/1), unix seconds",
-        .reserved = "zero",
-    };
 };
 
 pub const SyncItem = extern struct {
+    /// issuez_kind
     kind: u32,
     id: Str,
+    /// issuez_sync_outcome
     outcome: u32,
+    /// after the sync
     local_tip: Oid,
     remote_tip: Oid,
+    /// for QUARANTINED and FAILED
     reason: Str,
 
     pub const c_name = "issuez_sync_item";
     pub const type_kind: TypeKind = .record;
-    pub const field_docs = .{
-        .kind = "issuez_kind",
-        .outcome = "issuez_sync_outcome",
-        .local_tip = "after the sync",
-        .reason = "for QUARANTINED and FAILED",
-    };
 };
 
 pub const RefUpdate = extern struct {
     ref: Str = .{},
+    /// len 0 for a create
     old_oid: Oid = .{},
+    /// len 0 for a delete
     new_oid: Oid = .{},
+    /// zero
     reserved: [2]u64 = @splat(0),
 
     pub const c_name = "issuez_ref_update";
     pub const type_kind: TypeKind = .input;
-    pub const field_docs = .{
-        .old_oid = "len 0 for a create",
-        .new_oid = "len 0 for a delete",
-        .reserved = "zero",
-    };
 };
 
 pub const LabelCount = extern struct {
     name: Str,
+    /// of them not done
     open: u32,
+    /// issues carrying it
     total: u32,
 
     pub const c_name = "issuez_label_count";
     pub const type_kind: TypeKind = .record;
-    pub const field_docs = .{ .open = "of them not done", .total = "issues carrying it" };
 };
 
 pub const KnownPerson = extern struct {
+    /// the latest name they wrote under (empty for assignees only), email, user_id
     person: Person,
+    /// issues they opened
     authored: u32,
+    /// issues they are assigned
     assigned: u32,
 
     pub const c_name = "issuez_known_person";
     pub const type_kind: TypeKind = .record;
-    pub const field_docs = .{
-        .person = "the latest name they wrote under (empty for assignees only), email, user_id",
-        .authored = "issues they opened",
-        .assigned = "issues they are assigned",
-    };
 };
 
 pub const PushVerdict = extern struct {
     ref: Str,
+    /// issuez_kind; ISSUEZ_KIND_UNKNOWN for other refs
     kind: u32,
     id: Str,
+    /// issuez_push_action
     action: u32,
     accept: bool,
+    /// why not, or what to flag (author mismatch under WARN)
     problems: ?*const Problems,
+    /// a new issue without one
     needs_number: bool,
+    /// adds commits to a locked issue
     touches_locked: bool,
+    /// new commits
     commit_count: usize,
+    /// issues: the new commits as timeline entries, see issuez_push_verdict_entry_at; 0 for other
+    /// kinds
     entry_count: usize,
+    /// issues: who opened it (the pusher's own issue or not); NULL otherwise
     issue_author: ?*const Person = null,
+    /// issues: attachments the new commits add, see issuez_push_verdict_attachment_at
     attachment_count: usize = 0,
 
     pub const c_name = "issuez_push_verdict";
     pub const type_kind: TypeKind = .record;
-    pub const field_docs = .{
-        .kind = "issuez_kind; ISSUEZ_KIND_UNKNOWN for other refs",
-        .action = "issuez_push_action",
-        .problems = "why not, or what to flag (author mismatch under WARN)",
-        .needs_number = "a new issue without one",
-        .touches_locked = "adds commits to a locked issue",
-        .commit_count = "new commits",
-        .entry_count = "issues: the new commits as timeline entries, see " ++
-            "issuez_push_verdict_entry_at; 0 for other kinds",
-        .issue_author = "issues: who opened it (the pusher's own issue or not); NULL otherwise",
-        .attachment_count = "issues: attachments the new commits add, see " ++
-            "issuez_push_verdict_attachment_at",
-    };
 };
 
 // ─── The header, in order ──────────────────────────────────────────────
@@ -1253,11 +1256,11 @@ pub const Func = struct {
 };
 
 pub const Helper = struct {
-    name: []const u8,
-    verb: Verb,
+    name: []const u8 = "",
+    verb: Verb = .unknown,
     /// A Field or Opt tag name; "opt:<name>" for an Opt that shares a
     /// Field's name.
-    target: []const u8,
+    target: []const u8 = "",
     slot: enum {
         str,
         num,
@@ -1277,7 +1280,7 @@ pub const Helper = struct {
         name_num,
         /// id, name and the bytes as str (an attachment).
         attachment,
-    },
+    } = .none,
     /// The C type and name of the num slot's parameter: an enum's type,
     /// `bool` for a 0/1 flag.
     num_type: []const u8 = "int64_t",
@@ -1286,6 +1289,32 @@ pub const Helper = struct {
     num2_type: []const u8 = "int64_t",
     param2: []const u8 = "v2",
 };
+
+/// `issuez_q_<query option>`, `issuez_<verb>_<field>` (one label: ADD and
+/// REMOVE take the singular) or `issuez_opt_<option>`.
+fn helperName(comptime verb: Verb, comptime target: []const u8) []const u8 {
+    if (std.mem.startsWith(u8, target, "q_")) return "issuez_" ++ target;
+    if (std.mem.startsWith(u8, target, "opt:")) return "issuez_opt_" ++ target[4..];
+    if (!@hasField(Field, target)) return "issuez_opt_" ++ target;
+    const one = (verb == .add or verb == .remove) and target[target.len - 1] == 's';
+    return "issuez_" ++ @tagName(verb) ++ "_" ++ if (one) target[0 .. target.len - 1] else target;
+}
+
+/// A helper's row. `more` has its parameters where they aren't the default,
+/// and its name where it doesn't follow from the target.
+fn h(
+    comptime verb: Verb,
+    comptime target: []const u8,
+    comptime slot: @FieldType(Helper, "slot"),
+    comptime more: Helper,
+) Helper {
+    var row = more;
+    row.verb = verb;
+    row.target = target;
+    row.slot = slot;
+    if (row.name.len == 0) row.name = helperName(verb, target);
+    return row;
+}
 
 pub const Item = union(enum) {
     /// A banner and an optional comment below it.
@@ -1347,10 +1376,10 @@ pub const preamble =
     \\Types
     \\  - Value types (issuez_str, issuez_oid, issuez_time, issuez_date,
     \\    issuez_person, issuez_progress) are frozen and copied freely.
-    \\  - Records the library returns (comments, entries, problems, ...) only
-    \\    ever grow at the end: read them through the pointer, never copy one
-    \\    by value, never allocate one. Nested lists are read with *_count and
-    \\    *_at accessors, never as arrays of records.
+    \\  - Records the library returns (issue and milestone info, comments,
+    \\    entries, problems, ...) only ever grow at the end: read them through
+    \\    the pointer, never copy one by value, never allocate one. Nested lists
+    \\    are read with *_count and *_at accessors, never as arrays of records.
     \\  - Inputs the caller allocates (issuez_op, issuez_actor,
     \\    issuez_ref_update) are frozen and carry reserved space: zero it.
     \\  - Enum-valued fields of structs are uint32_t; the enums give the
@@ -1368,7 +1397,7 @@ pub const preamble =
     \\  A write is one commit: a comment, a state change (with FIXED_BY,
     \\  RELEASE, REASON) and field edits together. A delete or restore is a
     \\  commit of its own, and a description edit can't carry a comment;
-    \\  those combinations fail with ISSUEZ_E_UNSUPPORTED, problem INCOMPATIBLE.
+    \\  those combinations fail with ISSUEZ_E_INVALID_VALUE, problem INCOMPATIBLE.
     \\
     \\Op lists (writes, queries, options)
     \\  Calls taking several optional values take an array of issuez_op: a
@@ -1391,6 +1420,8 @@ pub const preamble =
     \\  - _new                 a handle built from what the call is given
     \\                         (issuez_cancel_new, issuez_store_new, issuez_diff_new)
     \\  - _load*               an issue or milestone, read from git
+    \\  - _info_of             a handle's single values, one record
+    \\                         (issuez_issue_info_of, issuez_milestone_info_of)
     \\  - _take                a value read off the repo into a handle
     \\                         (issuez_snapshot_take, issuez_label_counts_take)
     \\  - plain verbs          operations (issuez_search, issuez_sync,
@@ -1940,14 +1971,7 @@ pub const items = [_]Item{
             "is new since the tip since: what a host that projected the issue at since " ++
             "hasn't seen, merged-in commits included. NULL since: every entry is new. A " ++
             "since outside the issue's history (a purge rewrote it, or it isn't this " ++
-            "issue's) makes none new and issuez_issue_rewritten true.",
-    ),
-    f(
-        "issuez_issue_rewritten",
-        fn (?*const Issue) callconv(.c) bool,
-        &.{"i"},
-        "issuez_issue_load_since's since isn't in the history: the host can't tell " ++
-            "what is new. False from other loads.",
+            "issue's) makes none new and issuez_issue_info.rewritten true.",
     ),
     .{ .type = JsonFlag },
     f(
@@ -1974,50 +1998,20 @@ pub const items = [_]Item{
             "issuez_issue_list_skipped_at) unless ISSUEZ_LOAD_FLAG_STRICT.",
     ),
     f("issuez_issue_free", fn (?*Issue) callconv(.c) void, &.{"issue"}, ""),
-    f("issuez_issue_id", fn (?*const Issue) callconv(.c) Str, &.{"i"}, ""),
-    f("issuez_issue_tip", fn (?*const Issue) callconv(.c) Oid, &.{"i"}, "Pass as expect."),
-    f("issuez_issue_number", fn (?*const Issue, ?*u64) callconv(.c) bool, &.{ "i", "out" }, ""),
-    f("issuez_issue_format_version", fn (?*const Issue) callconv(.c) Str, &.{"i"}, ""),
-    f("issuez_issue_commit_count", fn (?*const Issue) callconv(.c) u32, &.{"i"}, ""),
-    f("issuez_issue_title", fn (?*const Issue) callconv(.c) Str, &.{"i"}, ""),
-    f("issuez_issue_description", fn (?*const Issue) callconv(.c) Str, &.{"i"}, ""),
-    f("issuez_issue_author", fn (?*const Issue) callconv(.c) ?*const Person, &.{"i"}, ""),
-    f("issuez_issue_created", fn (?*const Issue) callconv(.c) Time, &.{"i"}, ""),
-    f("issuez_issue_updated", fn (?*const Issue) callconv(.c) Time, &.{"i"}, ""),
     .{ .type = State },
-    f("issuez_issue_state", fn (?*const Issue) callconv(.c) State, &.{"i"}, ""),
-    f(
-        "issuez_issue_state_name",
-        fn (?*const Issue) callconv(.c) Str,
-        &.{"i"},
-        "\"open\", \"closed\", \"wontfix\", ...",
-    ),
-    f(
-        "issuez_issue_is_done",
-        fn (?*const Issue) callconv(.c) bool,
-        &.{"i"},
-        "closed or one of the repo's done states.",
-    ),
-    f(
-        "issuez_issue_workflow_state",
-        fn (?*const Issue) callconv(.c) Str,
-        &.{"i"},
-        "Defaulted for open issues; {NULL,0} for done ones.",
-    ),
-    f(
-        "issuez_issue_closed",
-        fn (?*const Issue, ?*Time, ?*?*const Person) callconv(.c) bool,
-        &.{ "i", "at", "by" },
-        "When and by whom the issue last became done; false while it isn't.",
-    ),
-    f("issuez_issue_fixed_by", fn (?*const Issue) callconv(.c) Str, &.{"i"}, ""),
-    f("issuez_issue_release", fn (?*const Issue) callconv(.c) Str, &.{"i"}, ""),
-    f("issuez_issue_reason", fn (?*const Issue) callconv(.c) Str, &.{"i"}, ""),
-    f("issuez_issue_is_deleted", fn (?*const Issue) callconv(.c) bool, &.{"i"}, ""),
-    f("issuez_issue_is_locked", fn (?*const Issue) callconv(.c) bool, &.{"i"}, ""),
-    f("issuez_issue_lock_reason", fn (?*const Issue) callconv(.c) Str, &.{"i"}, ""),
     .{ .type = Priority },
-    f("issuez_issue_priority", fn (?*const Issue) callconv(.c) Priority, &.{"i"}, ""),
+    .{ .prose = "An issue's single values, one record; lists and lookups have their own calls " ++
+        "below. Filled once, when the handle is built: reading it costs nothing and is safe " ++
+        "from any thread, like the rest of a loaded object. A newer library may add fields at " ++
+        "the end, which doesn't break a program built against this header because the library " ++
+        "owns the memory: read it through the pointer, never copy or allocate one." },
+    .{ .type = IssueInfo },
+    f(
+        "issuez_issue_info_of",
+        fn (?*const Issue) callconv(.c) ?*const IssueInfo,
+        &.{"i"},
+        "Borrowed from i. NULL for a NULL handle.",
+    ),
     f("issuez_issue_label_count", fn (?*const Issue) callconv(.c) usize, &.{"i"}, ""),
     f("issuez_issue_label_at", fn (?*const Issue, usize) callconv(.c) Str, &.{ "i", "k" }, ""),
     f("issuez_issue_has_label", fn (?*const Issue, Str) callconv(.c) bool, &.{ "i", "label" }, ""),
@@ -2028,36 +2022,8 @@ pub const items = [_]Item{
         &.{ "i", "k" },
         "",
     ),
-    f(
-        "issuez_issue_milestone_id",
-        fn (?*const Issue) callconv(.c) Str,
-        &.{"i"},
-        "Direct only; the effective one (through parents) is a projection answer.",
-    ),
-    f("issuez_issue_parent_id", fn (?*const Issue) callconv(.c) Str, &.{"i"}, ""),
     f("issuez_issue_blocker_count", fn (?*const Issue) callconv(.c) usize, &.{"i"}, ""),
     f("issuez_issue_blocker_at", fn (?*const Issue, usize) callconv(.c) Str, &.{ "i", "k" }, ""),
-    f(
-        "issuez_issue_start_date",
-        fn (?*const Issue, ?*Date) callconv(.c) bool,
-        &.{ "i", "out" },
-        "",
-    ),
-    f("issuez_issue_due_date", fn (?*const Issue, ?*Date) callconv(.c) bool, &.{ "i", "out" }, ""),
-    f(
-        "issuez_issue_estimate_minutes",
-        fn (?*const Issue, ?*u32) callconv(.c) bool,
-        &.{ "i", "out" },
-        "",
-    ),
-    f("issuez_issue_ref", fn (?*const Issue) callconv(.c) Str, &.{"i"}, "A branch or tag."),
-    f(
-        "issuez_issue_original_author",
-        fn (?*const Issue) callconv(.c) Str,
-        &.{"i"},
-        "An imported issue's author in the other tracker; {NULL,0} otherwise.",
-    ),
-    f("issuez_issue_original_id", fn (?*const Issue) callconv(.c) Str, &.{"i"}, ""),
     f(
         "issuez_issue_field",
         fn (?*const Issue, Str) callconv(.c) Str,
@@ -2116,19 +2082,6 @@ pub const items = [_]Item{
         "issuez_issue_comment_find",
         fn (?*const Issue, ?*const Oid) callconv(.c) ?*const Comment,
         &.{ "i", "id" },
-        "",
-    ),
-    f(
-        "issuez_comment_reaction_count",
-        fn (?*const Comment) callconv(.c) usize,
-        &.{"c"},
-        "The comment's reactions, from the record itself: the same as " ++
-            "issuez_issue_reaction_count with its id.",
-    ),
-    f(
-        "issuez_comment_reaction_at",
-        fn (?*const Comment, usize) callconv(.c) ?*const Reaction,
-        &.{ "c", "k" },
         "",
     ),
     f(
@@ -2414,41 +2367,15 @@ pub const items = [_]Item{
         "",
     ),
     f("issuez_milestone_list_free", fn (?*MilestoneList) callconv(.c) void, &.{"l"}, ""),
-    f("issuez_milestone_id", fn (?*const Milestone) callconv(.c) Str, &.{"m"}, ""),
-    f("issuez_milestone_tip", fn (?*const Milestone) callconv(.c) Oid, &.{"m"}, ""),
-    f("issuez_milestone_name", fn (?*const Milestone) callconv(.c) Str, &.{"m"}, ""),
-    f("issuez_milestone_description", fn (?*const Milestone) callconv(.c) Str, &.{"m"}, ""),
+    .{ .prose = "A milestone's single values, one record, like issuez_issue_info: filled once " ++
+        "when the handle is built, and fields may be added at the end, so read it through the " ++
+        "pointer and never copy or allocate one." },
+    .{ .type = MilestoneInfo },
     f(
-        "issuez_milestone_status_of",
-        fn (?*const Milestone) callconv(.c) MilestoneStatus,
+        "issuez_milestone_info_of",
+        fn (?*const Milestone) callconv(.c) ?*const MilestoneInfo,
         &.{"m"},
-        "",
-    ),
-    f(
-        "issuez_milestone_due_date",
-        fn (?*const Milestone, ?*Date) callconv(.c) bool,
-        &.{ "m", "out" },
-        "",
-    ),
-    f("issuez_milestone_created", fn (?*const Milestone) callconv(.c) Time, &.{"m"}, ""),
-    f(
-        "issuez_milestone_updated",
-        fn (?*const Milestone) callconv(.c) Time,
-        &.{"m"},
-        "Of its latest commit.",
-    ),
-    f(
-        "issuez_milestone_status_changed",
-        fn (?*const Milestone, ?*Time) callconv(.c) bool,
-        &.{ "m", "out" },
-        "When the status it has was set, by the last commit after the root that set it: " ++
-            "a completed milestone's closing time. False when none did.",
-    ),
-    f(
-        "issuez_milestone_author",
-        fn (?*const Milestone) callconv(.c) ?*const Person,
-        &.{"m"},
-        "Who created it.",
+        "Borrowed from m. NULL for a NULL handle.",
     ),
     f(
         "issuez_milestone_problems",
@@ -2815,272 +2742,104 @@ pub const items = [_]Item{
 };
 
 pub const helpers = [_]Helper{
-    .{ .name = "issuez_set_title", .verb = .set, .target = "title", .slot = .str },
-    .{ .name = "issuez_set_description", .verb = .set, .target = "description", .slot = .str },
-    .{ .name = "issuez_set_comment", .verb = .set, .target = "comment", .slot = .str },
-    .{ .name = "issuez_set_state", .verb = .set, .target = "state", .slot = .str },
-    .{ .name = "issuez_set_fixed_by", .verb = .set, .target = "fixed_by", .slot = .str },
-    .{ .name = "issuez_set_release", .verb = .set, .target = "release", .slot = .str },
-    .{ .name = "issuez_set_reason", .verb = .set, .target = "reason", .slot = .str },
-    .{
-        .name = "issuez_set_workflow_state",
-        .verb = .set,
-        .target = "workflow_state",
-        .slot = .str,
-    },
-    .{
-        .name = "issuez_clear_workflow_state",
-        .verb = .clear,
-        .target = "workflow_state",
-        .slot = .none,
-    },
-    .{ .name = "issuez_add_label", .verb = .add, .target = "labels", .slot = .str },
-    .{ .name = "issuez_remove_label", .verb = .remove, .target = "labels", .slot = .str },
-    .{ .name = "issuez_clear_labels", .verb = .clear, .target = "labels", .slot = .none },
-    .{ .name = "issuez_add_assignee", .verb = .add, .target = "assignees", .slot = .person },
-    .{ .name = "issuez_remove_assignee", .verb = .remove, .target = "assignees", .slot = .person },
-    .{ .name = "issuez_clear_assignees", .verb = .clear, .target = "assignees", .slot = .none },
-    .{
-        .name = "issuez_set_priority",
-        .verb = .set,
-        .target = "priority",
-        .slot = .num,
-        .num_type = "issuez_priority",
-        .param = "priority",
-    },
-    .{ .name = "issuez_clear_priority", .verb = .clear, .target = "priority", .slot = .none },
-    .{ .name = "issuez_set_milestone", .verb = .set, .target = "milestone", .slot = .str },
-    .{ .name = "issuez_inherit_milestone", .verb = .inherit, .target = "milestone", .slot = .none },
-    .{ .name = "issuez_clear_milestone", .verb = .clear, .target = "milestone", .slot = .none },
-    .{ .name = "issuez_set_parent", .verb = .set, .target = "parent", .slot = .str },
-    .{ .name = "issuez_clear_parent", .verb = .clear, .target = "parent", .slot = .none },
-    .{ .name = "issuez_add_blocker", .verb = .add, .target = "blocked_by", .slot = .str },
-    .{ .name = "issuez_remove_blocker", .verb = .remove, .target = "blocked_by", .slot = .str },
-    .{ .name = "issuez_set_start_date", .verb = .set, .target = "start_date", .slot = .date },
-    .{ .name = "issuez_clear_start_date", .verb = .clear, .target = "start_date", .slot = .none },
-    .{ .name = "issuez_set_due_date", .verb = .set, .target = "due_date", .slot = .date },
-    .{ .name = "issuez_clear_due_date", .verb = .clear, .target = "due_date", .slot = .none },
-    .{ .name = "issuez_set_estimate", .verb = .set, .target = "estimate", .slot = .num },
-    .{ .name = "issuez_clear_estimate", .verb = .clear, .target = "estimate", .slot = .none },
-    .{
-        .name = "issuez_set_deleted",
-        .verb = .set,
-        .target = "deleted",
-        .slot = .num,
-        .num_type = "bool",
-        .param = "deleted",
-    },
-    .{ .name = "issuez_set_number", .verb = .set, .target = "number", .slot = .num },
-    .{ .name = "issuez_set_name", .verb = .set, .target = "name", .slot = .str },
-    .{
-        .name = "issuez_set_milestone_status",
-        .verb = .set,
-        .target = "milestone_status",
-        .slot = .num,
+    h(.set, "title", .str, .{}),
+    h(.set, "description", .str, .{}),
+    h(.set, "comment", .str, .{}),
+    h(.set, "state", .str, .{}),
+    h(.set, "fixed_by", .str, .{}),
+    h(.set, "release", .str, .{}),
+    h(.set, "reason", .str, .{}),
+    h(.set, "workflow_state", .str, .{}),
+    h(.clear, "workflow_state", .none, .{}),
+    h(.add, "labels", .str, .{}),
+    h(.remove, "labels", .str, .{}),
+    h(.clear, "labels", .none, .{}),
+    h(.add, "assignees", .person, .{}),
+    h(.remove, "assignees", .person, .{}),
+    h(.clear, "assignees", .none, .{}),
+    h(.set, "priority", .num, .{ .num_type = "issuez_priority", .param = "priority" }),
+    h(.clear, "priority", .none, .{}),
+    h(.set, "milestone", .str, .{}),
+    h(.inherit, "milestone", .none, .{}),
+    h(.clear, "milestone", .none, .{}),
+    h(.set, "parent", .str, .{}),
+    h(.clear, "parent", .none, .{}),
+    h(.add, "blocked_by", .str, .{ .name = "issuez_add_blocker" }),
+    h(.remove, "blocked_by", .str, .{ .name = "issuez_remove_blocker" }),
+    h(.set, "start_date", .date, .{}),
+    h(.clear, "start_date", .none, .{}),
+    h(.set, "due_date", .date, .{}),
+    h(.clear, "due_date", .none, .{}),
+    h(.set, "estimate", .num, .{}),
+    h(.clear, "estimate", .none, .{}),
+    h(.set, "deleted", .num, .{ .num_type = "bool", .param = "deleted" }),
+    h(.set, "number", .num, .{}),
+    h(.set, "name", .str, .{}),
+    h(.set, "milestone_status", .num, .{
         .num_type = "issuez_milestone_status",
         .param = "status",
-    },
-    .{ .name = "issuez_set_extra", .verb = .set, .target = "extra", .slot = .name_str },
-    .{ .name = "issuez_expect", .verb = .set, .target = "expect", .slot = .oid },
-    .{ .name = "issuez_set_subject", .verb = .set, .target = "subject", .slot = .str },
-    .{ .name = "issuez_q_label", .verb = .add, .target = "q_label", .slot = .str },
-    .{ .name = "issuez_q_not_label", .verb = .add, .target = "q_not_label", .slot = .str },
-    .{ .name = "issuez_q_assignee", .verb = .add, .target = "q_assignee", .slot = .str },
-    .{ .name = "issuez_q_state", .verb = .add, .target = "q_state", .slot = .str },
-    .{ .name = "issuez_q_done", .verb = .set, .target = "q_done", .slot = .num, .param = "done" },
-    .{ .name = "issuez_q_limit", .verb = .set, .target = "q_limit", .slot = .num },
-    .{ .name = "issuez_q_after", .verb = .set, .target = "q_after", .slot = .str },
-    .{ .name = "issuez_opt_git_path", .verb = .set, .target = "git_path", .slot = .str },
-    .{ .name = "issuez_opt_committer", .verb = .set, .target = "committer", .slot = .committer },
-    .{ .name = "issuez_opt_pool_size", .verb = .set, .target = "pool_size", .slot = .num },
-    .{ .name = "issuez_opt_pusher", .verb = .set, .target = "pusher", .slot = .person },
-    .{ .name = "issuez_opt_pusher_email", .verb = .add, .target = "pusher_email", .slot = .str },
-    .{
-        .name = "issuez_opt_author_policy",
-        .verb = .set,
-        .target = "author_policy",
-        .slot = .num,
-        .num_type = "issuez_author_policy",
-        .param = "policy",
-    },
-    .{
-        .name = "issuez_opt_allow_numbers",
-        .verb = .set,
-        .target = "allow_numbers",
-        .slot = .num,
-        .num_type = "bool",
-        .param = "allow",
-    },
-    .{
-        .name = "issuez_opt_allow_purge",
-        .verb = .set,
-        .target = "allow_purge",
-        .slot = .num,
-        .num_type = "bool",
-        .param = "allow",
-    },
-    .{
-        .name = "issuez_opt_pusher_user_id",
-        .verb = .add,
-        .target = "pusher_user_id",
-        .slot = .str,
-    },
-    .{ .name = "issuez_opt_object_dir", .verb = .set, .target = "object_dir", .slot = .str },
-    .{
-        .name = "issuez_opt_alternate_object_dirs",
-        .verb = .set,
-        .target = "alternate_object_dirs",
-        .slot = .str,
-    },
-    .{ .name = "issuez_set_ref", .verb = .set, .target = "ref", .slot = .str },
-    .{ .name = "issuez_clear_ref", .verb = .clear, .target = "ref", .slot = .none },
-    .{
-        .name = "issuez_set_locked",
-        .verb = .set,
-        .target = "locked",
-        .slot = .num_str,
-        .num_type = "bool",
-        .param = "locked",
-        .param2 = "reason",
-    },
-    .{
-        .name = "issuez_add_attachment",
-        .verb = .add,
-        .target = "attachments",
-        .slot = .attachment,
-    },
-    .{ .name = "issuez_remove_attachment", .verb = .remove, .target = "attachments", .slot = .str },
-    .{
-        .name = "issuez_set_original_author",
-        .verb = .set,
-        .target = "original_author",
-        .slot = .str,
-    },
-    .{ .name = "issuez_set_original_id", .verb = .set, .target = "original_id", .slot = .str },
-    .{ .name = "issuez_edit_comment", .verb = .set, .target = "edit_comment", .slot = .oid },
-    .{ .name = "issuez_expect_edits", .verb = .set, .target = "expect_edits", .slot = .num },
-    .{ .name = "issuez_delete_comment", .verb = .set, .target = "delete_comment", .slot = .oid },
-    .{ .name = "issuez_restore_comment", .verb = .set, .target = "restore_comment", .slot = .oid },
-    .{ .name = "issuez_add_reaction", .verb = .add, .target = "reactions", .slot = .str },
-    .{ .name = "issuez_remove_reaction", .verb = .remove, .target = "reactions", .slot = .str },
-    .{ .name = "issuez_reaction_target", .verb = .set, .target = "reaction_target", .slot = .oid },
-    .{
-        .name = "issuez_q_deleted",
-        .verb = .set,
-        .target = "q_deleted",
-        .slot = .num,
-        .param = "deleted",
-    },
-    .{
-        .name = "issuez_q_workflow_state",
-        .verb = .add,
-        .target = "q_workflow_state",
-        .slot = .str,
-    },
-    .{ .name = "issuez_q_no_labels", .verb = .set, .target = "q_no_labels", .slot = .none },
-    .{ .name = "issuez_q_author", .verb = .add, .target = "q_author", .slot = .str },
-    .{
-        .name = "issuez_q_priority",
-        .verb = .add,
-        .target = "q_priority",
-        .slot = .num,
-        .num_type = "issuez_priority",
-        .param = "priority",
-    },
-    .{ .name = "issuez_q_milestone", .verb = .add, .target = "q_milestone", .slot = .str },
-    .{ .name = "issuez_q_parent", .verb = .set, .target = "q_parent", .slot = .str },
-    .{
-        .name = "issuez_q_blocked",
-        .verb = .set,
-        .target = "q_blocked",
-        .slot = .num,
-        .num_type = "bool",
-        .param = "blocked",
-    },
-    .{
-        .name = "issuez_q_updated",
-        .verb = .set,
-        .target = "q_updated",
-        .slot = .num_num2,
-        .param = "after",
-        .param2 = "before",
-    },
-    .{
-        .name = "issuez_q_text",
-        .verb = .set,
-        .target = "q_text",
-        .slot = .str_num,
-        .param = "text",
-        .num2_type = "bool",
-        .param2 = "ignore_case",
-    },
-    .{
-        .name = "issuez_q_order",
-        .verb = .set,
-        .target = "q_order",
-        .slot = .num_num2,
+    }),
+    h(.set, "extra", .name_str, .{}),
+    h(.set, "expect", .oid, .{ .name = "issuez_expect" }),
+    h(.set, "subject", .str, .{ .name = "issuez_set_subject" }),
+    h(.add, "q_label", .str, .{}),
+    h(.add, "q_not_label", .str, .{}),
+    h(.add, "q_assignee", .str, .{}),
+    h(.add, "q_state", .str, .{}),
+    h(.set, "q_done", .num, .{ .param = "done" }),
+    h(.set, "q_limit", .num, .{}),
+    h(.set, "q_after", .str, .{}),
+    h(.set, "git_path", .str, .{}),
+    h(.set, "committer", .committer, .{}),
+    h(.set, "pool_size", .num, .{}),
+    h(.set, "pusher", .person, .{}),
+    h(.add, "pusher_email", .str, .{}),
+    h(.set, "author_policy", .num, .{ .num_type = "issuez_author_policy", .param = "policy" }),
+    h(.set, "allow_numbers", .num, .{ .num_type = "bool", .param = "allow" }),
+    h(.set, "allow_purge", .num, .{ .num_type = "bool", .param = "allow" }),
+    h(.add, "pusher_user_id", .str, .{}),
+    h(.set, "object_dir", .str, .{}),
+    h(.set, "alternate_object_dirs", .str, .{}),
+    h(.set, "ref", .str, .{}),
+    h(.clear, "ref", .none, .{}),
+    h(.set, "locked", .num_str, .{ .num_type = "bool", .param = "locked", .param2 = "reason" }),
+    h(.add, "attachments", .attachment, .{}),
+    h(.remove, "attachments", .str, .{}),
+    h(.set, "original_author", .str, .{ .name = "issuez_set_original_author" }),
+    h(.set, "original_id", .str, .{ .name = "issuez_set_original_id" }),
+    h(.set, "edit_comment", .oid, .{ .name = "issuez_edit_comment" }),
+    h(.set, "expect_edits", .num, .{ .name = "issuez_expect_edits" }),
+    h(.set, "delete_comment", .oid, .{ .name = "issuez_delete_comment" }),
+    h(.set, "restore_comment", .oid, .{ .name = "issuez_restore_comment" }),
+    h(.add, "reactions", .str, .{}),
+    h(.remove, "reactions", .str, .{}),
+    h(.set, "reaction_target", .oid, .{ .name = "issuez_reaction_target" }),
+    h(.set, "q_deleted", .num, .{ .param = "deleted" }),
+    h(.add, "q_workflow_state", .str, .{}),
+    h(.set, "q_no_labels", .none, .{}),
+    h(.add, "q_author", .str, .{}),
+    h(.add, "q_priority", .num, .{ .num_type = "issuez_priority", .param = "priority" }),
+    h(.add, "q_milestone", .str, .{}),
+    h(.set, "q_parent", .str, .{}),
+    h(.set, "q_blocked", .num, .{ .num_type = "bool", .param = "blocked" }),
+    h(.set, "q_updated", .num_num2, .{ .param = "after", .param2 = "before" }),
+    h(.set, "q_text", .str_num, .{ .param = "text", .num2_type = "bool", .param2 = "ignore_case" }),
+    h(.set, "q_order", .num_num2, .{
         .num_type = "issuez_sort",
         .param = "sort",
         .num2_type = "bool",
         .param2 = "ascending",
-    },
-    .{ .name = "issuez_opt_env", .verb = .set, .target = "env", .slot = .name_str },
-    .{ .name = "issuez_opt_done_state", .verb = .add, .target = "done_state", .slot = .str },
-    .{
-        .name = "issuez_opt_workflow_state",
-        .verb = .add,
-        .target = "opt:workflow_state",
-        .slot = .str,
-    },
-    .{
-        .name = "issuez_opt_exclusive_scope",
-        .verb = .add,
-        .target = "exclusive_scope",
-        .slot = .str,
-    },
-    .{ .name = "issuez_opt_extra_prefix", .verb = .add, .target = "extra_prefix", .slot = .str },
-    .{
-        .name = "issuez_opt_timeout_local_ms",
-        .verb = .set,
-        .target = "timeout_local_ms",
-        .slot = .num,
-    },
-    .{
-        .name = "issuez_opt_timeout_network_ms",
-        .verb = .set,
-        .target = "timeout_network_ms",
-        .slot = .num,
-    },
-    .{
-        .name = "issuez_opt_limit",
-        .verb = .set,
-        .target = "limit",
-        .slot = .name_num,
-        .param = "value",
-    },
-    .{ .name = "issuez_opt_cache_issues", .verb = .set, .target = "cache_issues", .slot = .num },
-    .{
-        .name = "issuez_opt_attachment_store",
-        .verb = .set,
-        .target = "attachment_store",
-        .slot = .num,
-        .num_type = "bool",
-        .param = "store",
-    },
-    .{
-        .name = "issuez_opt_sync_push",
-        .verb = .set,
-        .target = "sync_push",
-        .slot = .num,
-        .num_type = "bool",
-        .param = "push",
-    },
-    .{
-        .name = "issuez_opt_sync_attachments",
-        .verb = .set,
-        .target = "sync_attachments",
-        .slot = .num,
-        .num_type = "bool",
-        .param = "attachments",
-    },
+    }),
+    h(.set, "env", .name_str, .{}),
+    h(.add, "done_state", .str, .{}),
+    h(.add, "opt:workflow_state", .str, .{}),
+    h(.add, "exclusive_scope", .str, .{}),
+    h(.add, "extra_prefix", .str, .{}),
+    h(.set, "timeout_local_ms", .num, .{}),
+    h(.set, "timeout_network_ms", .num, .{}),
+    h(.set, "limit", .name_num, .{ .param = "value" }),
+    h(.set, "cache_issues", .num, .{}),
+    h(.set, "attachment_store", .num, .{ .num_type = "bool", .param = "store" }),
+    h(.set, "sync_push", .num, .{ .num_type = "bool", .param = "push" }),
+    h(.set, "sync_attachments", .num, .{ .num_type = "bool", .param = "attachments" }),
 };

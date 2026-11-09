@@ -27,20 +27,15 @@ pub fn read(c: commands.Clone, tip: []const u8) Allocator.Error!Tomb {
     const arena = c.arena;
     var out: Tomb = .{};
     var comments: std.ArrayList([]const u8) = .empty;
-    var seen: std.StringHashMapUnmanaged(void) = .empty;
-    var stack: std.ArrayList([]const u8) = .empty;
-    try stack.append(arena, tip);
-    while (stack.pop()) |hex| {
-        if ((try seen.getOrPut(arena, hex)).found_existing) continue;
-        const cm = c.commit(hex) orelse continue;
-        for (cm.parents) |p| try stack.append(arena, try p.hexAlloc(arena));
-        const block = try commands.trailersOf(arena, cm.message);
+    var walk = try c.walk(tip);
+    while (try walk.next()) |x| {
+        const block = try commands.trailersOf(arena, x.commit.message);
         const kind = trailers.lastValue(block, "X-Purge") orelse continue;
         if (std.mem.eql(u8, kind, "issue")) out.issue = true;
         if (!std.mem.eql(u8, kind, "comment")) continue;
         for (block.trailers) |t| {
             if (!std.ascii.eqlIgnoreCase(t.key, "X-Purged-Commit")) continue;
-            if (!isFullHex(c, t.value)) continue;
+            if (!c.isFullHex(t.value)) continue;
             if (!commands.containsText(comments.items, t.value))
                 try comments.append(arena, t.value);
         }
@@ -56,35 +51,23 @@ pub fn of(c: commands.Clone, id: []const u8) Allocator.Error!?Tomb {
     return try read(c, tip);
 }
 
-fn isFullHex(c: commands.Clone, s: []const u8) bool {
-    if (s.len != c.format.hexLen()) return false;
-    for (s) |ch| if (!std.ascii.isDigit(ch) and !(ch >= 'a' and ch <= 'f')) return false;
-    return true;
-}
-
 /// The commit's ID before any purge.
 pub fn firstId(c: commands.Clone, hex: []const u8) Allocator.Error![]const u8 {
     const cm = c.commit(hex) orelse return hex;
     const block = try commands.trailersOf(c.arena, cm.message);
     const was = trailers.lastValue(block, "X-Rewritten-From") orelse return hex;
-    return if (isFullHex(c, was)) was else hex;
+    return if (c.isFullHex(was)) was else hex;
 }
 
 /// Whether the history of `tip` still has text a purge took: a commit
 /// whose first ID is purged and that isn't marked `X-Purged: true`.
 pub fn leaks(c: commands.Clone, tip: []const u8, t: Tomb) Allocator.Error!?[]const u8 {
-    const arena = c.arena;
-    var seen: std.StringHashMapUnmanaged(void) = .empty;
-    var stack: std.ArrayList([]const u8) = .empty;
-    try stack.append(arena, tip);
-    while (stack.pop()) |hex| {
-        if ((try seen.getOrPut(arena, hex)).found_existing) continue;
-        const cm = c.commit(hex) orelse continue;
-        for (cm.parents) |p| try stack.append(arena, try p.hexAlloc(arena));
-        if (!t.covers(try firstId(c, hex))) continue;
-        const block = try commands.trailersOf(arena, cm.message);
+    var walk = try c.walk(tip);
+    while (try walk.next()) |x| {
+        if (!t.covers(try firstId(c, x.hex))) continue;
+        const block = try commands.trailersOf(c.arena, x.commit.message);
         const marked = trailers.lastValue(block, "X-Purged") orelse "";
-        if (!std.mem.eql(u8, marked, "true")) return hex;
+        if (!std.mem.eql(u8, marked, "true")) return x.hex;
     }
     return null;
 }
@@ -114,22 +97,15 @@ pub fn rewrite(
     // The new commits too: a merge's new parents are read like any others.
     var over = c;
     over.objects = try c.objects.clone(c.arena);
-    var in_history: std.StringHashMapUnmanaged(void) = .empty;
-    {
-        var stack: std.ArrayList([]const u8) = .empty;
-        try stack.append(c.arena, tip);
-        while (stack.pop()) |hex| {
-            if ((try in_history.getOrPut(c.arena, hex)).found_existing) continue;
-            const cm = c.commit(hex) orelse return null;
-            for (cm.parents) |p| try stack.append(c.arena, try p.hexAlloc(c.arena));
-        }
-    }
+    var walk = try c.walk(tip);
+    while (try walk.next()) |_| {}
+    if (walk.missing) return null;
     const r: Rewriter = .{
         .c = c,
         .purged = purged,
         .memo = &memo,
         .over = &over,
-        .history = &in_history,
+        .history = &walk.seen,
     };
     return try r.new(tip);
 }
@@ -218,16 +194,8 @@ const Rewriter = struct {
 
     /// The parent with all the others in its history.
     fn lineTip(r: Rewriter, parents: []const []const u8) Allocator.Error!?[]const u8 {
-        const arena = r.c.arena;
         for (parents) |p| {
-            var seen: std.StringHashMapUnmanaged(void) = .empty;
-            var stack: std.ArrayList([]const u8) = .empty;
-            try stack.append(arena, p);
-            while (stack.pop()) |x| {
-                if ((try seen.getOrPut(arena, x)).found_existing) continue;
-                const cm = r.over.commit(x) orelse continue;
-                for (cm.parents) |y| try stack.append(arena, try y.hexAlloc(arena));
-            }
+            const seen = try r.over.reach(p);
             for (parents) |other| {
                 if (!seen.contains(other)) break;
             } else return p;

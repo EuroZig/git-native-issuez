@@ -262,41 +262,25 @@ func RefSpecs() []string {
 // Resolve turns user input ("a7f3", "#12", a UUID, a milestone name)
 // into UUIDs: none, one or several.
 func (r *Repo) Resolve(ctx context.Context, kind Kind, input string) ([]string, error) {
-	var ids []string
-	err := r.use(func(c *C.issuez_repo) error {
-		var m *C.issuez_matches
-		var cerr *C.issuez_error
-		rc := call(ctx, func(tok *C.issuez_cancel) C.issuez_code {
-			return C.issuez_resolve(c, C.issuez_kind(kind), cStr(input), tok, &m, &cerr)
-		})
-		if rc != C.ISSUEZ_OK {
-			return takeError(ctx, cerr)
-		}
-		defer C.issuez_matches_free(m)
-		ids = goStrs(C.issuez_matches_len(m), func(i C.size_t) C.issuez_str { return C.issuez_matches_at(m, i) })
-		return nil
-	})
-	return ids, err
+	return fetch(ctx, r, func(a cArgs, m **C.issuez_matches) C.issuez_code {
+		return C.issuez_resolve(a.repo, C.issuez_kind(kind), cStr(input), a.tok, m, a.cerr)
+	}, takeMatches)
+}
+
+// takeMatches copies and frees an owned list.
+func takeMatches(m *C.issuez_matches) []string {
+	defer C.issuez_matches_free(m)
+	return goStrs(C.issuez_matches_len(m), func(i C.size_t) C.issuez_str { return C.issuez_matches_at(m, i) })
 }
 
 // ResolveOne is Resolve that wants exactly one: ErrNotFound or
 // ErrAmbiguous otherwise.
 func (r *Repo) ResolveOne(ctx context.Context, kind Kind, input string) (string, error) {
-	var id string
-	err := r.use(func(c *C.issuez_repo) error {
-		buf := (*C.char)(C.malloc(C.ISSUEZ_UUID_BUFSIZE))
-		defer C.free(unsafe.Pointer(buf))
-		var cerr *C.issuez_error
-		rc := call(ctx, func(tok *C.issuez_cancel) C.issuez_code {
-			return C.issuez_resolve_one(c, C.issuez_kind(kind), cStr(input), tok, buf, &cerr)
-		})
-		if rc != C.ISSUEZ_OK {
-			return takeError(ctx, cerr)
-		}
-		id = C.GoString(buf)
-		return nil
-	})
-	return id, err
+	buf := (*C.char)(C.malloc(C.ISSUEZ_UUID_BUFSIZE))
+	defer C.free(unsafe.Pointer(buf))
+	return fetch(ctx, r, func(a cArgs, _ *struct{}) C.issuez_code {
+		return C.issuez_resolve_one(a.repo, C.issuez_kind(kind), cStr(input), a.tok, buf, a.cerr)
+	}, func(struct{}) string { return C.GoString(buf) })
 }
 
 // DropAll deletes every ref of the library's (issues, milestones,
@@ -305,18 +289,9 @@ func (r *Repo) ResolveOne(ctx context.Context, kind Kind, input string) (string,
 // writes running. Not a purge: clones keep their copies and sync them
 // back.
 func (r *Repo) DropAll(ctx context.Context) (int, error) {
-	var n int
-	err := r.use(func(c *C.issuez_repo) error {
-		var out C.size_t
-		var cerr *C.issuez_error
-		rc := call(ctx, func(tok *C.issuez_cancel) C.issuez_code { return C.issuez_repo_drop_all(c, tok, &out, &cerr) })
-		if rc != C.ISSUEZ_OK {
-			return takeError(ctx, cerr)
-		}
-		n = int(out)
-		return nil
-	})
-	return n, err
+	return fetch(ctx, r, func(a cArgs, out *C.size_t) C.issuez_code {
+		return C.issuez_repo_drop_all(a.repo, a.tok, out, a.cerr)
+	}, func(out C.size_t) int { return int(out) })
 }
 
 // AdoptRefs creates in r every issue, milestone, attachment and tombstone
@@ -329,16 +304,11 @@ func (r *Repo) AdoptRefs(ctx context.Context, from *Repo) (int, error) {
 	var n int
 	err := r.use(func(c *C.issuez_repo) error {
 		return from.use(func(f *C.issuez_repo) error {
-			var out C.size_t
-			var cerr *C.issuez_error
-			rc := call(ctx, func(tok *C.issuez_cancel) C.issuez_code {
-				return C.issuez_repo_adopt_refs(c, f, tok, &out, &cerr)
+			out, err := invoke(ctx, c, func(a cArgs, out *C.size_t) C.issuez_code {
+				return C.issuez_repo_adopt_refs(a.repo, f, a.tok, out, a.cerr)
 			})
-			if rc != C.ISSUEZ_OK {
-				return takeError(ctx, cerr)
-			}
 			n = int(out)
-			return nil
+			return err
 		})
 	})
 	return n, err
@@ -365,19 +335,12 @@ type Snapshot struct {
 
 // Snapshot takes the tips of every issue and milestone now.
 func (r *Repo) Snapshot(ctx context.Context) (*Snapshot, error) {
-	var snap *Snapshot
-	err := r.use(func(c *C.issuez_repo) error {
-		var s *C.issuez_snapshot
-		var cerr *C.issuez_error
-		rc := call(ctx, func(tok *C.issuez_cancel) C.issuez_code { return C.issuez_snapshot_take(c, tok, &s, &cerr) })
-		if rc != C.ISSUEZ_OK {
-			return takeError(ctx, cerr)
-		}
+	return fetch(ctx, r, func(a cArgs, s **C.issuez_snapshot) C.issuez_code {
+		return C.issuez_snapshot_take(a.repo, a.tok, s, a.cerr)
+	}, func(s *C.issuez_snapshot) *Snapshot {
 		defer C.issuez_snapshot_free(s)
-		snap = goSnapshot(s)
-		return nil
+		return goSnapshot(s)
 	})
-	return snap, err
 }
 
 func goSnapshot(s *C.issuez_snapshot) *Snapshot {
@@ -523,16 +486,13 @@ func (r *Repo) WriteSettings(ctx context.Context, s Settings) error {
 			}
 		}
 	}
-	return r.use(func(c *C.issuez_repo) error {
-		var pin runtime.Pinner
-		defer pin.Unpin()
-		cops, n := cOps(&pin, ops)
-		var cerr *C.issuez_error
-		if rc := call(ctx, func(tok *C.issuez_cancel) C.issuez_code { return C.issuez_settings_write(c, cops, n, tok, &cerr) }); rc != C.ISSUEZ_OK {
-			return takeError(ctx, cerr)
-		}
-		return nil
-	})
+	var pin runtime.Pinner
+	defer pin.Unpin()
+	cops, n := cOps(&pin, ops)
+	_, err := fetch(ctx, r, func(a cArgs, _ *struct{}) C.issuez_code {
+		return C.issuez_settings_write(a.repo, cops, n, a.tok, a.cerr)
+	}, func(struct{}) struct{} { return struct{}{} })
+	return err
 }
 
 // Import stages ordinary writes on Repo, with the target's policy and objects.
@@ -543,38 +503,17 @@ type Import struct{ *Repo }
 // BeginImport creates a private staging repo. Nothing becomes visible on the
 // target until Commit succeeds. Closing the target does not invalidate staging.
 func (r *Repo) BeginImport(ctx context.Context) (*Import, error) {
-	var stage *Import
-	err := r.use(func(c *C.issuez_repo) error {
-		var out *C.issuez_repo
-		var cerr *C.issuez_error
-		rc := call(ctx, func(tok *C.issuez_cancel) C.issuez_code {
-			return C.issuez_repo_begin_import(c, tok, &out, &cerr)
-		})
-		if rc != C.ISSUEZ_OK {
-			return takeError(ctx, cerr)
-		}
-		stage = &Import{Repo: wrapRepo(out)}
-		return nil
-	})
-	return stage, err
+	return fetch(ctx, r, func(a cArgs, out **C.issuez_repo) C.issuez_code {
+		return C.issuez_repo_begin_import(a.repo, a.tok, out, a.cerr)
+	}, func(out *C.issuez_repo) *Import { return &Import{Repo: wrapRepo(out)} })
 }
 
 // Commit publishes all staged refs atomically, then closes the staging repo.
 // On failure no refs are published; Close aborts, or Commit may be retried.
 func (i *Import) Commit(ctx context.Context) (int, error) {
-	var n int
-	err := i.Repo.use(func(c *C.issuez_repo) error {
-		var count C.size_t
-		var cerr *C.issuez_error
-		rc := call(ctx, func(tok *C.issuez_cancel) C.issuez_code {
-			return C.issuez_repo_commit_import(c, tok, &count, &cerr)
-		})
-		if rc != C.ISSUEZ_OK {
-			return takeError(ctx, cerr)
-		}
-		n = int(count)
-		return nil
-	})
+	n, err := fetch(ctx, i.Repo, func(a cArgs, out *C.size_t) C.issuez_code {
+		return C.issuez_repo_commit_import(a.repo, a.tok, out, a.cerr)
+	}, func(out C.size_t) int { return int(out) })
 	if err == nil {
 		err = i.Close()
 	}

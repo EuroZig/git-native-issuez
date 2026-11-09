@@ -11,7 +11,6 @@ import (
 	"encoding/hex"
 	"fmt"
 	"runtime"
-	"unsafe"
 )
 
 // Write is the receipt of a write.
@@ -83,56 +82,53 @@ func (o writeOpts) withExpect(e *Edit) []op {
 
 // write runs one write call and copies the receipt out.
 func (r *Repo) write(ctx context.Context, o writeOpts,
-	f func(c *C.issuez_repo, pin *runtime.Pinner, tok *C.issuez_cancel, out **C.issuez_write, cerr **C.issuez_error) C.issuez_code,
-) (res *Write, err error) {
-	err = r.use(func(c *C.issuez_repo) error {
-		var pin runtime.Pinner
-		defer pin.Unpin()
-		var w *C.issuez_write
-		var cerr *C.issuez_error
-		rc := call(ctx, func(tok *C.issuez_cancel) C.issuez_code { return f(c, &pin, tok, &w, &cerr) })
-		if rc != C.ISSUEZ_OK {
-			return takeError(ctx, cerr)
-		}
+	f func(a cArgs, pin *runtime.Pinner, w **C.issuez_write) C.issuez_code,
+) (*Write, error) {
+	var pin runtime.Pinner
+	defer pin.Unpin()
+	var failed error
+	res, err := fetch(ctx, r, func(a cArgs, w **C.issuez_write) C.issuez_code {
+		return f(a, &pin, w)
+	}, func(w *C.issuez_write) *Write {
 		defer C.issuez_write_free(w)
-		res = goWrite(w)
+		res := goWrite(w)
 		if o.reload && res.Kind == KindIssue {
-			var i *C.issuez_issue
-			rc := call(ctx, func(tok *C.issuez_cancel) C.issuez_code {
-				return C.issuez_write_load_issue(w, tok, &i, &cerr)
+			res.Issue, failed = reload(ctx, res, func(a cArgs, i **C.issuez_issue) C.issuez_code {
+				return C.issuez_write_load_issue(w, a.tok, i, a.cerr)
+			}, func(i *C.issuez_issue) *Issue {
+				defer C.issuez_issue_free(i)
+				return goIssue(i, false)
 			})
-			if rc != C.ISSUEZ_OK {
-				// The write landed; report that with the error.
-				e := takeError(ctx, cerr).(*Error)
-				e.Write = res
-				return e
-			}
-			defer C.issuez_issue_free(i)
-			res.Issue = goIssue(i, false)
 		}
 		if o.reload && res.Kind == KindMilestone {
-			var m *C.issuez_milestone
-			rc := call(ctx, func(tok *C.issuez_cancel) C.issuez_code {
-				return C.issuez_write_load_milestone(w, tok, &m, &cerr)
-			})
-			if rc != C.ISSUEZ_OK {
-				e := takeError(ctx, cerr).(*Error)
-				e.Write = res
-				return e
-			}
-			defer C.issuez_milestone_free(m)
-			res.Milestone = goMilestone(m)
+			res.Milestone, failed = reload(ctx, res, func(a cArgs, m **C.issuez_milestone) C.issuez_code {
+				return C.issuez_write_load_milestone(w, a.tok, m, a.cerr)
+			}, takeMilestone)
 		}
-		return nil
+		return res
 	})
+	if err == nil {
+		err = failed
+	}
 	return res, err
+}
+
+// reload is what a write that landed wrote; an error says the write landed.
+func reload[H, T any](ctx context.Context, w *Write, f func(cArgs, *H) C.issuez_code, take func(H) T) (T, error) {
+	h, err := invoke(ctx, nil, f)
+	if err != nil {
+		var none T
+		err.(*Error).Write = w
+		return none, err
+	}
+	return take(h), nil
 }
 
 // Create writes a new issue; e needs a title.
 func (r *Repo) Create(ctx context.Context, e *Edit, actor Actor, opts ...WriteOption) (*Write, error) {
-	return r.write(ctx, writeOptions(opts), func(c *C.issuez_repo, pin *runtime.Pinner, tok *C.issuez_cancel, out **C.issuez_write, cerr **C.issuez_error) C.issuez_code {
+	return r.write(ctx, writeOptions(opts), func(a cArgs, pin *runtime.Pinner, out **C.issuez_write) C.issuez_code {
 		ops, n := cOps(pin, e.opsOrNil())
-		return C.issuez_issue_create(c, ops, n, pinActor(pin, actor), tok, out, cerr)
+		return C.issuez_issue_create(a.repo, ops, n, pinActor(pin, actor), a.tok, out, a.cerr)
 	})
 }
 
@@ -143,9 +139,9 @@ func (r *Repo) Create(ctx context.Context, e *Edit, actor Actor, opts ...WriteOp
 // difference.
 func (r *Repo) Update(ctx context.Context, id string, e *Edit, actor Actor, opts ...WriteOption) (*Write, error) {
 	o := writeOptions(opts)
-	return r.write(ctx, o, func(c *C.issuez_repo, pin *runtime.Pinner, tok *C.issuez_cancel, out **C.issuez_write, cerr **C.issuez_error) C.issuez_code {
+	return r.write(ctx, o, func(a cArgs, pin *runtime.Pinner, out **C.issuez_write) C.issuez_code {
 		ops, n := cOps(pin, o.withExpect(e))
-		return C.issuez_issue_update(c, cStr(id), ops, n, pinActor(pin, actor), tok, out, cerr)
+		return C.issuez_issue_update(a.repo, cStr(id), ops, n, pinActor(pin, actor), a.tok, out, a.cerr)
 	})
 }
 
@@ -167,23 +163,12 @@ func (r *Repo) CheckUpdate(ctx context.Context, id string, e *Edit, opts ...Writ
 
 // check runs issuez_issue_check; id "" checks a create.
 func (r *Repo) check(ctx context.Context, id string, o []op) ([]Problem, error) {
-	var problems []Problem
-	err := r.use(func(c *C.issuez_repo) error {
-		var pin runtime.Pinner
-		defer pin.Unpin()
-		ops, n := cOps(&pin, o)
-		var out *C.issuez_problems
-		var cerr *C.issuez_error
-		rc := call(ctx, func(tok *C.issuez_cancel) C.issuez_code {
-			return C.issuez_issue_check(c, cStr(id), ops, n, tok, &out, &cerr)
-		})
-		if rc != C.ISSUEZ_OK {
-			return takeError(ctx, cerr)
-		}
-		problems = takeProblems(out)
-		return nil
-	})
-	return problems, err
+	var pin runtime.Pinner
+	defer pin.Unpin()
+	ops, n := cOps(&pin, o)
+	return fetch(ctx, r, func(a cArgs, out **C.issuez_problems) C.issuez_code {
+		return C.issuez_issue_check(a.repo, cStr(id), ops, n, a.tok, out, a.cerr)
+	}, takeProblems)
 }
 
 func optOID(pin *runtime.Pinner, o OID) *C.issuez_oid {
@@ -200,22 +185,9 @@ func optOID(pin *runtime.Pinner, o OID) *C.issuez_oid {
 // attachment, CodeLFS when the bytes aren't in this clone (git lfs
 // fetch), CodeCorrupt when they don't match.
 func (r *Repo) ReadAttachment(ctx context.Context, issueID, attachmentID string) ([]byte, error) {
-	var data []byte
-	err := r.use(func(c *C.issuez_repo) error {
-		var b *C.issuez_bytes
-		var cerr *C.issuez_error
-		rc := call(ctx, func(tok *C.issuez_cancel) C.issuez_code {
-			return C.issuez_attachment_read(c, cStr(issueID), cStr(attachmentID), tok, &b, &cerr)
-		})
-		if rc != C.ISSUEZ_OK {
-			return takeError(ctx, cerr)
-		}
-		defer C.issuez_bytes_free(b)
-		d := C.issuez_bytes_data(b)
-		data = C.GoBytes(unsafe.Pointer(d.ptr), C.int(d.len))
-		return nil
-	})
-	return data, err
+	return fetch(ctx, r, func(a cArgs, b **C.issuez_bytes) C.issuez_code {
+		return C.issuez_attachment_read(a.repo, cStr(issueID), cStr(attachmentID), a.tok, b, a.cerr)
+	}, takeBytes)
 }
 
 // AttachmentInfo is what a write would store of an attachment: its media
@@ -260,9 +232,9 @@ const (
 
 // CreateMilestone writes a new milestone; e needs SetName.
 func (r *Repo) CreateMilestone(ctx context.Context, e *MilestoneEdit, actor Actor, opts ...WriteOption) (*Write, error) {
-	return r.write(ctx, writeOptions(opts), func(c *C.issuez_repo, pin *runtime.Pinner, tok *C.issuez_cancel, out **C.issuez_write, cerr **C.issuez_error) C.issuez_code {
+	return r.write(ctx, writeOptions(opts), func(a cArgs, pin *runtime.Pinner, out **C.issuez_write) C.issuez_code {
 		ops, n := cOps(pin, e.edit().opsOrNil())
-		return C.issuez_milestone_create(c, ops, n, pinActor(pin, actor), tok, out, cerr)
+		return C.issuez_milestone_create(a.repo, ops, n, pinActor(pin, actor), a.tok, out, a.cerr)
 	})
 }
 
@@ -270,9 +242,9 @@ func (r *Repo) CreateMilestone(ctx context.Context, e *MilestoneEdit, actor Acto
 // edit that changes nothing writes nothing.
 func (r *Repo) UpdateMilestone(ctx context.Context, id string, e *MilestoneEdit, actor Actor, opts ...WriteOption) (*Write, error) {
 	o := writeOptions(opts)
-	return r.write(ctx, o, func(c *C.issuez_repo, pin *runtime.Pinner, tok *C.issuez_cancel, out **C.issuez_write, cerr **C.issuez_error) C.issuez_code {
+	return r.write(ctx, o, func(a cArgs, pin *runtime.Pinner, out **C.issuez_write) C.issuez_code {
 		ops, n := cOps(pin, o.withExpect(e.edit()))
-		return C.issuez_milestone_update(c, cStr(id), ops, n, pinActor(pin, actor), tok, out, cerr)
+		return C.issuez_milestone_update(a.repo, cStr(id), ops, n, pinActor(pin, actor), a.tok, out, a.cerr)
 	})
 }
 
@@ -287,25 +259,14 @@ type AttachmentSpec struct {
 // PrepareAttachment validates and hashes data once and sanitizes name.
 // An empty id picks a UUID before the host stores bytes or builds text links.
 func (r *Repo) PrepareAttachment(ctx context.Context, id, name string, data []byte) (AttachmentSpec, error) {
-	var spec AttachmentSpec
-	err := r.use(func(c *C.issuez_repo) error {
-		var pin runtime.Pinner
-		defer pin.Unpin()
-		var p *C.issuez_prepared_attachment
-		var cerr *C.issuez_error
-		rc := call(ctx, func(tok *C.issuez_cancel) C.issuez_code {
-			return C.issuez_attachment_prepare(c, cStr(id), cStr(name), cStr(string(data)), tok, &p, &cerr)
-		})
-		if rc != C.ISSUEZ_OK {
-			return takeError(ctx, cerr)
-		}
+	return fetch(ctx, r, func(a cArgs, p **C.issuez_prepared_attachment) C.issuez_code {
+		return C.issuez_attachment_prepare(a.repo, cStr(id), cStr(name), cStr(string(data)), a.tok, p, a.cerr)
+	}, func(p *C.issuez_prepared_attachment) AttachmentSpec {
 		defer C.issuez_prepared_attachment_free(p)
 		info := C.issuez_prepared_attachment_info(p)
-		spec = AttachmentSpec{ID: goStr(info.id), Name: goStr(info.name),
+		return AttachmentSpec{ID: goStr(info.id), Name: goStr(info.name),
 			MediaType: goStr(info.media_type), SHA256: goStr(info.sha256), Size: uint64(info.size)}
-		return nil
 	})
-	return spec, err
 }
 
 // AddPreparedAttachment adds metadata whose bytes the host already stored.

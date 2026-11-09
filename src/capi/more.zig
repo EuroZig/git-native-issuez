@@ -76,23 +76,16 @@ pub fn issuez_snapshot_take(
             const id = r.name[ns[0].len..];
             if (!issuez.format.uuid.isCanonical(id)) continue;
             entries.append(a, .{ .kind = ns[1], .id = Str.of(id), .tip = rt.oidOf(r.oid) }) catch
-                return rt.fail(err, .e_nomem, "out of memory", .{});
+                return rt.oom(err);
         }
     }
     stableSort(SnapEntry, entries.items, {}, lessEntry);
-    const s = makeSnapshot(entries.items) catch |e| return rt.failError(err, e, .{});
-    o.* = @ptrCast(s);
-    return .ok;
+    return rt.give(o, makeSnapshot(entries.items), err);
 }
 
-pub fn issuez_snapshot_free(s: ?*api.Snapshot) callconv(.c) void {
-    const o = rt.obj(SnapshotObj, s) orelse return;
-    rt.freeArena(o.arena);
-}
-pub fn issuez_snapshot_len(s: ?*const api.Snapshot) callconv(.c) usize {
-    const o = rt.obj(SnapshotObj, s) orelse return 0;
-    return o.entries.len;
-}
+const SnapshotReads = rt.Reads(api.Snapshot, SnapshotObj);
+pub const issuez_snapshot_free = SnapshotReads.free();
+pub const issuez_snapshot_len = SnapshotReads.count("entries");
 pub fn issuez_snapshot_at(
     s: ?*const api.Snapshot,
     i: usize,
@@ -123,10 +116,7 @@ pub fn issuez_snapshot_tip(
     };
     return false;
 }
-pub fn issuez_snapshot_encode(s: ?*const api.Snapshot) callconv(.c) Str {
-    const o = rt.obj(SnapshotObj, s) orelse return .{};
-    return o.encoded;
-}
+pub const issuez_snapshot_encode = SnapshotReads.field("encoded");
 
 pub fn issuez_snapshot_decode(
     bytes: Str,
@@ -163,13 +153,11 @@ pub fn issuez_snapshot_decode(
                 rt.issuez_oid_parse(Str.of(hex), &tip, null) != .ok)
                 return rt.fail(err, .e_invalid_argument, "damaged snapshot", .{});
             entries.append(a, .{ .kind = kind, .id = Str.of(id), .tip = tip }) catch
-                return rt.fail(err, .e_nomem, "out of memory", .{});
+                return rt.oom(err);
         }
     }
     stableSort(SnapEntry, entries.items, {}, lessEntry);
-    const s = makeSnapshot(entries.items) catch |e| return rt.failError(err, e, .{});
-    o.* = @ptrCast(s);
-    return .ok;
+    return rt.give(o, makeSnapshot(entries.items), err);
 }
 
 // ─── Diffs ─────────────────────────────────────────────────────────────
@@ -191,9 +179,7 @@ pub fn issuez_diff_new(
         new_snap,
     ) orelse return rt.fail(err, .e_invalid_argument, "new_snap is NULL", .{});
     const old: []const SnapEntry = if (rt.obj(SnapshotObj, old_snap)) |s| s.entries else &.{};
-    const d = diff(old, new.entries) catch |e| return rt.failError(err, e, .{});
-    o.* = @ptrCast(d);
-    return .ok;
+    return rt.give(o, diff(old, new.entries), err);
 }
 
 fn diff(old: []const SnapEntry, new: []const SnapEntry) !*DiffObj {
@@ -241,18 +227,10 @@ fn diff(old: []const SnapEntry, new: []const SnapEntry) !*DiffObj {
     return d;
 }
 
-pub fn issuez_diff_len(d: ?*const api.Diff) callconv(.c) usize {
-    const o = rt.obj(DiffObj, d) orelse return 0;
-    return o.entries.len;
-}
-pub fn issuez_diff_at(d: ?*const api.Diff, i: usize) callconv(.c) ?*const api.DiffEntry {
-    const o = rt.obj(DiffObj, d) orelse return null;
-    return if (i < o.entries.len) &o.entries[i] else null;
-}
-pub fn issuez_diff_free(d: ?*api.Diff) callconv(.c) void {
-    const o = rt.obj(DiffObj, d) orelse return;
-    rt.freeArena(o.arena);
-}
+const DiffReads = rt.Reads(api.Diff, DiffObj);
+pub const issuez_diff_len = DiffReads.count("entries");
+pub const issuez_diff_at = DiffReads.refAt("entries");
+pub const issuez_diff_free = DiffReads.free();
 
 // ─── Milestones ────────────────────────────────────────────────────────
 
@@ -260,46 +238,42 @@ const Milestone = issuez.milestone.Milestone;
 
 pub const MilestoneObj = struct {
     arena: ?*std.heap.ArenaAllocator = null,
-    id: Str,
-    tip: api.Oid,
-    name: Str,
-    description: Str,
-    status: api.MilestoneStatus,
-    due: ?api.Date,
-    created: api.Time,
-    updated: api.Time,
-    status_changed: ?api.Time,
-    author: api.Person,
+    info: api.MilestoneInfo,
     problems: *rt.ProblemList,
 };
 
 fn buildMilestone(a: Allocator, m: Milestone) !MilestoneObj {
-    var problems: std.ArrayList(rt.ProblemSpec) = .empty;
+    var problems: rt.Problems = .empty;
     for (m.conflicts) |c| try problems.append(a, .{
         .kind = .conflict,
         .key = try std.fmt.allocPrint(a, "{f}", .{c.target}),
         .value = c.value,
         .message = "clones disagree",
     });
+    const author = try a.create(api.Person);
+    author.* = try rt.personOf(a, m.author, m.author_id);
     return .{
-        .id = try rt.dupeZ(a, m.id),
-        .tip = rt.oidOf(m.tip),
-        .name = try rt.dupeZ(a, m.name),
-        .description = try rt.dupeZ(a, m.description),
-        .status = switch (m.status) {
-            .open => .open,
-            .completed => .completed,
-            .retired => .retired,
+        .info = .{
+            .id = try rt.dupeZ(a, m.id),
+            .tip = rt.oidOf(m.tip),
+            .name = try rt.dupeZ(a, m.name),
+            .description = try rt.dupeZ(a, m.description),
+            .status = @intFromEnum(@as(api.MilestoneStatus, switch (m.status) {
+                .open => .open,
+                .completed => .completed,
+                .retired => .retired,
+            })),
+            .due_date = if (m.due) |d| .{
+                .year = @intCast(d.year),
+                .month = d.month,
+                .day = d.day,
+            } else .{},
+            .created = .{ .unix_seconds = m.created },
+            .updated = .{ .unix_seconds = m.updated },
+            .has_status_changed = m.status_changed != null,
+            .status_changed = .{ .unix_seconds = m.status_changed orelse 0 },
+            .author = author,
         },
-        .due = if (m.due) |d| .{
-            .year = @intCast(d.year),
-            .month = d.month,
-            .day = d.day,
-        } else null,
-        .created = .{ .unix_seconds = m.created },
-        .updated = .{ .unix_seconds = m.updated },
-        .status_changed = if (m.status_changed) |t| .{ .unix_seconds = t } else null,
-        .author = try rt.personOf(a, m.author, m.author_id),
         .problems = try rt.borrowedProblems(a, problems.items),
     };
 }
@@ -355,14 +329,14 @@ pub fn issuez_milestone_load_at(
 }
 
 fn ownMilestone(m: issuez.milestone.Milestone, o: *?*api.Milestone, err: ?*?*api.Error) Code {
-    const arena = rt.newArena() catch return rt.fail(err, .e_nomem, "out of memory", .{});
+    const arena = rt.newArena() catch return rt.oom(err);
     const obj = arena.allocator().create(MilestoneObj) catch {
         rt.freeArena(arena);
-        return rt.fail(err, .e_nomem, "out of memory", .{});
+        return rt.oom(err);
     };
     obj.* = buildMilestone(arena.allocator(), m) catch {
         rt.freeArena(arena);
-        return rt.fail(err, .e_nomem, "out of memory", .{});
+        return rt.oom(err);
     };
     obj.arena = arena;
     o.* = @ptrCast(obj);
@@ -384,9 +358,7 @@ pub fn issuez_milestone_list_all(
     var c = Call.begin(repo, cancel) catch |e| return rt.failError(err, e, .{});
     defer c.end();
     const all = c.catalog().list(c.arena()) catch |e| return c.fail(err, e);
-    const list = makeMilestoneList(all) catch |e| return rt.failError(err, e, .{});
-    o.* = @ptrCast(list);
-    return .ok;
+    return rt.give(o, makeMilestoneList(all), err);
 }
 
 fn makeMilestoneList(all: []const Milestone) !*MilestoneListObj {
@@ -408,10 +380,8 @@ pub fn issuez_milestone_free(m: ?*api.Milestone) callconv(.c) void {
     const o = getM(m) orelse return;
     if (o.arena) |a| rt.freeArena(a);
 }
-pub fn issuez_milestone_list_len(l: ?*const api.MilestoneList) callconv(.c) usize {
-    const o = rt.obj(MilestoneListObj, l) orelse return 0;
-    return o.items.len;
-}
+const MilestoneListReads = rt.Reads(api.MilestoneList, MilestoneListObj);
+pub const issuez_milestone_list_len = MilestoneListReads.count("items");
 pub fn issuez_milestone_list_at(
     l: ?*const api.MilestoneList,
     i: usize,
@@ -419,48 +389,9 @@ pub fn issuez_milestone_list_at(
     const o = rt.obj(MilestoneListObj, l) orelse return null;
     return if (i < o.items.len) @ptrCast(&o.items[i]) else null;
 }
-pub fn issuez_milestone_list_free(l: ?*api.MilestoneList) callconv(.c) void {
-    const o = rt.obj(MilestoneListObj, l) orelse return;
-    rt.freeArena(o.arena);
-}
-pub fn issuez_milestone_id(m: ?*const api.Milestone) callconv(.c) Str {
-    return if (getM(m)) |o| o.id else .{};
-}
-pub fn issuez_milestone_tip(m: ?*const api.Milestone) callconv(.c) api.Oid {
-    return if (getM(m)) |o| o.tip else .{};
-}
-pub fn issuez_milestone_name(m: ?*const api.Milestone) callconv(.c) Str {
-    return if (getM(m)) |o| o.name else .{};
-}
-pub fn issuez_milestone_description(m: ?*const api.Milestone) callconv(.c) Str {
-    return if (getM(m)) |o| o.description else .{};
-}
-pub fn issuez_milestone_status_of(m: ?*const api.Milestone) callconv(.c) api.MilestoneStatus {
-    return if (getM(m)) |o| o.status else .unknown;
-}
-pub fn issuez_milestone_due_date(m: ?*const api.Milestone, out: ?*api.Date) callconv(.c) bool {
-    const d = (getM(m) orelse return false).due orelse return false;
-    if (out) |p| p.* = d;
-    return true;
-}
-pub fn issuez_milestone_created(m: ?*const api.Milestone) callconv(.c) api.Time {
-    return if (getM(m)) |o| o.created else .{};
-}
-pub fn issuez_milestone_updated(m: ?*const api.Milestone) callconv(.c) api.Time {
-    return if (getM(m)) |o| o.updated else .{};
-}
-pub fn issuez_milestone_status_changed(
-    m: ?*const api.Milestone,
-    out: ?*api.Time,
-) callconv(.c) bool {
-    const t = (getM(m) orelse return false).status_changed orelse return false;
-    if (out) |o| o.* = t;
-    return true;
-}
-pub fn issuez_milestone_author(m: ?*const api.Milestone) callconv(.c) ?*const api.Person {
-    const o = getM(m) orelse return null;
-    return &o.author;
-}
+pub const issuez_milestone_list_free = MilestoneListReads.free();
+const MilestoneReads = rt.Reads(api.Milestone, MilestoneObj);
+pub const issuez_milestone_info_of = MilestoneReads.ref("info");
 pub fn issuez_milestone_problems(m: ?*const api.Milestone) callconv(.c) ?*const api.Problems {
     const o = getM(m) orelse return null;
     return @ptrCast(o.problems);
@@ -568,11 +499,11 @@ fn buildProjection(c: *Call, around: ?[]const u8) !?*ProjectionObj {
             gop.value_ptr.* = .{ .done = pr.closed, .total = pr.total };
         }
     }
-    var all: std.ArrayList(rt.ProblemSpec) = .empty;
+    var all: rt.Problems = .empty;
     for (proj.problems) |p| try all.append(a, try projectionSpec(a, p));
     const per = try a.alloc(*rt.ProblemList, proj.issues.len);
     for (per, 0..) |*x, i| {
-        var specs: std.ArrayList(rt.ProblemSpec) = .empty;
+        var specs: rt.Problems = .empty;
         for (proj.problemsOf(@intCast(i))) |p| try specs.append(a, try projectionSpec(a, p));
         x.* = try rt.borrowedProblems(a, specs.items);
     }
@@ -641,7 +572,7 @@ fn indexOf(o: *const ProjectionObj, id: Str) ?u32 {
 }
 
 fn idAt(o: *const ProjectionObj, i: u32) Str {
-    return o.list.issues[i].id;
+    return o.list.issues[i].info.id;
 }
 
 pub fn issuez_projection_free(p: ?*api.Projection) callconv(.c) void {
@@ -748,23 +679,17 @@ pub const SyncReportObj = struct {
 pub const SyncOps = struct { push: bool = true, attachments: bool = true };
 
 /// The sync options; problems with them go to `problems`.
-pub fn parseSyncOps(
-    a: Allocator,
-    ops: []const api.Op,
-    problems: *std.ArrayList(rt.ProblemSpec),
-) Allocator.Error!SyncOps {
+pub fn parseSyncOps(a: Allocator, ops: []const api.Op, problems: *rt.Problems) !SyncOps {
     var out: SyncOps = .{};
-    for (ops, 0..) |op, i| if (rt.hasReserved(op)) {
-        try problems.append(a, rt.reservedProblem(@intCast(i)));
-    } else switch (@as(api.Opt, @enumFromInt(op.target))) {
-        .sync_push => out.push = op.num != 0,
-        .sync_attachments => out.attachments = op.num != 0,
-        else => try problems.append(a, .{
-            .kind = .unknown_target,
-            .message = "not a sync option",
-            .op_index = @intCast(i),
-        }),
-    };
+    for (ops, 0..) |op, i| {
+        const check: rt.OpCheck = .at(a, problems, i);
+        if (try check.reserved(op)) continue;
+        switch (@as(api.Opt, @enumFromInt(op.target))) {
+            .sync_push => out.push = op.num != 0,
+            .sync_attachments => out.attachments = op.num != 0,
+            else => try check.add(.unknown_target, "not a sync option"),
+        }
+    }
     return out;
 }
 
@@ -778,14 +703,14 @@ pub fn issuez_sync(
     err: ?*?*api.Error,
 ) callconv(.c) Code {
     const o = out orelse return rt.fail(err, .e_invalid_argument, "out is NULL", .{});
-    var problems: std.ArrayList(rt.ProblemSpec) = .empty;
+    var problems: rt.Problems = .empty;
     var scratch: std.heap.ArenaAllocator = .init(rt.gpa);
     defer scratch.deinit();
     const so = parseSyncOps(
         scratch.allocator(),
         if (opts) |p| p[0..n_opts] else &.{},
         &problems,
-    ) catch return rt.fail(err, .e_nomem, "out of memory", .{});
+    ) catch return rt.oom(err);
     const push = so.push;
     const attachments = so.attachments;
     if (problems.items.len > 0)
@@ -809,26 +734,14 @@ pub fn issuez_sync(
             .before_push = .{ .context = undefined, .run = skipUploads },
         };
         const report = sync.sync(a, remote.slice(), options) catch |e| return c.fail(err, e);
-        entries.appendSlice(
-            a,
-            report.merge.entries,
-        ) catch return rt.fail(err, .e_nomem, "out of memory", .{});
-        for (report.push.merges) |m| entries.appendSlice(
-            a,
-            m.entries,
-        ) catch return rt.fail(err, .e_nomem, "out of memory", .{});
+        entries.appendSlice(a, report.merge.entries) catch return rt.oom(err);
+        for (report.push.merges) |m| entries.appendSlice(a, m.entries) catch return rt.oom(err);
         sent = report.push.refs;
     } else {
         const report = sync.merge(a, remote.slice(), .{}) catch |e| return c.fail(err, e);
-        entries.appendSlice(
-            a,
-            report.entries,
-        ) catch return rt.fail(err, .e_nomem, "out of memory", .{});
+        entries.appendSlice(a, report.entries) catch return rt.oom(err);
     }
-    const r = makeSyncReport(&c, remote.slice(), entries.items, sent) catch |e|
-        return rt.failError(err, e, .{});
-    o.* = @ptrCast(r);
-    return .ok;
+    return rt.give(o, makeSyncReport(&c, remote.slice(), entries.items, sent), err);
 }
 
 fn skipUploads(
@@ -929,25 +842,11 @@ fn makeSyncReport(
     return r;
 }
 
-pub fn issuez_sync_report_len(r: ?*const api.SyncReport) callconv(.c) usize {
-    const o = rt.obj(SyncReportObj, r) orelse return 0;
-    return o.items.len;
-}
-pub fn issuez_sync_report_at(
-    r: ?*const api.SyncReport,
-    i: usize,
-) callconv(.c) ?*const api.SyncItem {
-    const o = rt.obj(SyncReportObj, r) orelse return null;
-    return if (i < o.items.len) &o.items[i] else null;
-}
-pub fn issuez_sync_report_ok(r: ?*const api.SyncReport) callconv(.c) bool {
-    const o = rt.obj(SyncReportObj, r) orelse return false;
-    return o.ok;
-}
-pub fn issuez_sync_report_free(r: ?*api.SyncReport) callconv(.c) void {
-    const o = rt.obj(SyncReportObj, r) orelse return;
-    rt.freeArena(o.arena);
-}
+const SyncReportReads = rt.Reads(api.SyncReport, SyncReportObj);
+pub const issuez_sync_report_len = SyncReportReads.count("items");
+pub const issuez_sync_report_at = SyncReportReads.refAt("items");
+pub const issuez_sync_report_ok = SyncReportReads.field("ok");
+pub const issuez_sync_report_free = SyncReportReads.free();
 
 pub fn issuez_quarantine_resolve(
     repo: ?*api.Repo,
@@ -1066,8 +965,7 @@ fn purge(
         a,
         "{s}{s}",
         .{ issuez.engine.issue_ref_prefix, ident },
-    ) catch
-        return rt.fail(err, .e_nomem, "out of memory", .{});
+    ) catch return rt.oom(err);
     // Before the purge drops them: the remotes that saw the old history,
     // and the attachments it had.
     const exposed = exposedRemotes(a, backend, ident) catch |e| return c.fail(err, e);
@@ -1099,15 +997,9 @@ fn purge(
         const still = for (kept) |k| {
             if (std.mem.eql(u8, k, id_)) break true;
         } else false;
-        if (!still) removed.append(
-            a,
-            id_,
-        ) catch return rt.fail(err, .e_nomem, "out of memory", .{});
+        if (!still) removed.append(a, id_) catch return rt.oom(err);
     }
-    const r = makePurgeResult(result, exposed, removed.items) catch |e|
-        return rt.failError(err, e, .{});
-    o.* = @ptrCast(r);
-    return .ok;
+    return rt.give(o, makePurgeResult(result, exposed, removed.items), err);
 }
 
 /// The UUIDs of every attachment the issue has at tip (null: its ref's),
@@ -1181,34 +1073,13 @@ fn makePurgeResult(
     return r;
 }
 
-pub fn issuez_purge_result_attachment_count(r: ?*const api.PurgeResult) callconv(.c) usize {
-    const o = rt.obj(PurgeResultObj, r) orelse return 0;
-    return o.removed_attachments.len;
-}
-pub fn issuez_purge_result_attachment_at(r: ?*const api.PurgeResult, i: usize) callconv(.c) Str {
-    const o = rt.obj(PurgeResultObj, r) orelse return .{};
-    return if (i < o.removed_attachments.len) o.removed_attachments[i] else .{};
-}
-
-pub fn issuez_purge_result_free(r: ?*api.PurgeResult) callconv(.c) void {
-    const o = rt.obj(PurgeResultObj, r) orelse return;
-    rt.freeArena(o.arena);
-}
-pub fn issuez_purge_result_new_tip(r: ?*const api.PurgeResult) callconv(.c) api.Oid {
-    const o = rt.obj(PurgeResultObj, r) orelse return .{};
-    return o.new_tip;
-}
-pub fn issuez_purge_result_exposed_remote_count(r: ?*const api.PurgeResult) callconv(.c) usize {
-    const o = rt.obj(PurgeResultObj, r) orelse return 0;
-    return o.exposed.len;
-}
-pub fn issuez_purge_result_exposed_remote_at(
-    r: ?*const api.PurgeResult,
-    i: usize,
-) callconv(.c) Str {
-    const o = rt.obj(PurgeResultObj, r) orelse return .{};
-    return if (i < o.exposed.len) o.exposed[i] else .{};
-}
+const PurgeResultReads = rt.Reads(api.PurgeResult, PurgeResultObj);
+pub const issuez_purge_result_attachment_count = PurgeResultReads.count("removed_attachments");
+pub const issuez_purge_result_attachment_at = PurgeResultReads.at("removed_attachments");
+pub const issuez_purge_result_free = PurgeResultReads.free();
+pub const issuez_purge_result_new_tip = PurgeResultReads.field("new_tip");
+pub const issuez_purge_result_exposed_remote_count = PurgeResultReads.count("exposed");
+pub const issuez_purge_result_exposed_remote_at = PurgeResultReads.at("exposed");
 
 // ─── Attachment bytes ──────────────────────────────────────────────────
 
@@ -1226,15 +1097,9 @@ pub fn makeBytes(data: []const u8) !*BytesObj {
     return b;
 }
 
-pub fn issuez_bytes_data(b: ?*const api.Bytes) callconv(.c) Str {
-    const o = rt.obj(BytesObj, b) orelse return .{};
-    return o.data;
-}
-
-pub fn issuez_bytes_free(b: ?*api.Bytes) callconv(.c) void {
-    const o = rt.obj(BytesObj, b) orelse return;
-    rt.freeArena(o.arena);
-}
+const BytesReads = rt.Reads(api.Bytes, BytesObj);
+pub const issuez_bytes_data = BytesReads.field("data");
+pub const issuez_bytes_free = BytesReads.free();
 
 const AttachmentStore = issuez.Attachments(repo_mod.Backend);
 
@@ -1254,7 +1119,7 @@ pub fn issuez_attachment_read(
     const a = c.arena();
     const prefix = issuez.engine.issue_ref_prefix;
     const ref_name = std.fmt.allocPrint(a, "{s}{s}", .{ prefix, issue_id.slice() }) catch
-        return rt.fail(err, .e_nomem, "out of memory", .{});
+        return rt.oom(err);
     const tip = (c.session.backend.resolveRef(ref_name) catch |e| return c.fail(err, e)) orelse
         return rt.failWith(err, .e_not_found, .{
             .subject = issue_id.slice(),
@@ -1275,9 +1140,7 @@ pub fn issuez_attachment_read(
     const content = store.read(a, att) catch |e| return c.fail(err, e);
     switch (content) {
         .bytes => |data| {
-            const b = makeBytes(data) catch |e| return rt.failError(err, e, .{});
-            o.* = @ptrCast(b);
-            return .ok;
+            return rt.give(o, makeBytes(data), err);
         },
         .missing => return rt.failWith(err, .e_lfs, .{ .subject = want }, "the " ++
             "attachment's bytes aren't in this clone (git lfs fetch)", .{}),
@@ -1293,29 +1156,22 @@ const settings_mod = issuez.settings;
 fn parseSettingsOps(
     a: Allocator,
     ops: []const api.Op,
-    problems: *std.ArrayList(rt.ProblemSpec),
-) Allocator.Error!settings_mod.WriteSpec {
+    problems: *rt.Problems,
+) !settings_mod.WriteSpec {
     var done: ?std.ArrayList([]const u8) = null;
     var workflow: ?std.ArrayList([]const u8) = null;
     var done_unset = false;
     var workflow_unset = false;
     for (ops, 0..) |op, i| {
-        const index: i64 = @intCast(i);
-        if (rt.hasReserved(op)) {
-            try problems.append(a, rt.reservedProblem(index));
-            continue;
-        }
+        const check: rt.OpCheck = .at(a, problems, i);
+        if (try check.reserved(op)) continue;
         const verb: api.Verb = @enumFromInt(op.verb);
         const target: api.Opt = @enumFromInt(op.target);
         const list, const unset = switch (target) {
             .done_state => .{ &done, &done_unset },
             .workflow_state => .{ &workflow, &workflow_unset },
             else => {
-                try problems.append(a, .{
-                    .kind = .unknown_target,
-                    .message = "not a setting",
-                    .op_index = index,
-                });
+                try check.add(.unknown_target, "not a setting");
                 continue;
             },
         };
@@ -1325,11 +1181,7 @@ fn parseSettingsOps(
                 try list.*.?.append(a, op.str.slice());
             },
             .clear => unset.* = true,
-            else => try problems.append(a, .{
-                .kind = .unknown_target,
-                .message = "settings take ADD or CLEAR",
-                .op_index = index,
-            }),
+            else => try check.add(.unknown_target, "settings take ADD or CLEAR"),
         }
     }
     return .{
@@ -1340,11 +1192,7 @@ fn parseSettingsOps(
     };
 }
 
-pub fn validateSettings(
-    a: Allocator,
-    ops: []const api.Op,
-    problems: *std.ArrayList(rt.ProblemSpec),
-) Allocator.Error!void {
+pub fn validateSettings(a: Allocator, ops: []const api.Op, problems: *rt.Problems) !void {
     _ = try parseSettingsOps(a, ops, problems);
 }
 
@@ -1358,9 +1206,9 @@ pub fn issuez_settings_write(
     var c = Call.begin(repo, cancel) catch |e| return rt.failError(err, e, .{});
     defer c.end();
     const a = c.arena();
-    var problems: std.ArrayList(rt.ProblemSpec) = .empty;
+    var problems: rt.Problems = .empty;
     const spec = parseSettingsOps(a, if (ops) |p| p[0..n] else &.{}, &problems) catch
-        return rt.fail(err, .e_nomem, "out of memory", .{});
+        return rt.oom(err);
     if (problems.items.len > 0) return rt.failWith(
         err,
         .e_invalid_value,
@@ -1405,9 +1253,7 @@ pub fn issuez_fsck(
     defer c.end();
     const report = Fsck.run(c.arena(), c.engine(), .{ .repair = repair }) catch |e|
         return c.fail(err, e);
-    const obj = fsckReportObj(report) catch |e| return rt.failError(err, e, .{});
-    o.* = @ptrCast(obj);
-    return .ok;
+    return rt.give(o, fsckReportObj(report), err);
 }
 
 fn fsckReportObj(report: Fsck.Report) !*FsckReportObj {
@@ -1461,28 +1307,13 @@ fn fsckReportObj(report: Fsck.Report) !*FsckReportObj {
     return obj;
 }
 
-pub fn issuez_fsck_report_issue_count(r: ?*const api.FsckReport) callconv(.c) usize {
-    return if (rt.obj(FsckReportObj, r)) |o| o.issues else 0;
-}
-pub fn issuez_fsck_report_milestone_count(r: ?*const api.FsckReport) callconv(.c) usize {
-    return if (rt.obj(FsckReportObj, r)) |o| o.milestones else 0;
-}
-pub fn issuez_fsck_report_error_count(r: ?*const api.FsckReport) callconv(.c) usize {
-    return if (rt.obj(FsckReportObj, r)) |o| o.errors else 0;
-}
-pub fn issuez_fsck_report_len(r: ?*const api.FsckReport) callconv(.c) usize {
-    return if (rt.obj(FsckReportObj, r)) |o| o.findings.len else 0;
-}
-pub fn issuez_fsck_report_at(
-    r: ?*const api.FsckReport,
-    i: usize,
-) callconv(.c) ?*const api.FsckFinding {
-    const o = rt.obj(FsckReportObj, r) orelse return null;
-    return if (i < o.findings.len) &o.findings[i] else null;
-}
-pub fn issuez_fsck_report_free(r: ?*api.FsckReport) callconv(.c) void {
-    if (rt.obj(FsckReportObj, r)) |o| rt.freeArena(o.arena);
-}
+const FsckReportReads = rt.Reads(api.FsckReport, FsckReportObj);
+pub const issuez_fsck_report_issue_count = FsckReportReads.field("issues");
+pub const issuez_fsck_report_milestone_count = FsckReportReads.field("milestones");
+pub const issuez_fsck_report_error_count = FsckReportReads.field("errors");
+pub const issuez_fsck_report_len = FsckReportReads.count("findings");
+pub const issuez_fsck_report_at = FsckReportReads.refAt("findings");
+pub const issuez_fsck_report_free = FsckReportReads.free();
 
 // ─── Remote setup ──────────────────────────────────────────────────────
 
@@ -1505,9 +1336,7 @@ pub fn issuez_remote_default(
         .one => |r| &.{r},
         .many => |rs| rs,
     };
-    const m = read.makeMatches(names) catch |e| return rt.failError(err, e, .{});
-    o.* = @ptrCast(m);
-    return .ok;
+    return rt.give(o, read.makeMatches(names), err);
 }
 
 pub fn issuez_remote_configure(
@@ -1586,9 +1415,7 @@ pub fn issuez_issue_json(
     const issue = (c.engine().find(a, id.slice()) catch |e| return c.fail(err, e)) orelse
         return rt.failWith(err, .e_not_found, .{ .subject = id.slice() }, "no such issue", .{});
     const done = c.engine().doneStates();
-    const b = jsonBytes(&.{issue}, full, false, done, a) catch |e| return rt.failError(err, e, .{});
-    o.* = @ptrCast(b);
-    return .ok;
+    return rt.give(o, jsonBytes(&.{issue}, full, false, done, a), err);
 }
 
 pub fn issuez_issue_json_many(
@@ -1612,21 +1439,19 @@ pub fn issuez_issue_json_many(
         var skipped: std.ArrayList([]const u8) = .empty;
         const every = read.loadEvery(&c, &skipped) catch |e| return c.fail(err, e);
         for (every) |issue| if (!issue.deleted) {
-            list.append(a, issue) catch return rt.fail(err, .e_nomem, "out of memory", .{});
+            list.append(a, issue) catch return rt.oom(err);
         };
     } else for (ids.?[0..n]) |id| {
         if (!issuez.format.uuid.isCanonical(id.slice()))
             return rt.fail(err, .e_invalid_argument, "not a full issue UUID", .{});
         const issue = c.engine().find(a, id.slice()) catch |e| switch (e) {
-            error.OutOfMemory => return rt.fail(err, .e_nomem, "out of memory", .{}),
+            error.OutOfMemory => return rt.oom(err),
             else => if (read.isDamaged(e)) continue else return c.fail(err, e),
         };
-        if (issue) |x| list.append(a, x) catch return rt.fail(err, .e_nomem, "out of memory", .{});
+        if (issue) |x| list.append(a, x) catch return rt.oom(err);
     }
     const done = c.engine().doneStates();
-    const b = jsonBytes(list.items, full, true, done, a) catch |e| return rt.failError(err, e, .{});
-    o.* = @ptrCast(b);
-    return .ok;
+    return rt.give(o, jsonBytes(list.items, full, true, done, a), err);
 }
 
 // ─── Sync status ───────────────────────────────────────────────────────
@@ -1649,9 +1474,7 @@ pub fn issuez_sync_status_take(
     defer c.end();
     const st = repo_mod.Sync.init(&c.session.backend).status(c.arena(), remote.slice()) catch |e|
         return c.fail(err, e);
-    const obj = syncStatusObj(st) catch |e| return rt.failError(err, e, .{});
-    o.* = @ptrCast(obj);
-    return .ok;
+    return rt.give(o, syncStatusObj(st), err);
 }
 
 fn syncStatusObj(st: issuez.sync.Status) !*SyncStatusObj {
@@ -1678,26 +1501,12 @@ fn syncStatusObj(st: issuez.sync.Status) !*SyncStatusObj {
     return obj;
 }
 
-pub fn issuez_sync_status_quarantined_count(s: ?*const api.SyncStatus) callconv(.c) usize {
-    return if (rt.obj(SyncStatusObj, s)) |o| o.quarantined.len else 0;
-}
-pub fn issuez_sync_status_quarantined_at(
-    s: ?*const api.SyncStatus,
-    i: usize,
-) callconv(.c) ?*const api.Quarantined {
-    const o = rt.obj(SyncStatusObj, s) orelse return null;
-    return if (i < o.quarantined.len) &o.quarantined[i] else null;
-}
-pub fn issuez_sync_status_pending_count(s: ?*const api.SyncStatus) callconv(.c) usize {
-    return if (rt.obj(SyncStatusObj, s)) |o| o.pending.len else 0;
-}
-pub fn issuez_sync_status_pending_at(s: ?*const api.SyncStatus, i: usize) callconv(.c) Str {
-    const o = rt.obj(SyncStatusObj, s) orelse return .{};
-    return if (i < o.pending.len) o.pending[i] else .{};
-}
-pub fn issuez_sync_status_free(s: ?*api.SyncStatus) callconv(.c) void {
-    if (rt.obj(SyncStatusObj, s)) |o| rt.freeArena(o.arena);
-}
+const SyncStatusReads = rt.Reads(api.SyncStatus, SyncStatusObj);
+pub const issuez_sync_status_quarantined_count = SyncStatusReads.count("quarantined");
+pub const issuez_sync_status_quarantined_at = SyncStatusReads.refAt("quarantined");
+pub const issuez_sync_status_pending_count = SyncStatusReads.count("pending");
+pub const issuez_sync_status_pending_at = SyncStatusReads.at("pending");
+pub const issuez_sync_status_free = SyncStatusReads.free();
 
 // ─── Search ────────────────────────────────────────────────────────────
 
@@ -1723,14 +1532,14 @@ pub fn issuez_search(
     const a = c.arena();
     var skipped: std.ArrayList([]const u8) = .empty;
     const issues = read.loadEvery(&c, &skipped) catch |e| return c.fail(err, e);
-    const arena = rt.newArena() catch return rt.fail(err, .e_nomem, "out of memory", .{});
+    const arena = rt.newArena() catch return rt.oom(err);
     const hits = searchHits(a, arena.allocator(), issues, needle.slice(), ignore_case) catch {
         rt.freeArena(arena);
-        return rt.fail(err, .e_nomem, "out of memory", .{});
+        return rt.oom(err);
     };
     const obj = arena.allocator().create(SearchHitsObj) catch {
         rt.freeArena(arena);
-        return rt.fail(err, .e_nomem, "out of memory", .{});
+        return rt.oom(err);
     };
     obj.* = .{ .arena = arena, .hits = hits };
     o.* = @ptrCast(obj);
@@ -1756,19 +1565,10 @@ fn searchHits(
     return out.items;
 }
 
-pub fn issuez_search_hits_len(h: ?*const api.SearchHits) callconv(.c) usize {
-    return if (rt.obj(SearchHitsObj, h)) |o| o.hits.len else 0;
-}
-pub fn issuez_search_hits_at(
-    h: ?*const api.SearchHits,
-    i: usize,
-) callconv(.c) ?*const api.SearchHit {
-    const o = rt.obj(SearchHitsObj, h) orelse return null;
-    return if (i < o.hits.len) &o.hits[i] else null;
-}
-pub fn issuez_search_hits_free(h: ?*api.SearchHits) callconv(.c) void {
-    if (rt.obj(SearchHitsObj, h)) |o| rt.freeArena(o.arena);
-}
+const SearchHitsReads = rt.Reads(api.SearchHits, SearchHitsObj);
+pub const issuez_search_hits_len = SearchHitsReads.count("hits");
+pub const issuez_search_hits_at = SearchHitsReads.refAt("hits");
+pub const issuez_search_hits_free = SearchHitsReads.free();
 
 // ─── Dropping everything ───────────────────────────────────────────────
 
@@ -1849,80 +1649,60 @@ pub const PushOps = struct {
 };
 
 /// The push check options; problems with them go to `problems`.
-pub fn parsePushOps(
-    a: Allocator,
-    ops: []const api.Op,
-    problems: *std.ArrayList(rt.ProblemSpec),
-) Allocator.Error!PushOps {
+pub fn parsePushOps(a: Allocator, ops: []const api.Op, problems: *rt.Problems) !PushOps {
     var policy: check_mod.Policy = .{};
     var emails: std.ArrayList([]const u8) = .empty;
     var ids: std.ArrayList([]const u8) = .empty;
     var vars: std.ArrayList([2][]const u8) = .empty;
     for (ops, 0..) |op, i| {
-        const bad: ?[]const u8 = if (rt.hasReserved(op))
-            "reserved fields must be zero"
-        else switch (@as(api.Opt, @enumFromInt(op.target))) {
-            .pusher => blk: {
-                if (op.person.email.len == 0) break :blk "the pusher needs an email";
-                try emails.append(a, op.person.email.slice());
-                if (op.person.user_id.len > 0) {
-                    const user_id = op.person.user_id.slice();
-                    if (!uuid_fmt.isCanonical(user_id)) break :blk "user_id isn't a UUID";
-                    try ids.append(a, op.person.user_id.slice());
+        const check: rt.OpCheck = .at(a, problems, i);
+        if (rt.hasReserved(op)) {
+            try check.add(.unknown_target, "reserved fields must be zero");
+            continue;
+        }
+        const s = op.str.slice();
+        switch (@as(api.Opt, @enumFromInt(op.target))) {
+            .pusher => {
+                const user_id = op.person.user_id.slice();
+                if (op.person.email.len == 0) {
+                    try check.add(.unknown_target, "the pusher needs an email");
+                    continue;
                 }
-                break :blk null;
+                try emails.append(a, op.person.email.slice());
+                if (user_id.len > 0 and !uuid_fmt.isCanonical(user_id)) {
+                    try check.add(.unknown_target, "user_id isn't a UUID");
+                } else if (user_id.len > 0) {
+                    try ids.append(a, user_id);
+                }
             },
-            .pusher_email => blk: {
-                if (op.str.len == 0) break :blk "empty email";
-                try emails.append(a, op.str.slice());
-                break :blk null;
+            .pusher_email => if (s.len == 0) {
+                try check.add(.unknown_target, "empty email");
+            } else {
+                try emails.append(a, s);
             },
-            .pusher_user_id => blk: {
-                if (!uuid_fmt.isCanonical(op.str.slice())) break :blk "not a UUID";
-                try ids.append(a, op.str.slice());
-                break :blk null;
+            .pusher_user_id => if (uuid_fmt.isCanonical(s)) {
+                try ids.append(a, s);
+            } else {
+                try check.add(.unknown_target, "not a UUID");
             },
             .author_policy => switch (@as(
                 api.AuthorPolicy,
                 @enumFromInt(std.math.cast(u32, op.num) orelse 0),
             )) {
-                .any => blk: {
-                    policy.author_policy = .any;
-                    break :blk null;
-                },
-                .warn => blk: {
-                    policy.author_policy = .warn;
-                    break :blk null;
-                },
-                .enforce => blk: {
-                    policy.author_policy = .enforce;
-                    break :blk null;
-                },
-                else => "not an issuez_author_policy",
+                .any => policy.author_policy = .any,
+                .warn => policy.author_policy = .warn,
+                .enforce => policy.author_policy = .enforce,
+                else => try check.add(.unknown_target, "not an issuez_author_policy"),
             },
-            .allow_numbers => blk: {
-                policy.allow_numbers = op.num != 0;
-                break :blk null;
-            },
-            .allow_purge => blk: {
-                policy.allow_purge = op.num != 0;
-                break :blk null;
-            },
-            .object_dir, .alternate_object_dirs => |t| blk: {
-                const name = if (t == .object_dir)
-                    "GIT_OBJECT_DIRECTORY"
-                else
-                    "GIT_ALTERNATE_OBJECT_DIRECTORIES";
-                try vars.append(a, .{ name, op.str.slice() });
-                break :blk null;
-            },
-            else => "not a push check option",
-        };
-        if (bad) |msg| try problems.append(a, .{
-            .kind = .unknown_target,
-            .message = msg,
-            .op_index = @intCast(i),
-        });
+            .allow_numbers => policy.allow_numbers = op.num != 0,
+            .allow_purge => policy.allow_purge = op.num != 0,
+            .object_dir => try vars.append(a, .{ "GIT_OBJECT_DIRECTORY", s }),
+            .alternate_object_dirs => try vars.append(
+                a,
+                .{ "GIT_ALTERNATE_OBJECT_DIRECTORIES", s },
+            ),
+            else => try check.add(.unknown_target, "not a push check option"),
+        }
     }
     policy.pusher_emails = emails.items;
     policy.pusher_ids = ids.items;
@@ -1946,9 +1726,9 @@ pub fn issuez_push_check(
     var scratch: std.heap.ArenaAllocator = .init(rt.gpa);
     defer scratch.deinit();
     const sa = scratch.allocator();
-    var problems: std.ArrayList(rt.ProblemSpec) = .empty;
+    var problems: rt.Problems = .empty;
     const parsed = parsePushOps(sa, if (opts) |p| p[0..n_opts] else &.{}, &problems) catch
-        return rt.fail(err, .e_nomem, "out of memory", .{});
+        return rt.oom(err);
     const policy = parsed.policy;
     const vars = parsed.vars;
     if (problems.items.len > 0) return rt.failWith(
@@ -1958,8 +1738,7 @@ pub fn issuez_push_check(
         "invalid options",
         .{},
     );
-    const list = sa.alloc(check_mod.Update, n_updates) catch
-        return rt.fail(err, .e_nomem, "out of memory", .{});
+    const list = sa.alloc(check_mod.Update, n_updates) catch return rt.oom(err);
     for (if (updates) |u| u[0..n_updates] else &.{}, list) |u, *x| {
         if (u.ref.len == 0) return rt.fail(
             err,
@@ -2042,7 +1821,7 @@ fn makeVerdicts(verdicts: []const check_mod.Verdict, ctx: read.Context) !*PushVe
     const a = arena.allocator();
     const items = try a.alloc(VerdictObj, verdicts.len);
     for (verdicts, items) |v, *x| {
-        var specs: std.ArrayList(rt.ProblemSpec) = .empty;
+        var specs: rt.Problems = .empty;
         for (v.problems) |p| try specs.append(a, try verdictProblem(a, p));
         var entries: std.ArrayList(read.EntryObj) = .empty;
         var added: std.ArrayList(api.Attachment) = .empty;
@@ -2061,9 +1840,7 @@ fn makeVerdicts(verdicts: []const check_mod.Verdict, ctx: read.Context) !*PushVe
             for (built.attachments) |att| if (isNew(v.new_commits, att.added_in)) {
                 try added.append(a, att);
             };
-            const author = try a.create(api.Person);
-            author.* = built.author;
-            issue_author = author;
+            issue_author = built.info.author;
         };
         x.* = .{
             .public = .{
@@ -2095,17 +1872,9 @@ fn makeVerdicts(verdicts: []const check_mod.Verdict, ctx: read.Context) !*PushVe
     return r;
 }
 
-pub fn issuez_push_verdicts_len(v: ?*const api.PushVerdicts) callconv(.c) usize {
-    const o = rt.obj(PushVerdictsObj, v) orelse return 0;
-    return o.items.len;
-}
-pub fn issuez_push_verdicts_at(
-    v: ?*const api.PushVerdicts,
-    i: usize,
-) callconv(.c) ?*const api.PushVerdict {
-    const o = rt.obj(PushVerdictsObj, v) orelse return null;
-    return if (i < o.items.len) &o.items[i].public else null;
-}
+const PushVerdictsReads = rt.Reads(api.PushVerdicts, PushVerdictsObj);
+pub const issuez_push_verdicts_len = PushVerdictsReads.count("items");
+pub const issuez_push_verdicts_at = PushVerdictsReads.publicAt("items");
 pub fn issuez_push_verdict_entry_at(
     v: ?*const api.PushVerdict,
     k: usize,
@@ -2124,10 +1893,7 @@ pub fn issuez_push_verdict_attachment_at(
     if (k >= p.attachment_count) return null;
     return &x.attachments.?[k];
 }
-pub fn issuez_push_verdicts_free(v: ?*api.PushVerdicts) callconv(.c) void {
-    const o = rt.obj(PushVerdictsObj, v) orelse return;
-    rt.freeArena(o.arena);
-}
+pub const issuez_push_verdicts_free = PushVerdictsReads.free();
 
 pub fn issuez_repo_commit_import(
     staging: ?*api.Repo,

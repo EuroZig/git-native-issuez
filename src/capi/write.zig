@@ -1,12 +1,9 @@
 //! Writes: op lists checked and turned into one engine write, write
 //! receipts, comment events and milestone writes.
 //!
-//! An op list becomes one commit. The engine writes a comment, a state
-//! change, field edits and a delete as separate operations, so for now a
-//! list asks for one of them; a list that combines them fails with
-//! UNSUPPORTED (problem INCOMPATIBLE) until the engine writes them in one
-//! commit. A comment can't ride on a state change either: a commit whose
-//! only text is its subject reads as the tool's own ("Close issue").
+//! An op list becomes one commit. A list that can't (a delete with other
+//! changes, a description edit with a comment) fails with INVALID_VALUE,
+//! problem INCOMPATIBLE.
 
 const std = @import("std");
 const api = @import("api.zig");
@@ -25,7 +22,6 @@ const Opt = api.Opt;
 const Verb = api.Verb;
 const Call = repo_mod.Call;
 const RepoObj = repo_mod.RepoObj;
-const Issue = issuez.model.issue.Issue;
 const Signature = issuez.backend.object.Signature;
 const Oid = issuez.backend.object.Oid;
 const core_fmt = issuez.format.core;
@@ -37,68 +33,48 @@ const Store = issuez.Attachments(repo_mod.Backend);
 
 // ─── Checking op lists ─────────────────────────────────────────────────
 
-const Problems = std.ArrayList(rt.ProblemSpec);
+const Problems = rt.Problems;
 
-const Slot = enum { str, num, date, oid, person, none, name_str };
+const set_only: []const Verb = &.{.set};
+const set_clear: []const Verb = &.{ .set, .clear };
+const add_remove: []const Verb = &.{ .add, .remove };
 
-const Rule = struct { verbs: []const Verb, slot: Slot };
-
-fn ruleOf(list: api.OpList, target: u32) ?Rule {
-    const issue_list = list == .issue_create or list == .issue_update;
-    const milestone_list = list == .milestone_create or list == .milestone_update;
-    if (issue_list or milestone_list) {
-        if (target >= 0x100) return switch (@as(Opt, @enumFromInt(target))) {
-            .expect => .{ .verbs = &.{.set}, .slot = .oid },
-            .prepared_attachment => if (issue_list)
-                .{ .verbs = &.{.add}, .slot = .str }
-            else
-                null,
-            .subject, .original_author, .original_id => .{ .verbs = &.{.set}, .slot = .str },
-            .edit_comment => if (list == .issue_update) .{
-                .verbs = &.{.set},
-                .slot = .oid,
-            } else null,
-            .expect_edits => if (list == .issue_update) .{
-                .verbs = &.{.set},
-                .slot = .num,
-            } else null,
-            .delete_comment, .restore_comment, .reaction_target => if (list == .issue_update)
-                .{ .verbs = &.{.set}, .slot = .oid }
-            else
-                null,
-            else => null,
-        };
-        const f: Field = @enumFromInt(target);
-        if (milestone_list) return switch (f) {
-            .name, .description => .{ .verbs = &.{.set}, .slot = .str },
-            .due_date => .{ .verbs = &.{ .set, .clear }, .slot = .date },
-            .milestone_status => .{ .verbs = &.{.set}, .slot = .num },
-            else => null,
-        };
-        return switch (f) {
-            .title, .description, .comment, .state, .fixed_by, .release, .reason => .{
-                .verbs = &.{.set},
-                .slot = .str,
-            },
-            .ref => .{ .verbs = &.{ .set, .clear }, .slot = .str },
-            .workflow_state => .{ .verbs = &.{ .set, .clear }, .slot = .str },
-            .labels, .blocked_by => .{ .verbs = &.{ .add, .remove, .clear }, .slot = .str },
-            .assignees => .{ .verbs = &.{ .add, .remove, .clear }, .slot = .person },
-            .priority, .estimate => .{ .verbs = &.{ .set, .clear }, .slot = .num },
-            .milestone => .{ .verbs = &.{ .set, .clear, .inherit }, .slot = .str },
-            .parent => .{ .verbs = &.{ .set, .clear }, .slot = .str },
-            .start_date, .due_date => .{ .verbs = &.{ .set, .clear }, .slot = .date },
-            .locked, .deleted, .number => .{ .verbs = &.{.set}, .slot = .num },
-            .extra => .{ .verbs = &.{.set}, .slot = .name_str },
-            .attachments => .{ .verbs = &.{ .add, .remove }, .slot = .name_str },
-            .reactions => if (list == .issue_update) .{
-                .verbs = &.{ .add, .remove },
-                .slot = .str,
-            } else null,
-            else => null,
-        };
-    }
-    return null;
+/// The verbs a target takes in a list; null when it isn't one of its targets.
+fn verbsOf(list: api.OpList, target: u32) ?[]const Verb {
+    const update = list == .issue_update;
+    const milestone = list == .milestone_create or list == .milestone_update;
+    if (target >= 0x100) return switch (@as(Opt, @enumFromInt(target))) {
+        // A new commit has no tip to expect, and its subject is the title.
+        .expect, .subject => if (list == .issue_create or list == .milestone_create)
+            null
+        else
+            set_only,
+        .original_author, .original_id => if (milestone) null else set_only,
+        .prepared_attachment => if (milestone) null else &.{.add},
+        .edit_comment,
+        .expect_edits,
+        .delete_comment,
+        .restore_comment,
+        .reaction_target,
+        => if (update) set_only else null,
+        else => null,
+    };
+    const f: Field = @enumFromInt(target);
+    if (milestone) return switch (f) {
+        .name, .description, .milestone_status => set_only,
+        .due_date => set_clear,
+        else => null,
+    };
+    return switch (f) {
+        .title, .description, .comment, .state, .fixed_by, .release, .reason => set_only,
+        .locked, .deleted, .number, .extra => set_only,
+        .ref, .workflow_state, .priority, .estimate, .parent, .start_date, .due_date => set_clear,
+        .labels, .blocked_by, .assignees => &.{ .add, .remove, .clear },
+        .milestone => &.{ .set, .clear, .inherit },
+        .attachments => add_remove,
+        .reactions => if (update) add_remove else null,
+        else => null,
+    };
 }
 
 fn targetField(target: u32) Field {
@@ -109,29 +85,17 @@ fn targetField(target: u32) Field {
 /// that doesn't need the repository.
 fn checkOps(a: Allocator, list: api.OpList, ops: []const api.Op, problems: *Problems) !void {
     for (ops, 0..) |op, i| {
-        const index: i64 = @intCast(i);
-        if (rt.hasReserved(op)) {
-            try problems.append(a, rt.reservedProblem(index));
-            continue;
-        }
+        var check: rt.OpCheck = .at(a, problems, i);
+        if (try check.reserved(op)) continue;
         const field = targetField(op.target);
-        const rule = ruleOf(list, op.target) orelse {
-            try problems.append(a, .{
-                .kind = .unknown_target,
-                .field = field,
-                .message = "not a target of this call",
-                .op_index = index,
-            });
+        check.field = field;
+        const verbs = verbsOf(list, op.target) orelse {
+            try check.add(.unknown_target, "not a target of this call");
             continue;
         };
         const verb: Verb = @enumFromInt(op.verb);
-        if (std.mem.indexOfScalar(Verb, rule.verbs, verb) == null) {
-            try problems.append(a, .{
-                .kind = .bad_verb,
-                .field = field,
-                .message = "this verb doesn't apply to this target",
-                .op_index = index,
-            });
+        if (std.mem.indexOfScalar(Verb, verbs, verb) == null) {
+            try check.add(.bad_verb, "this verb doesn't apply to this target");
             continue;
         }
         if (verb == .clear or verb == .inherit) continue;
@@ -144,148 +108,68 @@ fn checkOps(a: Allocator, list: api.OpList, ops: []const api.Op, problems: *Prob
             else => null,
         };
         if (max) |m| if (s.len > m) {
-            try problems.append(a, .{
-                .kind = .too_long,
-                .field = field,
-                .message = "longer than the limit",
-                .op_index = index,
-            });
+            try check.add(.too_long, "longer than the limit");
             continue;
         };
-        const p = struct {
-            fn add(
-                pr: *Problems,
-                al: Allocator,
-                f: Field,
-                idx: i64,
-                kind: api.ProblemKind,
-                v: []const u8,
-                msg: []const u8,
-            ) !void {
-                try pr.append(
-                    al,
-                    .{ .kind = kind, .field = f, .value = v, .message = msg, .op_index = idx },
-                );
-            }
-        };
+        const blank = std.mem.trim(u8, s, " \t\r\n").len == 0;
+        const multiline = std.mem.findAny(u8, s, "\r\n") != null;
         switch (field) {
-            .title, .name => if (std.mem.trim(u8, s, " \t\r\n").len == 0) {
-                try p.add(problems, a, field, index, .empty, s, "must not be empty");
-            } else if (std.mem.findAny(u8, s, "\r\n") != null) {
-                try p.add(problems, a, field, index, .newline, s, "must be one line");
+            .title, .name => if (blank) {
+                try check.addValue(.empty, s, "must not be empty");
+            } else if (multiline) {
+                try check.addValue(.newline, s, "must be one line");
             },
-            .comment => if (std.mem.trim(u8, s, " \t\r\n").len == 0)
-                try p.add(problems, a, field, index, .empty, s, "must not be empty"),
+            .comment => if (blank) try check.addValue(.empty, s, "must not be empty"),
             .state => if (!core_fmt.isState(s))
-                try p.add(
-                    problems,
-                    a,
-                    field,
-                    index,
-                    .bad_format,
-                    s,
-                    "states are letters, digits, '-' and '_'",
-                ),
-            .workflow_state => if (!fields_fmt.isSlug(s))
-                try p.add(
-                    problems,
-                    a,
-                    field,
-                    index,
-                    .bad_format,
-                    s,
-                    "workflow states are lowercase letters, digits and '-'",
-                ),
+                try check.addValue(.bad_format, s, "states are letters, digits, '-' and '_'"),
+            .workflow_state => if (!fields_fmt.isSlug(s)) try check.addValue(
+                .bad_format,
+                s,
+                "workflow states are lowercase letters, digits and '-'",
+            ),
             .ref => if (!fields_fmt.isRefName(s))
-                try p.add(problems, a, field, index, .bad_format, s, "not a branch or tag name"),
-            .locked => if (std.mem.findAny(u8, s, "\r\n") != null)
-                try p.add(problems, a, field, index, .newline, s, "must be one line"),
-            .fixed_by, .release, .reason => if (std.mem.findAny(u8, s, "\r\n") != null)
-                try p.add(problems, a, field, index, .newline, s, "must be one line"),
+                try check.addValue(.bad_format, s, "not a branch or tag name"),
+            .locked, .fixed_by, .release, .reason => if (multiline)
+                try check.addValue(.newline, s, "must be one line"),
             .labels => labels_fmt.validate(s) catch
-                try p.add(
-                    problems,
-                    a,
-                    field,
-                    index,
-                    .bad_format,
-                    s,
-                    "labels must not contain commas or newlines",
-                ),
+                try check.addValue(.bad_format, s, "labels must not contain commas or newlines"),
             .blocked_by, .parent, .milestone => if (!uuid_fmt.isCanonical(s))
-                try p.add(problems, a, field, index, .bad_format, s, "references are full UUIDs"),
+                try check.addValue(.bad_format, s, "references are full UUIDs"),
             .assignees => {
                 const email = op.person.email.slice();
                 if (core_fmt.checkEmail(email) != null)
-                    try p.add(
-                        problems,
-                        a,
-                        field,
-                        index,
-                        .bad_format,
-                        email,
-                        "not an email address",
-                    );
+                    try check.addValue(.bad_format, email, "not an email address");
                 const uid = op.person.user_id.slice();
                 if (uid.len > 0 and !uuid_fmt.isCanonical(uid))
-                    try p.add(problems, a, field, index, .bad_format, uid, "user IDs are UUIDs");
+                    try check.addValue(.bad_format, uid, "user IDs are UUIDs");
             },
-            .priority => if (op.num < 1 or op.num > 4)
-                try p.add(problems, a, field, index, .bad_format, "", "not a priority"),
+            .priority => if (op.num < 1 or op.num > 4) try check.add(.bad_format, "not a priority"),
             .estimate => if (op.num < 0 or op.num > 10 * 366 * 24 * 60)
-                try p.add(
-                    problems,
-                    a,
-                    field,
-                    index,
-                    .bad_format,
-                    "",
-                    "estimates are 0 to 10 years, in minutes",
-                ),
+                try check.add(.bad_format, "estimates are 0 to 10 years, in minutes"),
             .start_date, .due_date => if (engineDate(op.date) == null)
-                try p.add(problems, a, field, index, .bad_format, "", "not a calendar day"),
+                try check.add(.bad_format, "not a calendar day"),
             .milestone_status => if (op.num < 1 or op.num > 3)
-                try p.add(problems, a, field, index, .bad_format, "", "not a milestone status"),
+                try check.add(.bad_format, "not a milestone status"),
             .extra => {
                 const key = op.name.slice();
                 const namespaced = key.len > 2 and std.ascii.startsWithIgnoreCase(key, "X-");
                 const usable = issuez.format.trailers.isValidKey(key) and
                     !issuez.model.issue.isFormatKey(key);
-                if (!namespaced or !usable)
-                    try p.add(
-                        problems,
-                        a,
-                        field,
-                        index,
-                        .bad_format,
-                        key,
-                        "host fields are X- keys the format doesn't use",
-                    );
-                if (std.mem.findAny(u8, s, "\r\n") != null)
-                    try p.add(problems, a, field, index, .newline, s, "must be one line");
-            },
-            .number => if (op.num < 1)
-                try p.add(problems, a, field, index, .bad_format, "", "numbers start at 1"),
-            .attachments => if (verb == .remove) {
-                if (!uuid_fmt.isCanonical(s)) try p.add(
-                    problems,
-                    a,
-                    field,
-                    index,
+                if (!namespaced or !usable) try check.addValue(
                     .bad_format,
-                    s,
-                    "attachments are removed by their UUID",
+                    key,
+                    "host fields are X- keys the format doesn't use",
                 );
+                if (multiline) try check.addValue(.newline, s, "must be one line");
+            },
+            .number => if (op.num < 1) try check.add(.bad_format, "numbers start at 1"),
+            .attachments => if (verb == .remove) {
+                if (!uuid_fmt.isCanonical(s))
+                    try check.addValue(.bad_format, s, "attachments are removed by their UUID");
             } else {
-                if (s.len == 0)
-                    try p.add(problems, a, field, index, .empty, "", "an attachment has bytes");
-                if (op.name.len == 0)
-                    try p.add(problems, a, field, index, .empty, "", "an attachment has a name");
-                if (op.id.len > 0 and !uuid_fmt.isCanonical(op.id.slice())) try p.add(
-                    problems,
-                    a,
-                    field,
-                    index,
+                if (s.len == 0) try check.add(.empty, "an attachment has bytes");
+                if (op.name.len == 0) try check.add(.empty, "an attachment has a name");
+                if (op.id.len > 0 and !uuid_fmt.isCanonical(op.id.slice())) try check.addValue(
                     .bad_format,
                     op.id.slice(),
                     "an attachment's id is a full UUID",
@@ -298,9 +182,14 @@ fn checkOps(a: Allocator, list: api.OpList, ops: []const api.Op, problems: *Prob
             op.target == @intFromEnum(Opt.delete_comment) or
             op.target == @intFromEnum(Opt.restore_comment) or
             op.target == @intFromEnum(Opt.reaction_target);
-        if (oid_opt and rt.oidFrom(op.oid) == null)
-            try p.add(problems, a, .unknown, index, .bad_format, "", "not an object ID");
+        if (oid_opt and rt.oidFrom(op.oid) == null) try check.add(.bad_format, "not an object ID");
     }
+}
+
+/// checkOps, then the plan's problems when there are none yet.
+fn validate(a: Allocator, list: api.OpList, ops: []const api.Op, problems: *Problems) !void {
+    try checkOps(a, list, ops, problems);
+    if (problems.items.len == 0) _ = try plan(a, list, ops, problems);
 }
 
 /// "YYYY-MM-DD" for a real calendar day.
@@ -324,45 +213,44 @@ pub fn issuez_ops_validate(
     var problems: Problems = .empty;
     const slice = if (ops) |p| p[0..n] else &.{};
     switch (list) {
-        .issue_create, .issue_update, .milestone_create, .milestone_update => {
-            checkOps(
-                a,
-                list,
-                slice,
-                &problems,
-            ) catch return rt.fail(err, .e_nomem, "out of memory", .{});
-            if (problems.items.len == 0) {
-                _ = plan(
-                    a,
-                    list,
-                    slice,
-                    &problems,
-                ) catch return rt.fail(err, .e_nomem, "out of memory", .{});
-            }
-        },
-        .query => _ = read.parseQuery(a, slice, &problems) catch
-            return rt.fail(err, .e_nomem, "out of memory", .{}),
-        .open => repo_mod.validateOpen(a, slice, &problems) catch
-            return rt.fail(err, .e_nomem, "out of memory", .{}),
-        .sync => _ = more.parseSyncOps(a, slice, &problems) catch
-            return rt.fail(err, .e_nomem, "out of memory", .{}),
-        .push_check => _ = more.parsePushOps(a, slice, &problems) catch
-            return rt.fail(err, .e_nomem, "out of memory", .{}),
-        .settings => more.validateSettings(a, slice, &problems) catch
-            return rt.fail(err, .e_nomem, "out of memory", .{}),
+        .issue_create, .issue_update, .milestone_create, .milestone_update => validate(
+            a,
+            list,
+            slice,
+            &problems,
+        ) catch return rt.oom(err),
+        .query => _ = read.parseQuery(a, slice, &problems) catch return rt.oom(err),
+        .open => repo_mod.validateOpen(a, slice, &problems) catch return rt.oom(err),
+        .sync => _ = more.parseSyncOps(a, slice, &problems) catch return rt.oom(err),
+        .push_check => _ = more.parsePushOps(a, slice, &problems) catch return rt.oom(err),
+        .settings => more.validateSettings(a, slice, &problems) catch return rt.oom(err),
         else => return rt.fail(err, .e_invalid_argument, "not an issuez_op_list", .{}),
     }
-    const owned = rt.ownedProblems(problems.items) catch return rt.fail(
-        err,
-        .e_nomem,
-        "out of memory",
-        .{},
-    );
-    o.* = @ptrCast(owned);
-    return .ok;
+    return rt.give(o, rt.ownedProblems(problems.items), err);
 }
 
 // ─── Planning a write ──────────────────────────────────────────────────
+
+/// A list field's ops, as adds and removes; a CLEAR replaces.
+fn SetEdit(comptime Item: type) type {
+    return struct {
+        add: std.ArrayList(Item) = .empty,
+        remove: std.ArrayList([]const u8) = .empty,
+        replace: bool = false,
+
+        fn apply(e: *@This(), a: Allocator, verb: Verb, item: Item, key: []const u8) !void {
+            switch (verb) {
+                .clear => {
+                    e.replace = true;
+                    e.add.clearRetainingCapacity();
+                    e.remove.clearRetainingCapacity();
+                },
+                .add => try e.add.append(a, item),
+                else => try e.remove.append(a, key),
+            }
+        }
+    };
+}
 
 /// What an op list asks for, with the op each part came from.
 const Plan = struct {
@@ -383,17 +271,10 @@ const Plan = struct {
         clear_due: bool = false,
         status: ?fields_fmt.MilestoneStatus = null,
     } = .{},
-    /// Labels and blockers, as adds and removes; a CLEAR replaces.
-    labels_add: std.ArrayList([]const u8) = .empty,
-    labels_remove: std.ArrayList([]const u8) = .empty,
-    labels_replace: bool = false,
-    blockers_add: std.ArrayList([]const u8) = .empty,
-    blockers_remove: std.ArrayList([]const u8) = .empty,
-    blockers_replace: bool = false,
+    labels: SetEdit([]const u8) = .{},
+    blockers: SetEdit([]const u8) = .{},
+    assignees: SetEdit(fields_fmt.Assignee) = .{},
     extra: std.ArrayList(issuez.engine.HostField) = .empty,
-    assignees_add: std.ArrayList(fields_fmt.Assignee) = .empty,
-    assignees_remove: std.ArrayList([]const u8) = .empty,
-    assignees_replace: bool = false,
     has_fields: bool = false,
     has_state: bool = false,
     attachments_add: std.ArrayList(Store.Input) = .empty,
@@ -498,6 +379,11 @@ fn plan(a: Allocator, list: api.OpList, ops: []const api.Op, problems: *Problems
             continue;
         }
         switch (field) {
+            .comment, .deleted, .reactions => {},
+            .state, .fixed_by, .release, .reason => p.has_state = true,
+            else => p.has_fields = true,
+        }
+        switch (field) {
             .comment => {
                 if (creating) try unsupportedField(
                     a,
@@ -508,62 +394,25 @@ fn plan(a: Allocator, list: api.OpList, ops: []const api.Op, problems: *Problems
                 );
                 p.comment = s;
             },
-            .state => {
-                p.state = s;
-                p.has_state = true;
-            },
-            .fixed_by => {
-                p.fixed_by = s;
-                p.has_state = true;
-            },
-            .release => {
-                p.release = s;
-                p.has_state = true;
-            },
-            .reason => {
-                p.reason = s;
-                p.has_state = true;
-            },
+            .state => p.state = s,
+            .fixed_by => p.fixed_by = s,
+            .release => p.release = s,
+            .reason => p.reason = s,
             .deleted => p.deleted = op.num != 0,
             .title => {
                 p.edit.title = s;
                 p.create.title = s;
-                p.has_fields = true;
             },
             .description => {
                 p.edit.description = s;
                 p.create.body = s;
-                p.has_fields = true;
             },
             .workflow_state => {
                 p.edit.workflow = if (verb == .clear) .clear else .{ .set = s };
                 if (verb != .clear) p.create.workflow = s;
-                p.has_fields = true;
             },
-            .labels => {
-                switch (verb) {
-                    .clear => {
-                        p.labels_replace = true;
-                        p.labels_add.clearRetainingCapacity();
-                        p.labels_remove.clearRetainingCapacity();
-                    },
-                    .add => try p.labels_add.append(a, s),
-                    else => try p.labels_remove.append(a, s),
-                }
-                p.has_fields = true;
-            },
-            .blocked_by => {
-                switch (verb) {
-                    .clear => {
-                        p.blockers_replace = true;
-                        p.blockers_add.clearRetainingCapacity();
-                        p.blockers_remove.clearRetainingCapacity();
-                    },
-                    .add => try p.blockers_add.append(a, s),
-                    else => try p.blockers_remove.append(a, s),
-                }
-                p.has_fields = true;
-            },
+            .labels => try p.labels.apply(a, verb, s, s),
+            .blocked_by => try p.blockers.apply(a, verb, s, s),
             .assignees => {
                 const email = op.person.email.slice();
                 const uid = op.person.user_id.slice();
@@ -571,19 +420,8 @@ fn plan(a: Allocator, list: api.OpList, ops: []const api.Op, problems: *Problems
                     .uuid = if (uid.len > 0) uid else null,
                     .email = email,
                 };
-                switch (verb) {
-                    .clear => {
-                        p.assignees_replace = true;
-                        p.assignees_add.clearRetainingCapacity();
-                        p.assignees_remove.clearRetainingCapacity();
-                    },
-                    .add => try p.assignees_add.append(a, who),
-                    else => try p.assignees_remove.append(a, if (uid.len > 0)
-                        try who.text(a)
-                    else
-                        email),
-                }
-                p.has_fields = true;
+                const key = if (verb == .remove and uid.len > 0) try who.text(a) else email;
+                try p.assignees.apply(a, verb, who, key);
             },
             .priority => {
                 const pr: ?core_fmt.Priority = if (verb == .clear) null else switch (op.num) {
@@ -594,7 +432,6 @@ fn plan(a: Allocator, list: api.OpList, ops: []const api.Op, problems: *Problems
                 };
                 p.edit.priority = if (pr) |v| .{ .set = v } else .clear;
                 p.create.priority = pr;
-                p.has_fields = true;
             },
             .milestone => {
                 const m: issuez.engine.MilestoneEdit = switch (verb) {
@@ -604,12 +441,10 @@ fn plan(a: Allocator, list: api.OpList, ops: []const api.Op, problems: *Problems
                 };
                 p.edit.milestone = m;
                 p.create.milestone = m;
-                p.has_fields = true;
             },
             .parent => {
                 p.edit.parent = if (verb == .clear) .clear else .{ .set = s };
                 if (verb != .clear) p.create.parent = s;
-                p.has_fields = true;
             },
             .start_date, .due_date => {
                 const date = if (verb == .clear) null else engineDate(op.date).?;
@@ -622,7 +457,6 @@ fn plan(a: Allocator, list: api.OpList, ops: []const api.Op, problems: *Problems
                     p.edit.due_date = change;
                     p.create.due_date = date;
                 }
-                p.has_fields = true;
             },
             .estimate => {
                 p.edit.estimate_minutes = if (verb == .clear)
@@ -630,26 +464,24 @@ fn plan(a: Allocator, list: api.OpList, ops: []const api.Op, problems: *Problems
                 else
                     .{ .set = @intCast(op.num) };
                 if (verb != .clear) p.create.estimate_minutes = @intCast(op.num);
-                p.has_fields = true;
             },
             .number => {
                 p.edit.number = @intCast(op.num);
                 p.create.number = @intCast(op.num);
-                p.has_fields = true;
             },
             .locked => {
                 p.edit.locked = op.num != 0;
-                if (op.num != 0 and s.len > 0) p.edit.lock_reason = s;
-                p.has_fields = true;
+                p.create.locked = op.num != 0;
+                if (op.num != 0 and s.len > 0) {
+                    p.edit.lock_reason = s;
+                    p.create.lock_reason = s;
+                }
             },
             .ref => {
                 p.edit.ref = if (verb == .clear) .clear else .{ .set = s };
-                p.has_fields = true;
+                if (verb != .clear) p.create.ref = s;
             },
-            .extra => {
-                try p.extra.append(a, .{ .key = op.name.slice(), .value = s });
-                p.has_fields = true;
-            },
+            .extra => try p.extra.append(a, .{ .key = op.name.slice(), .value = s }),
             .reactions => {
                 if (!fields_fmt.isEmoji(s)) try problems.append(a, .{
                     .kind = .bad_format,
@@ -660,24 +492,18 @@ fn plan(a: Allocator, list: api.OpList, ops: []const api.Op, problems: *Problems
                 });
                 p.reaction = .{ .emoji = s, .present = verb == .add };
             },
-            .attachments => {
-                if (verb == .remove) {
-                    if (creating) try unsupportedField(
-                        a,
-                        problems,
-                        field,
-                        index,
-                        "a new issue has no attachments to remove",
-                    );
-                    try p.attachments_remove.append(a, s);
-                } else {
-                    const id: ?[]const u8 = if (op.id.len > 0) op.id.slice() else null;
-                    try p.attachments_add.append(
-                        a,
-                        .{ .name = op.name.slice(), .data = s, .id = id },
-                    );
-                }
-                p.has_fields = true;
+            .attachments => if (verb == .remove) {
+                if (creating) try unsupportedField(
+                    a,
+                    problems,
+                    field,
+                    index,
+                    "a new issue has no attachments to remove",
+                );
+                try p.attachments_remove.append(a, s);
+            } else {
+                const id: ?[]const u8 = if (op.id.len > 0) op.id.slice() else null;
+                try p.attachments_add.append(a, .{ .name = op.name.slice(), .data = s, .id = id });
             },
             else => unreachable,
         }
@@ -906,27 +732,14 @@ pub fn issuez_write_free(w: ?*api.Write) callconv(.c) void {
     const o = getWrite(w) orelse return;
     o.free();
 }
-pub fn issuez_write_kind(w: ?*const api.Write) callconv(.c) api.Kind {
-    return if (getWrite(w)) |o| o.kind else .unknown;
-}
-pub fn issuez_write_id(w: ?*const api.Write) callconv(.c) Str {
-    return if (getWrite(w)) |o| o.id else .{};
-}
-pub fn issuez_write_wrote(w: ?*const api.Write) callconv(.c) bool {
-    return if (getWrite(w)) |o| o.wrote else false;
-}
-pub fn issuez_write_commit(w: ?*const api.Write) callconv(.c) api.Oid {
-    return if (getWrite(w)) |o| o.commit else .{};
-}
-pub fn issuez_write_old_tip(w: ?*const api.Write) callconv(.c) api.Oid {
-    return if (getWrite(w)) |o| o.old_tip else .{};
-}
-pub fn issuez_write_new_tip(w: ?*const api.Write) callconv(.c) api.Oid {
-    return if (getWrite(w)) |o| o.new_tip else .{};
-}
-pub fn issuez_write_retries(w: ?*const api.Write) callconv(.c) u32 {
-    return if (getWrite(w)) |o| o.retries else 0;
-}
+const WriteReads = rt.Reads(api.Write, WriteObj);
+pub const issuez_write_kind = WriteReads.field("kind");
+pub const issuez_write_id = WriteReads.field("id");
+pub const issuez_write_wrote = WriteReads.field("wrote");
+pub const issuez_write_commit = WriteReads.field("commit");
+pub const issuez_write_old_tip = WriteReads.field("old_tip");
+pub const issuez_write_new_tip = WriteReads.field("new_tip");
+pub const issuez_write_retries = WriteReads.field("retries");
 pub fn issuez_write_entry(w: ?*const api.Write) callconv(.c) ?*const api.Entry {
     const o = getWrite(w) orelse return null;
     return &o.entry.public;
@@ -987,12 +800,13 @@ fn checked(
     list: api.OpList,
     slice: []const api.Op,
     prefixes: []const []const u8,
+    out: *Plan,
     err: ?*?*api.Error,
-) !union(enum) { ok: Plan, failed: Code } {
+) !?Code {
     var problems: Problems = .empty;
     try checkOps(a, list, slice, &problems);
-    if (problems.items.len > 0) return .{ .failed = invalid(err, problems.items) };
-    const p = try plan(a, list, slice, &problems);
+    if (problems.items.len > 0) return invalid(err, problems.items);
+    out.* = try plan(a, list, slice, &problems);
     // Host fields only under the prefixes the repo was opened with.
     for (slice, 0..) |op, i| {
         if (op.target != @intFromEnum(Field.extra)) continue;
@@ -1008,10 +822,41 @@ fn checked(
             .op_index = @intCast(i),
         });
     }
-    if (problems.items.len > 0) {
-        return .{ .failed = invalid(err, problems.items) };
-    }
-    return .{ .ok = p };
+    return if (problems.items.len > 0) invalid(err, problems.items) else null;
+}
+
+/// What every write starts from: its plan and who writes it.
+const Begun = struct { plan: Plan, author: ?Signature, who: Signature };
+
+/// The start of a write: `out` is set, or the failure's code comes back.
+fn beginWrite(
+    c: *Call,
+    out: *Begun,
+    list: api.OpList,
+    op_ptr: ?[*]const api.Op,
+    n: usize,
+    actor: ?*const api.Actor,
+    dry: bool,
+    err: ?*?*api.Error,
+) ?Code {
+    c.dry_run = dry;
+    const a = c.arena();
+    const slice = opSlice(op_ptr, n);
+    const failed = checked(a, list, slice, c.repo.extra_prefixes, &out.plan, err) catch |e|
+        return rt.failError(err, e, .{});
+    if (failed) |code| return code;
+    if (scopedFailed(c, slice, err)) |code| return code;
+    out.author = signatureOf(c, actor) catch return rt.fail(
+        err,
+        .e_invalid_argument,
+        "the actor needs an email, and its user_id must be a UUID",
+        .{},
+    );
+    out.who = out.author orelse who: {
+        const identity = c.engine().identity(a, null) catch |e| return c.fail(err, e);
+        break :who identity.author;
+    };
+    return null;
 }
 
 fn invalid(err: ?*?*api.Error, problems: []const rt.ProblemSpec) Code {
@@ -1146,46 +991,44 @@ fn scopeConflicts(
 
 /// Adding `scope/x` takes the issue's other `scope/` labels off.
 fn replaceScoped(a: Allocator, scopes: []const []const u8, p: *Plan, current: []const Str) !void {
-    if (p.labels_replace) return;
-    for (p.labels_add.items) |added| {
+    if (p.labels.replace) return;
+    for (p.labels.add.items) |added| {
         const scope = exclusiveScopeOf(scopes, added) orelse continue;
         for (current) |l| {
             const label = l.slice();
             if (std.mem.eql(u8, label, added)) continue;
             const other = exclusiveScopeOf(scopes, label) orelse continue;
-            if (std.mem.eql(u8, other, scope)) try p.labels_remove.append(a, label);
+            if (std.mem.eql(u8, other, scope)) try p.labels.remove.append(a, label);
         }
     }
 }
 
-fn applySets(a: Allocator, p: *Plan, current: ?Issue) !void {
-    if (p.labels_replace) {
-        p.edit.set_labels = p.labels_add.items;
+fn applySets(p: *Plan) void {
+    if (p.labels.replace) {
+        p.edit.set_labels = p.labels.add.items;
     } else {
-        p.edit.add_labels = p.labels_add.items;
-        p.edit.remove_labels = p.labels_remove.items;
+        p.edit.add_labels = p.labels.add.items;
+        p.edit.remove_labels = p.labels.remove.items;
     }
-    p.create.labels = p.labels_add.items;
-    if (p.blockers_replace) {
-        p.edit.set_blocked_by = p.blockers_add.items;
+    p.create.labels = p.labels.add.items;
+    if (p.blockers.replace) {
+        p.edit.set_blocked_by = p.blockers.add.items;
     } else {
-        p.edit.add_blocked_by = p.blockers_add.items;
-        p.edit.remove_blocked_by = p.blockers_remove.items;
+        p.edit.add_blocked_by = p.blockers.add.items;
+        p.edit.remove_blocked_by = p.blockers.remove.items;
     }
-    p.create.blocked_by = p.blockers_add.items;
-    const touched = p.assignees_replace or p.assignees_add.items.len > 0 or
-        p.assignees_remove.items.len > 0;
-    if (p.assignees_replace) {
-        p.edit.set_assignees = p.assignees_add.items;
+    p.create.blocked_by = p.blockers.add.items;
+    const touched = p.assignees.replace or p.assignees.add.items.len > 0 or
+        p.assignees.remove.items.len > 0;
+    if (p.assignees.replace) {
+        p.edit.set_assignees = p.assignees.add.items;
     } else if (touched) {
-        p.edit.add_assignees = p.assignees_add.items;
-        p.edit.remove_assignees = p.assignees_remove.items;
+        p.edit.add_assignees = p.assignees.add.items;
+        p.edit.remove_assignees = p.assignees.remove.items;
     }
-    p.create.assignees = p.assignees_add.items;
+    p.create.assignees = p.assignees.add.items;
     p.edit.extra = p.extra.items;
     p.create.extra = p.extra.items;
-    _ = a;
-    _ = current;
 }
 
 pub fn issuez_issue_create(
@@ -1213,64 +1056,25 @@ fn issueCreateIn(
     const o = out orelse return rt.fail(err, .e_invalid_argument, "out is NULL", .{});
     var c = Call.begin(repo, cancel) catch |e| return rt.failError(err, e, .{});
     defer c.end();
-    c.dry_run = dry;
+    var w: Begun = undefined;
+    if (beginWrite(&c, &w, .issue_create, op_ptr, n, actor, dry, err)) |code| return code;
     const a = c.arena();
-    var p = switch (checked(
-        a,
-        .issue_create,
-        opSlice(op_ptr, n),
-        c.repo.extra_prefixes,
-        err,
-    ) catch |e| return rt.failError(err, e, .{})) {
-        .ok => |v| v,
-        .failed => |code| return code,
-    };
-    if (scopedFailed(&c, opSlice(op_ptr, n), err)) |code| return code;
-    applySets(a, &p, null) catch |e| return rt.failError(err, e, .{});
-    const author = signatureOf(
-        &c,
-        actor,
-    ) catch return rt.fail(
-        err,
-        .e_invalid_argument,
-        "the actor needs an email, and its user_id must be a UUID",
-        .{},
-    );
-    const who = author orelse (c.engine().identity(
-        a,
-        null,
-    ) catch |e| return c.fail(err, e)).author;
-    p.create.author = author;
+    const p = &w.plan;
+    applySets(p);
+    p.create.author = w.author;
     if (p.state) |st| p.create.state = core_fmt.State.parse(st);
     p.create.fixed_by = p.fixed_by;
     p.create.release = p.release;
     p.create.reason = p.reason;
-    p.create.attachments = prepareAttachments(
-        &c,
-        &p,
-    ) catch |e| return writeFailed(&c, err, e, &p, "");
-    const engine = c.engine();
-    const created = engine.create(
-        a,
-        p.create,
-        .{},
-    ) catch |e| return writeFailed(&c, err, e, &p, "");
+    p.create.attachments = prepareAttachments(&c, p) catch |e|
+        return writeFailed(&c, err, e, p, "");
+    const created = c.engine().create(a, p.create, .{}) catch |e|
+        return writeFailed(&c, err, e, p, "");
     const id = created.id;
     const after = loadObjAt(&c, id, created.tip) catch null;
     const changes = if (after) |x| entryChanges(x, created.tip) else &.{};
 
-    const w = makeWrite(
-        &c,
-        .issue,
-        id,
-        null,
-        created.tip,
-        .created,
-        changes,
-        who,
-    ) catch |e| return rt.failError(err, e, .{});
-    o.* = @ptrCast(w);
-    return .ok;
+    return rt.give(o, makeWrite(&c, .issue, id, null, created.tip, .created, changes, w.who), err);
 }
 
 fn loadObj(c: *Call, id: []const u8) !?*read.IssueObj {
@@ -1323,47 +1127,24 @@ fn issueUpdateIn(
     );
     var c = Call.begin(repo, cancel) catch |e| return rt.failError(err, e, .{});
     defer c.end();
-    c.dry_run = dry;
+    var w: Begun = undefined;
+    if (beginWrite(&c, &w, .issue_update, op_ptr, n, actor, dry, err)) |code| return code;
     const a = c.arena();
-    var p = switch (checked(
-        a,
-        .issue_update,
-        opSlice(op_ptr, n),
-        c.repo.extra_prefixes,
-        err,
-    ) catch |e| return rt.failError(err, e, .{})) {
-        .ok => |v| v,
-        .failed => |code| return code,
-    };
-    if (scopedFailed(&c, opSlice(op_ptr, n), err)) |code| return code;
-    const author = signatureOf(
-        &c,
-        actor,
-    ) catch return rt.fail(
-        err,
-        .e_invalid_argument,
-        "the actor needs an email, and its user_id must be a UUID",
-        .{},
-    );
-    const who = author orelse (c.engine().identity(
-        a,
-        null,
-    ) catch |e| return c.fail(err, e)).author;
+    const p = &w.plan;
     const engine = c.engine();
     const before = (loadObj(&c, ident) catch |e| return c.fail(err, e)) orelse
         return rt.failWith(err, .e_not_found, .{ .subject = ident }, "no such issue", .{});
-    const removals = p.labels_remove.items.len;
-    replaceScoped(a, c.repo.exclusive_scopes, &p, before.labels) catch
-        return rt.fail(err, .e_nomem, "out of memory", .{});
+    const removals = p.labels.remove.items.len;
+    replaceScoped(a, c.repo.exclusive_scopes, p, before.labels) catch return rt.oom(err);
     // Pinned to the tip read only where the write depends on it: a state
     // kept from it, labels its scope takes off. Otherwise a concurrent
     // write is retried over, as in the engine.
-    const depends = (p.has_state and p.state == null) or p.labels_remove.items.len > removals;
-    applySets(a, &p, null) catch |e| return rt.failError(err, e, .{});
-    const old_tip = rt.oidFrom(before.tip).?;
+    const depends = (p.has_state and p.state == null) or p.labels.remove.items.len > removals;
+    applySets(p);
+    const old_tip = rt.oidFrom(before.info.tip).?;
     if (p.expect) |want| if (!want.eql(old_tip)) return rt.failWith(err, .e_version_mismatch, .{
         .subject = ident,
-        .current_tip = before.tip,
+        .current_tip = before.info.tip,
     }, "the issue changed since it was read", .{});
     if (p.expect_edits) |want| {
         if (want < 0 or want > std.math.maxInt(u32) or
@@ -1375,23 +1156,20 @@ fn issueUpdateIn(
         a,
         "{s}{s}",
         .{ issuez.engine.issue_ref_prefix, ident },
-    ) catch
-        return rt.fail(err, .e_nomem, "out of memory", .{});
+    ) catch return rt.oom(err);
     const expect: ?Oid = p.expect orelse if (depends) old_tip else null;
 
-    p.edit.attachments = attachmentChanges(
-        &c,
-        &p,
-    ) catch |e| return writeFailed(&c, err, e, &p, ident);
+    p.edit.attachments = attachmentChanges(&c, p) catch |e|
+        return writeFailed(&c, err, e, p, ident);
     if (p.has_state) {
-        p.edit.state = core_fmt.State.parse(p.state orelse before.state_name.slice());
+        p.edit.state = core_fmt.State.parse(p.state orelse before.info.state_name.slice());
         p.edit.fixed_by = p.fixed_by;
         p.edit.release = p.release;
         p.edit.reason = p.reason;
     }
     p.edit.comment = p.comment;
     p.edit.message = p.subject;
-    p.edit.author = author;
+    p.edit.author = w.author;
     p.edit.expect = expect;
     const comment_event: @FieldType(
         issuez.Update,
@@ -1410,7 +1188,7 @@ fn issueUpdateIn(
             .{ .target = p.reaction_target, .emoji = rx.emoji, .present = rx.present }
         else
             null,
-    }, .{}) catch |e| return writeFailed(&c, err, e, &p, ident);
+    }, .{}) catch |e| return writeFailed(&c, err, e, p, ident);
     c.retries = receipt.retries;
     c.skipped = !receipt.wrote;
     const entry_kind: api.EntryKind = switch (receipt.kind) {
@@ -1428,10 +1206,8 @@ fn issueUpdateIn(
 
     // After a retry the commit's parent isn't the tip read first.
     const parent = if (new_tip) |t| parentOf(&c, t) orelse old_tip else old_tip;
-    const w = makeWrite(&c, .issue, ident, parent, new_tip, entry_kind, changes, who) catch |e|
-        return rt.failError(err, e, .{});
-    o.* = @ptrCast(w);
-    return .ok;
+    const write = makeWrite(&c, .issue, ident, parent, new_tip, entry_kind, changes, w.who);
+    return rt.give(o, write, err);
 }
 
 /// The first parent of `commit`, when it can be read.
@@ -1464,15 +1240,7 @@ pub fn issuez_issue_check(
     const list: api.OpList = if (existing == null) .issue_create else .issue_update;
     var problems: Problems = .empty;
     const slice = opSlice(op_ptr, n);
-    checkOps(a, list, slice, &problems) catch return rt.fail(err, .e_nomem, "out of memory", .{});
-    if (problems.items.len == 0) {
-        _ = plan(
-            a,
-            list,
-            slice,
-            &problems,
-        ) catch return rt.fail(err, .e_nomem, "out of memory", .{});
-    }
+    validate(a, list, slice, &problems) catch return rt.oom(err);
     // Repository rules: the workflow states, references that must exist.
     if (problems.items.len == 0) {
         var c = Call.begin(repo, cancel) catch |e| return rt.failError(err, e, .{});
@@ -1490,14 +1258,7 @@ pub fn issuez_issue_check(
         if (dryFailed(a, code, e, &problems, err)) |failed| return failed;
         issuez_write_free(w);
     }
-    const owned = rt.ownedProblems(problems.items) catch return rt.fail(
-        err,
-        .e_nomem,
-        "out of memory",
-        .{},
-    );
-    o.* = @ptrCast(owned);
-    return .ok;
+    return rt.give(o, rt.ownedProblems(problems.items), err);
 }
 
 /// Who a dry run writes as: it writes nothing, and needs no identity.
@@ -1516,33 +1277,7 @@ fn dryFailed(
         .ok => return null,
         .e_invalid_value, .e_guard, .e_limit => {
             defer rt.issuez_error_free(e);
-            const list = rt.obj(rt.ErrorObj, e).?.problems;
-            const items = if (list) |l| l.items else &.{};
-            for (items) |p| problems.append(a, .{
-                .kind = @enumFromInt(p.kind),
-                .field = @enumFromInt(p.field),
-                .key = a.dupe(
-                    u8,
-                    p.key.slice(),
-                ) catch return rt.fail(err, .e_nomem, "out of memory", .{}),
-                .value = a.dupe(
-                    u8,
-                    p.value.slice(),
-                ) catch return rt.fail(err, .e_nomem, "out of memory", .{}),
-                .subject = a.dupe(
-                    u8,
-                    p.subject.slice(),
-                ) catch return rt.fail(err, .e_nomem, "out of memory", .{}),
-                .message = a.dupe(
-                    u8,
-                    p.message.slice(),
-                ) catch return rt.fail(err, .e_nomem, "out of memory", .{}),
-                .op_index = p.op_index,
-            }) catch return rt.fail(err, .e_nomem, "out of memory", .{});
-            if (items.len == 0) problems.append(a, .{
-                .kind = .unknown,
-                .message = a.dupe(u8, rt.issuez_error_message(e).slice()) catch "",
-            }) catch return rt.fail(err, .e_nomem, "out of memory", .{});
+            copyProblems(a, e, problems) catch return rt.oom(err);
             return null;
         },
         else => {
@@ -1552,11 +1287,30 @@ fn dryFailed(
     }
 }
 
+/// An error's problems, or one with its message, in memory of `a`.
+fn copyProblems(a: Allocator, e: ?*api.Error, problems: *Problems) !void {
+    // No error object: making it ran out of memory.
+    const list = (rt.obj(rt.ErrorObj, e) orelse return error.OutOfMemory).problems;
+    const items = if (list) |l| l.items else &.{};
+    for (items) |p| try problems.append(a, .{
+        .kind = @enumFromInt(p.kind),
+        .field = @enumFromInt(p.field),
+        .key = try a.dupe(u8, p.key.slice()),
+        .value = try a.dupe(u8, p.value.slice()),
+        .subject = try a.dupe(u8, p.subject.slice()),
+        .message = try a.dupe(u8, p.message.slice()),
+        .op_index = p.op_index,
+    });
+    if (items.len == 0) try problems.append(a, .{
+        .kind = .unknown,
+        .message = a.dupe(u8, rt.issuez_error_message(e).slice()) catch "",
+    });
+}
+
 /// INVALID_VALUE when two labels of one exclusive scope come together.
 fn scopedFailed(c: *Call, slice: []const api.Op, err: ?*?*api.Error) ?Code {
     var problems: Problems = .empty;
-    scopeConflicts(c.arena(), c.repo.exclusive_scopes, slice, &problems) catch
-        return rt.fail(err, .e_nomem, "out of memory", .{});
+    scopeConflicts(c.arena(), c.repo.exclusive_scopes, slice, &problems) catch return rt.oom(err);
     if (problems.items.len == 0) return null;
     return invalid(err, problems.items);
 }
@@ -1617,15 +1371,7 @@ pub fn issuez_milestone_check(
     const list: api.OpList = if (existing == null) .milestone_create else .milestone_update;
     var problems: Problems = .empty;
     const slice = opSlice(op_ptr, n);
-    checkOps(a, list, slice, &problems) catch return rt.fail(err, .e_nomem, "out of memory", .{});
-    if (problems.items.len == 0) {
-        _ = plan(
-            a,
-            list,
-            slice,
-            &problems,
-        ) catch return rt.fail(err, .e_nomem, "out of memory", .{});
-    }
+    validate(a, list, slice, &problems) catch return rt.oom(err);
     if (existing) |i| if (problems.items.len == 0) {
         const m = c.catalog().find(a, i.slice()) catch |e| return c.fail(err, e);
         if (m == null) return rt.failWith(
@@ -1649,14 +1395,7 @@ pub fn issuez_milestone_check(
         if (dryFailed(a, code, e, &problems, err)) |failed| return failed;
         issuez_write_free(w);
     }
-    const owned = rt.ownedProblems(problems.items) catch return rt.fail(
-        err,
-        .e_nomem,
-        "out of memory",
-        .{},
-    );
-    o.* = @ptrCast(owned);
-    return .ok;
+    return rt.give(o, rt.ownedProblems(problems.items), err);
 }
 
 pub fn issuez_milestone_create(
@@ -1684,39 +1423,18 @@ fn milestoneCreateIn(
     const o = out orelse return rt.fail(err, .e_invalid_argument, "out is NULL", .{});
     var c = Call.begin(repo, cancel) catch |e| return rt.failError(err, e, .{});
     defer c.end();
-    c.dry_run = dry;
+    var w: Begun = undefined;
+    if (beginWrite(&c, &w, .milestone_create, op_ptr, n, actor, dry, err)) |code| return code;
     const a = c.arena();
-    const p = switch (checked(
-        a,
-        .milestone_create,
-        opSlice(op_ptr, n),
-        c.repo.extra_prefixes,
-        err,
-    ) catch |e| return rt.failError(err, e, .{})) {
-        .ok => |v| v,
-        .failed => |code| return code,
-    };
-    const author = signatureOf(
-        &c,
-        actor,
-    ) catch return rt.fail(
-        err,
-        .e_invalid_argument,
-        "the actor needs an email, and its user_id must be a UUID",
-        .{},
-    );
-    const who = author orelse (c.engine().identity(
-        a,
-        null,
-    ) catch |e| return c.fail(err, e)).author;
+    const p = &w.plan;
     const catalog = c.catalog();
     const created = catalog.create(a, .{
         .name = p.milestone.name.?,
         .description = p.milestone.description orelse "",
         .due = p.milestone.due,
-        .author = author,
+        .author = w.author,
         .status = p.milestone.status orelse .open,
-    }, .{}) catch |e| return writeFailed(&c, err, e, &p, "");
+    }, .{}) catch |e| return writeFailed(&c, err, e, p, "");
     var changes: std.ArrayList(api.Change) = .empty;
     changes.append(a, .{
         .field = @intFromEnum(Field.name),
@@ -1724,21 +1442,13 @@ fn milestoneCreateIn(
         .op = @intFromEnum(Verb.set),
         .old_value = .{},
         .new_value = Str.of(p.milestone.name.?),
-    }) catch return rt.fail(err, .e_nomem, "out of memory", .{});
+    }) catch return rt.oom(err);
 
-    const w = makeWrite(
-        &c,
-        .milestone,
-        created.id,
-        null,
-        created.tip,
-        .created,
-        changes.items,
-        who,
-    ) catch |e|
-        return rt.failError(err, e, .{});
-    o.* = @ptrCast(w);
-    return .ok;
+    return rt.give(
+        o,
+        makeWrite(&c, .milestone, created.id, null, created.tip, .created, changes.items, w.who),
+        err,
+    );
 }
 
 pub fn issuez_milestone_update(
@@ -1775,31 +1485,10 @@ fn milestoneUpdateIn(
     );
     var c = Call.begin(repo, cancel) catch |e| return rt.failError(err, e, .{});
     defer c.end();
-    c.dry_run = dry;
+    var w: Begun = undefined;
+    if (beginWrite(&c, &w, .milestone_update, op_ptr, n, actor, dry, err)) |code| return code;
     const a = c.arena();
-    const p = switch (checked(
-        a,
-        .milestone_update,
-        opSlice(op_ptr, n),
-        c.repo.extra_prefixes,
-        err,
-    ) catch |e| return rt.failError(err, e, .{})) {
-        .ok => |v| v,
-        .failed => |code| return code,
-    };
-    const author = signatureOf(
-        &c,
-        actor,
-    ) catch return rt.fail(
-        err,
-        .e_invalid_argument,
-        "the actor needs an email, and its user_id must be a UUID",
-        .{},
-    );
-    const who = author orelse (c.engine().identity(
-        a,
-        null,
-    ) catch |e| return c.fail(err, e)).author;
+    const p = &w.plan;
     const catalog = c.catalog();
     const before = (catalog.find(a, ident) catch |e| return c.fail(err, e)) orelse
         return rt.failWith(err, .e_not_found, .{ .subject = ident }, "no such milestone", .{});
@@ -1820,9 +1509,9 @@ fn milestoneUpdateIn(
         .status = p.milestone.status,
         .description = p.milestone.description,
         .message = p.subject,
-        .author = author,
+        .author = w.author,
         .expect = p.expect orelse before.tip,
-    }, .{}) catch |e| return writeFailed(&c, err, e, &p, ident);
+    }, .{}) catch |e| return writeFailed(&c, err, e, p, ident);
     var changes: std.ArrayList(api.Change) = .empty;
     const add = struct {
         fn f(
@@ -1876,19 +1565,11 @@ fn milestoneUpdateIn(
         ) catch {};
     }
 
-    const w = makeWrite(
-        &c,
-        .milestone,
-        ident,
-        before.tip,
-        tip,
-        .update,
-        changes.items,
-        who,
-    ) catch |e|
-        return rt.failError(err, e, .{});
-    o.* = @ptrCast(w);
-    return .ok;
+    return rt.give(
+        o,
+        makeWrite(&c, .milestone, ident, before.tip, tip, .update, changes.items, w.who),
+        err,
+    );
 }
 
 comptime {
@@ -1976,12 +1657,8 @@ fn makePrepared(
     return p;
 }
 
-pub fn issuez_prepared_attachment_info(
-    p: ?*const api.PreparedAttachment,
-) callconv(.c) ?*const api.AttachmentSpec {
-    const o = rt.obj(PreparedObj, p) orelse return null;
-    return &o.info;
-}
+const PreparedReads = rt.Reads(api.PreparedAttachment, PreparedObj);
+pub const issuez_prepared_attachment_info = PreparedReads.ref("info");
 
 pub fn issuez_prepared_attachment_op(p: ?*const api.PreparedAttachment) callconv(.c) api.Op {
     const o = rt.obj(PreparedObj, p) orelse return .{};
@@ -1992,7 +1669,4 @@ pub fn issuez_prepared_attachment_op(p: ?*const api.PreparedAttachment) callconv
     };
 }
 
-pub fn issuez_prepared_attachment_free(p: ?*api.PreparedAttachment) callconv(.c) void {
-    const o = rt.obj(PreparedObj, p) orelse return;
-    rt.freeArena(o.arena);
-}
+pub const issuez_prepared_attachment_free = PreparedReads.free();

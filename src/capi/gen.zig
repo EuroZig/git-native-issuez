@@ -7,8 +7,10 @@ const api = @import("api.zig");
 
 const Writer = std.Io.Writer;
 
+var arena: std.mem.Allocator = undefined;
+
 pub fn main(init: std.process.Init) !u8 {
-    const arena = init.arena.allocator();
+    arena = init.arena.allocator();
     const args = try init.minimal.args.toSlice(arena);
     if (args.len != 3) {
         std.debug.print("usage: issuez-gen <header> <json>\n", .{});
@@ -82,8 +84,28 @@ fn enumConst(comptime T: type, comptime field: []const u8) []const u8 {
     comptime return T.c_prefix ++ upper(field);
 }
 
-fn docOf(comptime docs: anytype, comptime name: []const u8) []const u8 {
-    return if (@hasField(@TypeOf(docs), name)) @field(docs, name) else "";
+/// The `///` comment on a field of `T` in api.zig, lines joined.
+fn docOf(comptime T: type, name: []const u8) ![]const u8 {
+    const source = @embedFile("api.zig");
+    const type_name = comptime std.fs.path.extension(@typeName(T))[1..];
+    const start = std.mem.indexOf(u8, source, "pub const " ++ type_name ++ " = ").?;
+    var lines = std.mem.splitScalar(u8, source[start..], '\n');
+    var doc: std.ArrayList(u8) = .empty;
+    while (lines.next()) |raw| {
+        if (std.mem.eql(u8, raw, "};")) break;
+        const line = std.mem.trim(u8, raw, " ");
+        if (std.mem.startsWith(u8, line, "/// ")) {
+            if (doc.items.len > 0) try doc.append(arena, ' ');
+            try doc.appendSlice(arena, line[4..]);
+        } else if (std.mem.startsWith(u8, line, name) and line.len > name.len and
+            std.mem.indexOfScalar(u8, ":, ", line[name.len]) != null)
+        {
+            return doc.items;
+        } else {
+            doc.clearRetainingCapacity();
+        }
+    }
+    return "";
 }
 
 // ─── Header ────────────────────────────────────────────────────────────
@@ -199,13 +221,12 @@ fn writeType(w: *Writer, comptime T: type) !void {
     switch (@typeInfo(T)) {
         .@"enum" => |e| {
             try w.print("typedef enum {s} {{\n", .{T.c_name});
-            const docs = if (@hasDecl(T, "value_docs")) T.value_docs else .{};
             inline for (e.fields) |field| {
                 const line = comptime std.fmt.comptimePrint("    {s} = {d},", .{
                     enumConst(T, field.name),
                     field.value,
                 });
-                const doc = docOf(docs, field.name);
+                const doc = try docOf(T, field.name);
                 if (doc.len == 0) {
                     try w.print("{s}\n", .{line});
                 } else if (line.len + doc.len + 7 <= width) {
@@ -218,10 +239,9 @@ fn writeType(w: *Writer, comptime T: type) !void {
         },
         .@"struct" => |s| {
             try w.print("typedef struct {s} {{\n", .{T.c_name});
-            const docs = if (@hasDecl(T, "field_docs")) T.field_docs else .{};
             inline for (s.fields) |field| {
                 const line = comptime "    " ++ cDecl(field.type, field.name) ++ ";";
-                const doc = docOf(docs, field.name);
+                const doc = try docOf(T, field.name);
                 if (doc.len == 0) {
                     try w.print("{s}\n", .{line});
                 } else if (line.len + doc.len + 7 <= width) {
@@ -444,13 +464,12 @@ fn jsonType(w: *Writer, comptime T: type) !void {
     switch (@typeInfo(T)) {
         .@"enum" => |e| {
             try w.writeAll(", \"kind\": \"enum\", \"values\": [");
-            const docs = if (@hasDecl(T, "value_docs")) T.value_docs else .{};
             inline for (e.fields, 0..) |field, i| {
                 if (i > 0) try w.writeAll(", ");
                 try w.writeAll("{\"name\": ");
                 try str(w, comptime enumConst(T, field.name));
                 try w.print(", \"value\": {d}, \"doc\": ", .{field.value});
-                try str(w, docOf(docs, field.name));
+                try str(w, try docOf(T, field.name));
                 try w.writeAll("}");
             }
         },
@@ -458,7 +477,6 @@ fn jsonType(w: *Writer, comptime T: type) !void {
             try w.writeAll(", \"kind\": ");
             try str(w, @tagName(T.type_kind));
             try w.print(", \"size\": {d}, \"fields\": [", .{@sizeOf(T)});
-            const docs = if (@hasDecl(T, "field_docs")) T.field_docs else .{};
             inline for (s.fields, 0..) |field, i| {
                 if (i > 0) try w.writeAll(", ");
                 try w.writeAll("{\"name\": ");
@@ -466,7 +484,7 @@ fn jsonType(w: *Writer, comptime T: type) !void {
                 try w.writeAll(", \"type\": ");
                 try str(w, comptime cDecl(field.type, ""));
                 try w.print(", \"offset\": {d}, \"doc\": ", .{@offsetOf(T, field.name)});
-                try str(w, docOf(docs, field.name));
+                try str(w, try docOf(T, field.name));
                 try w.writeAll("}");
             }
         },

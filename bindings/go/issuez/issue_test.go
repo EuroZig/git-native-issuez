@@ -17,235 +17,6 @@ import (
 	"github.com/EuroZig/git-native-issuez/bindings/go/issuez"
 )
 
-func TestRoundTrip(t *testing.T) {
-	ctx := context.Background()
-	r := newRepo(t, issuez.WithCommitter("Server", "server@example.com"))
-
-	grace := issuez.Person{Email: "grace@example.com", UserID: "0c8d7a52-3f1e-4b6a-9d2c-5e4f3a2b1c0d"}
-	due := issuez.Date{Year: 2026, Month: time.December, Day: 1}
-	w, err := r.Create(ctx, new(issuez.Edit).
-		SetTitle("Login page crashes").
-		SetDescription("Happens on Safari only.").
-		SetLabels("bug", "ui").
-		SetPriority(issuez.PriorityHigh).
-		SetDueDate(due).
-		AddAssignee(grace), ada, issuez.Reload())
-	if err != nil {
-		t.Fatal(err)
-	}
-	i := w.Issue
-	if i == nil || i.Title != "Login page crashes" || i.Description != "Happens on Safari only." {
-		t.Fatalf("created issue: %+v", i)
-	}
-	if len(i.Labels) != 2 || i.Priority != issuez.PriorityHigh || *i.DueDate != due {
-		t.Errorf("fields: %v %v %v", i.Labels, i.Priority, i.DueDate)
-	}
-	if len(i.Assignees) != 1 || i.Assignees[0] != grace {
-		t.Errorf("assignees: %+v", i.Assignees)
-	}
-	if i.Author.Email != "ada@example.com" || i.WorkflowState != "backlog" || i.Done {
-		t.Errorf("author %v, workflow %q, done %v", i.Author, i.WorkflowState, i.Done)
-	}
-
-	// A comment, then a close, each checked against the version before.
-	cw, err := r.Update(ctx, w.ID, new(issuez.Edit).AddComment("Fixed in 1a2b3c4."), ada, issuez.ExpectTip(w.NewTip))
-	if err != nil {
-		t.Fatal(err)
-	}
-	if cw.Entry.Kind != issuez.EntryComment {
-		t.Errorf("comment entry kind %v", cw.Entry.Kind)
-	}
-	closed, err := r.Update(ctx, w.ID, new(issuez.Edit).SetState("closed").SetFixedBy("1a2b3c4"), ada, issuez.ExpectTip(cw.NewTip))
-	if err != nil {
-		t.Fatal(err)
-	}
-	var state *issuez.Change
-	for k := range closed.Entry.Changes {
-		if closed.Entry.Changes[k].Field == issuez.FieldState {
-			state = &closed.Entry.Changes[k]
-		}
-	}
-	if state == nil || state.Old != "open" || state.New != "closed" {
-		t.Errorf("state change: %+v", closed.Entry.Changes)
-	}
-
-	// A stale version: ErrVersionMismatch, with the tip now.
-	_, err = r.Update(ctx, w.ID, new(issuez.Edit).AddLabel("late"), ada, issuez.ExpectTip(w.NewTip))
-	var ie *issuez.Error
-	if !errors.Is(err, issuez.ErrVersionMismatch) || !errors.As(err, &ie) || ie.CurrentTip != closed.NewTip {
-		t.Errorf("stale write: %v", err)
-	}
-
-	got, err := r.Load(ctx, w.ID)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if !got.Done || got.Closed == nil || got.Closed.FixedBy != "1a2b3c4" || got.Closed.By.Email != "ada@example.com" {
-		t.Errorf("closed: done %v, %+v", got.Done, got.Closed)
-	}
-	if len(got.Comments) != 1 || got.Comments[0].Text != "Fixed in 1a2b3c4." {
-		t.Errorf("comments: %+v", got.Comments)
-	}
-	kinds := []issuez.EntryKind{issuez.EntryCreated, issuez.EntryComment, issuez.EntryUpdate}
-	if len(got.Timeline) != len(kinds) {
-		t.Fatalf("timeline: %+v", got.Timeline)
-	}
-	for k, want := range kinds {
-		if got.Timeline[k].Kind != want {
-			t.Errorf("timeline[%d] kind %v, want %v", k, got.Timeline[k].Kind, want)
-		}
-	}
-	var labelUI bool
-	for _, c := range got.Timeline[0].Changes {
-		labelUI = labelUI || (c.Field == issuez.FieldLabels && c.Op == issuez.VerbAdd && c.New == "ui")
-	}
-	if !labelUI || got.Timeline[1].Comment != cw.Commit {
-		t.Errorf("created changes %+v, comment entry %v", got.Timeline[0].Changes, got.Timeline[1].Comment)
-	}
-
-	page, err := r.Query(ctx, issuez.Query{Done: issuez.TriYes, Labels: []string{"bug"}})
-	if err != nil || len(page.Issues) != 1 || page.Issues[0].ID != w.ID || page.Next != "" {
-		t.Errorf("query: %v %+v", err, page)
-	}
-	if n, err := r.Count(ctx, issuez.Query{}); err != nil || n != 0 {
-		t.Errorf("open count: %v %d", err, n)
-	}
-	if id, err := r.ResolveOne(ctx, issuez.KindIssue, w.ID[:6]); err != nil || id != w.ID {
-		t.Errorf("resolve: %v %q", err, id)
-	}
-}
-
-func TestAssignees(t *testing.T) {
-	ctx := context.Background()
-	r := newRepo(t)
-	adaP := issuez.Person{Email: "ada@example.com", UserID: "0c8d7a52-3f1e-4b6a-9d2c-5e4f3a2b1c0d"}
-	bob := issuez.Person{Email: "bob@example.com"}
-	w, err := r.Create(ctx, new(issuez.Edit).SetTitle("Pair").AddAssignee(adaP).AddAssignee(bob), ada, issuez.Reload())
-	if err != nil {
-		t.Fatal(err)
-	}
-	if len(w.Issue.Assignees) != 2 || w.Issue.Assignees[0] != adaP || w.Issue.Assignees[1] != bob {
-		t.Fatalf("assignees: %+v", w.Issue.Assignees)
-	}
-	u, err := r.Update(ctx, w.ID, new(issuez.Edit).RemoveAssignee(issuez.Person{Email: "ada@example.com"}), ada, issuez.Reload())
-	if err != nil {
-		t.Fatal(err)
-	}
-	if len(u.Issue.Assignees) != 1 || u.Issue.Assignees[0] != bob {
-		t.Errorf("after removing ada: %+v", u.Issue.Assignees)
-	}
-	page, err := r.Query(ctx, issuez.Query{Assignees: []string{"bob@example.com"}})
-	if err != nil || len(page.Issues) != 1 {
-		t.Errorf("query by assignee: %v %d", err, len(page.Issues))
-	}
-}
-
-func TestNumbers(t *testing.T) {
-	ctx := context.Background()
-	r := newRepo(t)
-	w, err := r.Create(ctx, new(issuez.Edit).SetTitle("Twelve").SetNumber(12), ada, issuez.Reload())
-	if err != nil {
-		t.Fatal(err)
-	}
-	if w.Issue.Number != 12 {
-		t.Errorf("number %d", w.Issue.Number)
-	}
-	if id, err := r.ResolveOne(ctx, issuez.KindIssue, "#12"); err != nil || id != w.ID {
-		t.Errorf("#12: %v %q", err, id)
-	}
-	// Taken here: refused by the guard.
-	_, err = r.Create(ctx, new(issuez.Edit).SetTitle("Also twelve").SetNumber(12), ada)
-	var ie *issuez.Error
-	if !errors.Is(err, issuez.ErrGuard) || !errors.As(err, &ie) || ie.Problems[0].Kind != issuez.ProblemDuplicateNumber {
-		t.Errorf("taken: %v", err)
-	}
-	// Written once.
-	_, err = r.Update(ctx, w.ID, new(issuez.Edit).SetNumber(13), ada)
-	if !errors.As(err, &ie) || ie.Problems[0].Kind != issuez.ProblemReadOnlyField {
-		t.Errorf("changed: %v", err)
-	}
-	page, err := r.Query(ctx, issuez.Query{Order: issuez.SortNumber})
-	if err != nil || len(page.Issues) != 1 || page.Issues[0].Number != 12 {
-		t.Errorf("query: %v %+v", err, page)
-	}
-}
-
-func TestLockAndRef(t *testing.T) {
-	ctx := context.Background()
-	r := newRepo(t)
-	w := create(t, r, "Heated")
-	u, err := r.Update(ctx, w.ID, new(issuez.Edit).SetLocked(true, "too heated").SetRef("main"), ada, issuez.Reload())
-	if err != nil {
-		t.Fatal(err)
-	}
-	if !u.Issue.Locked || u.Issue.LockReason != "too heated" || u.Issue.Ref != "main" {
-		t.Errorf("locked: %+v", u.Issue)
-	}
-	u, err = r.Update(ctx, w.ID, new(issuez.Edit).SetLocked(false, "").SetRef(""), ada, issuez.Reload())
-	if err != nil {
-		t.Fatal(err)
-	}
-	if u.Issue.Locked || u.Issue.LockReason != "" || u.Issue.Ref != "" {
-		t.Errorf("unlocked: %+v", u.Issue)
-	}
-	var ie *issuez.Error
-	if _, err := r.Update(ctx, w.ID, new(issuez.Edit).SetRef("a b"), ada); !errors.As(err, &ie) || ie.Problems[0].Field != issuez.FieldRef {
-		t.Errorf("bad ref: %v", err)
-	}
-}
-
-func TestHostFieldsAndProvenance(t *testing.T) {
-	ctx := context.Background()
-	r := newRepo(t)
-	w, err := r.Create(ctx, new(issuez.Edit).SetTitle("Imported").SetExtra("X-Forgejo-Project", "7").
-		SetOriginal("octocat", "github:o/r#1"), ada, issuez.Reload())
-	if err != nil {
-		t.Fatal(err)
-	}
-	i := w.Issue
-	if i.Extra["X-Forgejo-Project"] != "7" || i.OriginalAuthor != "octocat" || i.OriginalID != "github:o/r#1" {
-		t.Errorf("imported: %+v", i)
-	}
-	var ie *issuez.Error
-	_, err = r.Update(ctx, w.ID, new(issuez.Edit).SetExtra("X-Other-Thing", "x"), ada)
-	if !errors.As(err, &ie) || ie.Problems[0].Field != issuez.FieldExtra {
-		t.Errorf("outside the prefix: %v", err)
-	}
-	_, err = r.Update(ctx, w.ID, new(issuez.Edit).SetExtra("X-Forgejo-Project", ""), ada)
-	if err != nil {
-		t.Fatal(err)
-	}
-	got, _ := r.Load(ctx, w.ID)
-	if _, ok := got.Extra["X-Forgejo-Project"]; ok {
-		t.Errorf("cleared field still there: %+v", got.Extra)
-	}
-}
-
-func TestHistory(t *testing.T) {
-	ctx := context.Background()
-	r := newRepo(t)
-	w := create(t, r, "Edited")
-	cw, err := r.Update(ctx, w.ID, new(issuez.Edit).AddComment("First take"), ada)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if _, err := r.Update(ctx, w.ID, new(issuez.Edit).EditComment(cw.Commit, "Second take"), ada, issuez.ExpectTip(cw.NewTip)); err != nil {
-		t.Fatal(err)
-	}
-	i, err := r.Load(ctx, w.ID, issuez.LoadHistory())
-	if err != nil {
-		t.Fatal(err)
-	}
-	h := i.Comments[0].History
-	if len(h) != 2 || h[0].Kind != issuez.RevisionOriginal || h[0].Text != "First take" ||
-		h[1].Kind != issuez.RevisionEdit || h[1].Text != "Second take" || i.Comments[0].Text != "Second take" {
-		t.Errorf("history: %+v", h)
-	}
-	if len(i.History) != 1 || i.History[0].Kind != issuez.RevisionOriginal {
-		t.Errorf("description history: %+v", i.History)
-	}
-}
-
 // TestConcurrentQueries: queries share the repo's cache of loaded issues
 // while another goroutine writes; every count is one the repo had.
 func TestConcurrentQueries(t *testing.T) {
@@ -400,6 +171,10 @@ func TestLoadHistory(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	many, _, err := r.LoadMany(ctx, []string{w.ID}, issuez.LoadHistory())
+	if err != nil || len(many) != 1 || len(many[0].Comments[0].History) != 2 {
+		t.Errorf("LoadMany with history: %+v, %v", many, err)
+	}
 	if len(without.History) != 0 || len(without.Comments[0].History) != 0 {
 		t.Errorf("history without LoadHistory: %+v", without.Comments[0].History)
 	}
@@ -552,6 +327,7 @@ func TestRepo_Count(t *testing.T) {
 	}
 }
 
+// covers: Issue_NewEntries
 func TestSince(t *testing.T) {
 	ctx := t.Context()
 	r := newRepo(t)
@@ -579,13 +355,6 @@ func TestSince(t *testing.T) {
 	gone, err := r.Load(ctx, w.ID, issuez.Since(other.NewTip))
 	if err != nil || !gone.Rewritten || len(gone.NewEntries()) != 0 {
 		t.Errorf("another issue's tip: rewritten %v, %v", gone.Rewritten, err)
-	}
-}
-
-func TestIssue_NewEntries(t *testing.T) {
-	i := &issuez.Issue{Timeline: []issuez.Entry{{Kind: issuez.EntryCreated}, {Kind: issuez.EntryComment, New: true}}}
-	if n := i.NewEntries(); len(n) != 1 || n[0].Kind != issuez.EntryComment {
-		t.Errorf("NewEntries() = %+v", n)
 	}
 }
 

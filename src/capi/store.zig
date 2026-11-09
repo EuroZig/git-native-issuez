@@ -35,7 +35,7 @@ pub fn issuez_store_new(
         RepoObj,
         repo,
     ) orelse return rt.fail(err, .e_invalid_argument, "repo is NULL", .{});
-    const s = rt.gpa.create(StoreObj) catch return rt.fail(err, .e_nomem, "out of memory", .{});
+    const s = rt.gpa.create(StoreObj) catch return rt.oom(err);
     s.* = .{ .repo = r, .changed_arena = .init(rt.gpa) };
     r.retain();
     o.* = @ptrCast(s);
@@ -84,8 +84,8 @@ fn refresh(c: *Call, s: *StoreObj) !bool {
     for (try c.engine().refs(a)) |ref| {
         const id = ref.id();
         if (s.issues.get(id)) |old| {
-            if (rt.issuez_oid_eq(&old.tip, &rt.oidOf(ref.tip))) {
-                try next.put(rt.gpa, old.id.slice(), old);
+            if (rt.issuez_oid_eq(&old.info.tip, &rt.oidOf(ref.tip))) {
+                try next.put(rt.gpa, old.info.id.slice(), old);
                 continue;
             }
         }
@@ -95,7 +95,7 @@ fn refresh(c: *Call, s: *StoreObj) !bool {
         };
         const obj = try read.ownedIssue(issue, ctx);
         try fresh.append(a, obj);
-        try next.put(rt.gpa, obj.id.slice(), obj);
+        try next.put(rt.gpa, obj.info.id.slice(), obj);
     }
     const refs = try now.clone(rt.gpa);
     // The diff's IDs may point into the old ref state: copy them first.
@@ -108,7 +108,7 @@ fn refresh(c: *Call, s: *StoreObj) !bool {
     } else |_| {}
     // Nothing fails from here on.
     for (s.issues.values()) |old| {
-        const kept = next.get(old.id.slice());
+        const kept = next.get(old.info.id.slice());
         if (kept == null or kept.? != old) read.issuez_issue_free(@ptrCast(old));
     }
     s.issues.deinit(rt.gpa);
@@ -119,9 +119,8 @@ fn refresh(c: *Call, s: *StoreObj) !bool {
     return true;
 }
 
-pub fn issuez_store_generation(store: ?*const api.Store) callconv(.c) u32 {
-    return if (rt.obj(StoreObj, store)) |s| s.generation else 0;
-}
+const StoreReads = rt.Reads(api.Store, StoreObj);
+pub const issuez_store_generation = StoreReads.field("generation");
 
 pub fn issuez_store_issue_count(store: ?*const api.Store) callconv(.c) usize {
     return if (rt.obj(StoreObj, store)) |s| s.issues.count() else 0;
@@ -137,11 +136,5 @@ pub fn issuez_store_find(store: ?*const api.Store, id: Str) callconv(.c) ?*const
     return if (s.issues.get(id.slice())) |i| @ptrCast(i) else null;
 }
 
-pub fn issuez_store_changed_count(store: ?*const api.Store) callconv(.c) usize {
-    return if (rt.obj(StoreObj, store)) |s| s.changed.len else 0;
-}
-
-pub fn issuez_store_changed_at(store: ?*const api.Store, i: usize) callconv(.c) Str {
-    const s = rt.obj(StoreObj, store) orelse return .{};
-    return if (i < s.changed.len) s.changed[i] else .{};
-}
+pub const issuez_store_changed_count = StoreReads.count("changed");
+pub const issuez_store_changed_at = StoreReads.at("changed");

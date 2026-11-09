@@ -43,9 +43,6 @@ pub const EntryObj = extern struct {
 pub const CommentObj = extern struct {
     public: api.Comment,
     attachment_ids: ?[*]const Str,
-    /// Its reactions, among the issue's.
-    reactions: ?[*]const *const ReactionObj = null,
-    reaction_count: usize = 0,
 };
 
 const ExtraField = struct { key: Str, value: Str };
@@ -53,40 +50,10 @@ const ExtraField = struct { key: Str, value: Str };
 pub const IssueObj = struct {
     /// Set when the issue is a handle of its own; null inside a list.
     arena: ?*std.heap.ArenaAllocator = null,
-    id: Str,
-    tip: api.Oid,
-    number: ?u64,
-    format_version: Str,
-    commit_count: u32,
-    title: Str,
-    description: Str,
-    author: api.Person,
-    created: api.Time,
-    updated: api.Time,
-    state: api.State,
-    state_name: Str,
-    done: bool,
-    workflow: Str,
-    closed_at: ?api.Time = null,
-    closed_by: api.Person = .{},
-    fixed_by: Str,
-    release: Str,
-    reason: Str,
-    deleted: bool,
-    locked: bool,
-    lock_reason: Str,
-    priority: api.Priority,
+    info: api.IssueInfo,
     labels: []const Str,
     assignees: []const api.Person,
-    milestone_id: Str,
-    parent_id: Str,
     blockers: []const Str,
-    start_date: ?api.Date,
-    due_date: ?api.Date,
-    estimate: ?u32,
-    ref: Str,
-    original_author: Str,
-    original_id: Str,
     fields: []const ExtraField,
     extra: []const ExtraField,
     problems: *rt.ProblemList,
@@ -98,8 +65,6 @@ pub const IssueObj = struct {
     reactions: []const ReactionObj,
     /// Present ones, then removed ones.
     attachments: []const api.Attachment,
-    /// issuez_issue_load_since's since isn't in the history.
-    rewritten: bool = false,
 };
 
 /// Trailers this library interprets; the rest are extras.
@@ -147,7 +112,8 @@ pub fn numberOf(issue: Issue) ?u64 {
 }
 
 pub fn build(a: Allocator, issue: Issue, ctx: Context) Allocator.Error!IssueObj {
-    const author = try rt.personOf(a, issue.author, issue.author_id);
+    const author = try a.create(api.Person);
+    author.* = try rt.personOf(a, issue.author, issue.author_id);
     const created: api.Time = .{
         .unix_seconds = issue.created,
         .tz_offset_minutes = issue.author.tz_offset_minutes,
@@ -175,7 +141,7 @@ pub fn build(a: Allocator, issue: Issue, ctx: Context) Allocator.Error!IssueObj 
         if (!isKnown(f.key)) try extra.append(a, e);
     }
 
-    var problems: std.ArrayList(rt.ProblemSpec) = .empty;
+    var problems: rt.Problems = .empty;
     for (issue.conflicts) |c| try problems.append(a, .{
         .kind = .conflict,
         .key = try std.fmt.allocPrint(a, "{f}", .{c.target}),
@@ -207,12 +173,12 @@ pub fn build(a: Allocator, issue: Issue, ctx: Context) Allocator.Error!IssueObj 
     var comment_of: std.ArrayList(?usize) = .empty;
     const people = try a.alloc(api.Person, issue.comments.len);
     const closure = view.closure(issue, ctx.done_states);
-    const closed_at: ?api.Time = if (closure) |cl| rt.timeOf(cl.at) else null;
-    const closed_by: api.Person = if (closure) |cl| try rt.personOf(
-        a,
-        cl.at,
-        cl.author_id,
-    ) else .{};
+    var closed_by: ?*const api.Person = null;
+    if (closure) |cl| {
+        const by = try a.create(api.Person);
+        by.* = try rt.personOf(a, cl.at, cl.author_id);
+        closed_by = by;
+    }
     for (issue.comments, people) |c, *person| {
         person.* = try rt.personOf(a, c.author, authorIdAt(issue.author_ids, c.oid));
         const at = rt.timeOf(c.author);
@@ -246,8 +212,6 @@ pub fn build(a: Allocator, issue: Issue, ctx: Context) Allocator.Error!IssueObj 
         } });
         try histories.append(a, try revisionsOf(a, c.history, issue.author_ids));
     }
-    const author_ptr = try a.create(api.Person);
-    author_ptr.* = author;
     var timeline: std.ArrayList(EntryObj) = .empty;
     var cx: ChangeContext = .of(issue, ctx.done_states);
     const created_changes = try changesOf(a, issue.created_changes, &cx);
@@ -255,7 +219,7 @@ pub fn build(a: Allocator, issue: Issue, ctx: Context) Allocator.Error!IssueObj 
         .public = .{
             .kind = @intFromEnum(api.EntryKind.created),
             .commit = rt.oidOf(issue.root),
-            .author = author_ptr,
+            .author = author,
             .at = created,
             .comment = null,
             .change_count = created_changes.len,
@@ -320,15 +284,6 @@ pub fn build(a: Allocator, issue: Issue, ctx: Context) Allocator.Error!IssueObj 
         };
     }
 
-    for (comments.items) |*cm| {
-        var mine: std.ArrayList(*const ReactionObj) = .empty;
-        for (reactions) |*rx| if (rx.has_target and rt.issuez_oid_eq(&rx.target, &cm.public.id)) {
-            try mine.append(a, rx);
-        };
-        cm.reactions = mine.items.ptr;
-        cm.reaction_count = mine.items.len;
-    }
-
     const attachments = try a.alloc(
         api.Attachment,
         issue.attachments.len + issue.removed_attachments.len,
@@ -357,49 +312,54 @@ pub fn build(a: Allocator, issue: Issue, ctx: Context) Allocator.Error!IssueObj 
     }
 
     return .{
-        .attachments = attachments,
-        .id = try rt.dupeZ(a, issue.id),
-        .tip = rt.oidOf(issue.tip),
-        .number = numberOf(issue),
-        .format_version = try rt.optZ(a, issue.format_version),
-        .commit_count = @intCast(issue.commit_count),
-        .title = try rt.dupeZ(a, issue.title),
-        .description = description,
-        .author = author,
-        .created = created,
-        .updated = .{
-            .unix_seconds = issue.updated,
-            .tz_offset_minutes = issue.updated_tz_offset_minutes,
+        .info = .{
+            .id = try rt.dupeZ(a, issue.id),
+            .tip = rt.oidOf(issue.tip),
+            .has_number = issue.number != null,
+            .number = numberOf(issue) orelse 0,
+            .format_version = try rt.optZ(a, issue.format_version),
+            .commit_count = @intCast(issue.commit_count),
+            .title = try rt.dupeZ(a, issue.title),
+            .description = description,
+            .author = author,
+            .created = created,
+            .updated = .{
+                .unix_seconds = issue.updated,
+                .tz_offset_minutes = issue.updated_tz_offset_minutes,
+            },
+            .state = @intFromEnum(state),
+            .state_name = try rt.dupeZ(a, issue.state.text()),
+            .is_done = issue.state.isDone(ctx.done_states),
+            .workflow_state = try rt.optZ(a, workflowOf(issue, ctx)),
+            .closed_by = closed_by,
+            .closed_at = if (closure) |cl| rt.timeOf(cl.at) else .{},
+            .fixed_by = try rt.optZ(a, issue.field("Fixed-By")),
+            .release = try rt.optZ(a, issue.field("Release")),
+            .reason = try rt.optZ(a, issue.field("Reason")),
+            .is_deleted = issue.deleted,
+            .is_locked = issue.locked,
+            .lock_reason = try rt.optZ(a, issue.lock_reason),
+            .priority = @intFromEnum(@as(api.Priority, if (issue.priority) |p| switch (p) {
+                .low => .low,
+                .medium => .medium,
+                .high => .high,
+                .critical => .critical,
+            } else .unknown)),
+            .milestone_id = try rt.optZ(a, issue.milestone_id),
+            .parent_id = try rt.optZ(a, issue.parent),
+            .start_date = if (issue.start_date) |d| dateOf(d) else .{},
+            .due_date = if (issue.due_date) |d| dateOf(d) else .{},
+            .has_estimate_minutes = issue.estimate_minutes != null,
+            .estimate_minutes = issue.estimate_minutes orelse 0,
+            .ref = try rt.optZ(a, issue.ref),
+            .original_author = try rt.optZ(a, issue.original_author),
+            .original_id = try rt.optZ(a, issue.original_id),
+            .rewritten = false,
         },
-        .state = state,
-        .state_name = try rt.dupeZ(a, issue.state.text()),
-        .done = issue.state.isDone(ctx.done_states),
-        .workflow = try rt.optZ(a, workflowOf(issue, ctx)),
-        .closed_at = closed_at,
-        .closed_by = closed_by,
-        .fixed_by = try rt.optZ(a, issue.field("Fixed-By")),
-        .release = try rt.optZ(a, issue.field("Release")),
-        .reason = try rt.optZ(a, issue.field("Reason")),
-        .deleted = issue.deleted,
-        .locked = issue.locked,
-        .lock_reason = try rt.optZ(a, issue.lock_reason),
-        .priority = if (issue.priority) |p| switch (p) {
-            .low => .low,
-            .medium => .medium,
-            .high => .high,
-            .critical => .critical,
-        } else .unknown,
+        .attachments = attachments,
         .labels = labels,
         .assignees = assignees,
-        .milestone_id = try rt.optZ(a, issue.milestone_id),
-        .parent_id = try rt.optZ(a, issue.parent),
         .blockers = blockers,
-        .start_date = if (issue.start_date) |d| dateOf(d) else null,
-        .due_date = if (issue.due_date) |d| dateOf(d) else null,
-        .estimate = issue.estimate_minutes,
-        .ref = try rt.optZ(a, issue.ref),
-        .original_author = try rt.optZ(a, issue.original_author),
-        .original_id = try rt.optZ(a, issue.original_id),
         .fields = fields.items,
         .extra = extra.items,
         .problems = try rt.borrowedProblems(a, problems.items),
@@ -522,146 +482,25 @@ pub fn issuez_issue_free(issue: ?*api.Issue) callconv(.c) void {
     if (o.arena) |a| rt.freeArena(a);
 }
 
-pub fn issuez_issue_id(i: ?*const api.Issue) callconv(.c) Str {
-    return if (get(i)) |o| o.id else .{};
-}
-pub fn issuez_issue_tip(i: ?*const api.Issue) callconv(.c) api.Oid {
-    return if (get(i)) |o| o.tip else .{};
-}
-pub fn issuez_issue_number(i: ?*const api.Issue, out: ?*u64) callconv(.c) bool {
-    const n = (get(i) orelse return false).number orelse return false;
-    if (out) |p| p.* = n;
-    return true;
-}
-pub fn issuez_issue_format_version(i: ?*const api.Issue) callconv(.c) Str {
-    return if (get(i)) |o| o.format_version else .{};
-}
-pub fn issuez_issue_commit_count(i: ?*const api.Issue) callconv(.c) u32 {
-    return if (get(i)) |o| o.commit_count else 0;
-}
-pub fn issuez_issue_title(i: ?*const api.Issue) callconv(.c) Str {
-    return if (get(i)) |o| o.title else .{};
-}
-pub fn issuez_issue_description(i: ?*const api.Issue) callconv(.c) Str {
-    return if (get(i)) |o| o.description else .{};
-}
-pub fn issuez_issue_author(i: ?*const api.Issue) callconv(.c) ?*const api.Person {
-    return if (get(i)) |o| &o.author else null;
-}
-pub fn issuez_issue_created(i: ?*const api.Issue) callconv(.c) api.Time {
-    return if (get(i)) |o| o.created else .{};
-}
-pub fn issuez_issue_updated(i: ?*const api.Issue) callconv(.c) api.Time {
-    return if (get(i)) |o| o.updated else .{};
-}
-pub fn issuez_issue_state(i: ?*const api.Issue) callconv(.c) api.State {
-    return if (get(i)) |o| o.state else .unknown;
-}
-pub fn issuez_issue_state_name(i: ?*const api.Issue) callconv(.c) Str {
-    return if (get(i)) |o| o.state_name else .{};
-}
-pub fn issuez_issue_is_done(i: ?*const api.Issue) callconv(.c) bool {
-    return if (get(i)) |o| o.done else false;
-}
-pub fn issuez_issue_workflow_state(i: ?*const api.Issue) callconv(.c) Str {
-    return if (get(i)) |o| o.workflow else .{};
-}
-pub fn issuez_issue_closed(
-    i: ?*const api.Issue,
-    at: ?*api.Time,
-    by: ?*?*const api.Person,
-) callconv(.c) bool {
-    const o = get(i) orelse return false;
-    const t = o.closed_at orelse return false;
-    if (at) |p| p.* = t;
-    if (by) |p| p.* = &o.closed_by;
-    return true;
-}
-pub fn issuez_issue_fixed_by(i: ?*const api.Issue) callconv(.c) Str {
-    return if (get(i)) |o| o.fixed_by else .{};
-}
-pub fn issuez_issue_release(i: ?*const api.Issue) callconv(.c) Str {
-    return if (get(i)) |o| o.release else .{};
-}
-pub fn issuez_issue_reason(i: ?*const api.Issue) callconv(.c) Str {
-    return if (get(i)) |o| o.reason else .{};
-}
-pub fn issuez_issue_is_deleted(i: ?*const api.Issue) callconv(.c) bool {
-    return if (get(i)) |o| o.deleted else false;
-}
-pub fn issuez_issue_is_locked(i: ?*const api.Issue) callconv(.c) bool {
-    return if (get(i)) |o| o.locked else false;
-}
-pub fn issuez_issue_lock_reason(i: ?*const api.Issue) callconv(.c) Str {
-    return if (get(i)) |o| o.lock_reason else .{};
-}
-pub fn issuez_issue_priority(i: ?*const api.Issue) callconv(.c) api.Priority {
-    return if (get(i)) |o| o.priority else .unknown;
-}
-pub fn issuez_issue_label_count(i: ?*const api.Issue) callconv(.c) usize {
-    return if (get(i)) |o| o.labels.len else 0;
-}
-pub fn issuez_issue_label_at(i: ?*const api.Issue, k: usize) callconv(.c) Str {
-    const o = get(i) orelse return .{};
-    return if (k < o.labels.len) o.labels[k] else .{};
-}
+const IssueReads = rt.Reads(api.Issue, IssueObj);
+pub const issuez_issue_info_of = IssueReads.ref("info");
+pub const issuez_issue_label_count = IssueReads.count("labels");
+pub const issuez_issue_label_at = IssueReads.at("labels");
 pub fn issuez_issue_has_label(i: ?*const api.Issue, label: Str) callconv(.c) bool {
     const o = get(i) orelse return false;
     for (o.labels) |l| if (std.mem.eql(u8, l.slice(), label.slice())) return true;
     return false;
 }
-pub fn issuez_issue_assignee_count(i: ?*const api.Issue) callconv(.c) usize {
-    return if (get(i)) |o| o.assignees.len else 0;
-}
-pub fn issuez_issue_assignee_at(i: ?*const api.Issue, k: usize) callconv(.c) ?*const api.Person {
-    const o = get(i) orelse return null;
-    return if (k < o.assignees.len) &o.assignees[k] else null;
-}
-pub fn issuez_issue_milestone_id(i: ?*const api.Issue) callconv(.c) Str {
-    return if (get(i)) |o| o.milestone_id else .{};
-}
-pub fn issuez_issue_parent_id(i: ?*const api.Issue) callconv(.c) Str {
-    return if (get(i)) |o| o.parent_id else .{};
-}
-pub fn issuez_issue_blocker_count(i: ?*const api.Issue) callconv(.c) usize {
-    return if (get(i)) |o| o.blockers.len else 0;
-}
-pub fn issuez_issue_blocker_at(i: ?*const api.Issue, k: usize) callconv(.c) Str {
-    const o = get(i) orelse return .{};
-    return if (k < o.blockers.len) o.blockers[k] else .{};
-}
-pub fn issuez_issue_start_date(i: ?*const api.Issue, out: ?*api.Date) callconv(.c) bool {
-    const d = (get(i) orelse return false).start_date orelse return false;
-    if (out) |p| p.* = d;
-    return true;
-}
-pub fn issuez_issue_due_date(i: ?*const api.Issue, out: ?*api.Date) callconv(.c) bool {
-    const d = (get(i) orelse return false).due_date orelse return false;
-    if (out) |p| p.* = d;
-    return true;
-}
-pub fn issuez_issue_estimate_minutes(i: ?*const api.Issue, out: ?*u32) callconv(.c) bool {
-    const m = (get(i) orelse return false).estimate orelse return false;
-    if (out) |p| p.* = m;
-    return true;
-}
-pub fn issuez_issue_ref(i: ?*const api.Issue) callconv(.c) Str {
-    return if (get(i)) |o| o.ref else .{};
-}
-pub fn issuez_issue_original_author(i: ?*const api.Issue) callconv(.c) Str {
-    return if (get(i)) |o| o.original_author else .{};
-}
-pub fn issuez_issue_original_id(i: ?*const api.Issue) callconv(.c) Str {
-    return if (get(i)) |o| o.original_id else .{};
-}
+pub const issuez_issue_assignee_count = IssueReads.count("assignees");
+pub const issuez_issue_assignee_at = IssueReads.refAt("assignees");
+pub const issuez_issue_blocker_count = IssueReads.count("blockers");
+pub const issuez_issue_blocker_at = IssueReads.at("blockers");
 pub fn issuez_issue_field(i: ?*const api.Issue, key: Str) callconv(.c) Str {
     const o = get(i) orelse return .{};
     for (o.fields) |f| if (std.ascii.eqlIgnoreCase(f.key.slice(), key.slice())) return f.value;
     return .{};
 }
-pub fn issuez_issue_extra_count(i: ?*const api.Issue) callconv(.c) usize {
-    return if (get(i)) |o| o.extra.len else 0;
-}
+pub const issuez_issue_extra_count = IssueReads.count("extra");
 pub fn issuez_issue_extra_at(
     i: ?*const api.Issue,
     k: usize,
@@ -680,18 +519,8 @@ pub fn issuez_issue_problems(i: ?*const api.Issue) callconv(.c) ?*const api.Prob
     const o = get(i) orelse return null;
     return @ptrCast(o.problems);
 }
-fn reactionsOn(o: *const IssueObj, comment: ?*const api.Oid, k: usize) ?*const ReactionObj {
-    var n: usize = 0;
-    for (o.reactions) |*rx| {
-        const on = if (comment) |c| rx.has_target and rt.issuez_oid_eq(
-            &rx.target,
-            c,
-        ) else !rx.has_target;
-        if (!on) continue;
-        if (n == k) return rx;
-        n += 1;
-    }
-    return null;
+fn reactionIsOn(rx: *const ReactionObj, comment: ?*const api.Oid) bool {
+    return if (comment) |c| rx.has_target and rt.issuez_oid_eq(&rx.target, c) else !rx.has_target;
 }
 
 pub fn issuez_issue_reaction_count(
@@ -700,7 +529,9 @@ pub fn issuez_issue_reaction_count(
 ) callconv(.c) usize {
     const o = get(i) orelse return 0;
     var n: usize = 0;
-    while (reactionsOn(o, comment, n) != null) n += 1;
+    for (o.reactions) |*rx| {
+        if (reactionIsOn(rx, comment)) n += 1;
+    }
     return n;
 }
 
@@ -710,7 +541,13 @@ pub fn issuez_issue_reaction_at(
     k: usize,
 ) callconv(.c) ?*const api.Reaction {
     const o = get(i) orelse return null;
-    return if (reactionsOn(o, comment, k)) |rx| &rx.public else null;
+    var n: usize = 0;
+    for (o.reactions) |*rx| {
+        if (!reactionIsOn(rx, comment)) continue;
+        if (n == k) return &rx.public;
+        n += 1;
+    }
+    return null;
 }
 
 pub fn issuez_reaction_user_at(r: ?*const api.Reaction, k: usize) callconv(.c) ?*const api.Person {
@@ -719,13 +556,8 @@ pub fn issuez_reaction_user_at(r: ?*const api.Reaction, k: usize) callconv(.c) ?
     return &rx.users.?[k];
 }
 
-pub fn issuez_issue_comment_count(i: ?*const api.Issue) callconv(.c) usize {
-    return if (get(i)) |o| o.comments.len else 0;
-}
-pub fn issuez_issue_comment_at(i: ?*const api.Issue, k: usize) callconv(.c) ?*const api.Comment {
-    const o = get(i) orelse return null;
-    return if (k < o.comments.len) &o.comments[k].public else null;
-}
+pub const issuez_issue_comment_count = IssueReads.count("comments");
+pub const issuez_issue_comment_at = IssueReads.publicAt("comments");
 pub fn issuez_issue_comment_find(
     i: ?*const api.Issue,
     id: ?*const api.Oid,
@@ -734,44 +566,16 @@ pub fn issuez_issue_comment_find(
     for (o.comments) |*c| if (rt.issuez_oid_eq(&c.public.id, id)) return &c.public;
     return null;
 }
-pub fn issuez_comment_reaction_count(cm: ?*const api.Comment) callconv(.c) usize {
-    const p = cm orelse return 0;
-    const obj: *const CommentObj = @fieldParentPtr("public", p);
-    return obj.reaction_count;
-}
-
-pub fn issuez_comment_reaction_at(
-    cm: ?*const api.Comment,
-    k: usize,
-) callconv(.c) ?*const api.Reaction {
-    const p = cm orelse return null;
-    const obj: *const CommentObj = @fieldParentPtr("public", p);
-    return if (k < obj.reaction_count) &obj.reactions.?[k].public else null;
-}
-
 pub fn issuez_comment_attachment_at(cm: ?*const api.Comment, k: usize) callconv(.c) Str {
     const p = cm orelse return .{};
     const obj: *const CommentObj = @fieldParentPtr("public", p);
     return if (k < p.attachment_count) obj.attachment_ids.?[k] else .{};
 }
 
-pub fn issuez_issue_attachment_count(i: ?*const api.Issue) callconv(.c) usize {
-    return if (get(i)) |o| o.attachments.len else 0;
-}
-pub fn issuez_issue_attachment_at(
-    i: ?*const api.Issue,
-    k: usize,
-) callconv(.c) ?*const api.Attachment {
-    const o = get(i) orelse return null;
-    return if (k < o.attachments.len) &o.attachments[k] else null;
-}
-pub fn issuez_issue_timeline_count(i: ?*const api.Issue) callconv(.c) usize {
-    return if (get(i)) |o| o.timeline.len else 0;
-}
-pub fn issuez_issue_timeline_at(i: ?*const api.Issue, k: usize) callconv(.c) ?*const api.Entry {
-    const o = get(i) orelse return null;
-    return if (k < o.timeline.len) &o.timeline[k].public else null;
-}
+pub const issuez_issue_attachment_count = IssueReads.count("attachments");
+pub const issuez_issue_attachment_at = IssueReads.refAt("attachments");
+pub const issuez_issue_timeline_count = IssueReads.count("timeline");
+pub const issuez_issue_timeline_at = IssueReads.publicAt("timeline");
 pub fn issuez_entry_change_at(e: ?*const api.Entry, k: usize) callconv(.c) ?*const api.Change {
     const entry: *const EntryObj = @ptrCast(@alignCast(e orelse return null));
     if (k >= entry.public.change_count) return null;
@@ -832,9 +636,7 @@ pub fn issuez_issue_load(
         "no such issue",
         .{},
     );
-    const obj = ownedIssue(found, .of(c.repo)) catch |e| return rt.failError(err, e, .{});
-    o.* = @ptrCast(obj);
-    return .ok;
+    return rt.give(o, ownedIssue(found, .of(c.repo)), err);
 }
 
 pub fn issuez_issue_load_at(
@@ -911,7 +713,7 @@ fn markNew(c: *Call, obj: *IssueObj, since: api.Oid) !void {
     } else false;
     const entries: []EntryObj = @constCast(obj.timeline);
     if (!in_history) {
-        obj.rewritten = true;
+        obj.info.rewritten = true;
         for (entries) |*e| e.public.is_new = false;
         return;
     }
@@ -920,11 +722,6 @@ fn markNew(c: *Call, obj: *IssueObj, since: api.Oid) !void {
     var seen: std.AutoHashMapUnmanaged([32]u8, void) = .empty;
     for (known) |k| try seen.put(a, rt.oidOf(k.oid).bytes, {});
     for (entries) |*e| e.public.is_new = !seen.contains(e.public.commit.bytes);
-}
-
-pub fn issuez_issue_rewritten(i: ?*const api.Issue) callconv(.c) bool {
-    const o = get(i) orelse return false;
-    return o.rewritten;
 }
 
 fn loadOne(c: *Call, id: []const u8) !?Issue {
@@ -987,29 +784,23 @@ pub fn issuez_issue_load_many(
                 "not a full issue UUID",
                 .{},
             );
-            skipped.append(a, text) catch return rt.fail(err, .e_nomem, "out of memory", .{});
+            skipped.append(a, text) catch return rt.oom(err);
             continue;
         }
         const found = loadOne(&c, text) catch |e| {
             if (strict or !isDamaged(e)) return c.fail(err, e);
-            skipped.append(a, text) catch return rt.fail(err, .e_nomem, "out of memory", .{});
+            skipped.append(a, text) catch return rt.oom(err);
             continue;
         };
         if (found) |issue| {
-            issues.append(a, issue) catch return rt.fail(err, .e_nomem, "out of memory", .{});
+            issues.append(a, issue) catch return rt.oom(err);
         } else if (strict) {
             return rt.failWith(err, .e_not_found, .{ .subject = text }, "no such issue", .{});
         } else {
-            skipped.append(a, text) catch return rt.fail(err, .e_nomem, "out of memory", .{});
+            skipped.append(a, text) catch return rt.oom(err);
         }
     }
-    const l = makeList(
-        issues.items,
-        skipped.items,
-        .of(c.repo),
-    ) catch |e| return rt.failError(err, e, .{});
-    o.* = @ptrCast(l);
-    return .ok;
+    return rt.give(o, makeList(issues.items, skipped.items, .of(c.repo)), err);
 }
 
 /// Every issue that loads; the damaged ones by ID.
@@ -1022,26 +813,15 @@ pub fn loadEvery(c: *Call, skipped: *std.ArrayList([]const u8)) ![]Issue {
     return c.repo.cache.loadAll(a, engine, refs, &c.held, skipped, isDamaged);
 }
 
-pub fn issuez_issue_list_len(l: ?*const api.IssueList) callconv(.c) usize {
-    const list = rt.obj(ListObj, l) orelse return 0;
-    return list.issues.len;
-}
+const ListReads = rt.Reads(api.IssueList, ListObj);
+pub const issuez_issue_list_len = ListReads.count("issues");
 pub fn issuez_issue_list_at(l: ?*const api.IssueList, i: usize) callconv(.c) ?*const api.Issue {
     const list = rt.obj(ListObj, l) orelse return null;
     return if (i < list.issues.len) @ptrCast(&list.issues[i]) else null;
 }
-pub fn issuez_issue_list_next_cursor(l: ?*const api.IssueList) callconv(.c) Str {
-    const list = rt.obj(ListObj, l) orelse return .{};
-    return list.next;
-}
-pub fn issuez_issue_list_skipped_count(l: ?*const api.IssueList) callconv(.c) usize {
-    const list = rt.obj(ListObj, l) orelse return 0;
-    return list.skipped.len;
-}
-pub fn issuez_issue_list_skipped_at(l: ?*const api.IssueList, i: usize) callconv(.c) Str {
-    const list = rt.obj(ListObj, l) orelse return .{};
-    return if (i < list.skipped.len) list.skipped[i] else .{};
-}
+pub const issuez_issue_list_next_cursor = ListReads.field("next");
+pub const issuez_issue_list_skipped_count = ListReads.count("skipped");
+pub const issuez_issue_list_skipped_at = ListReads.at("skipped");
 pub fn issuez_issue_list_free(l: ?*api.IssueList) callconv(.c) void {
     const list = rt.obj(ListObj, l) orelse return;
     if (list.borrowed) return;
@@ -1083,18 +863,11 @@ fn tri(n: i64) ?bool {
     };
 }
 
-pub fn parseQuery(
-    a: Allocator,
-    ops: []const api.Op,
-    problems: *std.ArrayList(rt.ProblemSpec),
-) !Query {
+pub fn parseQuery(a: Allocator, ops: []const api.Op, problems: *rt.Problems) !Query {
     var q: Query = .{};
     for (ops, 0..) |op, i| {
-        const index: i64 = @intCast(i);
-        if (rt.hasReserved(op)) {
-            try problems.append(a, rt.reservedProblem(index));
-            continue;
-        }
+        const check: rt.OpCheck = .at(a, problems, i);
+        if (try check.reserved(op)) continue;
         const s = op.str.slice();
         switch (@as(api.Opt, @enumFromInt(op.target))) {
             .q_done => q.done = tri(op.num),
@@ -1109,10 +882,7 @@ pub fn parseQuery(
             .q_priority => if (std.math.cast(u32, op.num)) |n| {
                 try q.priorities.append(a, @enumFromInt(n));
             } else {
-                try problems.append(
-                    a,
-                    .{ .kind = .bad_format, .message = "unknown priority", .op_index = index },
-                );
+                try check.add(.bad_format, "unknown priority");
             },
             .q_milestone => try q.milestones.append(a, s),
             .q_parent => q.parent = s,
@@ -1130,40 +900,19 @@ pub fn parseQuery(
                 q.ascending = op.num2 != 0;
                 switch (q.order) {
                     .created, .updated, .number, .priority, .due_date, .comments, .state => {},
-                    else => try problems.append(
-                        a,
-                        .{ .kind = .bad_format, .message = "unknown sort", .op_index = index },
-                    ),
+                    else => try check.add(.bad_format, "unknown sort"),
                 }
             },
             .q_limit => if (op.num < 1) {
-                try problems.append(
-                    a,
-                    .{
-                        .kind = .bad_format,
-                        .message = "the limit must be positive",
-                        .op_index = index,
-                    },
-                );
+                try check.add(.bad_format, "the limit must be positive");
             } else {
                 q.limit = @intCast(op.num);
             },
             .q_after => q.offset = parseCursor(s) orelse {
-                try problems.append(
-                    a,
-                    .{
-                        .kind = .bad_format,
-                        .message = "not a cursor of this query",
-                        .op_index = index,
-                    },
-                );
+                try check.add(.bad_format, "not a cursor of this query");
                 continue;
             },
-            else => try problems.append(a, .{
-                .kind = .unknown_target,
-                .message = "not a query option",
-                .op_index = index,
-            }),
+            else => try check.add(.unknown_target, "not a query option"),
         }
     }
     return q;
@@ -1280,7 +1029,7 @@ fn runQuery(c: *Call, ops: []const api.Op, err: ?*?*api.Error, page: bool) !unio
     list: struct { matched: []Issue, skipped: []const []const u8, next: ?usize },
 } {
     const a = c.arena();
-    var problems: std.ArrayList(rt.ProblemSpec) = .empty;
+    var problems: rt.Problems = .empty;
     const q = try parseQuery(a, ops, &problems);
     if (problems.items.len > 0) return .{ .failed = rt.failWith(err, .e_invalid_value, .{
         .problems = problems.items,
@@ -1349,16 +1098,13 @@ pub fn issuez_query_run(
             ) catch |e| return rt.failError(err, e, .{});
             list.held = list.arena.allocator().dupe(*cache_mod.Entry, c.held.items) catch {
                 rt.freeArena(list.arena);
-                return rt.fail(err, .e_nomem, "out of memory", .{});
+                return rt.oom(err);
             };
             for (list.held) |e| e.retain();
             if (l.next) |next| {
                 const text = std.fmt.allocPrint(list.arena.allocator(), "o:{d}", .{next}) catch
-                    return rt.fail(err, .e_nomem, "out of memory", .{});
-                list.next = rt.dupeZ(
-                    list.arena.allocator(),
-                    text,
-                ) catch return rt.fail(err, .e_nomem, "out of memory", .{});
+                    return rt.oom(err);
+                list.next = rt.dupeZ(list.arena.allocator(), text) catch return rt.oom(err);
             }
             o.* = @ptrCast(list);
             return .ok;
@@ -1434,9 +1180,7 @@ pub fn issuez_resolve(
     var c = Call.begin(repo, cancel) catch |e| return rt.failError(err, e, .{});
     defer c.end();
     const ids = resolveIds(&c, kind, input.slice()) catch |e| return c.fail(err, e);
-    const m = makeMatches(ids) catch |e| return rt.failError(err, e, .{});
-    o.* = @ptrCast(m);
-    return .ok;
+    return rt.give(o, makeMatches(ids), err);
 }
 
 pub fn makeMatches(ids: []const []const u8) !*MatchesObj {
@@ -1450,18 +1194,10 @@ pub fn makeMatches(ids: []const []const u8) !*MatchesObj {
     return m;
 }
 
-pub fn issuez_matches_len(m: ?*const api.Matches) callconv(.c) usize {
-    const o = rt.obj(MatchesObj, m) orelse return 0;
-    return o.ids.len;
-}
-pub fn issuez_matches_at(m: ?*const api.Matches, i: usize) callconv(.c) Str {
-    const o = rt.obj(MatchesObj, m) orelse return .{};
-    return if (i < o.ids.len) o.ids[i] else .{};
-}
-pub fn issuez_matches_free(m: ?*api.Matches) callconv(.c) void {
-    const o = rt.obj(MatchesObj, m) orelse return;
-    rt.freeArena(o.arena);
-}
+const MatchesReads = rt.Reads(api.Matches, MatchesObj);
+pub const issuez_matches_len = MatchesReads.count("ids");
+pub const issuez_matches_at = MatchesReads.at("ids");
+pub const issuez_matches_free = MatchesReads.free();
 
 pub fn issuez_resolve_one(
     repo: ?*api.Repo,
@@ -1527,9 +1263,7 @@ pub fn issuez_label_counts_take(
     const issues = liveIssues(&c) catch |e| return c.fail(err, e);
     const counts = query_mod.labelCounts(c.arena(), issues, c.repo.settings.done_states) catch |e|
         return rt.failError(err, e, .{});
-    const obj = labelCountsObj(counts) catch |e| return rt.failError(err, e, .{});
-    o.* = @ptrCast(obj);
-    return .ok;
+    return rt.give(o, labelCountsObj(counts), err);
 }
 
 fn labelCountsObj(counts: []const query_mod.LabelCount) !*LabelCountsObj {
@@ -1547,19 +1281,10 @@ fn labelCountsObj(counts: []const query_mod.LabelCount) !*LabelCountsObj {
     return obj;
 }
 
-pub fn issuez_label_counts_len(l: ?*const api.LabelCounts) callconv(.c) usize {
-    return if (rt.obj(LabelCountsObj, l)) |o| o.items.len else 0;
-}
-pub fn issuez_label_counts_at(
-    l: ?*const api.LabelCounts,
-    i: usize,
-) callconv(.c) ?*const api.LabelCount {
-    const o = rt.obj(LabelCountsObj, l) orelse return null;
-    return if (i < o.items.len) &o.items[i] else null;
-}
-pub fn issuez_label_counts_free(l: ?*api.LabelCounts) callconv(.c) void {
-    if (rt.obj(LabelCountsObj, l)) |o| rt.freeArena(o.arena);
-}
+const LabelCountsReads = rt.Reads(api.LabelCounts, LabelCountsObj);
+pub const issuez_label_counts_len = LabelCountsReads.count("items");
+pub const issuez_label_counts_at = LabelCountsReads.refAt("items");
+pub const issuez_label_counts_free = LabelCountsReads.free();
 
 pub const PeopleObj = struct {
     arena: *std.heap.ArenaAllocator,
@@ -1577,9 +1302,7 @@ pub fn issuez_people_take(
     defer c.end();
     const issues = liveIssues(&c) catch |e| return c.fail(err, e);
     const who = query_mod.people(c.arena(), issues) catch |e| return rt.failError(err, e, .{});
-    const obj = peopleObj(who) catch |e| return rt.failError(err, e, .{});
-    o.* = @ptrCast(obj);
-    return .ok;
+    return rt.give(o, peopleObj(who), err);
 }
 
 fn peopleObj(who: []const query_mod.Person) !*PeopleObj {
@@ -1601,16 +1324,10 @@ fn peopleObj(who: []const query_mod.Person) !*PeopleObj {
     return obj;
 }
 
-pub fn issuez_people_len(p: ?*const api.People) callconv(.c) usize {
-    return if (rt.obj(PeopleObj, p)) |o| o.items.len else 0;
-}
-pub fn issuez_people_at(p: ?*const api.People, i: usize) callconv(.c) ?*const api.KnownPerson {
-    const o = rt.obj(PeopleObj, p) orelse return null;
-    return if (i < o.items.len) &o.items[i] else null;
-}
-pub fn issuez_people_free(p: ?*api.People) callconv(.c) void {
-    if (rt.obj(PeopleObj, p)) |o| rt.freeArena(o.arena);
-}
+const PeopleReads = rt.Reads(api.People, PeopleObj);
+pub const issuez_people_len = PeopleReads.count("items");
+pub const issuez_people_at = PeopleReads.refAt("items");
+pub const issuez_people_free = PeopleReads.free();
 
 pub const ShortIdsObj = struct {
     arena: *std.heap.ArenaAllocator,
@@ -1630,14 +1347,10 @@ pub fn issuez_short_ids_take(
     const a = c.arena();
     // Refs are sorted by name, so by UUID.
     const refs = c.engine().refs(a) catch |e| return c.fail(err, e);
-    const ids = a.alloc([]const u8, refs.len) catch
-        return rt.fail(err, .e_nomem, "out of memory", .{});
+    const ids = a.alloc([]const u8, refs.len) catch return rt.oom(err);
     for (refs, ids) |r, *id| id.* = r.id();
-    const shorts = query_mod.shortIds(a, ids, min) catch
-        return rt.fail(err, .e_nomem, "out of memory", .{});
-    const obj = shortIdsObj(ids, shorts) catch |e| return rt.failError(err, e, .{});
-    o.* = @ptrCast(obj);
-    return .ok;
+    const shorts = query_mod.shortIds(a, ids, min) catch return rt.oom(err);
+    return rt.give(o, shortIdsObj(ids, shorts), err);
 }
 
 fn shortIdsObj(ids: []const []const u8, shorts: []const []const u8) !*ShortIdsObj {
@@ -1654,13 +1367,9 @@ fn shortIdsObj(ids: []const []const u8, shorts: []const []const u8) !*ShortIdsOb
     return obj;
 }
 
-pub fn issuez_short_ids_len(s: ?*const api.ShortIds) callconv(.c) usize {
-    return if (rt.obj(ShortIdsObj, s)) |o| o.items.len else 0;
-}
-pub fn issuez_short_ids_at(s: ?*const api.ShortIds, i: usize) callconv(.c) ?*const api.ShortId {
-    const o = rt.obj(ShortIdsObj, s) orelse return null;
-    return if (i < o.items.len) &o.items[i] else null;
-}
+const ShortIdsReads = rt.Reads(api.ShortIds, ShortIdsObj);
+pub const issuez_short_ids_len = ShortIdsReads.count("items");
+pub const issuez_short_ids_at = ShortIdsReads.refAt("items");
 pub fn issuez_short_ids_find(s: ?*const api.ShortIds, id: Str) callconv(.c) Str {
     const o = rt.obj(ShortIdsObj, s) orelse return .{};
     const want = id.slice();
@@ -1676,6 +1385,4 @@ pub fn issuez_short_ids_find(s: ?*const api.ShortIds, id: Str) callconv(.c) Str 
     }
     return .{};
 }
-pub fn issuez_short_ids_free(s: ?*api.ShortIds) callconv(.c) void {
-    if (rt.obj(ShortIdsObj, s)) |o| rt.freeArena(o.arena);
-}
+pub const issuez_short_ids_free = ShortIdsReads.free();

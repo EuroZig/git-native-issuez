@@ -1,43 +1,40 @@
 package issuez_test
 
 import (
-	"bytes"
 	"encoding/json"
 	"os"
 	"sort"
 	"strings"
 	"testing"
-
-	"github.com/EuroZig/git-native-issuez/bindings/go/issuez/internal/recordgen"
 )
 
 const apiJSON = "../../../docs/issuez-api.json"
 
-// TestRecordsGenerated: records_gen.go is what internal/recordgen writes
-// from the API's JSON (`go generate`). Outside the repository the JSON
-// isn't there, and the test skips.
-func TestRecordsGenerated(t *testing.T) {
-	api, err := os.ReadFile(apiJSON)
-	if err != nil {
-		t.Skip("docs/issuez-api.json isn't here:", err)
-	}
-	want, err := recordgen.Generate(api)
-	if err != nil {
-		t.Fatal(err)
-	}
-	have, err := os.ReadFile("records_gen.go")
-	if err != nil {
-		t.Fatal(err)
-	}
-	if !bytes.Equal(want, have) {
-		t.Fatal("records_gen.go is stale: run go generate in bindings/go/issuez")
-	}
-}
-
-// handWritten are the records and values the binding copies by hand: for
-// each, every C field, and what the Go side does with it. A field the C
-// API adds fails the test until it is read here (or left out, saying why).
+// handWritten are the records and values the binding copies: for each,
+// every C field, and what the Go side does with it. A field the C API adds
+// fails the test until it is read here (or left out, saying why).
 var handWritten = map[string]map[string]string{
+	"issuez_search_hit":   {"issue_id": "SearchHit.IssueID", "line": "SearchHit.Line"},
+	"issuez_label_count":  {"name": "LabelCount.Name", "open": "LabelCount.Open", "total": "LabelCount.Total"},
+	"issuez_known_person": {"person": "KnownPerson.Person", "authored": "KnownPerson.Authored", "assigned": "KnownPerson.Assigned"},
+	"issuez_sync_item": {
+		"kind": "SyncItem.Kind", "id": "SyncItem.ID", "outcome": "SyncItem.Outcome",
+		"local_tip": "SyncItem.LocalTip", "remote_tip": "SyncItem.RemoteTip", "reason": "SyncItem.Reason",
+	},
+	"issuez_fsck_finding": {
+		"kind": "FsckFinding.Kind", "is_error": "FsckFinding.IsError", "subject_kind": "FsckFinding.SubjectKind",
+		"subject": "FsckFinding.Subject", "message": "FsckFinding.Message",
+	},
+	"issuez_quarantined": {
+		"kind": "Quarantined.Kind", "id": "Quarantined.ID", "title": "Quarantined.Title",
+		"remote_tip": "Quarantined.RemoteTip", "reason": "Quarantined.Reason", "kept_local": "Quarantined.KeptLocal",
+	},
+	"issuez_attachment": {
+		"id": "Attachment.ID", "media_type": "Attachment.MediaType", "size": "Attachment.Size",
+		"sha256": "Attachment.SHA256", "name": "Attachment.Name", "added_in": "Attachment.AddedIn",
+		"added_by": "Attachment.AddedBy", "removed": "Attachment.Removed", "comment": "Attachment.Comment",
+		"at": "Attachment.At",
+	},
 	"issuez_attachment_spec": {"id": "AttachmentSpec.ID", "name": "AttachmentSpec.Name",
 		"media_type": "AttachmentSpec.MediaType", "sha256": "AttachmentSpec.SHA256", "size": "AttachmentSpec.Size"},
 	"issuez_short_id": {"id": "Repo.ShortIDs", "prefix": "Repo.ShortIDs"},
@@ -63,6 +60,29 @@ var handWritten = map[string]map[string]string{
 		"new_tip": "left out: Diff compares Snapshots in Go",
 	},
 	"issuez_reaction": {"emoji": "Reaction.Emoji", "user_count": "Reaction.Users"},
+	"issuez_issue_info": {
+		"id": "Issue.ID", "tip": "Issue.Tip", "has_number": "left out: Issue.Number 0 is none",
+		"number": "Issue.Number", "format_version": "Issue.FormatVersion",
+		"commit_count": "Issue.CommitCount", "title": "Issue.Title", "description": "Issue.Description",
+		"author": "Issue.Author", "created": "Issue.Created", "updated": "Issue.Updated",
+		"state": "left out: Issue.State is the name", "state_name": "Issue.State", "is_done": "Issue.Done",
+		"workflow_state": "Issue.WorkflowState", "closed_by": "Closure.By (nil Closed for none)",
+		"closed_at": "Closure.At", "fixed_by": "Closure.FixedBy", "release": "Closure.Release",
+		"reason": "Closure.Reason", "is_deleted": "Issue.Deleted", "is_locked": "Issue.Locked",
+		"lock_reason": "Issue.LockReason", "priority": "Issue.Priority", "milestone_id": "Issue.MilestoneID",
+		"parent_id": "Issue.ParentID", "start_date": "Issue.StartDate (nil for none)",
+		"due_date":             "Issue.DueDate (nil for none)",
+		"has_estimate_minutes": "left out: Issue.Estimate 0 is none", "estimate_minutes": "Issue.Estimate",
+		"ref": "Issue.Ref", "original_author": "Issue.OriginalAuthor", "original_id": "Issue.OriginalID",
+		"rewritten": "Issue.Rewritten",
+	},
+	"issuez_milestone_info": {
+		"id": "Milestone.ID", "tip": "Milestone.Tip", "name": "Milestone.Name",
+		"description": "Milestone.Description", "status": "Milestone.Status",
+		"due_date": "Milestone.DueDate (nil for none)", "created": "Milestone.Created",
+		"updated": "Milestone.Updated", "has_status_changed": "Milestone.StatusChanged (nil for none)",
+		"status_changed": "Milestone.StatusChanged", "author": "Milestone.Author",
+	},
 	"issuez_comment": {
 		"id": "Comment.ID", "author": "Comment.Author", "created": "Comment.Created",
 		"updated": "Comment.Updated", "text": "Comment.Text", "edited": "Comment.Edited",
@@ -100,8 +120,8 @@ var handWritten = map[string]map[string]string{
 	},
 }
 
-// TestRecordFieldsMapped: every C record or value is generated
-// (records_gen.go) or listed in handWritten with each of its fields.
+// TestRecordFieldsMapped: every C record or value is listed in handWritten
+// with each of its fields.
 func TestRecordFieldsMapped(t *testing.T) {
 	data, err := os.ReadFile(apiJSON)
 	if err != nil {
@@ -119,10 +139,6 @@ func TestRecordFieldsMapped(t *testing.T) {
 	if err := json.Unmarshal(data, &api); err != nil {
 		t.Fatal(err)
 	}
-	generated := map[string]bool{}
-	for _, name := range recordgen.Generated() {
-		generated[name] = true
-	}
 	seen := map[string]bool{}
 	for _, ty := range api.Types {
 		if ty.Kind != "record" && ty.Kind != "value" {
@@ -130,12 +146,12 @@ func TestRecordFieldsMapped(t *testing.T) {
 		}
 		seen[ty.Name] = true
 		// The binding's own conversions (goStr, goOID).
-		if generated[ty.Name] || ty.Name == "issuez_str" || ty.Name == "issuez_oid" {
+		if ty.Name == "issuez_str" || ty.Name == "issuez_oid" {
 			continue
 		}
 		fields, ok := handWritten[ty.Name]
 		if !ok {
-			t.Errorf("%s: neither generated (internal/recordgen) nor in handWritten", ty.Name)
+			t.Errorf("%s: not in handWritten", ty.Name)
 			continue
 		}
 		var c []string

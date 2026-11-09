@@ -1561,11 +1561,6 @@ const JsonCheck = struct {
         countOutcome(what, true);
     }
 
-    fn asArray(v: ?Value) ?[]const Value {
-        const a = v orelse return null;
-        return if (a == .array) a.array.items else null;
-    }
-
     fn asObject(v: Value) ?std.json.ObjectMap {
         return if (v == .object) v.object else null;
     }
@@ -1840,6 +1835,11 @@ fn collect(
     return true;
 }
 
+fn asArray(v: ?std.json.Value) ?[]const std.json.Value {
+    const a = v orelse return null;
+    return if (a == .array) a.array.items else null;
+}
+
 fn jsonText(o: std.json.ObjectMap, key: []const u8) ?[]const u8 {
     const v = o.get(key) orelse return null;
     return if (v == .string) v.string else null;
@@ -1859,23 +1859,13 @@ fn checkChanges(
     shown: []const u8,
     out: []const u8,
 ) CaseError!void {
-    const root = blk: {
-        const h = o.get("description_history") orelse return badJson(
-            shown,
-            "no description_history",
-            out,
-        );
-        if (h != .array or h.array.items.len == 0 or h.array.items[0] != .object)
-            return badJson(shown, "no description_history", out);
-        break :blk jsonText(
-            h.array.items[0].object,
-            "id",
-        ) orelse return badJson(shown, "no root", out);
-    };
+    const history = asArray(o.get("description_history")) orelse &.{};
+    if (history.len == 0 or history[0] != .object)
+        return badJson(shown, "no description_history", out);
+    const root = jsonText(history[0].object, "id") orelse return badJson(shown, "no root", out);
     try sameChanges(arena, clone, root, o.get("created_changes"), shown, out);
-    const comments = o.get("comments") orelse return badJson(shown, "no comments", out);
-    if (comments != .array) return badJson(shown, "no comments", out);
-    for (comments.array.items) |c| {
+    const comments = asArray(o.get("comments")) orelse return badJson(shown, "no comments", out);
+    for (comments) |c| {
         if (c != .object) return badJson(shown, "a comment that isn't an object", out);
         const id = jsonText(
             c.object,
@@ -1960,10 +1950,10 @@ fn sameHistories(
     _ = arena;
     const Same = struct {
         fn revisions(v: ?std.json.Value, want: []const oracle.commands.NaiveRevision) bool {
-            const list = v orelse return false;
-            if (list != .array or list.array.items.len != want.len) return false;
+            const list = asArray(v) orelse return false;
+            if (list.len != want.len) return false;
             for (want) |w| {
-                const found = for (list.array.items) |r| {
+                const found = for (list) |r| {
                     if (r != .object) return false;
                     const id = jsonText(r.object, "id") orelse return false;
                     const kind = jsonText(r.object, "kind") orelse return false;
@@ -1975,9 +1965,8 @@ fn sameHistories(
         }
     };
     if (!Same.revisions(o.get("description_history"), n.description_history)) return false;
-    const comments = o.get("comments") orelse return false;
-    if (comments != .array) return false;
-    for (comments.array.items) |c| {
+    const comments = asArray(o.get("comments")) orelse return false;
+    for (comments) |c| {
         if (c != .object) return false;
         const merge = c.object.get("merge") orelse return false;
         if (merge == .bool and merge.bool) continue;
@@ -2002,6 +1991,10 @@ fn sameAsNaive(
             const v = obj.get(key) orelse return false;
             if (want.len == 0) return v == .null;
             return v == .string and std.mem.eql(u8, v.string, try utf8(a, want));
+        }
+        fn flag(obj: std.json.ObjectMap, key: []const u8, raw: []const u8) bool {
+            const v = obj.get(key) orelse return false;
+            return v == .bool and v.bool == std.mem.eql(u8, raw, "true");
         }
         fn ifSet(a: Allocator, obj: std.json.ObjectMap, key: []const u8, raw: []const u8) !bool {
             const v = obj.get(key) orelse return false;
@@ -2040,9 +2033,9 @@ fn sameAsNaive(
     }) |f| if (!try Same.ifSet(arena, o, f[0], f[1])) return false;
 
     // `assignees` by email, in the oracle's order.
-    const assignees = o.get("assignees") orelse return false;
-    if (assignees != .array or assignees.array.items.len != n.assignees.len) return false;
-    for (assignees.array.items, n.assignees) |got, want| {
+    const assignees = asArray(o.get("assignees")) orelse return false;
+    if (assignees.len != n.assignees.len) return false;
+    for (assignees, n.assignees) |got, want| {
         if (got != .string) return false;
         const raw = try utf8(arena, want);
         const email = if (std.mem.findScalarLast(u8, raw, ' ')) |sp| raw[sp + 1 ..] else raw;
@@ -2062,17 +2055,15 @@ fn sameAsNaive(
         )) return false;
     }
     // Reactions: the same members as the oracle's.
-    const reactions = o.get("reactions") orelse return false;
-    if (reactions != .array) return false;
+    const reactions = asArray(o.get("reactions")) orelse return false;
     var count: usize = 0;
-    for (reactions.array.items) |r| {
+    for (reactions) |r| {
         if (r != .object) return false;
         const on = r.object.get("comment");
         const target = if (on != null and on.? == .string) on.?.string else "-";
         const emoji = jsonText(r.object, "emoji") orelse return false;
-        const users = r.object.get("users") orelse return false;
-        if (users != .array) return false;
-        for (users.array.items) |u| {
+        const users = asArray(r.object.get("users")) orelse return false;
+        for (users) |u| {
             if (u != .string) return false;
             const member = try std.fmt.allocPrint(
                 arena,
@@ -2085,30 +2076,27 @@ fn sameAsNaive(
     }
     if (count != n.reactions.len) return false;
     // Lock and ref: what reads as one, as written.
-    const locked = o.get("locked") orelse return false;
-    if (locked != .bool or locked.bool != std.mem.eql(u8, n.locked, "true")) return false;
+    if (!Same.flag(o, "locked", n.locked)) return false;
     if (!try Same.text(arena, o, "lock_reason", n.lock_reason)) return false;
     if (!try Same.ifSet(arena, o, "ref", n.ref)) return false;
-    const deleted = o.get("deleted") orelse return false;
-    if (deleted != .bool or deleted.bool != std.mem.eql(u8, n.deleted, "true")) return false;
+    if (!Same.flag(o, "deleted", n.deleted)) return false;
 
-    const labels = o.get("labels") orelse return false;
-    if (labels != .array or labels.array.items.len != n.labels.len) return false;
-    for (labels.array.items) |l| {
+    const labels = asArray(o.get("labels")) orelse return false;
+    if (labels.len != n.labels.len) return false;
+    for (labels) |l| {
         if (l != .string) return false;
         const found = for (n.labels) |want| {
             if (std.mem.eql(u8, l.string, try utf8(arena, want))) break true;
         } else false;
         if (!found) return false;
     }
-    const blocked_by = o.get("blocked_by") orelse return false;
-    if (blocked_by != .array) return false;
-    for (blocked_by.array.items) |b| {
+    const blocked_by = asArray(o.get("blocked_by")) orelse return false;
+    for (blocked_by) |b| {
         if (b != .string or !issuez.format.labels.contains(n.blocked_by, b.string)) return false;
     }
-    const attachments = o.get("attachments") orelse return false;
-    if (attachments != .array or attachments.array.items.len != n.attachments.len) return false;
-    for (attachments.array.items) |a| {
+    const attachments = asArray(o.get("attachments")) orelse return false;
+    if (attachments.len != n.attachments.len) return false;
+    for (attachments) |a| {
         if (a != .object) return false;
         const id = jsonText(a.object, "id") orelse return false;
         const found = for (n.attachments) |na| {
@@ -2337,37 +2325,20 @@ const PushChecker = struct {
         return true;
     }
 
-    fn policyOf(c: *PushChecker, arena: Allocator) Allocator.Error!struct {
-        issuez.push_check.Policy,
-        oracle.push_check.Policy,
-    } {
+    fn policyOf(c: *PushChecker, arena: Allocator) Allocator.Error!issuez.push_check.Policy {
         const r = c.rand;
-        if (r.boolean()) return .{
-            .{ .allow_numbers = true, .allow_purge = true },
-            .{ .allow_numbers = true, .allow_purge = true },
-        };
+        if (r.boolean()) return .{ .allow_numbers = true, .allow_purge = true };
         var emails: std.ArrayList([]const u8) = .empty;
         if (r.uintLessThan(u8, 4) != 0) try emails.append(
             arena,
             if (r.boolean()) c.identity else try std.ascii.allocUpperString(arena, c.identity),
         );
         if (r.boolean()) try emails.append(arena, "mallory@example.invalid");
-        const authors = r.uintLessThan(u8, 3);
-        const numbers = r.boolean();
-        const purges = r.boolean();
         return .{
-            .{
-                .pusher_emails = emails.items,
-                .author_policy = @enumFromInt(authors),
-                .allow_numbers = numbers,
-                .allow_purge = purges,
-            },
-            .{
-                .pusher_emails = emails.items,
-                .authors = @enumFromInt(authors),
-                .allow_numbers = numbers,
-                .allow_purge = purges,
-            },
+            .pusher_emails = emails.items,
+            .author_policy = @enumFromInt(r.uintLessThan(u8, 3)),
+            .allow_numbers = r.boolean(),
+            .allow_purge = r.boolean(),
         };
     }
 
@@ -2378,7 +2349,7 @@ const PushChecker = struct {
         updates: []const GitSim.Received,
         honest: bool,
     ) CaseError!void {
-        const engine_policy, const oracle_policy = try c.policyOf(arena);
+        const engine_policy = try c.policyOf(arena);
         const permissive = engine_policy.allow_numbers and engine_policy.allow_purge and
             engine_policy.author_policy == .any;
         const ups = try arena.alloc(issuez.push_check.Update, updates.len);
@@ -2414,7 +2385,12 @@ const PushChecker = struct {
             .refs = refs.items,
             .objects = objects.items,
         });
-        const want = oracle.push_check.expect(view, oups, oracle_policy) catch |e| switch (e) {
+        const want = oracle.push_check.expect(view, oups, .{
+            .pusher_emails = engine_policy.pusher_emails,
+            .authors = @enumFromInt(@intFromEnum(engine_policy.author_policy)),
+            .allow_numbers = engine_policy.allow_numbers,
+            .allow_purge = engine_policy.allow_purge,
+        }) catch |e| switch (e) {
             error.OutOfMemory => return error.OutOfMemory,
             error.NoRule => return countSkip("push check of a history the oracle can't read"),
         };
@@ -2569,6 +2545,37 @@ fn pushCheckStep(
     try checker.check(arena, &q, updates.items, false);
 }
 
+/// What `forge` writes with.
+const Forger = struct {
+    arena: Allocator,
+    q: *GitSim,
+    updates: *std.ArrayList(GitSim.Received),
+    sig: object.Signature,
+
+    /// A commit by the world's identity.
+    fn commit(f: Forger, tree: Oid, parents: []const Oid, message: []const u8) CaseError!Oid {
+        const c: object.Commit = .{
+            .tree = tree,
+            .parents = parents,
+            .author = f.sig,
+            .committer = f.sig,
+            .message = message,
+        };
+        return f.q.writeObject(.commit, try c.serializeAlloc(f.arena));
+    }
+
+    /// The push's update of `name` now goes to `oid`. False when it had one
+    /// already.
+    fn update(f: Forger, name: []const u8, oid: Oid) Allocator.Error!bool {
+        for (f.updates.items) |*u| if (std.mem.eql(u8, u.name, name)) {
+            u.new = oid;
+            return false;
+        };
+        try f.updates.append(f.arena, .{ .name = name, .old = f.q.refs.get(name), .new = oid });
+        return true;
+    }
+};
+
 /// Commits no tool of ours writes: numbers, files, a format from the
 /// future, tombstones good and bad.
 fn forge(
@@ -2579,12 +2586,12 @@ fn forge(
     q: *GitSim,
     updates: *std.ArrayList(GitSim.Received),
 ) CaseError!void {
-    const sig: object.Signature = .{
+    const f: Forger = .{ .arena = arena, .q = q, .updates = updates, .sig = .{
         .name = world.identity.name,
         .email = world.identity.email,
         .time = world.clock.now,
         .tz_offset_minutes = 0,
-    };
+    } };
     var issues: std.ArrayList(World.Ref) = .empty;
     for (clone.refs) |r| if (std.mem.startsWith(u8, r.name, "refs/issues/")) {
         try issues.append(arena, r);
@@ -2593,18 +2600,11 @@ fn forge(
     const kind = rand.uintLessThan(u8, 6);
     if (kind == 2 or issues.items.len == 0) {
         countOutcome("(push check forged: new format)", true);
-        const c: object.Commit = .{
-            .tree = empty,
-            .parents = &.{},
-            .author = sig,
-            .committer = sig,
-            .message = try std.fmt.allocPrint(
-                arena,
-                "Forged\n\nState: open\nFormat-Version: {d}\n",
-                .{rand.intRangeAtMost(u8, 1, 2)},
-            ),
-        };
-        const oid = try q.writeObject(.commit, try c.serializeAlloc(arena));
+        const oid = try f.commit(empty, &.{}, try std.fmt.allocPrint(
+            arena,
+            "Forged\n\nState: open\nFormat-Version: {d}\n",
+            .{rand.intRangeAtMost(u8, 1, 2)},
+        ));
         const name = try std.fmt.allocPrint(
             arena,
             "refs/issues/{s}",
@@ -2640,11 +2640,7 @@ fn forge(
             var top = d;
             top.parents = try arena.dupe(Oid, &.{j});
             const oid = try q.writeObject(.commit, try top.serializeAlloc(arena));
-            for (updates.items) |*u| if (std.mem.eql(u8, u.name, name)) {
-                u.new = oid;
-                return;
-            };
-            try updates.append(arena, .{ .name = name, .old = q.refs.get(name), .new = oid });
+            if (!try f.update(name, oid)) return;
             if (!containsName(updates.items, target.name)) {
                 const old = q.refs.get(target.name);
                 if (old == null or !old.?.eql(tip))
@@ -2659,18 +2655,9 @@ fn forge(
                 const t = issues.items[rand.uintLessThan(usize, issues.items.len)];
                 if (containsName(updates.items, t.name)) continue;
                 const parent = Oid.parseHex(world.format, t.oid) catch continue;
-                const c: object.Commit = .{
-                    .tree = empty,
-                    .parents = try arena.dupe(Oid, &.{parent}),
-                    .author = sig,
-                    .committer = sig,
-                    .message = try std.fmt.allocPrint(arena, "Number\n\nX-Number: {d}\n", .{n}),
-                };
-                const oid = try q.writeObject(.commit, try c.serializeAlloc(arena));
-                try updates.append(
-                    arena,
-                    .{ .name = t.name, .old = q.refs.get(t.name), .new = oid },
-                );
+                const message = try std.fmt.allocPrint(arena, "Number\n\nX-Number: {d}\n", .{n});
+                const oid = try f.commit(empty, &.{parent}, message);
+                _ = try f.update(t.name, oid);
             }
         },
         0, 1 => {
@@ -2683,27 +2670,12 @@ fn forge(
                 );
             } else empty;
             if (kind == 0) countOutcome("(push check forged: number)", true);
-            const c: object.Commit = .{
-                .tree = tree,
-                .parents = &.{tip},
-                .author = sig,
-                .committer = sig,
-                .message = try std.fmt.allocPrint(
-                    arena,
-                    "Number\n\nX-Number: {d}\n",
-                    .{rand.intRangeAtMost(u8, 1, 3)},
-                ),
-            };
-            const oid = try q.writeObject(.commit, try c.serializeAlloc(arena));
-            for (updates.items) |*u| if (std.mem.eql(u8, u.name, target.name)) {
-                u.new = oid;
-                return;
-            };
-            try updates.append(arena, .{
-                .name = target.name,
-                .old = q.refs.get(target.name),
-                .new = oid,
-            });
+            const oid = try f.commit(tree, &.{tip}, try std.fmt.allocPrint(
+                arena,
+                "Number\n\nX-Number: {d}\n",
+                .{rand.intRangeAtMost(u8, 1, 3)},
+            ));
+            _ = try f.update(target.name, oid);
         },
         else => {
             countOutcome("(push check forged: tombstone)", true);
@@ -2719,14 +2691,11 @@ fn forge(
                 ),
                 "Purge comment\n\nX-Purge: comment\nX-Purged-Commit: abc\n",
             };
-            const c: object.Commit = .{
-                .tree = empty,
-                .parents = if (old) |o| try arena.dupe(Oid, &.{o}) else &.{},
-                .author = sig,
-                .committer = sig,
-                .message = messages[rand.uintLessThan(usize, messages.len)],
-            };
-            const oid = try q.writeObject(.commit, try c.serializeAlloc(arena));
+            const oid = try f.commit(
+                empty,
+                if (old) |o| try arena.dupe(Oid, &.{o}) else &.{},
+                messages[rand.uintLessThan(usize, messages.len)],
+            );
             if (containsName(updates.items, tomb_name)) return;
             // Or the tombstone goes.
             const new: ?Oid = if (old != null and rand.uintLessThan(u8, 4) == 0) null else oid;

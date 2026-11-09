@@ -782,32 +782,41 @@ fn namesIssue(name: []const u8, id: []const u8) bool {
     return false;
 }
 
+/// Internal: the library's own plumbing, not API; it may change.
+/// `rewrite`'s backend when nothing may be written, a dry run or a check:
+/// hashes the objects, writes none.
+pub const HashOnly = struct {
+    format: object.ObjectFormat,
+
+    pub fn objectFormat(h: HashOnly) object.ObjectFormat {
+        return h.format;
+    }
+
+    pub fn writeObject(h: HashOnly, kind: object.ObjectKind, data: []const u8) error{}!Oid {
+        return object.hashObject(h.format, kind, data);
+    }
+};
+
+const GitSim = @import("../backend/GitSim.zig");
+const TestRepo = @import("test_repo.zig").TestRepo;
+
 test "a tombstone chain past the limit is read up to it" {
-    const GitSim = @import("../backend/GitSim.zig");
-    var arena_state: std.heap.ArenaAllocator = .init(std.testing.allocator);
-    defer arena_state.deinit();
-    const arena = arena_state.allocator();
-    var world: GitSim.World = .{ .seed = 5, .clones = &.{.{ .name = "a" }} };
-    var sim = try GitSim.init(arena, &world, 0);
-    const repo = repo_mod.Repo(GitSim).init(&sim);
+    var fx: TestRepo = .{};
+    defer fx.deinit();
+    const arena, const sim, const repo = try fx.open(5);
     const who = try repo.identity(arena, null);
     const first = try repo.writeCommit(arena, &.{}, who, "Purge issue\n\nX-Purge: issue\n");
     const second = try repo.writeCommit(arena, &.{first}, who, "Other\n");
     const third = try repo.writeCommit(arena, &.{second}, who, "Other\n");
-    try std.testing.expect((try readUpTo(arena, &sim, third, 3)).issue);
-    try std.testing.expect(!(try readUpTo(arena, &sim, third, 2)).issue);
+    try std.testing.expect((try readUpTo(arena, sim, third, 3)).issue);
+    try std.testing.expect(!(try readUpTo(arena, sim, third, 2)).issue);
 }
 
 test "purging a comment rewrites the issue, twice changes nothing" {
-    const GitSim = @import("../backend/GitSim.zig");
-    var arena_state: std.heap.ArenaAllocator = .init(std.testing.allocator);
-    defer arena_state.deinit();
-    const arena = arena_state.allocator();
-    var world: GitSim.World = .{ .seed = 3, .clones = &.{.{ .name = "a" }} };
-    var sim = try GitSim.init(arena, &world, 0);
-    const repo = repo_mod.Repo(GitSim).init(&sim);
-    const created = try repo.create(arena, .{ .title = "T" }, .{});
-    const ref = try std.fmt.allocPrint(arena, "refs/issues/{s}", .{created.id});
+    var fx: TestRepo = .{};
+    defer fx.deinit();
+    const arena, const sim, const repo = try fx.open(3);
+    const created, const ref = try fx.issue(.{ .title = "T" });
     const bad = try repo.comment(arena, ref, .{ .text = "Abuse" }, .{});
     _ = try repo.commentEvent(
         arena,
@@ -828,7 +837,7 @@ test "purging a comment rewrites the issue, twice changes nothing" {
     try std.testing.expect(t.comments[0].eql(bad.tip));
 
     const commits = try repo.loadCommits(arena, r.tip.?);
-    const again = try rewrite(arena, &sim, commits, r.tip.?, t.comments);
+    const again = try rewrite(arena, sim, commits, r.tip.?, t.comments);
     try std.testing.expect(again.tip.eql(r.tip.?));
     try std.testing.expectEqual(@as(usize, 0), again.map.len);
 
@@ -852,7 +861,7 @@ test "purging a comment rewrites the issue, twice changes nothing" {
     try std.testing.expect(containsOid(t2.comments, tip.tip));
     const from_scratch = try rewrite(
         arena,
-        &sim,
+        sim,
         try repo.loadCommits(arena, tip.tip),
         tip.tip,
         t2.comments,
@@ -861,18 +870,13 @@ test "purging a comment rewrites the issue, twice changes nothing" {
 }
 
 test "a merge a purge leaves nothing to merge is dropped" {
-    const GitSim = @import("../backend/GitSim.zig");
-    var arena_state: std.heap.ArenaAllocator = .init(std.testing.allocator);
-    defer arena_state.deinit();
-    const arena = arena_state.allocator();
-    var world: GitSim.World = .{ .seed = 3, .clones = &.{.{ .name = "a" }} };
-    var sim = try GitSim.init(arena, &world, 0);
-    const repo = repo_mod.Repo(GitSim).init(&sim);
-    const created = try repo.create(arena, .{ .title = "T" }, .{});
-    const ref = try std.fmt.allocPrint(arena, "refs/issues/{s}", .{created.id});
+    var fx: TestRepo = .{};
+    defer fx.deinit();
+    const arena, const sim, const repo = try fx.open(3);
+    _, const ref = try fx.issue(.{ .title = "T" });
     const bad = try repo.comment(arena, ref, .{ .text = "Abuse" }, .{});
     const purged: []const Oid = &.{bad.tip};
-    const other = try rewrite(arena, &sim, try repo.loadCommits(arena, bad.tip), bad.tip, purged);
+    const other = try rewrite(arena, sim, try repo.loadCommits(arena, bad.tip), bad.tip, purged);
     const newer = try repo.comment(arena, ref, .{ .text = "Newer" }, .{});
 
     // Merging the purged copy with the unpurged one restates stale values.
@@ -894,11 +898,11 @@ test "a merge a purge leaves nothing to merge is dropped" {
         .{ .author = sig, .committer = sig },
         "After\n",
     );
-    const r = try rewrite(arena, &sim, try repo.loadCommits(arena, after), after, purged);
+    const r = try rewrite(arena, sim, try repo.loadCommits(arena, after), after, purged);
 
     const linear = try rewrite(
         arena,
-        &sim,
+        sim,
         try repo.loadCommits(arena, newer.tip),
         newer.tip,
         purged,
@@ -910,7 +914,7 @@ test "a merge a purge leaves nothing to merge is dropped" {
     for (r.map) |m| {
         if (m.old.eql(merge)) try std.testing.expect(m.new.eql(linear.tip));
     }
-    const again = try rewrite(arena, &sim, commits, r.tip, purged);
+    const again = try rewrite(arena, sim, commits, r.tip, purged);
     try std.testing.expect(again.tip.eql(r.tip));
     try std.testing.expectEqual(@as(usize, 0), again.map.len);
 
@@ -927,23 +931,18 @@ test "a merge a purge leaves nothing to merge is dropped" {
         .{ .author = sig, .committer = sig },
         "Merge issue\n",
     );
-    const kept = try rewrite(arena, &sim, try repo.loadCommits(arena, real), real, purged);
+    const kept = try rewrite(arena, sim, try repo.loadCommits(arena, real), real, purged);
     const kept_object = (try sim.readObject(arena, kept.tip)).?;
     const kept_commit = try object.Commit.parse(arena, .sha1, kept_object.data);
     try std.testing.expectEqual(@as(usize, 2), kept_commit.parents.len);
 }
 
 test "an own merge that stays restates what its new parents resolve to" {
-    const GitSim = @import("../backend/GitSim.zig");
     const sync = @import("sync.zig");
-    var arena_state: std.heap.ArenaAllocator = .init(std.testing.allocator);
-    defer arena_state.deinit();
-    const arena = arena_state.allocator();
-    var world: GitSim.World = .{ .seed = 3, .clones = &.{.{ .name = "a" }} };
-    var sim = try GitSim.init(arena, &world, 0);
-    const repo = repo_mod.Repo(GitSim).init(&sim);
-    const created = try repo.create(arena, .{ .title = "T" }, .{});
-    const ref = try std.fmt.allocPrint(arena, "refs/issues/{s}", .{created.id});
+    var fx: TestRepo = .{};
+    defer fx.deinit();
+    const arena, const sim, const repo = try fx.open(3);
+    _, const ref = try fx.issue(.{ .title = "T" });
     const bad = try repo.comment(arena, ref, .{ .text = "Abuse" }, .{});
     const purged: []const Oid = &.{bad.tip};
     const person: object.Signature = .{
@@ -977,7 +976,7 @@ test "an own merge that stays restates what its new parents resolve to" {
         .{ .author = ours, .committer = ours },
         sync.merge_subject ++ "\n\nState: open\nX-Number: 7\n",
     );
-    const r = try rewrite(arena, &sim, try repo.loadCommits(arena, merge), merge, purged);
+    const r = try rewrite(arena, sim, try repo.loadCommits(arena, merge), merge, purged);
     const top = try object.Commit.parse(arena, .sha1, (try sim.readObject(arena, r.tip)).?.data);
     try std.testing.expectEqual(@as(usize, 2), top.parents.len);
     const block = try trailers.parse(arena, top.message, .{});
@@ -985,21 +984,16 @@ test "an own merge that stays restates what its new parents resolve to" {
     try std.testing.expectEqualStrings("7", trailers.lastValue(block, "X-Number").?);
     try std.testing.expect(trailers.lastValue(block, rewritten_from_key) != null);
 
-    const again = try rewrite(arena, &sim, try repo.loadCommits(arena, r.tip), r.tip, purged);
+    const again = try rewrite(arena, sim, try repo.loadCommits(arena, r.tip), r.tip, purged);
     try std.testing.expect(again.tip.eql(r.tip));
     try std.testing.expectEqual(@as(usize, 0), again.map.len);
 }
 
 test "purging an issue deletes it and its refs" {
-    const GitSim = @import("../backend/GitSim.zig");
-    var arena_state: std.heap.ArenaAllocator = .init(std.testing.allocator);
-    defer arena_state.deinit();
-    const arena = arena_state.allocator();
-    var world: GitSim.World = .{ .seed = 3, .clones = &.{.{ .name = "a" }} };
-    var sim = try GitSim.init(arena, &world, 0);
-    const repo = repo_mod.Repo(GitSim).init(&sim);
-    const created = try repo.create(arena, .{ .title = "Doxxing", .number = 7 }, .{});
-    const ref = try std.fmt.allocPrint(arena, "refs/issues/{s}", .{created.id});
+    var fx: TestRepo = .{};
+    defer fx.deinit();
+    const arena, const sim, const repo = try fx.open(3);
+    const created, const ref = try fx.issue(.{ .title = "Doxxing", .number = 7 });
     const purge = Purge(GitSim).fromRepo(repo);
     const r = try purge.issue(arena, ref, .{ .reason = "legal" }, .{});
     try std.testing.expect(r.tip == null);
@@ -1011,15 +1005,10 @@ test "purging an issue deletes it and its refs" {
 }
 
 test "a purged issue that came back is purged again, even by a comment purge" {
-    const GitSim = @import("../backend/GitSim.zig");
-    var arena_state: std.heap.ArenaAllocator = .init(std.testing.allocator);
-    defer arena_state.deinit();
-    const arena = arena_state.allocator();
-    var world: GitSim.World = .{ .seed = 3, .clones = &.{.{ .name = "a" }} };
-    var sim = try GitSim.init(arena, &world, 0);
-    const repo = repo_mod.Repo(GitSim).init(&sim);
-    const created = try repo.create(arena, .{ .title = "Doxxing" }, .{});
-    const ref = try std.fmt.allocPrint(arena, "refs/issues/{s}", .{created.id});
+    var fx: TestRepo = .{};
+    defer fx.deinit();
+    const arena, const sim, const repo = try fx.open(3);
+    const created, const ref = try fx.issue(.{ .title = "Doxxing" });
     const c = try repo.comment(arena, ref, .{ .text = "More" }, .{});
     const purge = Purge(GitSim).fromRepo(repo);
     _ = try purge.issue(arena, ref, .{}, .{});
@@ -1032,15 +1021,10 @@ test "a purged issue that came back is purged again, even by a comment purge" {
 }
 
 test "a purged comment loses its origin, keeps its fields" {
-    const GitSim = @import("../backend/GitSim.zig");
-    var arena_state: std.heap.ArenaAllocator = .init(std.testing.allocator);
-    defer arena_state.deinit();
-    const arena = arena_state.allocator();
-    var world: GitSim.World = .{ .seed = 5, .clones = &.{.{ .name = "a" }} };
-    var sim = try GitSim.init(arena, &world, 0);
-    const repo = repo_mod.Repo(GitSim).init(&sim);
-    const created = try repo.create(arena, .{ .title = "T" }, .{});
-    const ref = try std.fmt.allocPrint(arena, "refs/issues/{s}", .{created.id});
+    var fx: TestRepo = .{};
+    defer fx.deinit();
+    const arena, _, const repo = try fx.open(5);
+    _, const ref = try fx.issue(.{ .title = "T" });
     const bad = try repo.comment(arena, ref, .{
         .text = "Imported abuse",
         .original = .{ .author = "troll", .id = "gh-1" },
@@ -1055,15 +1039,10 @@ test "a purged comment loses its origin, keeps its fields" {
 }
 
 test "a purged comment's text that parses as trailers goes, its fields stay" {
-    const GitSim = @import("../backend/GitSim.zig");
-    var arena_state: std.heap.ArenaAllocator = .init(std.testing.allocator);
-    defer arena_state.deinit();
-    const arena = arena_state.allocator();
-    var world: GitSim.World = .{ .seed = 5, .clones = &.{.{ .name = "a" }} };
-    var sim = try GitSim.init(arena, &world, 0);
-    const repo = repo_mod.Repo(GitSim).init(&sim);
-    const created = try repo.create(arena, .{ .title = "T" }, .{});
-    const ref = try std.fmt.allocPrint(arena, "refs/issues/{s}", .{created.id});
+    var fx: TestRepo = .{};
+    defer fx.deinit();
+    const arena, const sim, const repo = try fx.open(5);
+    const created, const ref = try fx.issue(.{ .title = "T" });
     const who = try repo.identity(arena, null);
     // As upstream writes it, which doesn't refuse such a comment.
     const bad = try repo.writeCommit(
@@ -1085,29 +1064,11 @@ test "a purged comment's text that parses as trailers goes, its fields stay" {
     try std.testing.expectEqualStrings("closed", issue.state.text());
 }
 
-/// `rewrite`'s backend for a dry run: hashes the objects, writes none.
-const HashOnly = struct {
-    format: object.ObjectFormat,
-
-    pub fn objectFormat(h: HashOnly) object.ObjectFormat {
-        return h.format;
-    }
-
-    pub fn writeObject(h: HashOnly, kind: object.ObjectKind, data: []const u8) error{}!Oid {
-        return object.hashObject(h.format, kind, data);
-    }
-};
-
 test "purge: a dry run rewrites in memory and writes nothing" {
-    const GitSim = @import("../backend/GitSim.zig");
-    var arena_state: std.heap.ArenaAllocator = .init(std.testing.allocator);
-    defer arena_state.deinit();
-    const arena = arena_state.allocator();
-    var world: GitSim.World = .{ .seed = 63, .clones = &.{.{ .name = "a" }} };
-    var sim = try GitSim.init(arena, &world, 0);
-    const repo = repo_mod.Repo(GitSim).init(&sim);
-    const created = try repo.create(arena, .{ .title = "T" }, .{});
-    const ref = try std.fmt.allocPrint(arena, "refs/issues/{s}", .{created.id});
+    var fx: TestRepo = .{};
+    defer fx.deinit();
+    const arena, const sim, const repo = try fx.open(63);
+    const created, const ref = try fx.issue(.{ .title = "T" });
     const bad = try repo.comment(arena, ref, .{ .text = "Abuse" }, .{});
     const tip = try repo.comment(arena, ref, .{ .text = "Fine" }, .{});
     const purge = Purge(GitSim).fromRepo(repo);

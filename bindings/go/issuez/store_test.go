@@ -1,13 +1,25 @@
 package issuez_test
 
 import (
+	"slices"
+	"strconv"
+	"strings"
 	"testing"
 
 	"github.com/EuroZig/git-native-issuez/bindings/go/issuez"
 )
 
-func TestRepo_NewStore(t *testing.T) {
+// covers: Repo_NewStore, Store_Issues, Store_Find, Store_Generation
+func TestStore_Refresh(t *testing.T) {
+	ctx := t.Context()
 	r := newRepo(t)
+	one := create(t, r, "One")
+	// More issues than a small map holds (8): up to that Go iterates one in
+	// insertion order from a random start, which often passes as sorted.
+	const issues = 12
+	for i := 1; i < issues; i++ {
+		create(t, r, "Other "+strconv.Itoa(i))
+	}
 	s, err := r.NewStore()
 	if err != nil {
 		t.Fatal(err)
@@ -16,17 +28,14 @@ func TestRepo_NewStore(t *testing.T) {
 	if len(s.Issues()) != 0 || s.Generation() != 0 {
 		t.Error("not empty before the first refresh")
 	}
-}
-
-func TestStore_Refresh(t *testing.T) {
-	ctx := t.Context()
-	r := newRepo(t)
-	one := create(t, r, "One")
-	create(t, r, "Two")
-	s, _ := r.NewStore()
-	defer s.Close()
-	if changed, err := s.Refresh(ctx); err != nil || len(changed) != 2 || len(s.Issues()) != 2 {
-		t.Fatalf("first: %v %v", changed, err)
+	if changed, err := s.Refresh(ctx); err != nil || len(changed) != issues || len(s.Issues()) != issues || s.Generation() != 1 {
+		t.Fatalf("first: %v %v, generation %d", changed, err, s.Generation())
+	}
+	if !slices.IsSortedFunc(s.Issues(), func(a, b *issuez.Issue) int { return strings.Compare(a.ID, b.ID) }) {
+		t.Error("Issues() not in UUID order")
+	}
+	if s.Find("nope") != nil {
+		t.Error("Find of no such issue")
 	}
 	if changed, err := s.Refresh(ctx); err != nil || changed != nil {
 		t.Errorf("nothing moved: %v %v", changed, err)
@@ -40,40 +49,6 @@ func TestStore_Refresh(t *testing.T) {
 		t.Errorf("after an edit: %v %v", changed, err)
 	}
 	if s.Generation() != 2 {
-		t.Errorf("Generation() = %d", s.Generation())
-	}
-}
-
-func TestStore_Issues(t *testing.T) {
-	r := newRepo(t)
-	a, b := create(t, r, "A"), create(t, r, "B")
-	s, _ := r.NewStore()
-	defer s.Close()
-	s.Refresh(t.Context())
-	got := s.Issues()
-	if len(got) != 2 || got[0].ID > got[1].ID || (got[0].ID != a.ID && got[0].ID != b.ID) {
-		t.Errorf("Issues() = %v", got)
-	}
-}
-
-func TestStore_Find(t *testing.T) {
-	r := newRepo(t)
-	w := create(t, r, "Found")
-	s, _ := r.NewStore()
-	defer s.Close()
-	s.Refresh(t.Context())
-	if s.Find(w.ID) == nil || s.Find("nope") != nil {
-		t.Error("Find")
-	}
-}
-
-func TestStore_Generation(t *testing.T) {
-	r := newRepo(t)
-	s, _ := r.NewStore()
-	defer s.Close()
-	create(t, r, "X")
-	s.Refresh(t.Context())
-	if s.Generation() != 1 {
 		t.Errorf("Generation() = %d", s.Generation())
 	}
 }

@@ -32,10 +32,10 @@
  * Types
  *   - Value types (issuez_str, issuez_oid, issuez_time, issuez_date,
  *     issuez_person, issuez_progress) are frozen and copied freely.
- *   - Records the library returns (comments, entries, problems, ...) only
- *     ever grow at the end: read them through the pointer, never copy one
- *     by value, never allocate one. Nested lists are read with *_count and
- *     *_at accessors, never as arrays of records.
+ *   - Records the library returns (issue and milestone info, comments,
+ *     entries, problems, ...) only ever grow at the end: read them through
+ *     the pointer, never copy one by value, never allocate one. Nested lists
+ *     are read with *_count and *_at accessors, never as arrays of records.
  *   - Inputs the caller allocates (issuez_op, issuez_actor,
  *     issuez_ref_update) are frozen and carry reserved space: zero it.
  *   - Enum-valued fields of structs are uint32_t; the enums give the
@@ -53,7 +53,7 @@
  *   A write is one commit: a comment, a state change (with FIXED_BY,
  *   RELEASE, REASON) and field edits together. A delete or restore is a
  *   commit of its own, and a description edit can't carry a comment;
- *   those combinations fail with ISSUEZ_E_UNSUPPORTED, problem INCOMPATIBLE.
+ *   those combinations fail with ISSUEZ_E_INVALID_VALUE, problem INCOMPATIBLE.
  *
  * Op lists (writes, queries, options)
  *   Calls taking several optional values take an array of issuez_op: a
@@ -76,6 +76,8 @@
  *   - _new                 a handle built from what the call is given
  *                          (issuez_cancel_new, issuez_store_new, issuez_diff_new)
  *   - _load*               an issue or milestone, read from git
+ *   - _info_of             a handle's single values, one record
+ *                          (issuez_issue_info_of, issuez_milestone_info_of)
  *   - _take                a value read off the repo into a handle
  *                          (issuez_snapshot_take, issuez_label_counts_take)
  *   - plain verbs          operations (issuez_search, issuez_sync,
@@ -163,7 +165,7 @@ typedef enum issuez_code {
     ISSUEZ_E_CANCELLED = 18,
     ISSUEZ_E_NETWORK = 19, /* fetch or push to a remote failed */
     ISSUEZ_E_LFS = 20, /* git-lfs missing or a transfer failed */
-    ISSUEZ_E_UNSUPPORTED = 21, /* not built yet, or not in this build */
+    ISSUEZ_E_UNSUPPORTED = 21, /* not in this build, or not possible here */
     ISSUEZ_E_NOMEM = 22,
     ISSUEZ_E_INTERNAL = 23, /* a bug: please report */
 } issuez_code;
@@ -956,16 +958,10 @@ issuez_code issuez_issue_load_at(issuez_repo *repo, issuez_str id, const issuez_
  * commit is new since the tip since: what a host that projected the issue at
  * since hasn't seen, merged-in commits included. NULL since: every entry is
  * new. A since outside the issue's history (a purge rewrote it, or it isn't
- * this issue's) makes none new and issuez_issue_rewritten true.
+ * this issue's) makes none new and issuez_issue_info.rewritten true.
  */
 issuez_code issuez_issue_load_since(issuez_repo *repo, issuez_str id, const issuez_oid *since,
                                     issuez_cancel *cancel, issuez_issue **out, issuez_error **err);
-
-/*
- * issuez_issue_load_since's since isn't in the history: the host can't tell
- * what is new. False from other loads.
- */
-bool issuez_issue_rewritten(const issuez_issue *i);
 
 typedef enum issuez_json_flag {
     ISSUEZ_JSON_FLAG_NONE = 0,
@@ -1004,69 +1000,12 @@ issuez_code issuez_issue_load_many(issuez_repo *repo, const issuez_str *ids, siz
 
 void issuez_issue_free(issuez_issue *issue);
 
-issuez_str issuez_issue_id(const issuez_issue *i);
-
-/*
- * Pass as expect.
- */
-issuez_oid issuez_issue_tip(const issuez_issue *i);
-
-bool issuez_issue_number(const issuez_issue *i, uint64_t *out);
-
-issuez_str issuez_issue_format_version(const issuez_issue *i);
-
-uint32_t issuez_issue_commit_count(const issuez_issue *i);
-
-issuez_str issuez_issue_title(const issuez_issue *i);
-
-issuez_str issuez_issue_description(const issuez_issue *i);
-
-const issuez_person *issuez_issue_author(const issuez_issue *i);
-
-issuez_time issuez_issue_created(const issuez_issue *i);
-
-issuez_time issuez_issue_updated(const issuez_issue *i);
-
 typedef enum issuez_state {
     ISSUEZ_STATE_UNKNOWN = 0,
     ISSUEZ_STATE_OPEN = 1,
     ISSUEZ_STATE_CLOSED = 2,
-    ISSUEZ_STATE_OTHER = 3, /* see issuez_issue_state_name */
+    ISSUEZ_STATE_OTHER = 3, /* see issuez_issue_info.state_name */
 } issuez_state;
-
-issuez_state issuez_issue_state(const issuez_issue *i);
-
-/*
- * "open", "closed", "wontfix", ...
- */
-issuez_str issuez_issue_state_name(const issuez_issue *i);
-
-/*
- * closed or one of the repo's done states.
- */
-bool issuez_issue_is_done(const issuez_issue *i);
-
-/*
- * Defaulted for open issues; {NULL,0} for done ones.
- */
-issuez_str issuez_issue_workflow_state(const issuez_issue *i);
-
-/*
- * When and by whom the issue last became done; false while it isn't.
- */
-bool issuez_issue_closed(const issuez_issue *i, issuez_time *at, const issuez_person **by);
-
-issuez_str issuez_issue_fixed_by(const issuez_issue *i);
-
-issuez_str issuez_issue_release(const issuez_issue *i);
-
-issuez_str issuez_issue_reason(const issuez_issue *i);
-
-bool issuez_issue_is_deleted(const issuez_issue *i);
-
-bool issuez_issue_is_locked(const issuez_issue *i);
-
-issuez_str issuez_issue_lock_reason(const issuez_issue *i);
 
 typedef enum issuez_priority {
     ISSUEZ_PRIORITY_UNKNOWN = 0, /* also: not set */
@@ -1076,7 +1015,59 @@ typedef enum issuez_priority {
     ISSUEZ_PRIORITY_CRITICAL = 4,
 } issuez_priority;
 
-issuez_priority issuez_issue_priority(const issuez_issue *i);
+/*
+ * An issue's single values, one record; lists and lookups have their own calls
+ * below. Filled once, when the handle is built: reading it costs nothing and is
+ * safe from any thread, like the rest of a loaded object. A newer library may
+ * add fields at the end, which doesn't break a program built against this
+ * header because the library owns the memory: read it through the pointer,
+ * never copy or allocate one.
+ */
+typedef struct issuez_issue_info {
+    issuez_str id;
+    issuez_oid tip; /* pass as expect */
+    bool has_number; /* false: no number yet, and number is 0 */
+    uint64_t number;
+    issuez_str format_version;
+    uint32_t commit_count;
+    issuez_str title;
+    issuez_str description;
+    const issuez_person *author;
+    issuez_time created;
+    issuez_time updated;
+    uint32_t state; /* issuez_state */
+    issuez_str state_name; /* "open", "closed", "wontfix", ... */
+    bool is_done; /* closed or one of the repo's done states */
+    issuez_str workflow_state; /* defaulted for open issues; {NULL,0} for done ones */
+    const issuez_person *closed_by; /* who last made the issue done; NULL while it isn't */
+    issuez_time closed_at; /* when closed_by did; zero while it isn't done */
+    issuez_str fixed_by;
+    issuez_str release;
+    issuez_str reason;
+    bool is_deleted;
+    bool is_locked;
+    issuez_str lock_reason;
+    uint32_t priority; /* issuez_priority */
+    /* direct only; the effective one (through parents) is a projection answer */
+    issuez_str milestone_id;
+    issuez_str parent_id;
+    issuez_date start_date; /* zero: none */
+    issuez_date due_date; /* zero: none */
+    /* false: no estimate, and estimate_minutes is 0; true with 0 is an estimate of 0 */
+    bool has_estimate_minutes;
+    uint32_t estimate_minutes;
+    issuez_str ref; /* a branch or tag */
+    /* an imported issue's author in the other tracker; {NULL,0} otherwise */
+    issuez_str original_author;
+    issuez_str original_id;
+    /* issuez_issue_load_since's since isn't in the history; false from other loads */
+    bool rewritten;
+} issuez_issue_info;
+
+/*
+ * Borrowed from i. NULL for a NULL handle.
+ */
+const issuez_issue_info *issuez_issue_info_of(const issuez_issue *i);
 
 size_t issuez_issue_label_count(const issuez_issue *i);
 
@@ -1088,34 +1079,9 @@ size_t issuez_issue_assignee_count(const issuez_issue *i);
 
 const issuez_person *issuez_issue_assignee_at(const issuez_issue *i, size_t k);
 
-/*
- * Direct only; the effective one (through parents) is a projection answer.
- */
-issuez_str issuez_issue_milestone_id(const issuez_issue *i);
-
-issuez_str issuez_issue_parent_id(const issuez_issue *i);
-
 size_t issuez_issue_blocker_count(const issuez_issue *i);
 
 issuez_str issuez_issue_blocker_at(const issuez_issue *i, size_t k);
-
-bool issuez_issue_start_date(const issuez_issue *i, issuez_date *out);
-
-bool issuez_issue_due_date(const issuez_issue *i, issuez_date *out);
-
-bool issuez_issue_estimate_minutes(const issuez_issue *i, uint32_t *out);
-
-/*
- * A branch or tag.
- */
-issuez_str issuez_issue_ref(const issuez_issue *i);
-
-/*
- * An imported issue's author in the other tracker; {NULL,0} otherwise.
- */
-issuez_str issuez_issue_original_author(const issuez_issue *i);
-
-issuez_str issuez_issue_original_id(const issuez_issue *i);
 
 /*
  * Any trailer by key, case-insensitive, as resolved (unknown ones too).
@@ -1173,14 +1139,6 @@ size_t issuez_issue_comment_count(const issuez_issue *i);
 const issuez_comment *issuez_issue_comment_at(const issuez_issue *i, size_t k);
 
 const issuez_comment *issuez_issue_comment_find(const issuez_issue *i, const issuez_oid *id);
-
-/*
- * The comment's reactions, from the record itself: the same as
- * issuez_issue_reaction_count with its id.
- */
-size_t issuez_comment_reaction_count(const issuez_comment *c);
-
-const issuez_reaction *issuez_comment_reaction_at(const issuez_comment *c, size_t k);
 
 /*
  * The UUID of an attachment the comment's commit added; {NULL,0} past the end.
@@ -1550,35 +1508,31 @@ const issuez_milestone *issuez_milestone_list_at(const issuez_milestone_list *l,
 
 void issuez_milestone_list_free(issuez_milestone_list *l);
 
-issuez_str issuez_milestone_id(const issuez_milestone *m);
-
-issuez_oid issuez_milestone_tip(const issuez_milestone *m);
-
-issuez_str issuez_milestone_name(const issuez_milestone *m);
-
-issuez_str issuez_milestone_description(const issuez_milestone *m);
-
-issuez_milestone_status issuez_milestone_status_of(const issuez_milestone *m);
-
-bool issuez_milestone_due_date(const issuez_milestone *m, issuez_date *out);
-
-issuez_time issuez_milestone_created(const issuez_milestone *m);
+/*
+ * A milestone's single values, one record, like issuez_issue_info: filled once
+ * when the handle is built, and fields may be added at the end, so read it
+ * through the pointer and never copy or allocate one.
+ */
+typedef struct issuez_milestone_info {
+    issuez_str id;
+    issuez_oid tip;
+    issuez_str name;
+    issuez_str description;
+    uint32_t status; /* issuez_milestone_status */
+    issuez_date due_date; /* zero: none */
+    issuez_time created;
+    issuez_time updated; /* of its latest commit */
+    /* false: no commit after the root set the status, and status_changed is zero */
+    bool has_status_changed;
+    /* when the status it has was set, by the last commit after the root that set it: a completed milestone's closing time */
+    issuez_time status_changed;
+    const issuez_person *author; /* who created it */
+} issuez_milestone_info;
 
 /*
- * Of its latest commit.
+ * Borrowed from m. NULL for a NULL handle.
  */
-issuez_time issuez_milestone_updated(const issuez_milestone *m);
-
-/*
- * When the status it has was set, by the last commit after the root that set
- * it: a completed milestone's closing time. False when none did.
- */
-bool issuez_milestone_status_changed(const issuez_milestone *m, issuez_time *out);
-
-/*
- * Who created it.
- */
-const issuez_person *issuez_milestone_author(const issuez_milestone *m);
+const issuez_milestone_info *issuez_milestone_info_of(const issuez_milestone *m);
 
 const issuez_problems *issuez_milestone_problems(const issuez_milestone *m);
 

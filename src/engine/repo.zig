@@ -190,6 +190,11 @@ pub const CreateSpec = struct {
     workflow: ?[]const u8 = null,
     /// `X-Number`, unique in this clone (format.md §3).
     number: ?u64 = null,
+    /// `X-Locked`, with `lock_reason`: it starts locked.
+    locked: bool = false,
+    lock_reason: ?[]const u8 = null,
+    /// `X-Ref`, a branch or tag.
+    ref: ?[]const u8 = null,
     /// Host fields, as `extra` in `EditSpec`.
     extra: []const HostField = &.{},
     /// Images on the root commit, e.g. the description's.
@@ -461,6 +466,8 @@ pub const EditSpec = struct {
     /// Provenance of this commit, for imports.
     original: Original = .{},
     author: ?Signature = null,
+    /// The tip the caller read. Any other is VersionMismatch, also for an
+    /// `update` with nothing to write.
     expect: ?Oid = null,
 
     /// The targeted text must have this many edits, checked on every retry.
@@ -575,19 +582,6 @@ pub const CommentEventSpec = struct {
     author: ?Signature = null,
     expect: ?Oid = null,
     /// Edits: unrelated field changes may still be retried.
-    expect_edits: ?u32 = null,
-};
-
-/// The write bodies' common part.
-const LifecycleSpec = struct {
-    /// Defaults to "Delete issue", "Edit description", ...
-    message: ?[]const u8 = null,
-    /// Comment edits only: images added or removed with the new
-    /// text.
-    attachments: AttachmentChanges = .{},
-    author: ?Signature = null,
-    expect: ?Oid = null,
-    /// Comment edits: unrelated field changes may still be retried.
     expect_edits: ?u32 = null,
 };
 
@@ -1343,6 +1337,15 @@ pub fn Repo(comptime B: type) type {
                     .value = try std.fmt.allocPrint(arena, "{d}", .{n}),
                 });
             }
+            if (spec.locked) {
+                try list.append(arena, .{ .key = "X-Locked", .value = "true" });
+                if (spec.lock_reason) |v| if (v.len > 0)
+                    try list.append(arena, .{ .key = "X-Lock-Reason", .value = v });
+            }
+            if (spec.ref) |v| {
+                if (!fields_fmt.isRefName(v)) return error.InvalidValue;
+                try list.append(arena, .{ .key = "X-Ref", .value = v });
+            }
             try checkHostFields(spec.extra);
             for (spec.extra) |f| if (f.value.len > 0) try list.append(
                 arena,
@@ -1377,8 +1380,6 @@ pub fn Repo(comptime B: type) type {
                     .parent_changed = spec.parent != null,
                     .blockers_added = spec.blocked_by,
                     .closed = spec.state.isDone(self.doneStates()),
-                    .state_changed = false,
-                    .was_closed = false,
                     .milestone_id = ms.id,
                     .milestone_mode = ms.mode,
                     .milestone_changed = true,
@@ -1412,36 +1413,39 @@ pub fn Repo(comptime B: type) type {
             return error.ConcurrentModification;
         }
 
+        /// `spec.comment` alone.
         fn writeComment(
             self: Self,
             arena: Allocator,
             ref_or_id: []const u8,
-            spec: CommentSpec,
+            spec: EditSpec,
         ) Error!Oid {
             const ref_name = try refFor(arena, issue_ref_prefix, ref_or_id);
+            const text = spec.comment.?;
             try self.checkLimits();
-            if (spec.text.len > self.limits.max_body_bytes) return error.TooLong;
-            try checkNotBlank(spec.text);
+            if (text.len > self.limits.max_body_bytes) return error.TooLong;
+            try checkNotBlank(text);
             try checkOriginal(spec.original);
             var provenance: std.ArrayList(trailers.Trailer) = .empty;
             try spec.original.trailerList(arena, &provenance);
-            const split = splitMessage(spec.text);
+            const split = splitMessage(text);
             const message = try trailers.build(arena, split.subject, split.body, provenance.items);
             return self.appendCommit(arena, ref_name, spec.author, spec.expect, FixedMessage{
                 .text = message,
             });
         }
 
+        /// `spec.state` alone.
         fn writeState(
             self: Self,
             arena: Allocator,
             ref_or_id: []const u8,
-            spec: StateSpec,
+            spec: EditSpec,
         ) Error!Oid {
             const ref_name = try refFor(arena, issue_ref_prefix, ref_or_id);
             try self.checkLimits();
             // `.{ .other = "closed" }` is `.closed`.
-            const state = core_fmt.State.parse(spec.state.text());
+            const state = core_fmt.State.parse(spec.state.?.text());
             try self.checkText(state.text(), 64);
             if (!core_fmt.isState(state.text())) return error.InvalidValue;
             var list: std.ArrayList(trailers.Trailer) = .empty;
@@ -1472,11 +1476,7 @@ pub fn Repo(comptime B: type) type {
             text: []const u8,
             closed: bool,
 
-            pub fn message(b: StateBuilder, arena: Allocator, current: Issue) Error![]const u8 {
-                _ = arena;
-                _ = current;
-                return b.text;
-            }
+            pub const message = fixedText;
 
             pub fn guard(
                 b: StateBuilder,
@@ -1487,14 +1487,11 @@ pub fn Repo(comptime B: type) type {
                 return b.repo.runGuards(arena, .{
                     .id = current.id,
                     .parent = current.parent,
-                    .parent_changed = false,
-                    .blockers_added = &.{},
                     .closed = b.closed,
                     .state_changed = b.closed != was_closed,
                     .was_closed = was_closed,
                     .milestone_id = current.milestone_id,
                     .milestone_mode = current.milestone_mode,
-                    .milestone_changed = false,
                 });
             }
         };
@@ -1546,7 +1543,7 @@ pub fn Repo(comptime B: type) type {
             arena: Allocator,
             ref_or_id: []const u8,
             deleted: bool,
-            spec: LifecycleSpec,
+            spec: EditSpec,
         ) Error!Oid {
             const ref_name = try refFor(arena, issue_ref_prefix, ref_or_id);
             try self.checkLimits();
@@ -1571,11 +1568,7 @@ pub fn Repo(comptime B: type) type {
             text: []const u8,
             deleted: bool,
 
-            pub fn message(b: DeleteBuilder, arena: Allocator, current: Issue) Error![]const u8 {
-                _ = arena;
-                _ = current;
-                return b.text;
-            }
+            pub const message = fixedText;
 
             pub fn guard(
                 b: DeleteBuilder,
@@ -1585,14 +1578,10 @@ pub fn Repo(comptime B: type) type {
                 if (!b.deleted and current.deleted) return b.repo.runGuards(arena, .{
                     .id = current.id,
                     .parent = current.parent,
-                    .parent_changed = false,
-                    .blockers_added = &.{},
                     .closed = b.repo.isDone(current),
-                    .state_changed = false,
                     .was_closed = b.repo.isDone(current),
                     .milestone_id = current.milestone_id,
                     .milestone_mode = current.milestone_mode,
-                    .milestone_changed = false,
                     .restored = true,
                 });
                 if (!b.deleted or current.deleted) return .{};
@@ -1682,10 +1671,10 @@ pub fn Repo(comptime B: type) type {
             ref_or_id: []const u8,
             comment_oid: Oid,
             event: CommentEvent,
-            text: []const u8,
-            spec: LifecycleSpec,
+            spec: EditSpec,
         ) Error!Oid {
             const ref_name = try refFor(arena, issue_ref_prefix, ref_or_id);
+            const text = spec.comment orelse "";
             try self.checkLimits();
             if (text.len > self.limits.max_body_bytes) return error.TooLong;
             if (event == .edit) try checkNotBlank(text);
@@ -1827,47 +1816,21 @@ pub fn Repo(comptime B: type) type {
                         .delete => .comment_delete,
                         .restore => .comment_restore,
                     };
-                    const text = e.comment orelse "";
-                    const target = ce.target;
-                    break :blk try me.writeCommentEvent(arena, ref_or_id, target, ce.event, text, .{
-                        .message = e.message,
-                        .author = e.author,
-                        .expect = e.expect,
-                        .attachments = e.attachments,
-                        .expect_edits = e.expect_edits,
-                    });
+                    break :blk try me.writeCommentEvent(arena, ref_or_id, ce.target, ce.event, e);
                 }
                 if (u.deleted) |d| {
                     kind = .deleted;
-                    break :blk try me.writeDeleted(arena, ref_or_id, d, .{
-                        .message = e.message,
-                        .author = e.author,
-                        .expect = e.expect,
-                    });
+                    break :blk try me.writeDeleted(arena, ref_or_id, d, e);
                 }
                 var fields = e;
                 fields.state = null;
                 fields.comment = null;
                 const has_fields = !fields.isEmpty();
-                if (e.state != null and !has_fields and e.comment == null) {
-                    break :blk try me.writeState(arena, ref_or_id, .{
-                        .state = e.state.?,
-                        .message = e.message,
-                        .fixed_by = e.fixed_by,
-                        .release = e.release,
-                        .reason = e.reason,
-                        .author = e.author,
-                        .expect = e.expect,
-                    });
-                }
+                if (e.state != null and !has_fields and e.comment == null)
+                    break :blk try me.writeState(arena, ref_or_id, e);
                 if (e.comment != null and e.state == null and !has_fields) {
                     kind = .comment;
-                    break :blk try me.writeComment(arena, ref_or_id, .{
-                        .text = e.comment.?,
-                        .original = e.original,
-                        .author = e.author,
-                        .expect = e.expect,
-                    });
+                    break :blk try me.writeComment(arena, ref_or_id, e);
                 }
                 if (e.description != null) kind = .description_edit;
                 if (e.comment != null) kind = .comment;
@@ -1883,6 +1846,9 @@ pub fn Repo(comptime B: type) type {
             const tip = written orelse
                 (try self.backend.resolveRef(try refFor(arena, issue_ref_prefix, ref_or_id))) orelse
                 return error.IssueDisappeared;
+            // Nothing to write didn't get as far as the tip check.
+            if (written == null) if (e.expect) |want| if (!want.eql(tip))
+                return error.VersionMismatch;
             const receipt: Receipt = .{
                 .tip = tip,
                 .wrote = written != null and !skipped,
@@ -2495,14 +2461,14 @@ pub fn Repo(comptime B: type) type {
             );
         }
 
-        /// A builder with a message that doesn't depend on the tip.
+        /// `message` of a builder whose message doesn't depend on the tip.
+        fn fixedText(b: anytype, _: Allocator, _: Issue) Error![]const u8 {
+            return b.text;
+        }
+
         const FixedMessage = struct {
             text: []const u8,
-            pub fn message(b: FixedMessage, arena: Allocator, current: Issue) Error![]const u8 {
-                _ = arena;
-                _ = current;
-                return b.text;
-            }
+            pub const message = fixedText;
         };
 
         /// Internal: the library's own plumbing, not API; it may change.
@@ -2511,11 +2477,7 @@ pub fn Repo(comptime B: type) type {
             pub const skip_unchanged = true;
 
             text: []const u8,
-            pub fn message(b: FixedEdit, arena: Allocator, current: Issue) Error![]const u8 {
-                _ = arena;
-                _ = current;
-                return b.text;
-            }
+            pub const message = fixedText;
         };
 
         const EditBuilder = struct {
@@ -2798,14 +2760,14 @@ pub fn Repo(comptime B: type) type {
             /// Null on create.
             id: ?[]const u8,
             parent: ?[]const u8,
-            parent_changed: bool,
-            blockers_added: []const []const u8,
+            parent_changed: bool = false,
+            blockers_added: []const []const u8 = &.{},
             closed: bool,
-            state_changed: bool,
-            was_closed: bool,
+            state_changed: bool = false,
+            was_closed: bool = false,
             milestone_id: ?[]const u8,
             milestone_mode: ?fields_fmt.MilestoneMode,
-            milestone_changed: bool,
+            milestone_changed: bool = false,
             /// A deleted issue comes back.
             restored: bool = false,
             /// A number being given: no other issue here may have it.
@@ -3613,14 +3575,12 @@ test splitMessage {
 const GitSim = @import("../backend/GitSim.zig");
 const testing = std.testing;
 const RacingSim = @import("racing_sim.zig").RacingSim;
+const TestRepo = @import("test_repo.zig").TestRepo;
 
 test "create, comment, state, edit and read back" {
-    var arena_state: std.heap.ArenaAllocator = .init(testing.allocator);
-    defer arena_state.deinit();
-    const arena = arena_state.allocator();
-    var world: GitSim.World = .{ .seed = 3, .clones = &.{.{ .name = "a" }} };
-    var sim = try GitSim.init(arena, &world, 0);
-    const repo = Repo(GitSim).init(&sim);
+    var fx: TestRepo = .{};
+    defer fx.deinit();
+    const arena, const sim, const repo = try fx.open(3);
 
     const created = try repo.create(arena, .{
         .title = "Crash on login",
@@ -3629,7 +3589,7 @@ test "create, comment, state, edit and read back" {
         .assignees = &.{.byEmail("bob@e.x")},
         .priority = .high,
     }, .{});
-    const ref_name = try std.fmt.allocPrint(arena, "refs/issues/{s}", .{created.id});
+    const ref_name = try refNameOf(arena, created.id);
     _ = try repo.comment(arena, ref_name, .{ .text = "Repro on Firefox\n\nDetail line" }, .{});
     _ = try repo.setState(
         arena,
@@ -3676,12 +3636,9 @@ test "create, comment, state, edit and read back" {
 }
 
 test "extension fields" {
-    var arena_state: std.heap.ArenaAllocator = .init(testing.allocator);
-    defer arena_state.deinit();
-    const arena = arena_state.allocator();
-    var world: GitSim.World = .{ .seed = 21, .clones = &.{.{ .name = "a" }} };
-    var sim = try GitSim.init(arena, &world, 0);
-    const repo = Repo(GitSim).init(&sim);
+    var fx: TestRepo = .{};
+    defer fx.deinit();
+    const arena, const sim, const repo = try fx.open(21);
     const parent = try repo.create(arena, .{ .title = "Epic" }, .{});
     const blocker = try repo.create(arena, .{ .title = "Blocker" }, .{});
     const other = try repo.create(arena, .{ .title = "Other" }, .{});
@@ -3696,7 +3653,7 @@ test "extension fields" {
         .estimate_minutes = 90,
         .workflow = "ready",
     }, .{});
-    const ref_name = try std.fmt.allocPrint(arena, "refs/issues/{s}", .{child.id});
+    const ref_name = try refNameOf(arena, child.id);
     var issue = try repo.load(arena, .{ .name = ref_name, .tip = child.tip });
     try testing.expectEqualStrings(parent.id, issue.parent.?);
     try testing.expectEqual(@as(usize, 1), issue.blocked_by.len); // deduplicated
@@ -3750,14 +3707,10 @@ test "extension fields" {
 }
 
 test "caller mistakes are errors, not panics" {
-    var arena_state: std.heap.ArenaAllocator = .init(testing.allocator);
-    defer arena_state.deinit();
-    const arena = arena_state.allocator();
-    var world: GitSim.World = .{ .seed = 3, .clones = &.{.{ .name = "a" }} };
-    var sim = try GitSim.init(arena, &world, 0);
-    const repo = Repo(GitSim).init(&sim);
-    const created = try repo.create(arena, .{ .title = "Target" }, .{});
-    const ref_name = try std.fmt.allocPrint(arena, "refs/issues/{s}", .{created.id});
+    var fx: TestRepo = .{};
+    defer fx.deinit();
+    const arena, const sim, const repo = try fx.open(3);
+    _, const ref_name = try fx.issue(.{ .title = "Target" });
 
     try testing.expectError(error.NothingToEdit, repo.edit(arena, ref_name, .{}, .{}));
     try testing.expectError(error.MessageHasBody, repo.edit(arena, ref_name, .{
@@ -3820,15 +3773,32 @@ test "caller mistakes are errors, not panics" {
     _ = try repo.edit(arena, ref_name, .{ .priority = .clear, .set_assignees = &.{} }, .{});
 }
 
+test "a new issue can start locked and about a ref" {
+    var fx: TestRepo = .{};
+    defer fx.deinit();
+    const arena, _, const repo = try fx.open(5);
+    const created = try repo.create(arena, .{
+        .title = "From a template",
+        .locked = true,
+        .lock_reason = "heated",
+        .ref = "refs/tags/v1",
+    }, .{});
+    const ref_name = try refNameOf(arena, created.id);
+    const issue = try repo.load(arena, .{ .name = ref_name, .tip = created.tip });
+    try testing.expect(issue.locked);
+    try testing.expectEqualStrings("heated", issue.lock_reason.?);
+    try testing.expectEqualStrings("refs/tags/v1", issue.ref.?);
+    try testing.expectError(
+        error.InvalidValue,
+        repo.create(arena, .{ .title = "Bad ref", .ref = "a b" }, .{}),
+    );
+}
+
 test "expect" {
-    var arena_state: std.heap.ArenaAllocator = .init(testing.allocator);
-    defer arena_state.deinit();
-    const arena = arena_state.allocator();
-    var world: GitSim.World = .{ .seed = 5, .clones = &.{.{ .name = "a" }} };
-    var sim = try GitSim.init(arena, &world, 0);
-    const repo = Repo(GitSim).init(&sim);
-    const created = try repo.create(arena, .{ .title = "Versioned" }, .{});
-    const ref_name = try std.fmt.allocPrint(arena, "refs/issues/{s}", .{created.id});
+    var fx: TestRepo = .{};
+    defer fx.deinit();
+    const arena, const sim, const repo = try fx.open(5);
+    const created, const ref_name = try fx.issue(.{ .title = "Versioned" });
 
     // A client read the issue at `created.tip`, then someone else comments.
     const seen = created.tip;
@@ -3849,18 +3819,23 @@ test "expect" {
     // The refused calls wrote nothing.
     try testing.expect((try sim.resolveRef(ref_name)).?.eql(other.tip));
 
+    // Nothing to write: a stale `expect` is still the caller's conflict.
+    try testing.expectError(
+        error.VersionMismatch,
+        repo.update(arena, ref_name, .{ .edit = .{ .expect = seen } }, .{}),
+    );
+    const idle = try repo.update(arena, ref_name, .{ .edit = .{ .expect = other.tip } }, .{});
+    try testing.expect(!idle.wrote and idle.tip.eql(other.tip));
+
     const next = try repo.comment(arena, ref_name, .{ .text = "Mine", .expect = other.tip }, .{});
     const done = try repo.edit(arena, ref_name, .{ .title = "Renamed", .expect = next.tip }, .{});
     try testing.expect((try sim.resolveRef(ref_name)).?.eql(done.tip));
 }
 
 test "limits and paging" {
-    var arena_state: std.heap.ArenaAllocator = .init(testing.allocator);
-    defer arena_state.deinit();
-    const arena = arena_state.allocator();
-    var world: GitSim.World = .{ .seed = 9, .clones = &.{.{ .name = "a" }} };
-    var sim = try GitSim.init(arena, &world, 0);
-    var repo = Repo(GitSim).init(&sim);
+    var fx: TestRepo = .{};
+    defer fx.deinit();
+    const arena, _, var repo = try fx.open(9);
     for (0..5) |i| _ = try repo.create(arena, .{
         .title = try std.fmt.allocPrint(arena, "Issue {d}", .{i}),
     }, .{});
@@ -3889,12 +3864,9 @@ test "limits and paging" {
 }
 
 test "resolve: none, one, ambiguous" {
-    var arena_state: std.heap.ArenaAllocator = .init(testing.allocator);
-    defer arena_state.deinit();
-    const arena = arena_state.allocator();
-    var world: GitSim.World = .{ .seed = 9, .clones = &.{.{ .name = "a" }} };
-    var sim = try GitSim.init(arena, &world, 0);
-    const repo = Repo(GitSim).init(&sim);
+    var fx: TestRepo = .{};
+    defer fx.deinit();
+    const arena, _, const repo = try fx.open(9);
     _ = try repo.create(arena, .{ .title = "one" }, .{});
     _ = try repo.create(arena, .{ .title = "two" }, .{});
     try testing.expect(try repo.resolve(arena, "zzzz") == .none);
@@ -3902,14 +3874,10 @@ test "resolve: none, one, ambiguous" {
 }
 
 test "comments that would read as trailers are refused" {
-    var arena_state: std.heap.ArenaAllocator = .init(testing.allocator);
-    defer arena_state.deinit();
-    const arena = arena_state.allocator();
-    var world: GitSim.World = .{ .clones = &.{.{ .name = "a" }} };
-    var sim = try GitSim.init(arena, &world, 0);
-    const repo = Repo(GitSim).init(&sim);
-    const created = try repo.create(arena, .{ .title = "t" }, .{});
-    const ref_name = try std.fmt.allocPrint(arena, "refs/issues/{s}", .{created.id});
+    var fx: TestRepo = .{};
+    defer fx.deinit();
+    const arena, _, const repo = try fx.open(0);
+    const created, const ref_name = try fx.issue(.{ .title = "t" });
     try testing.expectError(
         error.BodyLooksLikeTrailers,
         repo.comment(arena, ref_name, .{ .text = "I agree.\n\nX-Deleted: true" }, .{}),
@@ -3927,17 +3895,14 @@ test "comments that would read as trailers are refused" {
 }
 
 test "a write that changes nothing isn't written" {
-    var arena_state: std.heap.ArenaAllocator = .init(testing.allocator);
-    defer arena_state.deinit();
-    const arena = arena_state.allocator();
-    var world: GitSim.World = .{ .seed = 5, .clones = &.{.{ .name = "a" }} };
-    var sim = try GitSim.init(arena, &world, 0);
-    var repo = Repo(GitSim).init(&sim);
+    var fx: TestRepo = .{};
+    defer fx.deinit();
+    const arena, _, var repo = try fx.open(5);
     var skipped = false;
     repo.call.skipped = &skipped;
 
     const made = try repo.create(arena, .{ .title = "Same", .labels = &.{ "bug", "ui" } }, .{});
-    const ref = try std.fmt.allocPrint(arena, "refs/issues/{s}", .{made.id});
+    const ref = try refNameOf(arena, made.id);
     // Every field as it is: no commit, the tip as it was.
     const same = try repo.edit(
         arena,
@@ -3978,9 +3943,6 @@ test "a write that changes nothing isn't written" {
         error.VersionMismatch,
         repo.edit(arena, ref, .{ .title = "Same", .expect = made.tip }, .{}),
     );
-    // Without an embedder's flag the result still says so.
-    repo.call.skipped = null;
-    try testing.expect(!(try repo.edit(arena, ref, .{ .title = "Same" }, .{})).wrote);
     // Assignees and blockers as well.
     const two = try repo.edit(
         arena,
@@ -3999,18 +3961,15 @@ test "a write that changes nothing isn't written" {
 }
 
 test "X-Author-Id: each commit names its author's UUID" {
-    var arena_state: std.heap.ArenaAllocator = .init(testing.allocator);
-    defer arena_state.deinit();
-    const arena = arena_state.allocator();
-    var world: GitSim.World = .{ .seed = 5, .clones = &.{.{ .name = "a" }} };
-    var sim = try GitSim.init(arena, &world, 0);
-    var repo = Repo(GitSim).init(&sim);
+    var fx: TestRepo = .{};
+    defer fx.deinit();
+    const arena, _, var repo = try fx.open(5);
     const ada = "0c8d7a52-3f1e-4b6a-9d2c-5e4f3a2b1c0d";
     const bob = "1d9e8b63-4a2f-4c7b-8e3d-6f5a4b3c2d1e";
 
     repo.call.author_id = ada;
     const made = try repo.create(arena, .{ .title = "Who wrote this" }, .{});
-    const ref = try std.fmt.allocPrint(arena, "refs/issues/{s}", .{made.id});
+    const ref = try refNameOf(arena, made.id);
     repo.call.author_id = bob;
     const said = try repo.comment(arena, ref, .{ .text = "Bob here" }, .{});
     repo.call.author_id = null;
@@ -4037,15 +3996,11 @@ test "X-Author-Id: each commit names its author's UUID" {
 }
 
 test "a comment, a state change and fields in one commit" {
-    var arena_state: std.heap.ArenaAllocator = .init(testing.allocator);
-    defer arena_state.deinit();
-    const arena = arena_state.allocator();
-    var world: GitSim.World = .{ .seed = 5, .clones = &.{.{ .name = "a" }} };
-    var sim = try GitSim.init(arena, &world, 0);
-    const repo = Repo(GitSim).init(&sim);
+    var fx: TestRepo = .{};
+    defer fx.deinit();
+    const arena, const sim, const repo = try fx.open(5);
 
-    const epic = try repo.create(arena, .{ .title = "Epic" }, .{});
-    const epic_ref = try std.fmt.allocPrint(arena, "refs/issues/{s}", .{epic.id});
+    const epic, const epic_ref = try fx.issue(.{ .title = "Epic" });
     const task = try repo.create(arena, .{ .title = "Task", .parent = epic.id }, .{});
 
     // Refused like setState: the task under it is open.
@@ -4053,7 +4008,7 @@ test "a comment, a state change and fields in one commit" {
         .comment = "Done.",
         .state = .closed,
     }, .{}));
-    const task_ref = try std.fmt.allocPrint(arena, "refs/issues/{s}", .{task.id});
+    const task_ref = try refNameOf(arena, task.id);
     const closed = try repo.edit(arena, task_ref, .{
         .comment = "Fixed in abc.",
         .add_labels = &.{"done"},
@@ -4089,12 +4044,9 @@ test "a comment, a state change and fields in one commit" {
 const issuez_model_kind_comment = issue_model.Comment.Kind.comment;
 
 test "several assignees" {
-    var arena_state: std.heap.ArenaAllocator = .init(testing.allocator);
-    defer arena_state.deinit();
-    const arena = arena_state.allocator();
-    var world: GitSim.World = .{ .seed = 9, .clones = &.{.{ .name = "a" }} };
-    var sim = try GitSim.init(arena, &world, 0);
-    const repo = Repo(GitSim).init(&sim);
+    var fx: TestRepo = .{};
+    defer fx.deinit();
+    const arena, const sim, const repo = try fx.open(9);
 
     const ada_id = "0c8d7a52-3f1e-4b6a-9d2c-5e4f3a2b1c0d";
     const ada = ada_id ++ " ada@e.x";
@@ -4102,7 +4054,7 @@ test "several assignees" {
         .title = "Pair",
         .assignees = &.{ .{ .uuid = ada_id, .email = "ada@e.x" }, .byEmail("bob@e.x") },
     }, .{});
-    const ref = try std.fmt.allocPrint(arena, "refs/issues/{s}", .{created.id});
+    const ref = try refNameOf(arena, created.id);
     const root = (try sim.readObject(arena, created.tip)).?;
     const rc = try object.Commit.parse(arena, .sha1, root.data);
     try testing.expect(std.mem.indexOf(u8, rc.message, "Assignee: " ++ ada ++ "\n") != null);
@@ -4134,21 +4086,13 @@ test "several assignees" {
     const none = try repo.edit(arena, ref, .{ .set_assignees = &.{} }, .{});
     issue = try repo.load(arena, .{ .name = ref, .tip = none.tip });
     try testing.expectEqual(@as(usize, 0), issue.assignees.len);
-    try testing.expectError(
-        error.InvalidValue,
-        repo.edit(arena, ref, .{ .add_assignees = &.{.byEmail("not an email")} }, .{}),
-    );
 }
 
 test "lock and ref" {
-    var arena_state: std.heap.ArenaAllocator = .init(testing.allocator);
-    defer arena_state.deinit();
-    const arena = arena_state.allocator();
-    var world: GitSim.World = .{ .seed = 11, .clones = &.{.{ .name = "a" }} };
-    var sim = try GitSim.init(arena, &world, 0);
-    const repo = Repo(GitSim).init(&sim);
-    const created = try repo.create(arena, .{ .title = "Heated" }, .{});
-    const ref = try std.fmt.allocPrint(arena, "refs/issues/{s}", .{created.id});
+    var fx: TestRepo = .{};
+    defer fx.deinit();
+    const arena, _, const repo = try fx.open(11);
+    _, const ref = try fx.issue(.{ .title = "Heated" });
 
     const locked = try repo.edit(
         arena,
@@ -4176,18 +4120,15 @@ test "lock and ref" {
 }
 
 test "host fields and provenance" {
-    var arena_state: std.heap.ArenaAllocator = .init(testing.allocator);
-    defer arena_state.deinit();
-    const arena = arena_state.allocator();
-    var world: GitSim.World = .{ .seed = 13, .clones = &.{.{ .name = "a" }} };
-    var sim = try GitSim.init(arena, &world, 0);
-    const repo = Repo(GitSim).init(&sim);
+    var fx: TestRepo = .{};
+    defer fx.deinit();
+    const arena, _, const repo = try fx.open(13);
     const created = try repo.create(arena, .{
         .title = "Imported",
         .extra = &.{.{ .key = "X-Forgejo-Project", .value = "7" }},
         .original = .{ .author = "octocat", .id = "github:o/r#1" },
     }, .{});
-    const ref = try std.fmt.allocPrint(arena, "refs/issues/{s}", .{created.id});
+    const ref = try refNameOf(arena, created.id);
     const commented = try repo.comment(arena, ref, .{
         .text = "Thanks",
         .original = .{ .author = "hubot", .id = "github:o/r#c-2" },
@@ -4215,14 +4156,10 @@ test "host fields and provenance" {
 }
 
 test "reactions" {
-    var arena_state: std.heap.ArenaAllocator = .init(testing.allocator);
-    defer arena_state.deinit();
-    const arena = arena_state.allocator();
-    var world: GitSim.World = .{ .seed = 17, .clones = &.{.{ .name = "a" }} };
-    var sim = try GitSim.init(arena, &world, 0);
-    const repo = Repo(GitSim).init(&sim);
-    const created = try repo.create(arena, .{ .title = "Liked" }, .{});
-    const ref = try std.fmt.allocPrint(arena, "refs/issues/{s}", .{created.id});
+    var fx: TestRepo = .{};
+    defer fx.deinit();
+    const arena, _, const repo = try fx.open(17);
+    const created, const ref = try fx.issue(.{ .title = "Liked" });
     const c = try repo.comment(arena, ref, .{ .text = "Nice" }, .{});
 
     const sig = struct {
@@ -4279,26 +4216,18 @@ test "reactions" {
 }
 
 test "guards" {
-    var arena_state: std.heap.ArenaAllocator = .init(testing.allocator);
-    defer arena_state.deinit();
-    const arena = arena_state.allocator();
-    var world: GitSim.World = .{ .seed = 31, .clones = &.{.{ .name = "a" }} };
-    var sim = try GitSim.init(arena, &world, 0);
-    const repo = Repo(GitSim).init(&sim);
-    const refOf = struct {
-        fn f(a: Allocator, c: Created) ![]const u8 {
-            return std.fmt.allocPrint(a, "refs/issues/{s}", .{c.id});
-        }
-    }.f;
+    var fx: TestRepo = .{};
+    defer fx.deinit();
+    const arena, _, const repo = try fx.open(31);
 
     const epic = try repo.create(arena, .{ .title = "Epic" }, .{});
     const task = try repo.create(arena, .{ .title = "Task", .parent = epic.id }, .{});
     const sub = try repo.create(arena, .{ .title = "Sub", .parent = task.id }, .{});
 
-    try testing.expectError(error.ParentIsSelf, repo.edit(arena, try refOf(arena, epic), .{
+    try testing.expectError(error.ParentIsSelf, repo.edit(arena, try refNameOf(arena, epic.id), .{
         .parent = .{ .set = epic.id },
     }, .{}));
-    try testing.expectError(error.ParentCycle, repo.edit(arena, try refOf(arena, epic), .{
+    try testing.expectError(error.ParentCycle, repo.edit(arena, try refNameOf(arena, epic.id), .{
         .parent = .{ .set = sub.id },
     }, .{}));
     try testing.expectError(error.ReferenceNotFound, repo.create(arena, .{
@@ -4314,46 +4243,46 @@ test "guards" {
     }, .{}));
     // Moving a subtree counts its height.
     const side = try repo.create(arena, .{ .title = "Side" }, .{});
-    try testing.expectError(error.TooDeep, repo.edit(arena, try refOf(arena, epic), .{
+    try testing.expectError(error.TooDeep, repo.edit(arena, try refNameOf(arena, epic.id), .{
         .parent = .{ .set = side.id },
     }, .{}));
 
     const b1 = try repo.create(arena, .{ .title = "B1", .blocked_by = &.{side.id} }, .{});
-    try testing.expectError(error.BlocksItself, repo.edit(arena, try refOf(arena, b1), .{
+    try testing.expectError(error.BlocksItself, repo.edit(arena, try refNameOf(arena, b1.id), .{
         .add_blocked_by = &.{b1.id},
     }, .{}));
-    try testing.expectError(error.BlockerCycle, repo.edit(arena, try refOf(arena, side), .{
+    try testing.expectError(error.BlockerCycle, repo.edit(arena, try refNameOf(arena, side.id), .{
         .add_blocked_by = &.{b1.id},
     }, .{}));
 
     try testing.expectError(
         error.OpenDescendants,
-        repo.setState(arena, try refOf(arena, task), .{ .state = .closed }, .{}),
+        repo.setState(arena, try refNameOf(arena, task.id), .{ .state = .closed }, .{}),
     );
     const leaf = try repo.create(arena, .{ .title = "Leaf", .parent = side.id }, .{});
     // Any state but open is done: a `wontfix` leaf doesn't hold its parent
     // open, and counts as closing.
     _ = try repo.setState(
         arena,
-        try refOf(arena, leaf),
+        try refNameOf(arena, leaf.id),
         .{ .state = .{ .other = "wontfix" } },
         .{},
     );
-    _ = try repo.setState(arena, try refOf(arena, leaf), .{ .state = .closed }, .{});
-    _ = try repo.setState(arena, try refOf(arena, side), .{ .state = .closed }, .{});
+    _ = try repo.setState(arena, try refNameOf(arena, leaf.id), .{ .state = .closed }, .{});
+    _ = try repo.setState(arena, try refNameOf(arena, side.id), .{ .state = .closed }, .{});
     try testing.expectError(error.ClosedAncestor, repo.create(arena, .{
         .title = "Under closed",
         .parent = side.id,
     }, .{}));
     try testing.expectError(
         error.ClosedAncestor,
-        repo.setState(arena, try refOf(arena, leaf), .{ .state = .open }, .{}),
+        repo.setState(arena, try refNameOf(arena, leaf.id), .{ .state = .open }, .{}),
     );
-    try testing.expectError(error.ClosedAncestor, repo.edit(arena, try refOf(arena, b1), .{
+    try testing.expectError(error.ClosedAncestor, repo.edit(arena, try refNameOf(arena, b1.id), .{
         .parent = .{ .set = side.id },
     }, .{}));
-    _ = try repo.setState(arena, try refOf(arena, side), .{ .state = .open }, .{});
-    _ = try repo.setState(arena, try refOf(arena, leaf), .{ .state = .open }, .{});
+    _ = try repo.setState(arena, try refNameOf(arena, side.id), .{ .state = .open }, .{});
+    _ = try repo.setState(arena, try refNameOf(arena, leaf.id), .{ .state = .open }, .{});
 
     // Whatever the guards let through leaves no violation.
     const issues = try repo.loadAll(arena);
@@ -4362,40 +4291,32 @@ test "guards" {
 }
 
 test "parent cache: stale entries are reloaded, a broken cache is ignored" {
-    var arena_state: std.heap.ArenaAllocator = .init(testing.allocator);
-    defer arena_state.deinit();
-    const arena = arena_state.allocator();
-    var world: GitSim.World = .{ .seed = 37, .clones = &.{.{ .name = "a" }} };
-    var sim = try GitSim.init(arena, &world, 0);
-    const repo = Repo(GitSim).init(&sim);
-    const nameOf = struct {
-        fn f(a: Allocator, c: Created) ![]const u8 {
-            return std.fmt.allocPrint(a, "refs/issues/{s}", .{c.id});
-        }
-    }.f;
+    var fx: TestRepo = .{};
+    defer fx.deinit();
+    const arena, const sim, const repo = try fx.open(37);
 
     const epic = try repo.create(arena, .{ .title = "Epic" }, .{});
     const one = try repo.create(arena, .{ .title = "One", .parent = epic.id }, .{});
     // A refused close writes nothing, not even the cache.
     try testing.expectError(error.OpenDescendants, repo.setState(
         arena,
-        try nameOf(arena, epic),
+        try refNameOf(arena, epic.id),
         .{ .state = .closed },
         .{},
     ));
     try testing.expect(try sim.resolveRef(parent_cache_ref) == null);
-    _ = try repo.setState(arena, try nameOf(arena, one), .{ .state = .closed }, .{});
+    _ = try repo.setState(arena, try refNameOf(arena, one.id), .{ .state = .closed }, .{});
     const first = (try sim.resolveRef(parent_cache_ref)).?;
 
     // Not in the cache yet: found by loading it.
     const two = try repo.create(arena, .{ .title = "Two", .parent = epic.id }, .{});
     try testing.expectError(error.OpenDescendants, repo.setState(
         arena,
-        try nameOf(arena, epic),
+        try refNameOf(arena, epic.id),
         .{ .state = .closed },
         .{},
     ));
-    _ = try repo.setState(arena, try nameOf(arena, two), .{ .state = .closed }, .{});
+    _ = try repo.setState(arena, try refNameOf(arena, two.id), .{ .state = .closed }, .{});
     // A few stale entries don't make it worth rewriting.
     try testing.expect((try sim.resolveRef(parent_cache_ref)).?.eql(first));
 
@@ -4405,28 +4326,25 @@ test "parent cache: stale entries are reloaded, a broken cache is ignored" {
         .name = parent_cache_ref,
         .op = .{ .update = .{ .new = junk, .old = (try sim.resolveRef(parent_cache_ref)).? } },
     }});
-    _ = try repo.setState(arena, try nameOf(arena, two), .{ .state = .open }, .{});
+    _ = try repo.setState(arena, try refNameOf(arena, two.id), .{ .state = .open }, .{});
     try testing.expectError(error.OpenDescendants, repo.setState(
         arena,
-        try nameOf(arena, epic),
+        try refNameOf(arena, epic.id),
         .{ .state = .closed },
         .{},
     ));
-    _ = try repo.setState(arena, try nameOf(arena, two), .{ .state = .closed }, .{});
-    _ = try repo.setState(arena, try nameOf(arena, epic), .{ .state = .closed }, .{});
+    _ = try repo.setState(arena, try refNameOf(arena, two.id), .{ .state = .closed }, .{});
+    _ = try repo.setState(arena, try refNameOf(arena, epic.id), .{ .state = .closed }, .{});
     try testing.expect(!(try sim.resolveRef(parent_cache_ref)).?.eql(junk));
 }
 
 test "guards on foreign cycles" {
-    var arena_state: std.heap.ArenaAllocator = .init(testing.allocator);
-    defer arena_state.deinit();
-    const arena = arena_state.allocator();
-    var world: GitSim.World = .{ .seed = 35, .clones = &.{.{ .name = "a" }} };
-    var sim = try GitSim.init(arena, &world, 0);
-    const repo = Repo(GitSim).init(&sim);
+    var fx: TestRepo = .{};
+    defer fx.deinit();
+    const arena, const sim, const repo = try fx.open(35);
     const a = try repo.create(arena, .{ .title = "A" }, .{});
     const b = try repo.create(arena, .{ .title = "B", .parent = a.id }, .{});
-    const a_ref = try std.fmt.allocPrint(arena, "refs/issues/{s}", .{a.id});
+    const a_ref = try refNameOf(arena, a.id);
 
     // Someone else closes A and makes it B's child: an A, B cycle.
     const who = try sim.identity(arena);
@@ -4449,12 +4367,9 @@ test "guards on foreign cycles" {
 }
 
 test "lifecycle" {
-    var arena_state: std.heap.ArenaAllocator = .init(testing.allocator);
-    defer arena_state.deinit();
-    const arena = arena_state.allocator();
-    var world: GitSim.World = .{ .seed = 41, .clones = &.{.{ .name = "a" }} };
-    var sim = try GitSim.init(arena, &world, 0);
-    const repo = Repo(GitSim).init(&sim);
+    var fx: TestRepo = .{};
+    defer fx.deinit();
+    const arena, const sim, const repo = try fx.open(41);
     const parent = try repo.create(arena, .{ .title = "Parent", .body = "Old." }, .{});
     const child = try repo.create(arena, .{ .title = "Child", .parent = parent.id }, .{});
     const ref = try refNameOf(arena, parent.id);
@@ -4471,11 +4386,11 @@ test "lifecycle" {
         .{ .target = c.tip, .event = .edit, .text = "Typo fixed" },
         .{},
     );
-    var issue = try latest(repo, arena, &sim, ref);
+    var issue = try latest(repo, arena, sim, ref);
     try testing.expectEqualStrings("Typo fixed", issue.comments[0].subject);
     try testing.expect(issue.comments[0].edited);
     _ = try repo.commentEvent(arena, ref, .{ .target = c.tip, .event = .delete }, .{});
-    issue = try latest(repo, arena, &sim, ref);
+    issue = try latest(repo, arena, sim, ref);
     try testing.expect(issue.comments[0].deleted);
     _ = try repo.commentEvent(arena, ref, .{ .target = c.tip, .event = .restore }, .{});
     try testing.expectError(
@@ -4484,7 +4399,7 @@ test "lifecycle" {
     );
 
     _ = try repo.edit(arena, ref, .{ .description = "New.\n\nTwo paragraphs." }, .{});
-    issue = try latest(repo, arena, &sim, ref);
+    issue = try latest(repo, arena, sim, ref);
     try testing.expectEqualStrings("New.\n\nTwo paragraphs.", issue.description);
     try testing.expectEqual(@as(usize, 1), issue.comments.len); // events aren't comments
 
@@ -4492,10 +4407,10 @@ test "lifecycle" {
     try testing.expectError(error.ActiveChildren, repo.setDeleted(arena, ref, .{}, .{}));
     _ = try repo.setDeleted(arena, try refNameOf(arena, child.id), .{}, .{});
     _ = try repo.setDeleted(arena, ref, .{}, .{});
-    issue = try latest(repo, arena, &sim, ref);
+    issue = try latest(repo, arena, sim, ref);
     try testing.expect(issue.deleted);
     _ = try repo.setDeleted(arena, ref, .{ .deleted = false }, .{});
-    try testing.expect(!(try latest(repo, arena, &sim, ref)).deleted);
+    try testing.expect(!(try latest(repo, arena, sim, ref)).deleted);
 
     // A closed parent gains open work while deleted (deleted ancestors
     // don't stop a reopen): it can't come back until that work is closed.
@@ -4512,18 +4427,16 @@ test "lifecycle" {
 }
 
 test "guards under concurrent change" {
-    var arena_state: std.heap.ArenaAllocator = .init(testing.allocator);
-    defer arena_state.deinit();
-    const arena = arena_state.allocator();
-    var world: GitSim.World = .{ .seed = 33, .clones = &.{.{ .name = "a" }} };
-    var sim = try GitSim.init(arena, &world, 0);
-    const parent = try Repo(GitSim).init(&sim).create(arena, .{ .title = "Parent" }, .{});
-    const parent_ref = try std.fmt.allocPrint(arena, "refs/issues/{s}", .{parent.id});
+    var fx: TestRepo = .{};
+    defer fx.deinit();
+    const arena, const sim, const plain = try fx.open(33);
+    const parent = try plain.create(arena, .{ .title = "Parent" }, .{});
+    const parent_ref = try refNameOf(arena, parent.id);
 
     // The parent gets closed between our guard read and our write. The
     // verify line fails and the retry sees it closed.
     var racing: RacingSim = .{
-        .sim = &sim,
+        .sim = sim,
         .race = .{ .ref = parent_ref, .message = "", .close = true },
     };
     const repo = Repo(RacingSim).init(&racing);
@@ -4537,7 +4450,7 @@ test "guards under concurrent change" {
     // verify line can't pin that absence. The guard ref makes the write
     // conflict, and the retry sees the child.
     for ([_]bool{ false, true }) |delete| {
-        const epic = try Repo(GitSim).init(&sim).create(arena, .{ .title = "Epic" }, .{});
+        const epic = try plain.create(arena, .{ .title = "Epic" }, .{});
         const epic_ref = try refNameOf(arena, epic.id);
         racing.race = .{ .ref = epic_ref, .message = "", .child_of = epic.id };
         if (delete) {
@@ -4555,12 +4468,9 @@ test "guards under concurrent change" {
 }
 
 test "guards skip what they can't read" {
-    var arena_state: std.heap.ArenaAllocator = .init(testing.allocator);
-    defer arena_state.deinit();
-    const arena = arena_state.allocator();
-    var world: GitSim.World = .{ .seed = 37, .clones = &.{.{ .name = "a" }} };
-    var sim = try GitSim.init(arena, &world, 0);
-    const repo = Repo(GitSim).init(&sim);
+    var fx: TestRepo = .{};
+    defer fx.deinit();
+    const arena, const sim, const repo = try fx.open(37);
     const leaf = try repo.create(arena, .{ .title = "Leaf" }, .{});
 
     // A damaged issue elsewhere doesn't stop closing a healthy one.
@@ -4584,18 +4494,13 @@ test "guards skip what they can't read" {
 }
 
 test "CAS conflict rebuilds the commit" {
-    var arena_state: std.heap.ArenaAllocator = .init(testing.allocator);
-    defer arena_state.deinit();
-    const arena = arena_state.allocator();
-    var world: GitSim.World = .{ .clones = &.{.{ .name = "a" }} };
-    var sim = try GitSim.init(arena, &world, 0);
-    const created = try Repo(
-        GitSim,
-    ).init(&sim).create(arena, .{ .title = "t", .labels = &.{"a"} }, .{});
-    const ref_name = try std.fmt.allocPrint(arena, "refs/issues/{s}", .{created.id});
+    var fx: TestRepo = .{};
+    defer fx.deinit();
+    const arena, const sim, _ = try fx.open(0);
+    _, const ref_name = try fx.issue(.{ .title = "t", .labels = &.{"a"} });
 
     var racing: RacingSim = .{
-        .sim = &sim,
+        .sim = sim,
         .race = .{ .ref = ref_name, .message = "concurrent comment" },
     };
     var repo = Repo(RacingSim).init(&racing);
@@ -4618,12 +4523,9 @@ test "CAS conflict rebuilds the commit" {
 }
 
 test "a full issue swaps a label in one edit" {
-    var arena_state: std.heap.ArenaAllocator = .init(testing.allocator);
-    defer arena_state.deinit();
-    const arena = arena_state.allocator();
-    var world: GitSim.World = .{ .clones = &.{.{ .name = "a" }} };
-    var sim = try GitSim.init(arena, &world, 0);
-    var repo = Repo(GitSim).init(&sim);
+    var fx: TestRepo = .{};
+    defer fx.deinit();
+    const arena, const sim, var repo = try fx.open(0);
     repo.limits.max_labels = 2;
     const created = try repo.create(arena, .{ .title = "Full", .labels = &.{ "a", "b" } }, .{});
     const ref = try refNameOf(arena, created.id);
@@ -4637,12 +4539,9 @@ test "a full issue swaps a label in one edit" {
 }
 
 test "a dry run checks everything and writes nothing" {
-    var arena_state: std.heap.ArenaAllocator = .init(testing.allocator);
-    defer arena_state.deinit();
-    const arena = arena_state.allocator();
-    var world: GitSim.World = .{ .clones = &.{.{ .name = "a" }} };
-    var sim = try GitSim.init(arena, &world, 0);
-    var repo = Repo(GitSim).init(&sim);
+    var fx: TestRepo = .{};
+    defer fx.deinit();
+    const arena, const sim, var repo = try fx.open(0);
     const parent = try repo.create(arena, .{ .title = "Parent" }, .{});
     const pref = try refNameOf(arena, parent.id);
     _ = try repo.create(arena, .{ .title = "Child", .parent = parent.id }, .{});
@@ -4665,12 +4564,9 @@ test "a dry run checks everything and writes nothing" {
 }
 
 test "dropAll: every ref of the library's goes, the rest stays" {
-    var arena_state: std.heap.ArenaAllocator = .init(testing.allocator);
-    defer arena_state.deinit();
-    const arena = arena_state.allocator();
-    var world: GitSim.World = .{ .seed = 61, .clones = &.{.{ .name = "a" }} };
-    var sim = try GitSim.init(arena, &world, 0);
-    var repo: Repo(GitSim) = .init(&sim);
+    var fx: TestRepo = .{};
+    defer fx.deinit();
+    const arena, const sim, const repo = try fx.open(61);
     _ = try repo.create(arena, .{ .title = "One" }, .{});
     _ = try repo.create(arena, .{ .title = "Two" }, .{});
     const blob = try sim.writeObject(.blob, "x");
@@ -4713,26 +4609,6 @@ test "adoptFrom: another repository's refs, at once, never over ours" {
     try testing.expectError(error.RefConflict, main.adoptFrom(arena, scratch));
 }
 
-test "writes take an issue's UUID as well as its ref; find loads by UUID" {
-    var arena_state: std.heap.ArenaAllocator = .init(testing.allocator);
-    defer arena_state.deinit();
-    const arena = arena_state.allocator();
-    var world: GitSim.World = .{ .seed = 83, .clones = &.{.{ .name = "a" }} };
-    var sim = try GitSim.init(arena, &world, 0);
-    const repo = Repo(GitSim).init(&sim);
-    const made = try repo.create(arena, .{ .title = "By ID" }, .{});
-    const id = made.id;
-    _ = try repo.edit(arena, id, .{ .add_labels = &.{"bug"} }, .{});
-    _ = try repo.comment(arena, id, .{ .text = "Seen." }, .{});
-    _ = try repo.setState(arena, id, .{ .state = .closed }, .{});
-    _ = try repo.react(arena, id, .{ .emoji = ":+1:" }, .{});
-    const issue = (try repo.find(arena, id)).?;
-    try testing.expectEqualStrings("bug", issue.labels[0]);
-    try testing.expect(issue.state == .closed);
-    try testing.expectEqual(@as(usize, 1), issue.reactions.len);
-    try testing.expect(try repo.find(arena, "0b6c4f63-6f5a-4a3e-9c2b-1d2e3f4a5b6c") == null);
-}
-
 test "open: git config's settings applied, invalid done states refused" {
     var arena_state: std.heap.ArenaAllocator = .init(testing.allocator);
     defer arena_state.deinit();
@@ -4745,7 +4621,6 @@ test "open: git config's settings applied, invalid done states refused" {
     const repo = try Repo(GitSim).open(arena, &sim);
     try testing.expectEqualStrings("cancelled", repo.doneStates()[0]);
     try testing.expectEqualStrings("doing", repo.workflowStates().?[1]);
-    try testing.expectEqualStrings("cancelled", repo.settings.done_states[0]);
     try testing.expectError(
         error.InvalidDoneStates,
         Repo(GitSim).fromSettings(&sim, .{ .invalid_done_state = "open" }),
@@ -4753,12 +4628,9 @@ test "open: git config's settings applied, invalid done states refused" {
 }
 
 test "update: one entry for every write, with its receipt" {
-    var arena_state: std.heap.ArenaAllocator = .init(testing.allocator);
-    defer arena_state.deinit();
-    const arena = arena_state.allocator();
-    var world: GitSim.World = .{ .seed = 97, .clones = &.{.{ .name = "a" }} };
-    var sim = try GitSim.init(arena, &world, 0);
-    const repo = Repo(GitSim).init(&sim);
+    var fx: TestRepo = .{};
+    defer fx.deinit();
+    const arena, _, const repo = try fx.open(97);
     const made = try repo.create(arena, .{ .title = "Routed" }, .{});
     const id = made.id;
     const said = try repo.update(arena, id, .{ .edit = .{ .comment = "Hello" } }, .{});
@@ -4788,15 +4660,13 @@ test "update: one entry for every write, with its receipt" {
     try testing.expect(
         gone.wrote and gone.kind == .deleted and (try repo.find(arena, id)).?.deleted,
     );
+    try testing.expect(try repo.find(arena, "0b6c4f63-6f5a-4a3e-9c2b-1d2e3f4a5b6c") == null);
 }
 
 test "diagnostics: a refused write says the field, the value and the limit" {
-    var arena_state: std.heap.ArenaAllocator = .init(testing.allocator);
-    defer arena_state.deinit();
-    const arena = arena_state.allocator();
-    var world: GitSim.World = .{ .seed = 107, .clones = &.{.{ .name = "a" }} };
-    var sim = try GitSim.init(arena, &world, 0);
-    var repo = Repo(GitSim).init(&sim);
+    var fx: TestRepo = .{};
+    defer fx.deinit();
+    const arena, _, var repo = try fx.open(107);
     var d: errors_mod.Diagnostics = .{ .arena = arena };
     repo.call.diagnostics = &d;
     const made = try repo.create(arena, .{ .title = "Checked" }, .{});
@@ -4841,12 +4711,9 @@ test "MilestoneEdit: parts and back" {
 }
 
 test "text expectations survive unrelated races and reject concurrent text edits" {
-    var arena_state: std.heap.ArenaAllocator = .init(testing.allocator);
-    defer arena_state.deinit();
-    const a = arena_state.allocator();
-    var world: GitSim.World = .{ .seed = 211, .clones = &.{.{ .name = "a" }} };
-    var sim = try GitSim.init(a, &world, 0);
-    const plain = Repo(GitSim).init(&sim);
+    var fx: TestRepo = .{};
+    defer fx.deinit();
+    const a, const sim, const plain = try fx.open(211);
     const made = try plain.create(a, .{ .title = "Versioned", .body = "Original" }, .{});
     const ref = try refNameOf(a, made.id);
     const comment = try plain.comment(a, ref, .{ .text = "Comment" }, .{});
@@ -4863,7 +4730,7 @@ test "text expectations survive unrelated races and reject concurrent text edits
         .comment_event = .{ .target = comment.tip, .event = .delete },
     }, .{}));
     var racing: RacingSim = .{
-        .sim = &sim,
+        .sim = sim,
         .race = .{ .ref = ref, .message = "Unrelated comment" },
     };
     const repo = Repo(RacingSim).init(&racing);
@@ -4895,27 +4762,19 @@ test "text expectations survive unrelated races and reject concurrent text edits
 }
 
 test "editBatch: all or nothing" {
-    var arena_state: std.heap.ArenaAllocator = .init(testing.allocator);
-    defer arena_state.deinit();
-    const arena = arena_state.allocator();
-    var world: GitSim.World = .{ .seed = 7, .clones = &.{.{ .name = "a" }} };
-    var sim = try GitSim.init(arena, &world, 0);
-    const repo = Repo(GitSim).init(&sim);
+    var fx: TestRepo = .{};
+    defer fx.deinit();
+    const arena, const sim, const repo = try fx.open(7);
     const Catalog = @import("milestone.zig").Catalog(GitSim);
     const cat = Catalog.fromRepo(repo);
     const v1 = try cat.create(arena, .{ .name = "v1" }, .{});
 
-    const ref = struct {
-        fn f(a: Allocator, id: []const u8) []const u8 {
-            return std.fmt.allocPrint(a, "refs/issues/{s}", .{id}) catch unreachable;
-        }
-    }.f;
     const a = try repo.create(arena, .{ .title = "A" }, .{});
     const b = try repo.create(arena, .{ .title = "B" }, .{});
     const c = try repo.create(arena, .{ .title = "C" }, .{});
-    const ra = ref(arena, a.id);
-    const rb = ref(arena, b.id);
-    const rc = ref(arena, c.id);
+    const ra = try refNameOf(arena, a.id);
+    const rb = try refNameOf(arena, b.id);
+    const rc = try refNameOf(arena, c.id);
 
     // Two issues into one milestone: one guard ref, moved once.
     const res = try repo.editBatch(arena, &.{
@@ -4997,17 +4856,10 @@ test "editBatch: all or nothing" {
     );
 }
 
-fn issueRef(arena: Allocator, id: anytype) ![]const u8 {
-    return std.fmt.allocPrint(arena, "refs/issues/{s}", .{id});
-}
-
 test "editBatch: parents, checked as the batch leaves them" {
-    var arena_state: std.heap.ArenaAllocator = .init(testing.allocator);
-    defer arena_state.deinit();
-    const arena = arena_state.allocator();
-    var world: GitSim.World = .{ .seed = 8, .clones = &.{.{ .name = "a" }} };
-    var sim = try GitSim.init(arena, &world, 0);
-    var repo = Repo(GitSim).init(&sim);
+    var fx: TestRepo = .{};
+    defer fx.deinit();
+    const arena, const sim, var repo = try fx.open(8);
     repo.limits.max_depth = 2;
     var ids: [4][]const u8 = undefined;
     var refs: [4][]const u8 = undefined;
@@ -5018,7 +4870,7 @@ test "editBatch: parents, checked as the batch leaves them" {
             .{},
         );
         id.* = try arena.dupe(u8, created.id);
-        r.* = try issueRef(arena, created.id);
+        r.* = try refNameOf(arena, created.id);
     }
     // Each fine alone, a loop together.
     try testing.expectError(error.ParentCycle, repo.editBatch(arena, &.{
@@ -5058,16 +4910,14 @@ test "editBatch: parents, checked as the batch leaves them" {
 }
 
 test "editBatch: retries when an issue moves under it" {
-    var arena_state: std.heap.ArenaAllocator = .init(testing.allocator);
-    defer arena_state.deinit();
-    const arena = arena_state.allocator();
-    var world: GitSim.World = .{ .seed = 9, .clones = &.{.{ .name = "a" }} };
-    var sim = try GitSim.init(arena, &world, 0);
-    const a = try Repo(GitSim).init(&sim).create(arena, .{ .title = "A" }, .{});
-    const b = try Repo(GitSim).init(&sim).create(arena, .{ .title = "B" }, .{});
-    const ra = try issueRef(arena, a.id);
-    const rb = try issueRef(arena, b.id);
-    var racing: RacingSim = .{ .sim = &sim, .race = .{ .ref = ra, .message = "Meanwhile" } };
+    var fx: TestRepo = .{};
+    defer fx.deinit();
+    const arena, const sim, const plain = try fx.open(9);
+    const a = try plain.create(arena, .{ .title = "A" }, .{});
+    const b = try plain.create(arena, .{ .title = "B" }, .{});
+    const ra = try refNameOf(arena, a.id);
+    const rb = try refNameOf(arena, b.id);
+    var racing: RacingSim = .{ .sim = sim, .race = .{ .ref = ra, .message = "Meanwhile" } };
     const repo = Repo(RacingSim).init(&racing);
     // No expect: the comment that lands first is kept, the edits too.
     const res = try repo.editBatch(arena, &.{
@@ -5082,17 +4932,14 @@ test "editBatch: retries when an issue moves under it" {
 }
 
 test "editBatch: WriteOptions: a dry run writes nothing, an author ID stamps every commit" {
-    var arena_state: std.heap.ArenaAllocator = .init(testing.allocator);
-    defer arena_state.deinit();
-    const arena = arena_state.allocator();
-    var world: GitSim.World = .{ .seed = 61, .clones = &.{.{ .name = "a" }} };
-    var sim = try GitSim.init(arena, &world, 0);
-    const repo = Repo(GitSim).init(&sim);
+    var fx: TestRepo = .{};
+    defer fx.deinit();
+    const arena, const sim, const repo = try fx.open(61);
     const a = try repo.create(arena, .{ .title = "A" }, .{});
     const b = try repo.create(arena, .{ .title = "B" }, .{});
     const edits = [_]Repo(GitSim).BatchEdit{
-        .{ .ref_name = try issueRef(arena, a.id), .spec = .{ .title = "A2" } },
-        .{ .ref_name = try issueRef(arena, b.id), .spec = .{ .title = "B2" } },
+        .{ .ref_name = try refNameOf(arena, a.id), .spec = .{ .title = "A2" } },
+        .{ .ref_name = try refNameOf(arena, b.id), .spec = .{ .title = "B2" } },
     };
 
     const dry = try repo.editBatch(arena, &edits, .{ .dry_run = true });

@@ -57,6 +57,22 @@ function. Strings and nested records borrowed from an output remain valid
 until that output is freed. No caller-allocated ABI record changed for
 these APIs.
 
+An issue's or milestone's single values are one record, filled when the
+handle is built; lists and lookups keep their own calls:
+
+```c
+const issuez_issue_info *info = issuez_issue_info_of(issue);
+printf("%.*s: %.*s\n", (int)info->state_name.len, info->state_name.ptr,
+       (int)info->title.len, info->title.ptr);
+for (size_t k = 0; k < issuez_issue_label_count(issue); k++) { /* ... */ }
+```
+
+Fields may be added at the end of the record in later versions, which is
+safe because the library owns the memory: read through the pointer and
+never copy or allocate one. An absent string is `{NULL, 0}`, an absent date
+zero; the others say so (`has_number`, `has_estimate_minutes`, `closed_by`
+NULL, `has_status_changed`).
+
 For an external image store, open with `issuez_opt_attachment_store(0)`,
 then prepare an image:
 

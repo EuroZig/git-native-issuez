@@ -18,8 +18,6 @@
 // commit: the returned Write and Error.Write then identify what committed.
 package issuez
 
-//go:generate go run ./internal/recordgen/cmd ../../../docs/issuez-api.json records_gen.go
-
 /*
 #cgo CFLAGS: -I${SRCDIR}/include
 #cgo LDFLAGS: -lissuez
@@ -115,12 +113,17 @@ func cStrs(p *runtime.Pinner, ss []string) (*C.issuez_str, C.size_t) {
 }
 
 func goStrs(n C.size_t, at func(C.size_t) C.issuez_str) []string {
+	return goList(n, func(i C.size_t) string { return goStr(at(i)) })
+}
+
+// goList copies n items out of a C list; nil for none.
+func goList[T any](n C.size_t, at func(C.size_t) T) []T {
 	if n == 0 {
 		return nil
 	}
-	out := make([]string, n)
+	out := make([]T, n)
 	for i := range out {
-		out[i] = goStr(at(C.size_t(i)))
+		out[i] = at(C.size_t(i))
 	}
 	return out
 }
@@ -221,6 +224,14 @@ func goDate(d C.issuez_date) Date {
 	return Date{Year: int(d.year), Month: time.Month(d.month), Day: int(d.day)}
 }
 
+// goOptDate is nil for no date, which C has as a zero year.
+func goOptDate(d C.issuez_date) *Date {
+	if d.year == 0 {
+		return nil
+	}
+	return new(goDate(d))
+}
+
 func cDate(d Date) C.issuez_date {
 	return C.issuez_date{year: C.int16_t(d.Year), month: C.uint8_t(d.Month), day: C.uint8_t(d.Day)}
 }
@@ -239,6 +250,13 @@ func goPerson(p *C.issuez_person) Person {
 		return Person{}
 	}
 	return Person{Name: goStr(p.name), Email: goStr(p.email), UserID: goStr(p.user_id)}
+}
+
+func goOptPerson(p *C.issuez_person) *Person {
+	if p == nil {
+		return nil
+	}
+	return new(goPerson(p))
 }
 
 // Actor is who performs a write: the commit's author. The committer is
@@ -293,4 +311,39 @@ func call(ctx context.Context, f func(*C.issuez_cancel) C.issuez_code) C.issuez_
 		C.issuez_cancel_trigger(tok)
 	}
 	return f(tok)
+}
+
+// cArgs is what every C call takes besides its own arguments.
+type cArgs struct {
+	repo *C.issuez_repo
+	tok  *C.issuez_cancel
+	cerr **C.issuez_error
+}
+
+// fetch makes one C call on r that fills in an H, a handle or a value, and
+// turns that into the result with take, which frees a handle. Both run under
+// r's read lock, so Close waits for them. A call with pointers in Go memory
+// pins them before fetch and unpins after: f runs once, inside.
+func fetch[H, T any](ctx context.Context, r *Repo, f func(cArgs, *H) C.issuez_code, take func(H) T) (res T, err error) {
+	err = r.use(func(c *C.issuez_repo) error {
+		h, err := invoke(ctx, c, f)
+		if err != nil {
+			return err
+		}
+		res = take(h)
+		return nil
+	})
+	return res, err
+}
+
+// invoke makes one C call tied to ctx. A failure is the library's *Error,
+// with what the call left in H.
+func invoke[H any](ctx context.Context, c *C.issuez_repo, f func(cArgs, *H) C.issuez_code) (H, error) {
+	var h H
+	var cerr *C.issuez_error
+	rc := call(ctx, func(tok *C.issuez_cancel) C.issuez_code { return f(cArgs{c, tok, &cerr}, &h) })
+	if rc != C.ISSUEZ_OK {
+		return h, takeError(ctx, cerr)
+	}
+	return h, nil
 }

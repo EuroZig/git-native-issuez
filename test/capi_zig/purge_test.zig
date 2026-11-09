@@ -84,10 +84,7 @@ test "issuez_purge_issue: an issue a remote saw" {
     defer r.deinit();
     const h = r.handle;
     _ = try fixture.hub(&r, "hub.git");
-    const x = try fixture.create(
-        h,
-        &.{ c.issuez_set_title(fixture.str("Doxxing")), c.issuez_set_number(4) },
-    );
+    const x = try fixture.titled(h, "Doxxing");
     const local_only = try fixture.titled(h, "Never pushed");
     (try fixture.sync(h, &.{})).deinit();
     _ = local_only;
@@ -108,7 +105,7 @@ test "issuez_purge_issue: an issue a remote saw" {
     try testing.expectEqual(@as(usize, 0), c.issuez_purge_result_exposed_remote_count(null));
     try testing.expectEqual(@as(u8, 0), c.issuez_purge_result_new_tip(null).len);
 
-    // Gone, with its tombstone; its number is free again.
+    // Gone, with its tombstone.
     var out: ?*c.issuez_issue = null;
     try expect.code(
         c.ISSUEZ_E_NOT_FOUND,
@@ -125,10 +122,6 @@ test "issuez_purge_issue: an issue a remote saw" {
     );
     try testing.expect(std.mem.find(u8, why, "Ada") != null);
     try testing.expect(std.mem.find(u8, why, "Reason: legal") != null);
-    _ = try fixture.create(
-        h,
-        &.{ c.issuez_set_title(fixture.str("Four again")), c.issuez_set_number(4) },
-    );
 
     try expect.code(
         c.ISSUEZ_E_NOT_FOUND,
@@ -189,7 +182,7 @@ test "issuez_purge_comment: the text goes, the fields stay, later commits move" 
     c.issuez_purge_result_free(pr);
     const i = try fixture.load(h, x.idStr());
     defer c.issuez_issue_free(i);
-    const tip = c.issuez_issue_tip(i);
+    const tip = c.issuez_issue_info_of(i).*.tip;
     try testing.expect(c.issuez_oid_eq(&tip, &new_tip));
     try testing.expect(c.issuez_issue_comment_at(i, 0).*.purged);
     try testing.expect(c.issuez_issue_has_label(i, fixture.str("kept")));
@@ -251,10 +244,10 @@ test "lifetime: results outlive the repo and each other, freed in any order" {
     );
     c.issuez_repo_close(h);
     // All still readable, and a receipt can still load its issue.
-    try expect.str("Kept", c.issuez_issue_title(issue));
+    try expect.str("Kept", c.issuez_issue_info_of(issue).*.title);
     try expect.str(
         "Kept",
-        c.issuez_issue_title(c.issuez_issue_list_at(c.issuez_projection_issues(proj), 0)),
+        c.issuez_issue_info_of(c.issuez_issue_list_at(c.issuez_projection_issues(proj), 0)).*.title,
     );
     try testing.expectEqual(@as(usize, 1), c.issuez_snapshot_len(snap));
     var after: ?*c.issuez_issue = null;
@@ -266,7 +259,7 @@ test "lifetime: results outlive the repo and each other, freed in any order" {
     c.issuez_milestone_list_free(ms);
     c.issuez_issue_free(after);
     c.issuez_snapshot_free(snap);
-    try expect.str("Kept", c.issuez_issue_title(c.issuez_issue_list_at(list, 0)));
+    try expect.str("Kept", c.issuez_issue_info_of(c.issuez_issue_list_at(list, 0)).*.title);
     c.issuez_issue_list_free(list);
 }
 

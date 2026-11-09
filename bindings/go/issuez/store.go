@@ -42,24 +42,18 @@ func (r *Repo) NewStore() (*Store, error) {
 // created, changed or deleted since the last refresh, nil when nothing
 // moved.
 func (s *Store) Refresh(ctx context.Context) ([]string, error) {
-	var changed []string
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if s.c == nil {
 		return nil, &Error{Code: CodeInvalidArgument, Message: "store is closed"}
 	}
-	err := s.r.use(func(*C.issuez_repo) error {
-		var moved C.bool
-		var cerr *C.issuez_error
-		if rc := call(ctx, func(tok *C.issuez_cancel) C.issuez_code {
-			return C.issuez_store_refresh(s.c, tok, &moved, &cerr)
-		}); rc != C.ISSUEZ_OK {
-			return takeError(ctx, cerr)
-		}
+	return fetch(ctx, s.r, func(a cArgs, moved *C.bool) C.issuez_code {
+		return C.issuez_store_refresh(s.c, a.tok, moved, a.cerr)
+	}, func(moved C.bool) []string {
 		if !moved {
 			return nil
 		}
-		changed = goStrs(C.issuez_store_changed_count(s.c), func(i C.size_t) C.issuez_str {
+		changed := goStrs(C.issuez_store_changed_count(s.c), func(i C.size_t) C.issuez_str {
 			return C.issuez_store_changed_at(s.c, i)
 		})
 		for _, id := range changed {
@@ -73,7 +67,7 @@ func (s *Store) Refresh(ctx context.Context) ([]string, error) {
 		if n := int(C.issuez_store_issue_count(s.c)); n != len(s.issues) {
 			for k := C.size_t(0); k < C.size_t(n); k++ {
 				i := C.issuez_store_issue_at(s.c, k)
-				id := goStr(C.issuez_issue_id(i))
+				id := goStr(C.issuez_issue_info_of(i).id)
 				if _, ok := s.issues[id]; !ok {
 					s.issues[id] = goIssue(i, false)
 				}
@@ -84,9 +78,8 @@ func (s *Store) Refresh(ctx context.Context) ([]string, error) {
 			s.order = append(s.order, id)
 		}
 		sort.Strings(s.order)
-		return nil
+		return changed
 	})
-	return changed, err
 }
 
 // Issues is every issue as of the last Refresh, deleted ones too, in UUID

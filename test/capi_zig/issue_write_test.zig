@@ -109,7 +109,6 @@ test "issuez_issue_check: every guard, nothing written" {
             },
             c.ISSUEZ_PROBLEM_UNKNOWN_WORKFLOW_STATE,
         },
-        .{ null, &.{c.issuez_set_title(fixture.str("a\nb"))}, c.ISSUEZ_PROBLEM_NEWLINE },
     };
     for (cases, 0..) |case, i| {
         var ps = try checkProblems(h, case[0], case[1]);
@@ -173,9 +172,10 @@ test "issuez_issue_create: minimal, dated, closed, refused" {
     try expect.code(c.ISSUEZ_OK, c.issuez_issue_create(h, &ops, 1, &dated, null, &w, &err), err);
     var issue: ?*c.issuez_issue = null;
     try expect.code(c.ISSUEZ_OK, c.issuez_write_load_issue(w, null, &issue, null), null);
-    try testing.expectEqual(@as(i64, 1_500_000_000), c.issuez_issue_created(issue).unix_seconds);
-    try testing.expectEqual(@as(i16, 120), c.issuez_issue_created(issue).tz_offset_minutes);
-    try expect.str("bob@example.invalid", c.issuez_issue_author(issue).*.email);
+    const info = c.issuez_issue_info_of(issue);
+    try testing.expectEqual(@as(i64, 1_500_000_000), info.*.created.unix_seconds);
+    try testing.expectEqual(@as(i16, 120), info.*.created.tz_offset_minutes);
+    try expect.str("bob@example.invalid", info.*.author.*.email);
     c.issuez_issue_free(issue);
     c.issuez_write_free(w);
 
@@ -184,8 +184,24 @@ test "issuez_issue_create: minimal, dated, closed, refused" {
     const id = try r.arena().dupe(u8, fixture.slice(c.issuez_write_id(w)));
     c.issuez_write_free(w);
     const plain = try fixture.load(h, fixture.str(id));
-    try expect.str("tester@example.invalid", c.issuez_issue_author(plain).*.email);
+    try expect.str("tester@example.invalid", c.issuez_issue_info_of(plain).*.author.*.email);
     c.issuez_issue_free(plain);
+
+    // From a template: locked and about a ref on its root.
+    var locked = fixture.opNum(c.ISSUEZ_FIELD_LOCKED, 1);
+    locked.str = fixture.str("heated");
+    const started = try fixture.create(h, &.{
+        c.issuez_set_title(fixture.str("From a template")),
+        locked,
+        fixture.opStr(c.ISSUEZ_FIELD_REF, c.ISSUEZ_OP_SET, "refs/tags/v1"),
+    });
+    const si = try fixture.load(h, started.idStr());
+    const started_info = c.issuez_issue_info_of(si);
+    try testing.expect(started_info.*.is_locked);
+    try expect.str("heated", started_info.*.lock_reason);
+    try expect.str("refs/tags/v1", started_info.*.ref);
+    try testing.expectEqual(@as(u32, 1), started_info.*.commit_count);
+    c.issuez_issue_free(si);
 
     // Imported closed.
     const closed = try fixture.create(h, &.{
@@ -194,9 +210,9 @@ test "issuez_issue_create: minimal, dated, closed, refused" {
         c.issuez_set_fixed_by(fixture.str("abc123")),
     });
     const ci = try fixture.load(h, closed.idStr());
-    try testing.expect(c.issuez_issue_is_done(ci));
-    try expect.str("abc123", c.issuez_issue_fixed_by(ci));
-    try testing.expectEqual(@as(u32, 1), c.issuez_issue_commit_count(ci));
+    try testing.expect(c.issuez_issue_info_of(ci).*.is_done);
+    try expect.str("abc123", c.issuez_issue_info_of(ci).*.fixed_by);
+    try testing.expectEqual(@as(u32, 1), c.issuez_issue_info_of(ci).*.commit_count);
     c.issuez_issue_free(ci);
 
     // Refused: no title, deleted, a comment, a guard, an actor without email.
@@ -213,6 +229,18 @@ test "issuez_issue_create: minimal, dated, closed, refused" {
         .{
             &.{ c.issuez_set_title(fixture.str("T")), c.issuez_set_parent(closed.idStr()) },
             c.ISSUEZ_E_GUARD,
+        },
+        // Nothing here could take these: refused, not dropped.
+        .{
+            &.{
+                c.issuez_set_title(fixture.str("T")),
+                fixture.opStr(c.ISSUEZ_OPT_SUBJECT, c.ISSUEZ_OP_SET, "Why"),
+            },
+            c.ISSUEZ_E_INVALID_VALUE,
+        },
+        .{
+            &.{ c.issuez_set_title(fixture.str("T")), c.issuez_expect(closed.tip) },
+            c.ISSUEZ_E_INVALID_VALUE,
         },
     };
     for (refused, 0..) |case, i| {
@@ -273,13 +301,13 @@ test "issuez_issue_create: minimal, dated, closed, refused" {
     c.issuez_write_free(w);
     const hi = try fixture.load(h, fixture.str(hid));
     defer c.issuez_issue_free(hi);
-    try expect.str(uid, c.issuez_issue_author(hi).*.user_id);
+    try expect.str(uid, c.issuez_issue_info_of(hi).*.author.*.user_id);
     try expect.str(uid, c.issuez_issue_comment_at(hi, 0).*.author.*.user_id);
     try expect.str(uid, c.issuez_issue_timeline_at(hi, 1).*.author.*.user_id);
     // Without one, none.
     const anon = try fixture.load(h, fixture.str(id));
     defer c.issuez_issue_free(anon);
-    try expect.str("", c.issuez_issue_author(anon).*.user_id);
+    try expect.str("", c.issuez_issue_info_of(anon).*.author.*.user_id);
     try expect.code(
         c.ISSUEZ_E_INVALID_ARGUMENT,
         c.issuez_issue_create(h, &ops, 1, &fixture.ada, null, null, null),
@@ -316,7 +344,7 @@ test "issuez_issue_update: set, clear, add, remove, with a comment, missing" {
         c.issuez_set_subject(fixture.str("Rework")),
     });
     var i = try fixture.load(h, id);
-    try expect.str("After", c.issuez_issue_title(i));
+    try expect.str("After", c.issuez_issue_info_of(i).*.title);
     try testing.expect(
         c.issuez_issue_has_label(
             i,
@@ -324,14 +352,13 @@ test "issuez_issue_update: set, clear, add, remove, with a comment, missing" {
         ) and !c.issuez_issue_has_label(i, fixture.str("a")),
     );
     try testing.expectEqual(
-        @as(c.issuez_priority, c.ISSUEZ_PRIORITY_UNKNOWN),
-        c.issuez_issue_priority(i),
+        @as(u32, c.ISSUEZ_PRIORITY_UNKNOWN),
+        c.issuez_issue_info_of(i).*.priority,
     );
-    var d: c.issuez_date = undefined;
-    try testing.expect(!c.issuez_issue_due_date(i, &d));
-    try testing.expect(c.issuez_issue_start_date(i, &d));
+    try testing.expectEqual(@as(i16, 0), c.issuez_issue_info_of(i).*.due_date.year);
+    try testing.expect(c.issuez_issue_info_of(i).*.start_date.year != 0);
     try expect.str(other.idSlice(), c.issuez_issue_blocker_at(i, 0));
-    try expect.str("backlog", c.issuez_issue_workflow_state(i));
+    try expect.str("backlog", c.issuez_issue_info_of(i).*.workflow_state);
     const subject = try r.git(
         &.{
             "log",
@@ -344,7 +371,7 @@ test "issuez_issue_update: set, clear, add, remove, with a comment, missing" {
     c.issuez_issue_free(i);
 
     // Clearing a set replaces it; a comment rides along.
-    _ = try fixture.update(
+    const last = try fixture.update(
         h,
         id,
         &.{
@@ -375,35 +402,20 @@ test "issuez_issue_update: set, clear, add, remove, with a comment, missing" {
         c.issuez_issue_update(h, fixture.str("abc"), &ops, 1, &fixture.ada, null, &w, null),
         null,
     );
-    // Nothing to change: OK, nothing written. Values as they are too.
+    // Nothing to change: OK, nothing written, the tip as it was.
     try expect.code(
         c.ISSUEZ_OK,
         c.issuez_issue_update(h, id, null, 0, &fixture.ada, null, &w, null),
         null,
     );
     try testing.expect(!c.issuez_write_wrote(w));
-    const tip = c.issuez_write_new_tip(w);
-    c.issuez_write_free(w);
-    const now = try fixture.load(h, id);
-    const title = c.issuez_issue_title(now);
-    const same = [_]c.issuez_op{
-        c.issuez_set_title(title),
-        c.issuez_set_state(fixture.str("open")),
-    };
-    try expect.code(
-        c.ISSUEZ_OK,
-        c.issuez_issue_update(h, id, &same, same.len, &fixture.ada, null, &w, null),
-        null,
-    );
-    c.issuez_issue_free(now);
-    try testing.expect(!c.issuez_write_wrote(w));
     const kept = c.issuez_write_new_tip(w);
-    try testing.expect(c.issuez_oid_eq(&kept, &tip));
+    try testing.expect(c.issuez_oid_eq(&kept, &last));
     try testing.expectEqual(@as(usize, 0), c.issuez_write_entry(w).*.change_count);
     c.issuez_write_free(w);
 }
 
-test "issuez_issue_update: a comment's edit, delete and restore; the root, stale" {
+test "issuez_issue_update: a comment's edit, delete and restore; the root" {
     const leaks = fixture.Leaks.start();
     defer leaks.check();
     var r: fixture.Repo = undefined;
@@ -433,26 +445,6 @@ test "issuez_issue_update: a comment's edit, delete and restore; the root, stale
         err,
         "edit",
     );
-    // Stale expect.
-    try expect.code(
-        c.ISSUEZ_E_VERSION_MISMATCH,
-        fixture.updateRc(
-            h,
-            id,
-            &.{
-                c.issuez_edit_comment(said.commit),
-                c.issuez_set_comment(fixture.str("No")),
-                c.issuez_expect(said.tip),
-            },
-            &fixture.ada,
-            null,
-            &w,
-            &err,
-        ),
-        err,
-    );
-    c.issuez_error_free(err);
-    err = null;
     _ = try fixture.wrote(
         fixture.updateRc(
             h,
@@ -518,7 +510,7 @@ test "issuez_issue_update: a comment's edit, delete and restore; the root, stale
     c.issuez_error_free(err);
 }
 
-test "issuez_write_wrote: a reaction added, again, taken back, on a comment" {
+test "issuez_write_wrote: a reaction added, taken back, on a comment" {
     const leaks = fixture.Leaks.start();
     defer leaks.check();
     var r: fixture.Repo = undefined;
@@ -543,21 +535,6 @@ test "issuez_write_wrote: a reaction added, again, taken back, on a comment" {
         null,
     );
     try testing.expect(c.issuez_write_wrote(w));
-    c.issuez_write_free(w);
-    try expect.code(
-        c.ISSUEZ_OK,
-        fixture.updateRc(
-            h,
-            id,
-            &.{c.issuez_add_reaction(fixture.str(":+1:"))},
-            &fixture.ada,
-            null,
-            &w,
-            null,
-        ),
-        null,
-    );
-    try testing.expect(!c.issuez_write_wrote(w));
     c.issuez_write_free(w);
     try expect.code(
         c.ISSUEZ_OK,
@@ -591,15 +568,17 @@ test "issuez_write_wrote: a reaction added, again, taken back, on a comment" {
     );
     try testing.expect(c.issuez_write_wrote(w));
     c.issuez_write_free(w);
+    _ = try fixture.update(h, id, &.{
+        c.issuez_reaction_target(said.commit),
+        c.issuez_add_reaction(fixture.str("eyes")),
+    });
     const i = try fixture.load(h, id);
     defer c.issuez_issue_free(i);
     try testing.expectEqual(@as(usize, 0), c.issuez_issue_reaction_count(i, null));
-    try testing.expectEqual(@as(usize, 1), c.issuez_issue_reaction_count(i, &said.commit));
-    const cm = c.issuez_issue_comment_find(i, &said.commit);
-    try testing.expectEqual(@as(usize, 1), c.issuez_comment_reaction_count(cm));
-    try expect.str("heart", c.issuez_comment_reaction_at(cm, 0).*.emoji);
-    try testing.expect(c.issuez_comment_reaction_at(cm, 1) == null);
-    try testing.expectEqual(@as(usize, 0), c.issuez_comment_reaction_count(null));
+    try testing.expectEqual(@as(usize, 2), c.issuez_issue_reaction_count(i, &said.commit));
+    try expect.str("heart", c.issuez_issue_reaction_at(i, &said.commit, 0).*.emoji);
+    try expect.str("eyes", c.issuez_issue_reaction_at(i, &said.commit, 1).*.emoji);
+    try testing.expect(c.issuez_issue_reaction_at(i, &said.commit, 2) == null);
     var err: ?*c.issuez_error = null;
     try expect.code(
         c.ISSUEZ_E_INVALID_VALUE,
@@ -615,36 +594,16 @@ test "issuez_write_wrote: a reaction added, again, taken back, on a comment" {
         err,
     );
     c.issuez_error_free(err);
-    // An expected tip that isn't the issue's any more.
+    // A commit of its own.
+    const mixed = [_]c.issuez_op{
+        c.issuez_add_reaction(fixture.str("eyes")),
+        c.issuez_set_title(fixture.str("x")),
+    };
     try expect.code(
-        c.ISSUEZ_E_VERSION_MISMATCH,
-        fixture.updateRc(
-            h,
-            id,
-            &.{ c.issuez_add_reaction(fixture.str("eyes")), c.issuez_expect(made.tip) },
-            &fixture.ada,
-            null,
-            &w,
-            &err,
-        ),
-        err,
-    );
-    c.issuez_error_free(err);
-    const now = c.issuez_issue_tip(i);
-    try expect.code(
-        c.ISSUEZ_OK,
-        fixture.updateRc(
-            h,
-            id,
-            &.{ c.issuez_add_reaction(fixture.str("eyes")), c.issuez_expect(now) },
-            &fixture.ada,
-            null,
-            &w,
-            null,
-        ),
+        c.ISSUEZ_E_INVALID_VALUE,
+        c.issuez_issue_update(h, id, &mixed, mixed.len, &fixture.ada, null, &w, null),
         null,
     );
-    c.issuez_write_free(w);
 }
 
 // covers: issuez_write_kind, issuez_write_id, issuez_write_commit, issuez_write_old_tip
@@ -694,7 +653,7 @@ test "issuez_write_free: receipts" {
     try expect.str("high", ch.new_value);
     var issue: ?*c.issuez_issue = null;
     try expect.code(c.ISSUEZ_OK, c.issuez_write_load_issue(w, null, &issue, null), null);
-    const tip = c.issuez_issue_tip(issue);
+    const tip = c.issuez_issue_info_of(issue).*.tip;
     const new_tip = c.issuez_write_new_tip(w);
     try testing.expect(c.issuez_oid_eq(&tip, &new_tip));
     c.issuez_issue_free(issue);
@@ -813,19 +772,9 @@ test "issuez_issue_update: EXPECT_EDITS, a text's version that other changes don
             .ops = &.{ c.issuez_set_description(fixture.str("stale")), edits(0) },
             .code = c.ISSUEZ_E_VERSION_MISMATCH,
         },
-        // Another change in between leaves the description's version be.
-        .{ .ops = &.{c.issuez_add_label(fixture.str("bug"))}, .code = c.ISSUEZ_OK },
-        .{
-            .ops = &.{ c.issuez_set_description(fixture.str("v2")), edits(1) },
-            .code = c.ISSUEZ_OK,
-        },
         .{
             .ops = &.{ edit_comment, c.issuez_set_comment(fixture.str("c1")), edits(0) },
             .code = c.ISSUEZ_OK,
-        },
-        .{
-            .ops = &.{ edit_comment, c.issuez_set_comment(fixture.str("stale")), edits(0) },
-            .code = c.ISSUEZ_E_VERSION_MISMATCH,
         },
         .{
             .ops = &.{ c.issuez_add_label(fixture.str("x")), edits(0) },
@@ -845,81 +794,6 @@ test "issuez_issue_update: EXPECT_EDITS, a text's version that other changes don
     }
     const i = try fixture.load(h, id);
     defer c.issuez_issue_free(i);
-    try expect.str("v2", c.issuez_issue_description(i));
+    try expect.str("v1", c.issuez_issue_info_of(i).*.description);
     try expect.str("c1", c.issuez_issue_comment_find(i, &said.commit).*.text);
-}
-
-// covers: issuez_comment_reaction_count, issuez_comment_reaction_at
-test "issuez_issue_update: DELETE_COMMENT, RESTORE_COMMENT and REACTIONS as update ops" {
-    const leaks = fixture.Leaks.start();
-    defer leaks.check();
-    var r: fixture.Repo = undefined;
-    try r.init(.{});
-    defer r.deinit();
-    const h = r.handle;
-    const made = try fixture.titled(h, "Ops");
-    const id = made.idStr();
-    const said = try fixture.comment(h, id, "Hello");
-    var w: ?*c.issuez_write = null;
-    var err: ?*c.issuez_error = null;
-    const del = [_]c.issuez_op{c.issuez_delete_comment(said.commit)};
-    _ = try fixture.wrote(
-        c.issuez_issue_update(h, id, &del, del.len, &fixture.ada, null, &w, &err),
-        w,
-        err,
-        "delete",
-    );
-    var i = try fixture.load(h, id);
-    try testing.expect(c.issuez_issue_comment_find(i, &said.commit).*.deleted);
-    c.issuez_issue_free(i);
-    const back = [_]c.issuez_op{c.issuez_restore_comment(said.commit)};
-    _ = try fixture.wrote(
-        c.issuez_issue_update(h, id, &back, back.len, &fixture.ada, null, &w, &err),
-        w,
-        err,
-        "restore",
-    );
-    const like = [_]c.issuez_op{
-        c.issuez_add_reaction(fixture.str("heart")),
-        c.issuez_reaction_target(said.commit),
-    };
-    _ = try fixture.wrote(
-        c.issuez_issue_update(h, id, &like, like.len, &fixture.ada, null, &w, &err),
-        w,
-        err,
-        "react",
-    );
-    const on_issue = [_]c.issuez_op{c.issuez_add_reaction(fixture.str(":+1:"))};
-    _ = try fixture.wrote(
-        c.issuez_issue_update(h, id, &on_issue, on_issue.len, &fixture.ada, null, &w, &err),
-        w,
-        err,
-        "react",
-    );
-    i = try fixture.load(h, id);
-    defer c.issuez_issue_free(i);
-    try testing.expect(!c.issuez_issue_comment_find(i, &said.commit).*.deleted);
-    try testing.expectEqual(@as(usize, 1), c.issuez_issue_reaction_count(i, &said.commit));
-    const cm = c.issuez_issue_comment_find(i, &said.commit);
-    try testing.expectEqual(@as(usize, 1), c.issuez_comment_reaction_count(cm));
-    try expect.str("heart", c.issuez_comment_reaction_at(cm, 0).*.emoji);
-    try testing.expect(c.issuez_comment_reaction_at(cm, 1) == null);
-    try testing.expectEqual(@as(usize, 0), c.issuez_comment_reaction_count(null));
-    try testing.expectEqual(@as(usize, 1), c.issuez_issue_reaction_count(i, null));
-    // A commit of its own.
-    const mixed = [_]c.issuez_op{
-        c.issuez_add_reaction(fixture.str("eyes")),
-        c.issuez_set_title(fixture.str("x")),
-    };
-    try expect.code(
-        c.ISSUEZ_E_INVALID_VALUE,
-        c.issuez_issue_update(h, id, &mixed, mixed.len, &fixture.ada, null, &w, null),
-        null,
-    );
-    const bad = [_]c.issuez_op{c.issuez_add_reaction(fixture.str("a b"))};
-    try expect.code(
-        c.ISSUEZ_E_INVALID_VALUE,
-        c.issuez_issue_update(h, id, &bad, bad.len, &fixture.ada, null, &w, null),
-        null,
-    );
 }

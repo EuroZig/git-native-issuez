@@ -11,7 +11,7 @@ import (
 	"time"
 )
 
-//go:generate go run ./internal/enumgen/cmd enums_gen.go enums_gen_test.go
+//go:generate go run ./internal/enumgen/cmd enums_gen.go
 
 // Field is an issue or milestone field (ISSUEZ_FIELD_*), as used in
 // writes, timeline changes and problems.

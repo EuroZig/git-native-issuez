@@ -144,19 +144,6 @@ fn classify(ref: []const u8) struct { kind: Kind, id: []const u8 } {
     return .{ .kind = .other, .id = "" };
 }
 
-/// Hashes what `purge.rewrite` would write: checking writes nothing.
-const HashOnly = struct {
-    format: object.ObjectFormat,
-
-    pub fn objectFormat(h: HashOnly) object.ObjectFormat {
-        return h.format;
-    }
-
-    pub fn writeObject(h: HashOnly, kind: object.ObjectKind, data: []const u8) !Oid {
-        return object.hashObject(h.format, kind, data);
-    }
-};
-
 /// The commits of `commits` reachable from `start`, by OID.
 const Reach = std.AutoHashMapUnmanaged([Oid.max_byte_len]u8, void);
 
@@ -292,7 +279,23 @@ pub fn PushCheck(comptime B: type) type {
             return verdicts;
         }
 
-        const Problems = std.ArrayList(Problem);
+        const Problems = struct {
+            arena: Allocator,
+            list: std.ArrayList(Problem) = .empty,
+
+            fn add(p: *Problems, kind: ProblemKind, message: []const u8) Allocator.Error!void {
+                try p.list.append(p.arena, .{ .kind = kind, .message = message });
+            }
+
+            fn at(
+                p: *Problems,
+                kind: ProblemKind,
+                commit: Oid,
+                message: []const u8,
+            ) Allocator.Error!void {
+                try p.list.append(p.arena, .{ .kind = kind, .commit = commit, .message = message });
+            }
+        };
 
         fn verdictOf(
             u: Update,
@@ -306,20 +309,20 @@ pub fn PushCheck(comptime B: type) type {
                 .kind = kind,
                 .id = id,
                 .action = action,
-                .accept = for (problems.items) |p| {
+                .accept = for (problems.list.items) |p| {
                     if (p.rejects) break false;
                 } else true,
-                .problems = problems.items,
+                .problems = problems.list.items,
             };
         }
 
         fn invalid(r: *Run, u: Update, id: []const u8) Error!Verdict {
-            var problems: Problems = .empty;
-            try problems.append(r.arena, if (std.mem.startsWith(u8, u.ref, prefixes.local) and
+            var problems: Problems = .{ .arena = r.arena };
+            if (std.mem.startsWith(u8, u.ref, prefixes.local) and
                 !std.mem.startsWith(u8, u.ref, prefixes.tombstones))
-                .{ .kind = .local_ref, .message = "a local-only ref" }
+                try problems.add(.local_ref, "a local-only ref")
             else
-                .{ .kind = .bad_ref_name, .message = "not a UUID" });
+                try problems.add(.bad_ref_name, "not a UUID");
             return verdictOf(u, .invalid, id, try actionOf(r, u, null), &problems);
         }
 
@@ -336,17 +339,30 @@ pub fn PushCheck(comptime B: type) type {
         fn historyOf(r: *Run, tip: Oid, problems: *Problems) Error!?[]CommitInput {
             return r.check.repo.loadCommits(r.arena, tip) catch |e| switch (e) {
                 error.CorruptIssue, error.HistoryTooLong => {
-                    try problems.append(r.arena, .{
-                        .kind = .invalid_history,
-                        .message = if (e == error.HistoryTooLong)
-                            "history too long"
-                        else
-                            "history unreadable",
-                    });
+                    try problems.add(.invalid_history, if (e == error.HistoryTooLong)
+                        "history too long"
+                    else
+                        "history unreadable");
                     return null;
                 },
                 else => |x| return x,
             };
+        }
+
+        /// `tip` with `purged` purged, hashed only; null when it can't be
+        /// rewritten.
+        fn purgedTip(
+            r: *Run,
+            history: []const CommitInput,
+            tip: Oid,
+            purged: []const Oid,
+        ) Allocator.Error!?Oid {
+            const hash: purge_mod.HashOnly = .{ .format = r.format() };
+            const rw = purge_mod.rewrite(r.arena, hash, history, tip, purged) catch |e| switch (e) {
+                error.OutOfMemory => return error.OutOfMemory,
+                else => return null,
+            };
+            return rw.tip;
         }
 
         /// The commits `history` has and `base`'s history doesn't.
@@ -432,6 +448,7 @@ pub fn PushCheck(comptime B: type) type {
             problems: *Problems,
         ) Error!void {
             if (r.policy.author_policy == .any) return;
+            const rejects = r.policy.author_policy == .enforce;
             for (commits) |c| {
                 if (try mergeAddsNothing(r, c, kind, issue_id, history)) continue;
                 // A host's UUID names its user whatever the email says.
@@ -439,9 +456,9 @@ pub fn PushCheck(comptime B: type) type {
                     const own = for (r.policy.pusher_ids) |p| {
                         if (std.ascii.eqlIgnoreCase(p, id)) break true;
                     } else false;
-                    if (!own) try problems.append(r.arena, .{
+                    if (!own) try problems.list.append(r.arena, .{
                         .kind = .author_mismatch,
-                        .rejects = r.policy.author_policy == .enforce,
+                        .rejects = rejects,
                         .commit = c.oid,
                         .message = try std.fmt.allocPrint(
                             r.arena,
@@ -454,9 +471,9 @@ pub fn PushCheck(comptime B: type) type {
                     if (std.ascii.eqlIgnoreCase(e, c.author.email)) break true;
                 } else false;
                 if (ok) continue;
-                try problems.append(r.arena, .{
+                try problems.list.append(r.arena, .{
                     .kind = .author_mismatch,
-                    .rejects = r.policy.author_policy == .enforce,
+                    .rejects = rejects,
                     .commit = c.oid,
                     .message = try std.fmt.allocPrint(
                         r.arena,
@@ -468,16 +485,16 @@ pub fn PushCheck(comptime B: type) type {
         }
 
         fn deleteVerdict(r: *Run, u: Update, kind: Kind, id: []const u8) Error!Verdict {
-            var problems: Problems = .empty;
+            var problems: Problems = .{ .arena = r.arena };
             const purged = if (r.tombs.get(id)) |t| t.issue else false;
             const purgeable = kind == .issue or kind == .attachments;
             if (!(purgeable and purged)) {
-                try problems.append(r.arena, .{ .kind = .deleted, .message = "deletes a ref" });
+                try problems.add(.deleted, "deletes a ref");
             } else if (!r.policy.allow_purge) {
-                try problems.append(r.arena, .{
-                    .kind = .purge_not_allowed,
-                    .message = "deleting a purged issue needs leave to purge",
-                });
+                try problems.add(
+                    .purge_not_allowed,
+                    "deleting a purged issue needs leave to purge",
+                );
             }
             return verdictOf(u, kind, id, .delete, &problems);
         }
@@ -485,18 +502,13 @@ pub fn PushCheck(comptime B: type) type {
         fn tombstone(r: *Run, u: Update, id: []const u8) Error!Verdict {
             if (u.new == null) return deleteVerdict(r, u, .tombstone, id);
             const new = u.new.?;
-            var problems: Problems = .empty;
-            if (!r.policy.allow_purge) try problems.append(r.arena, .{
-                .kind = .purge_not_allowed,
-                .message = "the pusher may not purge",
-            });
+            var problems: Problems = .{ .arena = r.arena };
+            if (!r.policy.allow_purge)
+                try problems.add(.purge_not_allowed, "the pusher may not purge");
             const history = (try historyOf(r, new, &problems)) orelse
                 return verdictOf(u, .tombstone, id, try actionOf(r, u, null), &problems);
             const action = try actionOf(r, u, history);
-            if (action == .rewrite) try problems.append(r.arena, .{
-                .kind = .non_fast_forward,
-                .message = "not a fast-forward",
-            });
+            if (action == .rewrite) try problems.add(.non_fast_forward, "not a fast-forward");
             const base: ?[]const CommitInput = if (u.old) |o|
                 (try historyOf(r, o, &problems)) orelse
                     return verdictOf(u, .tombstone, id, action, &problems)
@@ -506,20 +518,11 @@ pub fn PushCheck(comptime B: type) type {
             const empty = object.emptyTree(r.format());
             for (fresh) |c| {
                 if (c.tree != null and !c.tree.?.eql(empty)) {
-                    try problems.append(r.arena, .{
-                        .kind = .not_a_purge,
-                        .commit = c.oid,
-                        .message = "a tombstone commit with files",
-                    });
+                    try problems.at(.not_a_purge, c.oid, "a tombstone commit with files");
                     continue;
                 }
-                if (!try isPurge(r.arena, r.format(), c)) {
-                    try problems.append(r.arena, .{
-                        .kind = .not_a_purge,
-                        .commit = c.oid,
-                        .message = "a tombstone commit that isn't a purge",
-                    });
-                }
+                if (!try isPurge(r.arena, r.format(), c))
+                    try problems.at(.not_a_purge, c.oid, "a tombstone commit that isn't a purge");
             }
             try authors(r, fresh, .tombstone, id, history, &problems);
             var v = verdictOf(u, .tombstone, id, action, &problems);
@@ -549,10 +552,10 @@ pub fn PushCheck(comptime B: type) type {
             if (u.new == null) return deleteVerdict(r, u, kind, id);
             const new = u.new.?;
             const a = r.arena;
-            var problems: Problems = .empty;
+            var problems: Problems = .{ .arena = a };
             const tomb: ?purge_mod.Tombstone = if (kind == .issue) r.tombs.get(id) else null;
             if (tomb) |t| if (t.issue) {
-                try problems.append(a, .{ .kind = .purged, .message = "the issue is purged" });
+                try problems.add(.purged, "the issue is purged");
                 return verdictOf(u, kind, id, try actionOf(r, u, null), &problems);
             };
             const history = (try historyOf(r, new, &problems)) orelse
@@ -569,7 +572,7 @@ pub fn PushCheck(comptime B: type) type {
                 history,
                 .{ .root_keys = root_keys },
             )) |p|
-                try problems.append(a, .{
+                try problems.list.append(a, .{
                     .kind = .invalid_history,
                     .commit = switch (p) {
                         .non_empty_tree => |oid| oid,
@@ -585,23 +588,17 @@ pub fn PushCheck(comptime B: type) type {
                         .unreadable => "history unreadable",
                     },
                 });
-            if (problems.items.len > 0) return verdictOf(u, kind, id, action, &problems);
+            if (problems.list.items.len > 0) return verdictOf(u, kind, id, action, &problems);
             for (history) |c| if (c.parents.len == 0) {
                 const block = try trailers.parse(a, c.message, .{});
                 const v = trailers.lastValue(block, "Format-Version") orelse "";
-                if (!std.mem.eql(u8, v, "1")) try problems.append(a, .{
-                    .kind = .format_version,
-                    .commit = c.oid,
-                    .message = "Format-Version isn't 1",
-                });
+                if (!std.mem.eql(u8, v, "1"))
+                    try problems.at(.format_version, c.oid, "Format-Version isn't 1");
             };
             const loaded = issue_model.materialize(a, id, new, history) catch |e| switch (e) {
                 error.OutOfMemory => return error.OutOfMemory,
                 else => {
-                    try problems.append(a, .{
-                        .kind = .invalid_history,
-                        .message = "history unreadable",
-                    });
+                    try problems.add(.invalid_history, "history unreadable");
                     return verdictOf(u, kind, id, action, &problems);
                 },
             };
@@ -621,35 +618,16 @@ pub fn PushCheck(comptime B: type) type {
             if (action == .rewrite) {
                 const purging = if (tomb) |t| t.comments.len > 0 else false;
                 if (!purging) {
-                    try problems.append(a, .{
-                        .kind = .non_fast_forward,
-                        .message = "not a fast-forward",
-                    });
+                    try problems.add(.non_fast_forward, "not a fast-forward");
                 } else if (!r.policy.allow_purge) {
-                    try problems.append(a, .{
-                        .kind = .purge_not_allowed,
-                        .message = "replacing history needs leave to purge",
-                    });
+                    try problems.add(.purge_not_allowed, "replacing history needs leave to purge");
                 } else {
-                    const hash: HashOnly = .{ .format = r.format() };
-                    const rw = purge_mod.rewrite(
-                        a,
-                        hash,
-                        old_history.?,
-                        u.old.?,
-                        tomb.?.comments,
-                    ) catch |e|
-                        switch (e) {
-                            error.OutOfMemory => return error.OutOfMemory,
-                            else => null,
-                        };
-                    if (rw == null or !contains(history, rw.?.tip)) {
-                        try problems.append(a, .{
-                            .kind = .non_fast_forward,
-                            .message = "doesn't contain the old history, purged",
-                        });
+                    const rw = try purgedTip(r, old_history.?, u.old.?, tomb.?.comments);
+                    if (rw == null or !contains(history, rw.?)) {
+                        const message = "doesn't contain the old history, purged";
+                        try problems.add(.non_fast_forward, message);
                     } else {
-                        const kept = try reachable(a, history, rw.?.tip);
+                        const kept = try reachable(a, history, rw.?);
                         var list: std.ArrayList(CommitInput) = .empty;
                         for (history) |c| if (kept.contains(c.oid.bytes)) try list.append(a, c);
                         base = list.items;
@@ -659,21 +637,9 @@ pub fn PushCheck(comptime B: type) type {
             const fresh = try newCommits(r, history, base);
 
             if (tomb) |t| if (t.comments.len > 0) {
-                const hash: HashOnly = .{ .format = r.format() };
-                const rw = purge_mod.rewrite(
-                    a,
-                    hash,
-                    history,
-                    new,
-                    t.comments,
-                ) catch |e| switch (e) {
-                    error.OutOfMemory => return error.OutOfMemory,
-                    else => null,
-                };
-                if (rw == null or !rw.?.tip.eql(new)) try problems.append(a, .{
-                    .kind = .purged,
-                    .message = "history has purged comments",
-                });
+                const rw = try purgedTip(r, history, new, t.comments);
+                if (rw == null or !rw.?.eql(new))
+                    try problems.add(.purged, "history has purged comments");
             };
 
             var gives_number = false;
@@ -688,25 +654,19 @@ pub fn PushCheck(comptime B: type) type {
                                 std.mem.eql(u8, t.value, try std.fmt.allocPrint(a, "{d}", .{n}))
                             else
                                 false;
-                            if (!same) try problems.append(a, .{
-                                .kind = .number_set,
-                                .commit = c.oid,
-                                .message = "numbers are the host's to give",
-                            });
+                            const message = "numbers are the host's to give";
+                            if (!same) try problems.at(.number_set, c.oid, message);
                         }
                     }
                 } else if (loaded.number) |n| {
                     if (old_number != null and old_number.? != n) {
-                        try problems.append(a, .{
-                            .kind = .number_changed,
-                            .message = "the issue had another number",
-                        });
+                        try problems.add(.number_changed, "the issue had another number");
                     } else if (old_number == null) {
                         gives_number = true;
                         if (r.numbers == null) r.numbers = try r.check.repo.numbers(a);
                         if (r.numbers.?.get(n)) |owners| for (owners.items) |o| {
                             if (std.mem.eql(u8, o.id(), id)) continue;
-                            try problems.append(a, .{
+                            try problems.list.append(a, .{
                                 .kind = .number_taken,
                                 .subject = o.id(),
                                 .message = "another issue has this number",
@@ -761,20 +721,16 @@ pub fn PushCheck(comptime B: type) type {
             if (u.new == null) return deleteVerdict(r, u, .attachments, id);
             const new = u.new.?;
             const a = r.arena;
-            var problems: Problems = .empty;
+            var problems: Problems = .{ .arena = a };
             const history = (try historyOf(r, new, &problems)) orelse
                 return verdictOf(u, .attachments, id, try actionOf(r, u, null), &problems);
             const action = try actionOf(r, u, history);
             if (action == .rewrite) {
                 if (r.tombs.get(id) == null) {
-                    try problems.append(a, .{
-                        .kind = .non_fast_forward,
-                        .message = "not a fast-forward",
-                    });
-                } else if (!r.policy.allow_purge) try problems.append(a, .{
-                    .kind = .purge_not_allowed,
-                    .message = "replacing history needs leave to purge",
-                });
+                    try problems.add(.non_fast_forward, "not a fast-forward");
+                } else if (!r.policy.allow_purge) {
+                    try problems.add(.purge_not_allowed, "replacing history needs leave to purge");
+                }
             }
             const base = if (u.old) |o| r.check.repo.loadCommits(a, o) catch null else null;
             const fresh = try newCommits(r, history, base);
@@ -792,14 +748,10 @@ pub fn PushCheck(comptime B: type) type {
                     try isDerived(r, att, id, c, issue_history)
                 else
                     try pointersOnly(r, c);
-                if (!ok) try problems.append(a, .{
-                    .kind = .not_derived,
-                    .commit = c.oid,
-                    .message = if (c.oid.eql(new))
-                        "not what the issue's attachments derive"
-                    else
-                        "a tree that isn't LFS pointers",
-                });
+                if (!ok) try problems.at(.not_derived, c.oid, if (c.oid.eql(new))
+                    "not what the issue's attachments derive"
+                else
+                    "a tree that isn't LFS pointers");
             }
             var v = verdictOf(u, .attachments, id, action, &problems);
             v.new_commits = fresh;
@@ -980,7 +932,6 @@ test "numbers, authors and locks" {
     const arena = arena_state.allocator();
     const s = try TestServer.init(arena, 6);
     const numbered = try s.repo.create(arena, .{ .title = "N", .number = 3 }, .{});
-    const taken = try s.repo.create(arena, .{ .title = "Taken", .number = 4 }, .{});
     try s.set(try s.issueRef(numbered.id), null);
     const up: Update = .{ .ref = try s.issueRef(numbered.id), .old = null, .new = numbered.tip };
 
@@ -990,22 +941,16 @@ test "numbers, authors and locks" {
     try testing.expect(allowed[0].accept);
     try testing.expect(!allowed[0].needs_number);
 
-    // Another clone gave #4 too.
-    try s.set(try s.issueRef(taken.id), taken.tip);
-    const dup = try s.repo.create(arena, .{ .title = "Dup" }, .{});
-    _ = dup;
-    const four = try s.repo.create(arena, .{ .title = "Four" }, .{});
-    _ = four;
-    const clash_issue = try s.repo.create(arena, .{ .title = "Clash" }, .{});
-    const clash_ref = try s.issueRef(clash_issue.id);
-    const given = try s.repo.edit(arena, clash_ref, .{ .number = 5 }, .{});
-    try s.set(clash_ref, null);
-    const clash = try s.check(&.{
-        .{ .ref = clash_ref, .old = null, .new = given.tip },
+    // Two numbers given in one push: different, so no clash.
+    const other = try s.repo.create(arena, .{ .title = "Other" }, .{});
+    const other_ref = try s.issueRef(other.id);
+    const given = try s.repo.edit(arena, other_ref, .{ .number = 5 }, .{});
+    try s.set(other_ref, null);
+    const both = try s.check(&.{
+        .{ .ref = other_ref, .old = null, .new = given.tip },
         up,
     }, .{ .allow_numbers = true });
-    try testing.expect(clash[0].accept);
-    _ = try s.repo.create(arena, .{ .title = "x" }, .{});
+    try testing.expect(both[0].accept);
 
     const author: object.Signature = .{
         .name = "Mallory",
@@ -1036,6 +981,57 @@ test "numbers, authors and locks" {
         .{ .pusher_emails = &.{"mallory@X"}, .author_policy = .enforce },
     );
     try testing.expect(own[0].accept);
+}
+
+test "numbers: taken on the server or in the push, and changed" {
+    var arena_state: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const s = try TestServer.init(arena, 9);
+    const numbers: Policy = .{ .allow_numbers = true };
+
+    // Another issue on the server has #4. Writes refuse that, so #4 is given first.
+    const late = try s.repo.create(arena, .{ .title = "Late" }, .{});
+    const late_ref = try s.issueRef(late.id);
+    const four = try s.repo.edit(arena, late_ref, .{ .number = 4 }, .{});
+    try s.set(late_ref, late.tip);
+    const owner = try s.repo.create(arena, .{ .title = "Owner", .number = 4 }, .{});
+    const owner_ref = try s.issueRef(owner.id);
+    const taken = try s.check(&.{.{ .ref = late_ref, .old = late.tip, .new = four.tip }}, numbers);
+    try testing.expect(!taken[0].accept and hasProblem(taken[0], .number_taken));
+    try testing.expectEqualStrings(owner.id, taken[0].problems[0].subject);
+
+    // #4 becomes #5 on the issue that has it: only a foreign commit can say so.
+    const sig: object.Signature = .{
+        .name = "a",
+        .email = "a@x",
+        .time = 1_700_000_000,
+        .tz_offset_minutes = 0,
+    };
+    const five = try s.repo.writeCommit(
+        arena,
+        &.{owner.tip},
+        .{ .author = sig, .committer = sig },
+        "Number\n\nX-Number: 5\n",
+    );
+    const changed = try s.check(&.{.{ .ref = owner_ref, .old = owner.tip, .new = five }}, numbers);
+    try testing.expect(!changed[0].accept and hasProblem(changed[0], .number_changed));
+
+    // Two new issues give #9 in one push; neither is on the server yet.
+    const one = try s.repo.create(arena, .{ .title = "One", .number = 9 }, .{});
+    const one_ref = try s.issueRef(one.id);
+    try s.set(one_ref, null);
+    const two = try s.repo.create(arena, .{ .title = "Two", .number = 9 }, .{});
+    const two_ref = try s.issueRef(two.id);
+    try s.set(two_ref, null);
+    const pushed = try s.check(&.{
+        .{ .ref = one_ref, .old = null, .new = one.tip },
+        .{ .ref = two_ref, .old = null, .new = two.tip },
+    }, numbers);
+    try testing.expect(!pushed[0].accept and hasProblem(pushed[0], .number_taken));
+    try testing.expectEqualStrings(two.id, pushed[0].problems[0].subject);
+    try testing.expect(!pushed[1].accept and hasProblem(pushed[1], .number_taken));
+    try testing.expectEqualStrings(one.id, pushed[1].problems[0].subject);
 }
 
 test "authors: only a merge that adds nothing is exempt" {

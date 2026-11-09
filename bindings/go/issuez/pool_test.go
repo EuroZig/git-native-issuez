@@ -8,17 +8,13 @@ import (
 	"github.com/EuroZig/git-native-issuez/bindings/go/issuez"
 )
 
-func TestNewPool(t *testing.T) {
-	p := issuez.NewPool[int](2, issuez.WithEnv(testEnv()))
-	defer p.Close()
-	if p.Len() != 0 {
-		t.Errorf("Len() = %d", p.Len())
-	}
-}
-
+// covers: NewPool, Pool_Len
 func TestPool_Do(t *testing.T) {
 	p := issuez.NewPool[int](4, issuez.WithEnv(testEnv()))
 	defer p.Close()
+	if p.Len() != 0 {
+		t.Errorf("new pool: Len() = %d", p.Len())
+	}
 	dir := initRepo(t)
 	var first *issuez.Repo
 	if err := p.Do(1, dir, func(r *issuez.Repo) error {
@@ -135,16 +131,5 @@ func TestPool_Close(t *testing.T) {
 	}
 	if err := p.Do(1, dir, func(*issuez.Repo) error { return nil }); !errors.As(err, new(*issuez.Error)) {
 		t.Errorf("after Close: %v", err)
-	}
-}
-
-func TestPool_Len(t *testing.T) {
-	p := issuez.NewPool[string](4, issuez.WithEnv(testEnv()))
-	defer p.Close()
-	if err := p.Do("a", initRepo(t), func(*issuez.Repo) error { return nil }); err != nil {
-		t.Fatal(err)
-	}
-	if p.Len() != 1 {
-		t.Errorf("Len() = %d", p.Len())
 	}
 }

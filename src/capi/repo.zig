@@ -517,22 +517,14 @@ pub fn issuez_repo_open(
 }
 
 /// Sets `r` from the open options; problems with them go to `problems`.
-fn applyOptions(
-    r: *RepoObj,
-    arena: Allocator,
-    ops: []const api.Op,
-    problems: *std.ArrayList(rt.ProblemSpec),
-) !void {
+fn applyOptions(r: *RepoObj, arena: Allocator, ops: []const api.Op, problems: *rt.Problems) !void {
     var done: std.ArrayList([]const u8) = .empty;
     var workflow: std.ArrayList([]const u8) = .empty;
     var scopes: std.ArrayList([]const u8) = .empty;
     var prefixes: std.ArrayList([]const u8) = .empty;
     for (ops, 0..) |op, i| {
-        const index: i64 = @intCast(i);
-        if (rt.hasReserved(op)) {
-            try problems.append(arena, rt.reservedProblem(index));
-            continue;
-        }
+        const check: rt.OpCheck = .at(arena, problems, i);
+        if (try check.reserved(op)) continue;
         const verb: api.Verb = @enumFromInt(op.verb);
         const target: Opt = @enumFromInt(op.target);
         const s = op.str.slice();
@@ -556,11 +548,7 @@ fn applyOptions(
             .exclusive_scope => try scopes.append(arena, try arena.dupe(u8, s)),
             .extra_prefix => try prefixes.append(arena, try arena.dupe(u8, s)),
             .pool_size => if (op.num < 1 or op.num > 64) {
-                try problems.append(arena, .{
-                    .kind = .bad_format,
-                    .message = "pool size is 1 to 64",
-                    .op_index = index,
-                });
+                try check.add(.bad_format, "pool size is 1 to 64");
             } else {
                 r.pool_size = @intCast(op.num);
             },
@@ -575,11 +563,7 @@ fn applyOptions(
                 }
             },
             .cache_issues => if (op.num < 0) {
-                try problems.append(arena, .{
-                    .kind = .bad_format,
-                    .message = "the cache size can't be negative",
-                    .op_index = index,
-                });
+                try check.add(.bad_format, "the cache size can't be negative");
             } else {
                 r.cache.max = @intCast(op.num);
             },
@@ -589,14 +573,10 @@ fn applyOptions(
                     .kind = .unknown_target,
                     .key = try arena.dupe(u8, op.name.slice()),
                     .message = "no such limit",
-                    .op_index = index,
+                    .op_index = check.index,
                 });
             },
-            else => try problems.append(arena, .{
-                .kind = .unknown_target,
-                .message = "not an option of issuez_repo_open",
-                .op_index = index,
-            }),
+            else => try check.add(.unknown_target, "not an option of issuez_repo_open"),
         }
     }
     if (!r.limits.valid()) try problems.append(arena, .{
@@ -611,11 +591,7 @@ fn applyOptions(
 
 /// `issuez_ops_validate` for ISSUEZ_LIST_OPEN: the options on a repo that
 /// is never opened.
-pub fn validateOpen(
-    arena: Allocator,
-    ops: []const api.Op,
-    problems: *std.ArrayList(rt.ProblemSpec),
-) !void {
+pub fn validateOpen(arena: Allocator, ops: []const api.Op, problems: *rt.Problems) !void {
     var r: RepoObj = .{ .arena = undefined, .open_path = "", .env = .init(rt.gpa) };
     defer r.env.deinit();
     try applyOptions(&r, arena, ops, problems);
@@ -639,7 +615,7 @@ fn open(
     };
     errdefer r.env.deinit();
 
-    var problems: std.ArrayList(rt.ProblemSpec) = .empty;
+    var problems: rt.Problems = .empty;
     try applyOptions(r, arena, ops, &problems);
     if (problems.items.len > 0) {
         // The problems point into the arena: copy them out first.
@@ -729,10 +705,8 @@ pub fn issuez_repo_set_logger(
     rt.setScoped(&r.logger, min_level, cb, userdata);
 }
 
-pub fn issuez_repo_git_dir(repo: ?*const api.Repo) callconv(.c) Str {
-    const r = rt.obj(RepoObj, repo) orelse return .{};
-    return r.git_dir;
-}
+const RepoReads = rt.Reads(api.Repo, RepoObj);
+pub const issuez_repo_git_dir = RepoReads.field("git_dir");
 
 pub fn issuez_repo_limit(repo: ?*const api.Repo, name: Str, out: ?*u64) callconv(.c) bool {
     const r = rt.obj(RepoObj, repo) orelse return false;
@@ -745,84 +719,52 @@ pub fn issuez_repo_limit(repo: ?*const api.Repo, name: Str, out: ?*u64) callconv
     return false;
 }
 
-pub fn issuez_repo_workflow_state_count(repo: ?*const api.Repo) callconv(.c) usize {
-    const r = rt.obj(RepoObj, repo) orelse return 0;
-    return r.workflow_states.len;
-}
-
-pub fn issuez_repo_workflow_state_at(repo: ?*const api.Repo, i: usize) callconv(.c) Str {
-    const r = rt.obj(RepoObj, repo) orelse return .{};
-    return if (i < r.workflow_states.len) r.workflow_states[i] else .{};
-}
-
-pub fn issuez_repo_done_state_count(repo: ?*const api.Repo) callconv(.c) usize {
-    const r = rt.obj(RepoObj, repo) orelse return 0;
-    return r.done_states.len;
-}
-
-pub fn issuez_repo_done_state_at(repo: ?*const api.Repo, i: usize) callconv(.c) Str {
-    const r = rt.obj(RepoObj, repo) orelse return .{};
-    return if (i < r.done_states.len) r.done_states[i] else .{};
-}
+pub const issuez_repo_workflow_state_count = RepoReads.count("workflow_states");
+pub const issuez_repo_workflow_state_at = RepoReads.at("workflow_states");
+pub const issuez_repo_done_state_count = RepoReads.count("done_states");
+pub const issuez_repo_done_state_at = RepoReads.at("done_states");
 
 /// Rebuild the immutable open options so staging uses the same policy.
 fn importOptions(a: Allocator, r: *RepoObj, env: *const std.process.Environ.Map) ![]api.Op {
-    const set = @intFromEnum(api.Verb.set);
-    var ops: std.ArrayList(api.Op) = .empty;
-    try ops.append(a, .{
-        .verb = @intFromEnum(api.Verb.clear),
-        .target = @intFromEnum(api.Opt.env),
-    });
+    var ops: OpBuilder = .{ .a = a };
+    try ops.add(.clear, .env, .{});
     var it = env.iterator();
-    while (it.next()) |kv| try ops.append(a, .{
-        .verb = set,
-        .target = @intFromEnum(api.Opt.env),
-        .name = Str.of(kv.key_ptr.*),
-        .str = Str.of(kv.value_ptr.*),
-    });
-    try ops.append(a, .{
-        .verb = set,
-        .target = @intFromEnum(api.Opt.git_path),
-        .str = Str.of(r.git_path),
-    });
-    if (r.committer) |who| try ops.append(a, .{
-        .verb = set,
-        .target = @intFromEnum(api.Opt.committer),
+    while (it.next()) |kv|
+        try ops.add(.set, .env, .{ .name = Str.of(kv.key_ptr.*), .str = Str.of(kv.value_ptr.*) });
+    try ops.add(.set, .git_path, .{ .str = Str.of(r.git_path) });
+    if (r.committer) |who| try ops.add(.set, .committer, .{
         .person = .{ .name = Str.of(who.name), .email = Str.of(who.email) },
     });
-    inline for (.{
-        .{ api.Opt.done_state, r.settings.done_states },
-        .{ api.Opt.workflow_state, r.settings.workflow_states },
-        .{ api.Opt.exclusive_scope, r.exclusive_scopes },
-        .{ api.Opt.extra_prefix, r.extra_prefixes },
-    }) |group| {
-        for (group[1]) |value| try ops.append(a, .{
-            .verb = @intFromEnum(api.Verb.add),
-            .target = @intFromEnum(group[0]),
-            .str = Str.of(value),
-        });
-    }
+    for (r.settings.done_states) |v| try ops.add(.add, .done_state, .{ .str = Str.of(v) });
+    for (r.settings.workflow_states) |v| try ops.add(.add, .workflow_state, .{ .str = Str.of(v) });
+    for (r.exclusive_scopes) |v| try ops.add(.add, .exclusive_scope, .{ .str = Str.of(v) });
+    for (r.extra_prefixes) |v| try ops.add(.add, .extra_prefix, .{ .str = Str.of(v) });
     inline for (@typeInfo(issuez.engine.Limits).@"struct".fields) |field| {
-        try ops.append(a, .{
-            .verb = set,
-            .target = @intFromEnum(api.Opt.limit),
+        try ops.add(.set, .limit, .{
             .name = Str.of(field.name),
             .num = @intCast(@field(r.limits, field.name)),
         });
     }
-    inline for (.{
-        .{ api.Opt.attachment_store, @as(i64, @intFromBool(r.store_attachments)) },
-        .{ api.Opt.pool_size, @as(i64, r.pool_size) },
-        .{ api.Opt.cache_issues, @as(i64, @intCast(r.cache.max)) },
-        .{ api.Opt.timeout_local_ms, r.timeouts.command.toMilliseconds() },
-        .{ api.Opt.timeout_network_ms, r.timeouts.network.toMilliseconds() },
-    }) |value| try ops.append(a, .{
-        .verb = set,
-        .target = @intFromEnum(value[0]),
-        .num = value[1],
-    });
-    return ops.items;
+    try ops.add(.set, .attachment_store, .{ .num = @intFromBool(r.store_attachments) });
+    try ops.add(.set, .pool_size, .{ .num = r.pool_size });
+    try ops.add(.set, .cache_issues, .{ .num = @intCast(r.cache.max) });
+    try ops.add(.set, .timeout_local_ms, .{ .num = r.timeouts.command.toMilliseconds() });
+    try ops.add(.set, .timeout_network_ms, .{ .num = r.timeouts.network.toMilliseconds() });
+    return ops.list.items;
 }
+
+const OpBuilder = struct {
+    a: Allocator,
+    list: std.ArrayList(api.Op) = .empty,
+
+    /// `value` with the verb and the target set.
+    fn add(b: *OpBuilder, verb: api.Verb, target: Opt, value: api.Op) !void {
+        var op = value;
+        op.verb = @intFromEnum(verb);
+        op.target = @intFromEnum(target);
+        try b.list.append(b.a, op);
+    }
+};
 
 pub fn issuez_repo_begin_import(
     repo: ?*api.Repo,

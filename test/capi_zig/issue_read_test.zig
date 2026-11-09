@@ -18,9 +18,7 @@ const Rich = struct {
     r: fixture.Repo,
     x: fixture.Created,
     bare: fixture.Created,
-    parent: fixture.Created,
     blocker: fixture.Created,
-    milestone: fixture.Created,
     c1: c.issuez_oid,
     c2: c.issuez_oid,
     issue: *c.issuez_issue,
@@ -30,9 +28,9 @@ const Rich = struct {
         try rich.r.init(.{});
         errdefer rich.r.deinit();
         const h = rich.r.handle;
-        rich.parent = try fixture.titled(h, "Parent");
+        const parent = try fixture.titled(h, "Parent");
         rich.blocker = try fixture.titled(h, "Blocker");
-        rich.milestone = try fixture.milestone(h, "v1");
+        const milestone = try fixture.milestone(h, "v1");
         var locked = fixture.opNum(c.ISSUEZ_FIELD_LOCKED, 1);
         locked.str = fixture.str("heated");
         var assignee = std.mem.zeroes(c.issuez_op);
@@ -48,8 +46,8 @@ const Rich = struct {
             c.issuez_add_assignee(
                 .{ .name = .{}, .email = fixture.str("ada@example.invalid"), .user_id = .{} },
             ),
-            c.issuez_set_milestone(rich.milestone.idStr()),
-            c.issuez_set_parent(rich.parent.idStr()),
+            c.issuez_set_milestone(milestone.idStr()),
+            c.issuez_set_parent(parent.idStr()),
             c.issuez_add_blocker(rich.blocker.idStr()),
             c.issuez_set_start_date(.{ .year = 2026, .month = 11, .day = 1 }),
             c.issuez_set_due_date(.{ .year = 2026, .month = 12, .day = 1 }),
@@ -191,7 +189,7 @@ test "issuez_issue_load, issuez_issue_free: by UUID, missing, not a UUID, damage
     defer r.deinit();
     const made = try fixture.titled(r.handle, "Loaded");
     const issue = try fixture.load(r.handle, made.idStr());
-    try expect.str("Loaded", c.issuez_issue_title(issue));
+    try expect.str("Loaded", c.issuez_issue_info_of(issue).*.title);
     c.issuez_issue_free(issue);
     c.issuez_issue_free(null);
     var out: ?*c.issuez_issue = null;
@@ -237,8 +235,8 @@ test "issuez_issue_load_many: found, missing, strict" {
         null,
     );
     try testing.expectEqual(@as(usize, 3), c.issuez_issue_list_len(list));
-    try expect.str("A", c.issuez_issue_title(c.issuez_issue_list_at(list, 0)));
-    try expect.str("B", c.issuez_issue_title(c.issuez_issue_list_at(list, 1)));
+    try expect.str("A", c.issuez_issue_info_of(c.issuez_issue_list_at(list, 0)).*.title);
+    try expect.str("B", c.issuez_issue_info_of(c.issuez_issue_list_at(list, 1)).*.title);
     try testing.expectEqual(@as(usize, 1), c.issuez_issue_list_skipped_count(list));
     try expect.str(missing, c.issuez_issue_list_skipped_at(list, 0));
     c.issuez_issue_list_free(list);
@@ -272,133 +270,232 @@ test "issuez_issue_load_many: found, missing, strict" {
     );
 }
 
-// covers: issuez_issue_tip, issuez_issue_number, issuez_issue_format_version
-// covers: issuez_issue_commit_count
-test "issuez_issue_id: identity" {
+const lin_id = "7d1f0a34-2b6c-4e8d-a1f3-9c0b5d7e6f21";
+
+/// Someone writing at a time and in a zone of their own.
+fn at(
+    name: []const u8,
+    email: []const u8,
+    id: []const u8,
+    when: *const c.issuez_time,
+) c.issuez_actor {
+    return .{
+        .name = fixture.str(name),
+        .email = fixture.str(email),
+        .user_id = fixture.str(id),
+        .at = when,
+        .reserved = .{ 0, 0, 0, 0 },
+    };
+}
+
+// C fills the record by hand: no two fields here hold the same value, so a swapped field fails.
+test "issuez_issue_info_of: every value of a closed, locked issue" {
     const leaks = fixture.Leaks.start();
     defer leaks.check();
-    var rich: Rich = undefined;
-    try rich.init();
-    defer rich.deinit();
-    const i = rich.issue;
-    try expect.str(rich.x.idSlice(), c.issuez_issue_id(i));
-    const tip = c.issuez_issue_tip(i);
-    const want = try rich.r.git(
-        &.{
-            "rev-parse",
-            try std.fmt.allocPrint(rich.r.arena(), "refs/issues/{s}", .{rich.x.idSlice()}),
-        },
+    var r: fixture.Repo = undefined;
+    try r.init(.{});
+    defer r.deinit();
+    const h = r.handle;
+    const parent = try fixture.titled(h, "Parent");
+    const milestone = try fixture.milestone(h, "v1");
+    const t1: c.issuez_time = .{ .unix_seconds = 1_700_000_000, .tz_offset_minutes = 60 };
+    const t2: c.issuez_time = .{ .unix_seconds = 1_700_000_500, .tz_offset_minutes = 120 };
+    const t3: c.issuez_time = .{ .unix_seconds = 1_700_001_000, .tz_offset_minutes = -180 };
+    const opener = at("Ada", "ada@example.invalid", "", &t1);
+    const closer = at("Grace", "grace@example.invalid", "", &t2);
+    const last = at("Lin", "lin@example.invalid", lin_id, &t3);
+    const create_ops = [_]c.issuez_op{
+        c.issuez_set_title(fixture.str("Login page crashes")),
+        c.issuez_set_description(fixture.str("On Safari.")),
+        c.issuez_set_priority(c.ISSUEZ_PRIORITY_HIGH),
+        c.issuez_set_milestone(milestone.idStr()),
+        c.issuez_set_parent(parent.idStr()),
+        c.issuez_set_start_date(.{ .year = 2026, .month = 11, .day = 1 }),
+        c.issuez_set_due_date(.{ .year = 2027, .month = 12, .day = 31 }),
+        c.issuez_set_estimate(90),
+        c.issuez_set_number(7),
+        fixture.opStr(c.ISSUEZ_OPT_ORIGINAL_AUTHOR, c.ISSUEZ_OP_SET, "octo@github"),
+        fixture.opStr(c.ISSUEZ_OPT_ORIGINAL_ID, c.ISSUEZ_OP_SET, "gh-12"),
+    };
+    var w: ?*c.issuez_write = null;
+    var err: ?*c.issuez_error = null;
+    try expect.code(
+        c.ISSUEZ_OK,
+        c.issuez_issue_create(h, &create_ops, create_ops.len, &opener, null, &w, &err),
+        err,
     );
-    const hex = fixture.oidHex(tip);
-    try testing.expectEqualStrings(want, hex[0..want.len]);
-    var n: u64 = 0;
-    try testing.expect(c.issuez_issue_number(i, &n));
-    try testing.expectEqual(@as(u64, 7), n);
-    try testing.expect(!c.issuez_issue_number(rich.plain, &n));
-    try expect.str("1", c.issuez_issue_format_version(i));
-    const count = try rich.r.git(&.{ "rev-list", "--count", want });
-    try testing.expectEqual(try std.fmt.parseInt(u32, count, 10), c.issuez_issue_commit_count(i));
-    try testing.expectEqual(@as(u32, 2), c.issuez_issue_commit_count(rich.plain));
-    try expect.str("", c.issuez_issue_id(null));
+    var id_buf: [36]u8 = undefined;
+    @memcpy(&id_buf, fixture.slice(c.issuez_write_id(w)));
+    c.issuez_write_free(w);
+    const id = fixture.str(&id_buf);
+    var locked = fixture.opNum(c.ISSUEZ_FIELD_LOCKED, 1);
+    locked.str = fixture.str("heated");
+    _ = try fixture.wrote(
+        fixture.updateRc(h, id, &.{
+            c.issuez_set_state(fixture.str("closed")),
+            c.issuez_set_fixed_by(fixture.str("1a2b3c4")),
+            c.issuez_set_release(fixture.str("1.2")),
+            c.issuez_set_reason(fixture.str("completed")),
+            fixture.opStr(c.ISSUEZ_FIELD_REF, c.ISSUEZ_OP_SET, "v2"),
+            locked,
+        }, &closer, null, &w, &err),
+        w,
+        err,
+        "close",
+    );
+    _ = try fixture.wrote(
+        fixture.updateRc(
+            h,
+            id,
+            &.{c.issuez_set_comment(fixture.str("Late"))},
+            &last,
+            null,
+            &w,
+            &err,
+        ),
+        w,
+        err,
+        "comment",
+    );
+
+    const issue = try fixture.load(h, id);
+    defer c.issuez_issue_free(issue);
+    const info = c.issuez_issue_info_of(issue);
+    try testing.expect(c.issuez_issue_info_of(issue) == info);
+    try expect.str(&id_buf, info.*.id);
+    const ref = try std.fmt.allocPrint(r.arena(), "refs/issues/{s}", .{id_buf});
+    const want_tip = try r.git(&.{ "rev-parse", ref });
+    try testing.expectEqualStrings(want_tip, fixture.oidHex(info.*.tip)[0..want_tip.len]);
+    try testing.expect(info.*.has_number);
+    try testing.expectEqual(@as(u64, 7), info.*.number);
+    try expect.str("1", info.*.format_version);
+    try testing.expectEqual(@as(u32, 3), info.*.commit_count);
+    try expect.str("Login page crashes", info.*.title);
+    try expect.str("On Safari.", info.*.description);
+    try expect.str("Ada", info.*.author.*.name);
+    try expect.str("ada@example.invalid", info.*.author.*.email);
+    try testing.expectEqual(t1, info.*.created);
+    try testing.expectEqual(t3, info.*.updated);
+    try testing.expectEqual(@as(u32, c.ISSUEZ_STATE_CLOSED), info.*.state);
+    try expect.str("closed", info.*.state_name);
+    try testing.expect(info.*.is_done);
+    try expect.str("grace@example.invalid", info.*.closed_by.*.email);
+    try testing.expectEqual(t2, info.*.closed_at);
+    try expect.str("1a2b3c4", info.*.fixed_by);
+    try expect.str("1.2", info.*.release);
+    try expect.str("completed", info.*.reason);
+    try testing.expect(info.*.is_locked);
+    try expect.str("heated", info.*.lock_reason);
+    try testing.expectEqual(@as(u32, c.ISSUEZ_PRIORITY_HIGH), info.*.priority);
+    try expect.str(milestone.idSlice(), info.*.milestone_id);
+    try expect.str(parent.idSlice(), info.*.parent_id);
+    try testing.expectEqual(
+        c.issuez_date{ .year = 2026, .month = 11, .day = 1 },
+        info.*.start_date,
+    );
+    try testing.expectEqual(c.issuez_date{ .year = 2027, .month = 12, .day = 31 }, info.*.due_date);
+    try testing.expect(info.*.has_estimate_minutes);
+    try testing.expectEqual(@as(u32, 90), info.*.estimate_minutes);
+    try expect.str("v2", info.*.ref);
+    try expect.str("octo@github", info.*.original_author);
+    try expect.str("gh-12", info.*.original_id);
+    // The next test's is_deleted and the load_since test's rewritten set them.
+    try testing.expect(!info.*.is_deleted and !info.*.rewritten);
 }
 
-// covers: issuez_issue_description, issuez_issue_author, issuez_issue_created
-// covers: issuez_issue_updated
-test "issuez_issue_title: text and who" {
+test "issuez_issue_info_of: a deleted open issue with nothing else set, and NULL" {
     const leaks = fixture.Leaks.start();
     defer leaks.check();
-    var rich: Rich = undefined;
-    try rich.init();
-    defer rich.deinit();
-    const i = rich.issue;
-    try expect.str("Login page crashes", c.issuez_issue_title(i));
-    try expect.str("On Safari only.", c.issuez_issue_description(i));
-    try expect.str("", c.issuez_issue_description(rich.plain));
-    const author = c.issuez_issue_author(i).*;
-    try expect.str("Ada", author.name);
-    try expect.str("ada@example.invalid", author.email);
-    const created = c.issuez_issue_created(i);
-    const updated = c.issuez_issue_updated(i);
-    try testing.expect(created.unix_seconds > 1_600_000_000);
-    try testing.expect(updated.unix_seconds >= created.unix_seconds);
+    var r: fixture.Repo = undefined;
+    try r.init(.{});
+    defer r.deinit();
+    const h = r.handle;
+    const x = try fixture.titled(h, "Bare");
+    _ = try fixture.update(h, x.idStr(), &.{c.issuez_set_deleted(true)});
+    const issue = try fixture.load(h, x.idStr());
+    defer c.issuez_issue_free(issue);
+    const info = c.issuez_issue_info_of(issue);
+    try testing.expect(info.*.is_deleted);
+    try testing.expect(!info.*.is_done and !info.*.is_locked and !info.*.rewritten);
+    try testing.expectEqual(@as(u32, c.ISSUEZ_STATE_OPEN), info.*.state);
+    // Open: the default workflow state, nobody closed it.
+    try expect.str("backlog", info.*.workflow_state);
+    try testing.expect(info.*.closed_by == null);
+    try testing.expectEqual(std.mem.zeroes(c.issuez_time), info.*.closed_at);
+    try testing.expect(!info.*.has_number and !info.*.has_estimate_minutes);
+    try testing.expectEqual(@as(u64, 0), info.*.number);
+    try testing.expectEqual(@as(u32, 0), info.*.estimate_minutes);
+    try testing.expectEqual(std.mem.zeroes(c.issuez_date), info.*.start_date);
+    try testing.expectEqual(std.mem.zeroes(c.issuez_date), info.*.due_date);
+    try testing.expectEqual(@as(u32, c.ISSUEZ_PRIORITY_UNKNOWN), info.*.priority);
+    // A description is always there, if empty; these are absent, {NULL,0}.
+    try testing.expect(info.*.description.ptr != null);
+    try expect.str("", info.*.description);
+    for ([_]c.issuez_str{
+        info.*.fixed_by,     info.*.release,   info.*.reason, info.*.lock_reason,
+        info.*.milestone_id, info.*.parent_id, info.*.ref,    info.*.original_author,
+        info.*.original_id,
+    }) |absent| try testing.expect(absent.ptr == null and absent.len == 0);
+    try testing.expect(c.issuez_issue_info_of(null) == null);
 }
 
-// covers: issuez_issue_state_name, issuez_issue_is_done, issuez_issue_closed
-// covers: issuez_issue_fixed_by, issuez_issue_release, issuez_issue_reason
-test "issuez_issue_state: closing" {
+test "issuez_issue_info_of: each optional is there on its own, an estimate of 0 included" {
     const leaks = fixture.Leaks.start();
     defer leaks.check();
-    var rich: Rich = undefined;
-    try rich.init();
-    defer rich.deinit();
-    const i = rich.issue;
-    try testing.expectEqual(@as(c.issuez_state, c.ISSUEZ_STATE_CLOSED), c.issuez_issue_state(i));
-    try expect.str("closed", c.issuez_issue_state_name(i));
-    try testing.expect(c.issuez_issue_is_done(i));
-    var at: c.issuez_time = undefined;
-    var by: [*c]const c.issuez_person = null;
-    try testing.expect(c.issuez_issue_closed(i, &at, &by));
-    try expect.str("ada@example.invalid", by.*.email);
-    try expect.str("1a2b3c4", c.issuez_issue_fixed_by(i));
-    try expect.str("1.2", c.issuez_issue_release(i));
-    try expect.str("completed", c.issuez_issue_reason(i));
+    var r: fixture.Repo = undefined;
+    try r.init(.{});
+    defer r.deinit();
+    const h = r.handle;
+    const zero = try fixture.create(h, &.{
+        c.issuez_set_title(fixture.str("Zero")),
+        c.issuez_set_estimate(0),
+        c.issuez_set_due_date(.{ .year = 2026, .month = 12, .day = 1 }),
+    });
+    const first = try fixture.load(h, zero.idStr());
+    defer c.issuez_issue_free(first);
+    const a = c.issuez_issue_info_of(first);
+    try testing.expect(a.*.has_estimate_minutes and !a.*.has_number);
+    try testing.expectEqual(@as(u32, 0), a.*.estimate_minutes);
+    try testing.expectEqual(@as(i16, 2026), a.*.due_date.year);
+    try testing.expectEqual(@as(i16, 0), a.*.start_date.year);
+    const numbered = try fixture.create(h, &.{
+        c.issuez_set_title(fixture.str("Numbered")),
+        c.issuez_set_number(3),
+        c.issuez_set_start_date(.{ .year = 2026, .month = 11, .day = 1 }),
+    });
+    const second = try fixture.load(h, numbered.idStr());
+    defer c.issuez_issue_free(second);
+    const b = c.issuez_issue_info_of(second);
+    try testing.expect(b.*.has_number and !b.*.has_estimate_minutes);
+    try testing.expectEqual(@as(i16, 2026), b.*.start_date.year);
+    try testing.expectEqual(@as(i16, 0), b.*.due_date.year);
+}
 
-    const p = rich.plain;
-    try testing.expectEqual(@as(c.issuez_state, c.ISSUEZ_STATE_OPEN), c.issuez_issue_state(p));
-    try testing.expect(!c.issuez_issue_is_done(p));
-    try testing.expect(!c.issuez_issue_closed(p, &at, &by));
-    try expect.str("", c.issuez_issue_fixed_by(p));
-
-    // Another state, done by default; reopened, not closed any more.
-    const h = rich.r.handle;
-    _ = try fixture.update(h, rich.bare.idStr(), &.{c.issuez_set_state(fixture.str("wontfix"))});
-    const wontfix = try fixture.load(h, rich.bare.idStr());
+test "issuez_issue_info_of: a done state of the repo, then reopened" {
+    const leaks = fixture.Leaks.start();
+    defer leaks.check();
+    var r: fixture.Repo = undefined;
+    try r.init(.{});
+    defer r.deinit();
+    const h = r.handle;
+    const x = try fixture.create(h, &.{
+        c.issuez_set_title(fixture.str("Ready")),
+        c.issuez_set_workflow_state(fixture.str("ready")),
+    });
+    _ = try fixture.update(h, x.idStr(), &.{c.issuez_set_state(fixture.str("wontfix"))});
+    const wontfix = try fixture.load(h, x.idStr());
     defer c.issuez_issue_free(wontfix);
-    try testing.expectEqual(
-        @as(c.issuez_state, c.ISSUEZ_STATE_OTHER),
-        c.issuez_issue_state(wontfix),
-    );
-    try expect.str("wontfix", c.issuez_issue_state_name(wontfix));
-    try testing.expect(c.issuez_issue_is_done(wontfix));
-    _ = try fixture.update(h, rich.x.idStr(), &.{c.issuez_set_state(fixture.str("open"))});
-    const reopened = try fixture.load(h, rich.x.idStr());
+    const done = c.issuez_issue_info_of(wontfix);
+    try testing.expectEqual(@as(u32, c.ISSUEZ_STATE_OTHER), done.*.state);
+    try expect.str("wontfix", done.*.state_name);
+    try testing.expect(done.*.is_done and done.*.closed_by != null);
+    try testing.expect(done.*.workflow_state.ptr == null);
+    _ = try fixture.update(h, x.idStr(), &.{c.issuez_set_state(fixture.str("open"))});
+    const reopened = try fixture.load(h, x.idStr());
     defer c.issuez_issue_free(reopened);
-    try testing.expect(!c.issuez_issue_closed(reopened, &at, &by));
-    try expect.str("ready", c.issuez_issue_workflow_state(reopened));
-}
-
-// covers: issuez_issue_is_deleted, issuez_issue_is_locked, issuez_issue_lock_reason
-// covers: issuez_issue_priority, issuez_issue_ref
-test "issuez_issue_workflow_state: fields" {
-    const leaks = fixture.Leaks.start();
-    defer leaks.check();
-    var rich: Rich = undefined;
-    try rich.init();
-    defer rich.deinit();
-    const i = rich.issue;
-    // Done issues have no workflow state; open ones the default.
-    try expect.str("", c.issuez_issue_workflow_state(i));
-    try expect.str("backlog", c.issuez_issue_workflow_state(rich.plain));
-    try testing.expect(!c.issuez_issue_is_deleted(i));
-    try testing.expect(c.issuez_issue_is_locked(i));
-    try expect.str("heated", c.issuez_issue_lock_reason(i));
-    try testing.expectEqual(
-        @as(c.issuez_priority, c.ISSUEZ_PRIORITY_HIGH),
-        c.issuez_issue_priority(i),
-    );
-    try expect.str("v2", c.issuez_issue_ref(i));
-    const p = rich.plain;
-    try testing.expect(!c.issuez_issue_is_locked(p));
-    try expect.str("", c.issuez_issue_lock_reason(p));
-    try testing.expectEqual(
-        @as(c.issuez_priority, c.ISSUEZ_PRIORITY_UNKNOWN),
-        c.issuez_issue_priority(p),
-    );
-    try expect.str("", c.issuez_issue_ref(p));
-    _ = try fixture.update(rich.r.handle, rich.bare.idStr(), &.{c.issuez_set_deleted(true)});
-    const deleted = try fixture.load(rich.r.handle, rich.bare.idStr());
-    defer c.issuez_issue_free(deleted);
-    try testing.expect(c.issuez_issue_is_deleted(deleted));
+    const open = c.issuez_issue_info_of(reopened);
+    try testing.expect(!open.*.is_done and open.*.closed_by == null);
+    try expect.str("ready", open.*.workflow_state);
 }
 
 // covers: issuez_issue_label_at, issuez_issue_has_label, issuez_issue_assignee_count
@@ -427,55 +524,27 @@ test "issuez_issue_label_count: sets" {
     try testing.expect(c.issuez_issue_assignee_at(i, 2) == null);
 }
 
-// covers: issuez_issue_parent_id, issuez_issue_blocker_count, issuez_issue_blocker_at
-test "issuez_issue_milestone_id: relations" {
+// covers: issuez_issue_blocker_at
+test "issuez_issue_blocker_count: relations" {
     const leaks = fixture.Leaks.start();
     defer leaks.check();
     var rich: Rich = undefined;
     try rich.init();
     defer rich.deinit();
     const i = rich.issue;
-    try expect.str(rich.milestone.idSlice(), c.issuez_issue_milestone_id(i));
-    try expect.str(rich.parent.idSlice(), c.issuez_issue_parent_id(i));
     try testing.expectEqual(@as(usize, 1), c.issuez_issue_blocker_count(i));
     try expect.str(rich.blocker.idSlice(), c.issuez_issue_blocker_at(i, 0));
     try expect.str("", c.issuez_issue_blocker_at(i, 1));
-    try expect.str("", c.issuez_issue_milestone_id(rich.plain));
-    try expect.str("", c.issuez_issue_parent_id(rich.plain));
 }
 
-// covers: issuez_issue_due_date, issuez_issue_estimate_minutes
-test "issuez_issue_start_date: set and unset" {
-    const leaks = fixture.Leaks.start();
-    defer leaks.check();
-    var rich: Rich = undefined;
-    try rich.init();
-    defer rich.deinit();
-    var d: c.issuez_date = undefined;
-    try testing.expect(c.issuez_issue_start_date(rich.issue, &d));
-    try testing.expectEqual(@as(c_int, 1), @as(c_int, d.day));
-    try testing.expect(c.issuez_issue_due_date(rich.issue, &d));
-    try testing.expectEqual(@as(c_int, 12), @as(c_int, d.month));
-    var m: u32 = 0;
-    try testing.expect(c.issuez_issue_estimate_minutes(rich.issue, &m));
-    try testing.expectEqual(@as(u32, 90), m);
-    try testing.expect(!c.issuez_issue_start_date(rich.plain, &d));
-    try testing.expect(!c.issuez_issue_due_date(rich.plain, &d));
-    try testing.expect(!c.issuez_issue_estimate_minutes(rich.plain, &m));
-}
-
-// covers: issuez_issue_original_id, issuez_issue_field, issuez_issue_extra_count
-// covers: issuez_issue_extra_at
-test "issuez_issue_original_author: trailers" {
+// covers: issuez_issue_extra_count, issuez_issue_extra_at
+test "issuez_issue_field: trailers" {
     const leaks = fixture.Leaks.start();
     defer leaks.check();
     var rich: Rich = undefined;
     try rich.init();
     defer rich.deinit();
     const i = rich.issue;
-    try expect.str("octo@github", c.issuez_issue_original_author(i));
-    try expect.str("gh-12", c.issuez_issue_original_id(i));
-    try expect.str("", c.issuez_issue_original_author(rich.plain));
     try expect.str("high", c.issuez_issue_field(i, fixture.str("Priority")));
     try expect.str("3", c.issuez_issue_field(i, fixture.str("X-Forgejo-Project")));
     try expect.str("", c.issuez_issue_field(i, fixture.str("No-Such-Key")));
@@ -507,6 +576,8 @@ test "issuez_issue_problems: a value another tool wrote that doesn't parse" {
     try expect.str("X-Due-Date", p.key);
     try expect.str("someday", p.value);
     try testing.expectEqual(@as(i64, -1), p.op_index);
+    // Ignored: the record has no date.
+    try testing.expectEqual(@as(i16, 0), c.issuez_issue_info_of(rich.plain).*.due_date.year);
 }
 
 // covers: issuez_issue_reaction_at, issuez_reaction_user_at
@@ -572,7 +643,7 @@ test "issuez_issue_timeline_count: every kind of step" {
     defer rich.deinit();
     const i = rich.issue;
     const n = c.issuez_issue_timeline_count(i);
-    try testing.expectEqual(c.issuez_issue_commit_count(i), @as(u32, @intCast(n)));
+    try testing.expectEqual(c.issuez_issue_info_of(i).*.commit_count, @as(u32, @intCast(n)));
     const created = c.issuez_issue_timeline_at(i, 0).*;
     try testing.expectEqual(@as(u32, c.ISSUEZ_ENTRY_CREATED), created.kind);
     try testing.expect(created.change_count > 0);
@@ -655,7 +726,7 @@ test "issuez_issue_history_count: the description and comments, version by versi
     try testing.expectEqual(@as(usize, 1), c.issuez_issue_history_count(rich.plain, null));
 }
 
-test "issuez_issue_load_since, issuez_issue_rewritten: entries new since a tip" {
+test "issuez_issue_load_since: entries new since a tip" {
     const leaks = fixture.Leaks.start();
     defer leaks.check();
     var r: fixture.Repo = undefined;
@@ -673,7 +744,7 @@ test "issuez_issue_load_since, issuez_issue_rewritten: entries new since a tip" 
         @as(c.issuez_code, c.ISSUEZ_OK),
         c.issuez_issue_load_since(h, x.idStr(), &first.commit, null, &i, &err),
     );
-    try testing.expect(!c.issuez_issue_rewritten(i));
+    try testing.expect(!c.issuez_issue_info_of(i).*.rewritten);
     try testing.expectEqual(@as(usize, 3), c.issuez_issue_timeline_count(i));
     try testing.expect(!c.issuez_issue_timeline_at(i, 0).*.is_new);
     try testing.expect(!c.issuez_issue_timeline_at(i, 1).*.is_new);
@@ -689,9 +760,8 @@ test "issuez_issue_load_since, issuez_issue_rewritten: entries new since a tip" 
     for (0..3) |k| try testing.expect(c.issuez_issue_timeline_at(i, k).*.is_new);
     c.issuez_issue_free(i);
     const plain = try fixture.load(h, x.idStr());
-    try testing.expect(
-        c.issuez_issue_timeline_at(plain, 2).*.is_new and !c.issuez_issue_rewritten(plain),
-    );
+    try testing.expect(c.issuez_issue_timeline_at(plain, 2).*.is_new);
+    try testing.expect(!c.issuez_issue_info_of(plain).*.rewritten);
     c.issuez_issue_free(plain);
 
     // Another issue's tip isn't in this history.
@@ -699,7 +769,7 @@ test "issuez_issue_load_since, issuez_issue_rewritten: entries new since a tip" 
         @as(c.issuez_code, c.ISSUEZ_OK),
         c.issuez_issue_load_since(h, x.idStr(), &other.tip, null, &i, &err),
     );
-    try testing.expect(c.issuez_issue_rewritten(i));
+    try testing.expect(c.issuez_issue_info_of(i).*.rewritten);
     for (0..3) |k| try testing.expect(!c.issuez_issue_timeline_at(i, k).*.is_new);
     c.issuez_issue_free(i);
 
@@ -707,7 +777,6 @@ test "issuez_issue_load_since, issuez_issue_rewritten: entries new since a tip" 
         @as(c.issuez_code, c.ISSUEZ_E_INVALID_ARGUMENT),
         c.issuez_issue_load_since(h, fixture.str("x"), null, null, &i, null),
     );
-    try testing.expect(!c.issuez_issue_rewritten(null));
 }
 
 /// The changes of timeline entry k.

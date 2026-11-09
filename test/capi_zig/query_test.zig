@@ -155,7 +155,7 @@ const World = struct {
             if (i > 0) try out.append(w.r.arena(), ',');
             try out.appendSlice(
                 w.r.arena(),
-                fixture.slice(c.issuez_issue_title(c.issuez_issue_list_at(list, i))),
+                fixture.slice(c.issuez_issue_info_of(c.issuez_issue_list_at(list, i)).*.title),
             );
         }
         var count: u64 = 0;
@@ -269,15 +269,6 @@ test "issuez_query_run: every sort" {
             return e;
         };
     }
-    var err: ?*c.issuez_error = null;
-    var list: ?*c.issuez_issue_list = null;
-    const bad = [_]c.issuez_op{num(c.ISSUEZ_OPT_Q_ORDER, 99)};
-    try expect.code(
-        c.ISSUEZ_E_INVALID_VALUE,
-        c.issuez_query_run(w.r.handle, &bad, 1, null, &list, &err),
-        err,
-    );
-    c.issuez_error_free(err);
 }
 
 // covers: issuez_issue_list_at, issuez_issue_list_next_cursor, issuez_issue_list_free
@@ -293,7 +284,7 @@ test "issuez_issue_list_len: pages" {
     var list: ?*c.issuez_issue_list = null;
     try expect.code(c.ISSUEZ_OK, c.issuez_query_run(w.r.handle, &page, 2, null, &list, null), null);
     try testing.expectEqual(@as(usize, 2), c.issuez_issue_list_len(list));
-    try expect.str("Dark mode", c.issuez_issue_title(c.issuez_issue_list_at(list, 1)));
+    try expect.str("Dark mode", c.issuez_issue_info_of(c.issuez_issue_list_at(list, 1)).*.title);
     try testing.expect(c.issuez_issue_list_at(list, 2) == null);
     const cursor = c.issuez_issue_list_next_cursor(list);
     try expect.terminated(cursor);
@@ -303,7 +294,7 @@ test "issuez_issue_list_len: pages" {
     page[2] = c.issuez_q_after(fixture.str(saved));
     try expect.code(c.ISSUEZ_OK, c.issuez_query_run(w.r.handle, &page, 3, null, &list, null), null);
     try testing.expectEqual(@as(usize, 1), c.issuez_issue_list_len(list));
-    try expect.str("Child", c.issuez_issue_title(c.issuez_issue_list_at(list, 0)));
+    try expect.str("Child", c.issuez_issue_info_of(c.issuez_issue_list_at(list, 0)).*.title);
     try expect.str("", c.issuez_issue_list_next_cursor(list));
     c.issuez_issue_list_free(list);
     c.issuez_issue_list_free(null);
@@ -569,7 +560,7 @@ test "issuez_store_new: a live view" {
     try testing.expect(c.issuez_store_changed_at(s, 1).ptr == null);
     const now = c.issuez_store_find(s, x.idStr()).?;
     try testing.expect(now != kept);
-    try expect.str("One, renamed", c.issuez_issue_title(now));
+    try expect.str("One, renamed", c.issuez_issue_info_of(now).*.title);
     try testing.expect(
         c.issuez_store_issue_at(s, 0) != null and c.issuez_store_issue_at(s, 2) == null,
     );

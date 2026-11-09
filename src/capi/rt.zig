@@ -206,6 +206,97 @@ pub fn obj(comptime T: type, p: anytype) ?*T {
     return @ptrCast(@alignCast(@constCast(raw)));
 }
 
+/// The accessors that do nothing but read a handle's object, `Obj`: its
+/// C functions, by the name of the field. A NULL handle or an index out of
+/// range reads as zero.
+pub fn Reads(comptime H: type, comptime Obj: type) type {
+    return struct {
+        fn Field(comptime name: []const u8) type {
+            return @FieldType(Obj, name);
+        }
+
+        fn Elem(comptime name: []const u8) type {
+            return @typeInfo(Field(name)).pointer.child;
+        }
+
+        fn Public(comptime name: []const u8) type {
+            return @FieldType(Elem(name), "public");
+        }
+
+        pub fn field(comptime name: []const u8) fn (?*const H) callconv(.c) Field(name) {
+            return struct {
+                fn read(h: ?*const H) callconv(.c) Field(name) {
+                    const o = obj(Obj, h) orelse return std.mem.zeroes(Field(name));
+                    return @field(o, name);
+                }
+            }.read;
+        }
+
+        pub fn ref(comptime name: []const u8) fn (?*const H) callconv(.c) ?*const Field(name) {
+            return struct {
+                fn read(h: ?*const H) callconv(.c) ?*const Field(name) {
+                    const o = obj(Obj, h) orelse return null;
+                    return &@field(o, name);
+                }
+            }.read;
+        }
+
+        pub fn count(comptime name: []const u8) fn (?*const H) callconv(.c) usize {
+            return struct {
+                fn read(h: ?*const H) callconv(.c) usize {
+                    const o = obj(Obj, h) orelse return 0;
+                    return @field(o, name).len;
+                }
+            }.read;
+        }
+
+        pub fn at(comptime name: []const u8) fn (?*const H, usize) callconv(.c) Elem(name) {
+            return struct {
+                fn read(h: ?*const H, i: usize) callconv(.c) Elem(name) {
+                    const o = obj(Obj, h) orelse return std.mem.zeroes(Elem(name));
+                    const list = @field(o, name);
+                    return if (i < list.len) list[i] else std.mem.zeroes(Elem(name));
+                }
+            }.read;
+        }
+
+        pub fn refAt(
+            comptime name: []const u8,
+        ) fn (?*const H, usize) callconv(.c) ?*const Elem(name) {
+            return struct {
+                fn read(h: ?*const H, i: usize) callconv(.c) ?*const Elem(name) {
+                    const o = obj(Obj, h) orelse return null;
+                    const list = @field(o, name);
+                    return if (i < list.len) &list[i] else null;
+                }
+            }.read;
+        }
+
+        /// `refAt` of a list whose items keep their public part in `public`.
+        pub fn publicAt(
+            comptime name: []const u8,
+        ) fn (?*const H, usize) callconv(.c) ?*const Public(name) {
+            return struct {
+                fn read(h: ?*const H, i: usize) callconv(.c) ?*const Public(name) {
+                    const o = obj(Obj, h) orelse return null;
+                    const list = @field(o, name);
+                    return if (i < list.len) &list[i].public else null;
+                }
+            }.read;
+        }
+
+        /// For handles that are nothing but their arena.
+        pub fn free() fn (?*H) callconv(.c) void {
+            return struct {
+                fn f(h: ?*H) callconv(.c) void {
+                    const o = obj(Obj, h) orelse return;
+                    freeArena(o.arena);
+                }
+            }.f;
+        }
+    };
+}
+
 pub fn handle(comptime H: type, p: anytype) *H {
     return @ptrCast(p);
 }
@@ -307,6 +398,47 @@ pub const ProblemSpec = struct {
     op_index: i64 = -1,
 };
 
+pub const Problems = std.ArrayList(ProblemSpec);
+
+/// The problems of one op of a list being checked.
+pub const OpCheck = struct {
+    a: Allocator,
+    problems: *Problems,
+    index: i64,
+    field: api.Field = .unknown,
+
+    pub fn at(a: Allocator, problems: *Problems, index: usize) OpCheck {
+        return .{ .a = a, .problems = problems, .index = @intCast(index) };
+    }
+
+    pub fn add(c: OpCheck, kind: api.ProblemKind, message: []const u8) !void {
+        try c.addValue(kind, "", message);
+    }
+
+    pub fn addValue(
+        c: OpCheck,
+        kind: api.ProblemKind,
+        value: []const u8,
+        message: []const u8,
+    ) !void {
+        try c.problems.append(c.a, .{
+            .kind = kind,
+            .field = c.field,
+            .value = value,
+            .message = message,
+            .op_index = c.index,
+        });
+    }
+
+    /// Input types carry reserved space, which must be zero: a later minor
+    /// version may give it a meaning. True when the op's isn't.
+    pub fn reserved(c: OpCheck, op: api.Op) !bool {
+        if (!hasReserved(op)) return false;
+        try c.add(.bad_format, "reserved fields must be zero");
+        return true;
+    }
+};
+
 pub fn problem(arena: Allocator, p: ProblemSpec) Allocator.Error!api.Problem {
     return .{
         .kind = @intFromEnum(p.kind),
@@ -339,10 +471,8 @@ pub fn borrowedProblems(arena: Allocator, items: []const ProblemSpec) Allocator.
     return list;
 }
 
-pub fn issuez_problems_len(p: ?*const api.Problems) callconv(.c) usize {
-    const list = obj(ProblemList, p) orelse return 0;
-    return list.items.len;
-}
+const ProblemListReads = Reads(api.Problems, ProblemList);
+pub const issuez_problems_len = ProblemListReads.count("items");
 
 pub fn issuez_problems_at(p: ?*const api.Problems, i: usize) callconv(.c) ?*const api.Problem {
     const list = obj(ProblemList, p) orelse return null;
@@ -382,6 +512,16 @@ pub const Detail = struct {
 /// Sets *err (when wanted) and returns code.
 pub fn fail(err: ?*?*api.Error, code: Code, comptime fmt: []const u8, args: anytype) Code {
     return failWith(err, code, .{}, fmt, args);
+}
+
+pub fn oom(err: ?*?*api.Error) Code {
+    return fail(err, .e_nomem, "out of memory", .{});
+}
+
+/// The end of most calls: a new handle goes to the caller's `out`.
+pub fn give(out: anytype, made: anytype, err: ?*?*api.Error) Code {
+    out.* = @ptrCast(made catch |e| return failError(err, e, .{}));
+    return .ok;
 }
 
 /// Whether flags has a bit the flag enum F doesn't define: a call fails
@@ -437,25 +577,11 @@ pub fn issuez_error_free(err: ?*api.Error) callconv(.c) void {
     freeArena(e.arena);
 }
 
-pub fn issuez_error_code(err: ?*const api.Error) callconv(.c) Code {
-    const e = obj(ErrorObj, err) orelse return .ok;
-    return e.code;
-}
-
-pub fn issuez_error_message(err: ?*const api.Error) callconv(.c) Str {
-    const e = obj(ErrorObj, err) orelse return .{};
-    return e.message;
-}
-
-pub fn issuez_error_subject(err: ?*const api.Error) callconv(.c) Str {
-    const e = obj(ErrorObj, err) orelse return .{};
-    return e.subject;
-}
-
-pub fn issuez_error_git_stderr(err: ?*const api.Error) callconv(.c) Str {
-    const e = obj(ErrorObj, err) orelse return .{};
-    return e.git_stderr;
-}
+const ErrorReads = Reads(api.Error, ErrorObj);
+pub const issuez_error_code = ErrorReads.field("code");
+pub const issuez_error_message = ErrorReads.field("message");
+pub const issuez_error_subject = ErrorReads.field("subject");
+pub const issuez_error_git_stderr = ErrorReads.field("git_stderr");
 
 pub fn issuez_error_current_tip(err: ?*const api.Error, out: ?*api.Oid) callconv(.c) bool {
     const e = obj(ErrorObj, err) orelse return false;
@@ -630,19 +756,9 @@ pub fn issuez_cancel_free(c: ?*api.Cancel) callconv(.c) void {
     gpa.destroy(t);
 }
 
-/// Input types carry reserved space, which must be zero: a later minor
-/// version may give it a meaning.
 pub fn hasReserved(x: anytype) bool {
     for (x.reserved) |r| if (r != 0) return true;
     return false;
-}
-
-pub fn reservedProblem(op_index: i64) ProblemSpec {
-    return .{
-        .kind = .bad_format,
-        .message = "reserved fields must be zero",
-        .op_index = op_index,
-    };
 }
 
 pub fn cancelled(c: ?*api.Cancel) bool {

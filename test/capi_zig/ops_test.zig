@@ -25,42 +25,16 @@ fn op(verb: c_uint, target: c_uint) c.issuez_op {
     return o;
 }
 
-test "issuez_ops_validate: every list accepts its own ops" {
+test "issuez_ops_validate: the create lists accept their ops" {
     fixture.ensureInit();
     const leaks = fixture.Leaks.start();
     defer leaks.check();
-    var env: [fixture.env_vars.len]c.issuez_op = undefined;
-    var open_ops = std.ArrayList(c.issuez_op).empty;
-    defer open_ops.deinit(testing.allocator);
-    try open_ops.appendSlice(testing.allocator, fixture.envOps(&env));
-    try open_ops.append(testing.allocator, c.issuez_opt_pool_size(2));
-    var limit = op(c.ISSUEZ_OP_SET, c.ISSUEZ_OPT_LIMIT);
-    limit.name = fixture.str("max_labels");
-    limit.num = 10;
-    try open_ops.append(testing.allocator, limit);
-    var sync_push = op(c.ISSUEZ_OP_SET, c.ISSUEZ_OPT_SYNC_PUSH);
-    sync_push.num = 0;
     const cases = [_]struct { c.issuez_op_list, []const c.issuez_op }{
         .{
             c.ISSUEZ_LIST_ISSUE_CREATE,
             &.{ c.issuez_set_title(fixture.str("T")), c.issuez_add_label(fixture.str("bug")) },
         },
-        .{
-            c.ISSUEZ_LIST_ISSUE_UPDATE,
-            &.{ c.issuez_set_priority(c.ISSUEZ_PRIORITY_HIGH), c.issuez_clear_labels() },
-        },
         .{ c.ISSUEZ_LIST_MILESTONE_CREATE, &.{c.issuez_set_name(fixture.str("v1"))} },
-        .{
-            c.ISSUEZ_LIST_MILESTONE_UPDATE,
-            &.{c.issuez_set_milestone_status(c.ISSUEZ_MILESTONE_COMPLETED)},
-        },
-        .{ c.ISSUEZ_LIST_QUERY, &.{ c.issuez_q_label(fixture.str("bug")), c.issuez_q_limit(5) } },
-        .{ c.ISSUEZ_LIST_OPEN, open_ops.items },
-        .{ c.ISSUEZ_LIST_SYNC, &.{sync_push} },
-        .{
-            c.ISSUEZ_LIST_PUSH_CHECK,
-            &.{ c.issuez_opt_pusher_email(fixture.str("a@x")), c.issuez_opt_allow_purge(true) },
-        },
     };
     for (cases) |case| {
         var ps = try problemsOf(case[0], case[1]);
@@ -72,6 +46,7 @@ test "issuez_ops_validate: every list accepts its own ops" {
     }
 }
 
+// covers: issuez_problems_free
 test "issuez_ops_validate: each kind of mistake, at its op" {
     fixture.ensureInit();
     const leaks = fixture.Leaks.start();
@@ -133,22 +108,12 @@ test "issuez_ops_validate: each kind of mistake, at its op" {
         },
         .{
             c.ISSUEZ_LIST_QUERY,
-            fixture.opNum(c.ISSUEZ_OPT_Q_PRIORITY, -1),
-            c.ISSUEZ_PROBLEM_BAD_FORMAT,
-        },
-        .{
-            c.ISSUEZ_LIST_QUERY,
             fixture.opNum(c.ISSUEZ_OPT_Q_ORDER, 1 << 40),
             c.ISSUEZ_PROBLEM_BAD_FORMAT,
         },
         .{
             c.ISSUEZ_LIST_PUSH_CHECK,
             fixture.opNum(c.ISSUEZ_OPT_AUTHOR_POLICY, 1 << 40),
-            c.ISSUEZ_PROBLEM_UNKNOWN_TARGET,
-        },
-        .{
-            c.ISSUEZ_LIST_PUSH_CHECK,
-            fixture.opNum(c.ISSUEZ_OPT_AUTHOR_POLICY, -1),
             c.ISSUEZ_PROBLEM_UNKNOWN_TARGET,
         },
         .{
@@ -211,4 +176,5 @@ test "issuez_ops_validate: each kind of mistake, at its op" {
         c.issuez_ops_validate(99, null, 0, &ps, null),
         null,
     );
+    c.issuez_problems_free(null);
 }

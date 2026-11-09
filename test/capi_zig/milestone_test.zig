@@ -36,54 +36,93 @@ fn load(h: *c.issuez_repo, id: c.issuez_str) !*c.issuez_milestone {
     return m.?;
 }
 
-// covers: issuez_milestone_load, issuez_milestone_free, issuez_milestone_id, issuez_milestone_tip
-// covers: issuez_milestone_name, issuez_milestone_description, issuez_milestone_status_of
-// covers: issuez_milestone_due_date, issuez_milestone_created
-test "issuez_milestone_create: every field" {
+// C fills the record by hand: no two fields here hold the same value, so a swapped field fails.
+test "issuez_milestone_info_of: every value" {
     const leaks = fixture.Leaks.start();
     defer leaks.check();
     var r: fixture.Repo = undefined;
     try r.init(.{});
     defer r.deinit();
     const h = r.handle;
-    const full = try create(h, &.{
-        c.issuez_set_name(fixture.str("v1.0")),
+    var t1: c.issuez_time = .{ .unix_seconds = 1_700_000_000, .tz_offset_minutes = 0 };
+    var t2: c.issuez_time = .{ .unix_seconds = 1_700_000_500, .tz_offset_minutes = 0 };
+    var t3: c.issuez_time = .{ .unix_seconds = 1_700_001_000, .tz_offset_minutes = 0 };
+    var opener = fixture.ada;
+    opener.at = &t1;
+    var closer = fixture.ada;
+    closer.email = fixture.str("grace@example.invalid");
+    closer.at = &t2;
+    var renamer = fixture.ada;
+    renamer.email = fixture.str("lin@example.invalid");
+    renamer.at = &t3;
+    const ops = [_]c.issuez_op{
+        c.issuez_set_name(fixture.str("v0.9")),
         c.issuez_set_description(fixture.str("The first release.")),
         c.issuez_set_due_date(.{ .year = 2026, .month = 12, .day = 24 }),
-    });
-    const m = try load(h, full.idStr());
-    try expect.str(full.idSlice(), c.issuez_milestone_id(m));
-    const tip = c.issuez_milestone_tip(m);
-    try testing.expect(c.issuez_oid_eq(&tip, &full.tip));
-    try expect.str("v1.0", c.issuez_milestone_name(m));
-    try expect.str("The first release.", c.issuez_milestone_description(m));
-    try testing.expectEqual(
-        @as(c.issuez_milestone_status, c.ISSUEZ_MILESTONE_OPEN),
-        c.issuez_milestone_status_of(m),
+    };
+    var w: ?*c.issuez_write = null;
+    var err: ?*c.issuez_error = null;
+    try expect.code(
+        c.ISSUEZ_OK,
+        c.issuez_milestone_create(h, &ops, ops.len, &opener, null, &w, &err),
+        err,
     );
-    var d: c.issuez_date = undefined;
-    try testing.expect(c.issuez_milestone_due_date(m, &d));
-    try testing.expectEqual(@as(c_int, 24), @as(c_int, d.day));
-    try testing.expect(c.issuez_milestone_created(m).unix_seconds > 1_600_000_000);
-    c.issuez_milestone_free(m);
+    var id_buf: [36]u8 = undefined;
+    @memcpy(&id_buf, fixture.slice(c.issuez_write_id(w)));
+    c.issuez_write_free(w);
+    const id = fixture.str(&id_buf);
+    const complete = [_]c.issuez_op{c.issuez_set_milestone_status(c.ISSUEZ_MILESTONE_COMPLETED)};
+    try expect.code(
+        c.ISSUEZ_OK,
+        c.issuez_milestone_update(h, id, &complete, 1, &closer, null, &w, &err),
+        err,
+    );
+    c.issuez_write_free(w);
+    const rename = [_]c.issuez_op{c.issuez_set_name(fixture.str("v1.0"))};
+    try expect.code(
+        c.ISSUEZ_OK,
+        c.issuez_milestone_update(h, id, &rename, 1, &renamer, null, &w, &err),
+        err,
+    );
+    const tip = c.issuez_write_new_tip(w);
+    c.issuez_write_free(w);
 
-    // Imported completed; minimal.
-    const done = try create(
-        h,
-        &.{
-            c.issuez_set_name(fixture.str("v0.9")),
-            c.issuez_set_milestone_status(c.ISSUEZ_MILESTONE_COMPLETED),
-        },
-    );
-    const dm = try load(h, done.idStr());
-    try testing.expectEqual(
-        @as(c.issuez_milestone_status, c.ISSUEZ_MILESTONE_COMPLETED),
-        c.issuez_milestone_status_of(dm),
-    );
-    try testing.expect(!c.issuez_milestone_due_date(dm, &d));
-    try expect.str("", c.issuez_milestone_description(dm));
-    c.issuez_milestone_free(dm);
+    const m = try load(h, id);
+    defer c.issuez_milestone_free(m);
+    const info = c.issuez_milestone_info_of(m);
+    try testing.expect(c.issuez_milestone_info_of(m) == info);
+    try expect.str(&id_buf, info.*.id);
+    try testing.expect(c.issuez_oid_eq(&info.*.tip, &tip));
+    try expect.str("v1.0", info.*.name);
+    try expect.str("The first release.", info.*.description);
+    try testing.expectEqual(@as(u32, c.ISSUEZ_MILESTONE_COMPLETED), info.*.status);
+    try testing.expectEqual(c.issuez_date{ .year = 2026, .month = 12, .day = 24 }, info.*.due_date);
+    try testing.expectEqual(t1.unix_seconds, info.*.created.unix_seconds);
+    try testing.expectEqual(t3.unix_seconds, info.*.updated.unix_seconds);
+    try testing.expect(info.*.has_status_changed);
+    try testing.expectEqual(t2.unix_seconds, info.*.status_changed.unix_seconds);
+    try expect.str("ada@example.invalid", info.*.author.*.email);
+}
+
+// covers: issuez_milestone_load, issuez_milestone_free, issuez_milestone_create
+test "issuez_milestone_info_of: a minimal one, NULL, and what can't be created or found" {
+    const leaks = fixture.Leaks.start();
+    defer leaks.check();
+    var r: fixture.Repo = undefined;
+    try r.init(.{});
+    defer r.deinit();
+    const h = r.handle;
+    const made = try fixture.milestone(h, "Minimal");
+    const m = try load(h, made.idStr());
+    const info = c.issuez_milestone_info_of(m);
+    try testing.expectEqual(@as(u32, c.ISSUEZ_MILESTONE_OPEN), info.*.status);
+    try expect.str("", info.*.description);
+    try testing.expectEqual(std.mem.zeroes(c.issuez_date), info.*.due_date);
+    try testing.expect(!info.*.has_status_changed);
+    try testing.expectEqual(@as(i64, 0), info.*.status_changed.unix_seconds);
+    c.issuez_milestone_free(m);
     c.issuez_milestone_free(null);
+    try testing.expect(c.issuez_milestone_info_of(null) == null);
 
     var w: ?*c.issuez_write = null;
     var err: ?*c.issuez_error = null;
@@ -91,6 +130,18 @@ test "issuez_milestone_create: every field" {
     try expect.code(
         c.ISSUEZ_E_INVALID_VALUE,
         c.issuez_milestone_create(h, &nameless, 1, &fixture.ada, null, &w, &err),
+        err,
+    );
+    c.issuez_error_free(err);
+    err = null;
+    // A milestone has no original author: refused, not dropped.
+    const imported = [_]c.issuez_op{
+        c.issuez_set_name(fixture.str("v2")),
+        c.issuez_set_original_author(fixture.str("octo@example.invalid")),
+    };
+    try expect.code(
+        c.ISSUEZ_E_INVALID_VALUE,
+        c.issuez_milestone_create(h, &imported, imported.len, &fixture.ada, null, &w, &err),
         err,
     );
     c.issuez_error_free(err);
@@ -103,7 +154,6 @@ test "issuez_milestone_create: every field" {
         err,
     );
     c.issuez_error_free(err);
-    try expect.str("", c.issuez_milestone_name(null));
 }
 
 // covers: issuez_milestone_list_len, issuez_milestone_list_at, issuez_milestone_list_free
@@ -125,7 +175,7 @@ test "issuez_milestone_list_all: none, several" {
     try testing.expectEqual(@as(usize, 3), c.issuez_milestone_list_len(list));
     var names: [3][]const u8 = undefined;
     for (&names, 0..) |*n, i| n.* = fixture.slice(
-        c.issuez_milestone_name(c.issuez_milestone_list_at(list, i)),
+        c.issuez_milestone_info_of(c.issuez_milestone_list_at(list, i)).*.name,
     );
     std.mem.sort([]const u8, &names, {}, struct {
         fn lt(_: void, x: []const u8, y: []const u8) bool {
@@ -162,7 +212,7 @@ test "issuez_milestone_update: rename, due, status, stale" {
         null,
     );
     var m = try load(h, id);
-    try expect.str("Summer", c.issuez_milestone_name(m));
+    try expect.str("Summer", c.issuez_milestone_info_of(m).*.name);
     c.issuez_milestone_free(m);
     try expect.code(c.ISSUEZ_OK, update(h, id, &.{c.issuez_clear_due_date()}), null);
     try expect.code(
@@ -171,12 +221,9 @@ test "issuez_milestone_update: rename, due, status, stale" {
         null,
     );
     m = try load(h, id);
-    var d: c.issuez_date = undefined;
-    try testing.expect(!c.issuez_milestone_due_date(m, &d));
-    try testing.expectEqual(
-        @as(c.issuez_milestone_status, c.ISSUEZ_MILESTONE_RETIRED),
-        c.issuez_milestone_status_of(m),
-    );
+    const retired = c.issuez_milestone_info_of(m);
+    try testing.expectEqual(std.mem.zeroes(c.issuez_date), retired.*.due_date);
+    try testing.expectEqual(@as(u32, c.ISSUEZ_MILESTONE_RETIRED), retired.*.status);
     c.issuez_milestone_free(m);
     try expect.code(
         c.ISSUEZ_OK,
@@ -186,6 +233,12 @@ test "issuez_milestone_update: rename, due, status, stale" {
     try expect.code(
         c.ISSUEZ_E_VERSION_MISMATCH,
         update(h, id, &.{ c.issuez_set_name(fixture.str("Autumn")), c.issuez_expect(made.tip) }),
+        null,
+    );
+    // Nothing to write: the engine never gets to see this one.
+    try expect.code(
+        c.ISSUEZ_E_VERSION_MISMATCH,
+        update(h, id, &.{c.issuez_expect(made.tip)}),
         null,
     );
     try expect.code(
@@ -248,11 +301,9 @@ test "issuez_milestone_check: valid, completing with open work, nothing written"
     c.issuez_problems_free(ps);
     const ml = try load(h, id);
     defer c.issuez_milestone_free(ml);
-    try expect.str("Busy", c.issuez_milestone_name(ml));
-    try testing.expectEqual(
-        @as(c.issuez_milestone_status, c.ISSUEZ_MILESTONE_OPEN),
-        c.issuez_milestone_status_of(ml),
-    );
+    try expect.str("Busy", c.issuez_milestone_info_of(ml).*.name);
+    const info = c.issuez_milestone_info_of(ml);
+    try testing.expectEqual(@as(u32, c.ISSUEZ_MILESTONE_OPEN), info.*.status);
 }
 
 test "issuez_milestone_problems: two clones renamed it differently" {
@@ -283,38 +334,4 @@ test "issuez_milestone_problems: two clones renamed it differently" {
     const pl = try load(h, plain.idStr());
     defer c.issuez_milestone_free(pl);
     try testing.expectEqual(@as(usize, 0), c.issuez_problems_len(c.issuez_milestone_problems(pl)));
-}
-
-// covers: issuez_milestone_status_changed, issuez_milestone_author
-test "issuez_milestone_updated: times and who" {
-    const leaks = fixture.Leaks.start();
-    defer leaks.check();
-    var r: fixture.Repo = undefined;
-    try r.init(.{});
-    defer r.deinit();
-    const h = r.handle;
-    const made = try fixture.milestone(h, "Spring");
-    const id = made.idStr();
-    var m = try load(h, id);
-    var t: c.issuez_time = undefined;
-    try testing.expect(!c.issuez_milestone_status_changed(m, &t));
-    try testing.expectEqual(
-        c.issuez_milestone_created(m).unix_seconds,
-        c.issuez_milestone_updated(m).unix_seconds,
-    );
-    try expect.str("ada@example.invalid", c.issuez_milestone_author(m).*.email);
-    c.issuez_milestone_free(m);
-    try expect.code(
-        c.ISSUEZ_OK,
-        update(h, id, &.{c.issuez_set_milestone_status(c.ISSUEZ_MILESTONE_COMPLETED)}),
-        null,
-    );
-    m = try load(h, id);
-    defer c.issuez_milestone_free(m);
-    try testing.expect(c.issuez_milestone_status_changed(m, &t));
-    try testing.expect(t.unix_seconds >= c.issuez_milestone_created(m).unix_seconds);
-    try testing.expect(c.issuez_milestone_status_changed(m, null));
-    try testing.expect(!c.issuez_milestone_status_changed(null, &t));
-    try testing.expect(c.issuez_milestone_author(null) == null);
-    try testing.expectEqual(@as(i64, 0), c.issuez_milestone_updated(null).unix_seconds);
 }
