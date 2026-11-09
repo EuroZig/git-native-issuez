@@ -577,11 +577,7 @@ pub fn Catalog(comptime B: type) type {
                     if (!std.mem.eql(u8, m orelse continue, c.id)) continue;
                     if (!proj.isDone(@intCast(i))) return error.OpenWorkInMilestone;
                     try verify.append(arena, .{
-                        .name = try std.fmt.allocPrint(
-                            arena,
-                            "{s}{s}",
-                            .{ repo_mod.issue_ref_prefix, issue.id },
-                        ),
+                        .name = try repo_mod.refNameOf(arena, issue.id),
                         .op = .{ .verify = issue.tip },
                     });
                 }
@@ -667,14 +663,17 @@ fn checkName(n: []const u8) error{InvalidText}!void {
 
 const testing = std.testing;
 const GitSim = @import("../backend/GitSim.zig");
+const TestRepo = @import("test_repo.zig").TestRepo;
+
+fn refOf(a: Allocator, id: []const u8) ![]const u8 {
+    return std.fmt.allocPrint(a, "refs/issues/{s}", .{id});
+}
 
 test "catalog" {
-    var arena_state: std.heap.ArenaAllocator = .init(testing.allocator);
-    defer arena_state.deinit();
-    const arena = arena_state.allocator();
-    var world: GitSim.World = .{ .seed = 51, .clones = &.{.{ .name = "a" }} };
-    var sim = try GitSim.init(arena, &world, 0);
-    const cat = Catalog(GitSim).init(&sim);
+    var fx: TestRepo = .{};
+    defer fx.deinit();
+    const arena, const sim, _ = try fx.open(51);
+    const cat = Catalog(GitSim).init(sim);
 
     const v1 = try cat.create(arena, .{
         .name = "v1.0",
@@ -755,18 +754,10 @@ fn complete(cat: Catalog(GitSim), arena: Allocator, id: []const u8) !Oid {
 }
 
 test "issues in milestones" {
-    var arena_state: std.heap.ArenaAllocator = .init(testing.allocator);
-    defer arena_state.deinit();
-    const arena = arena_state.allocator();
-    var world: GitSim.World = .{ .seed = 53, .clones = &.{.{ .name = "a" }} };
-    var sim = try GitSim.init(arena, &world, 0);
-    const cat = Catalog(GitSim).init(&sim);
-    const repo = repo_mod.Repo(GitSim).init(&sim);
-    const refOf = struct {
-        fn f(a: Allocator, id: []const u8) ![]const u8 {
-            return std.fmt.allocPrint(a, "refs/issues/{s}", .{id});
-        }
-    }.f;
+    var fx: TestRepo = .{};
+    defer fx.deinit();
+    const arena, const sim, const repo = try fx.open(53);
+    const cat = Catalog(GitSim).init(sim);
 
     const v1 = try cat.create(arena, .{ .name = "v1" }, .{});
     const mid = v1.id;
@@ -841,18 +832,10 @@ test "issues in milestones" {
 }
 
 test "milestone guards: retired, inherited work, damaged issues" {
-    var arena_state: std.heap.ArenaAllocator = .init(testing.allocator);
-    defer arena_state.deinit();
-    const arena = arena_state.allocator();
-    var world: GitSim.World = .{ .seed = 57, .clones = &.{.{ .name = "a" }} };
-    var sim = try GitSim.init(arena, &world, 0);
-    const cat = Catalog(GitSim).init(&sim);
-    const repo = repo_mod.Repo(GitSim).init(&sim);
-    const refOf = struct {
-        fn f(a: Allocator, id: []const u8) ![]const u8 {
-            return std.fmt.allocPrint(a, "refs/issues/{s}", .{id});
-        }
-    }.f;
+    var fx: TestRepo = .{};
+    defer fx.deinit();
+    const arena, const sim, const repo = try fx.open(57);
+    const cat = Catalog(GitSim).init(sim);
 
     // Issue writes don't reach milestones, and an ID goes with explicit.
     const m1 = (try cat.create(arena, .{ .name = "m1" }, .{})).id;
@@ -922,12 +905,9 @@ test "milestone guards: retired, inherited work, damaged issues" {
 }
 
 test "Catalog.choose" {
-    var arena_state: std.heap.ArenaAllocator = .init(testing.allocator);
-    defer arena_state.deinit();
-    const arena = arena_state.allocator();
-    var world: GitSim.World = .{ .seed = 52, .clones = &.{.{ .name = "a" }} };
-    var sim = try GitSim.init(arena, &world, 0);
-    const repo = repo_mod.Repo(GitSim).init(&sim);
+    var fx: TestRepo = .{};
+    defer fx.deinit();
+    const arena, _, const repo = try fx.open(52);
     const cat = Catalog(GitSim).fromRepo(repo);
 
     const v1 = try cat.create(arena, .{ .name = "v1" }, .{});
@@ -978,12 +958,10 @@ test "Catalog.choose" {
 }
 
 test "Milestone: updated, author and when its status changed" {
-    var arena_state: std.heap.ArenaAllocator = .init(testing.allocator);
-    defer arena_state.deinit();
-    const arena = arena_state.allocator();
-    var world: GitSim.World = .{ .seed = 59, .clones = &.{.{ .name = "a" }} };
-    var sim = try GitSim.init(arena, &world, 0);
-    const cat = Catalog(GitSim).init(&sim);
+    var fx: TestRepo = .{};
+    defer fx.deinit();
+    const arena, const sim, _ = try fx.open(59);
+    const cat = Catalog(GitSim).init(sim);
     const made = try cat.create(arena, .{ .name = "v1" }, .{});
     var m = (try cat.find(arena, made.id)).?;
     try testing.expect(m.status_changed == null);
@@ -997,12 +975,10 @@ test "Milestone: updated, author and when its status changed" {
 }
 
 test "editBatch: issues and due dates together" {
-    var arena_state: std.heap.ArenaAllocator = .init(testing.allocator);
-    defer arena_state.deinit();
-    const arena = arena_state.allocator();
-    var world: GitSim.World = .{ .seed = 52, .clones = &.{.{ .name = "a" }} };
-    var sim = try GitSim.init(arena, &world, 0);
-    const cat = Catalog(GitSim).init(&sim);
+    var fx: TestRepo = .{};
+    defer fx.deinit();
+    const arena, const sim, _ = try fx.open(52);
+    const cat = Catalog(GitSim).init(sim);
     const v1 = try cat.create(arena, .{ .name = "v1", .due = day("2026-12-01") }, .{});
     const issue = try cat.repo.create(arena, .{ .title = "Work" }, .{});
     const ref = try std.fmt.allocPrint(arena, "refs/issues/{s}", .{issue.id});
@@ -1057,12 +1033,10 @@ test "editBatch: issues and due dates together" {
 }
 
 test "editBatch: a milestone deleted after a conflict is not found" {
-    var arena_state: std.heap.ArenaAllocator = .init(testing.allocator);
-    defer arena_state.deinit();
-    const arena = arena_state.allocator();
-    var world: GitSim.World = .{ .seed = 53, .clones = &.{.{ .name = "a" }} };
-    var sim = try GitSim.init(arena, &world, 0);
-    const cat = Catalog(GitSim).init(&sim);
+    var fx: TestRepo = .{};
+    defer fx.deinit();
+    const arena, const sim, _ = try fx.open(53);
+    const cat = Catalog(GitSim).init(sim);
     const v1 = try cat.create(arena, .{ .name = "v1" }, .{});
     const name = try repo_mod.milestoneRefName(arena, v1.id);
     try sim.updateRefs(&.{.{ .name = name, .op = .{ .delete = v1.tip } }});
@@ -1081,12 +1055,10 @@ fn day(text: []const u8) fields_fmt.Date {
 }
 
 test "WriteOptions: milestone writes and batches take a dry run and an author ID" {
-    var arena_state: std.heap.ArenaAllocator = .init(testing.allocator);
-    defer arena_state.deinit();
-    const arena = arena_state.allocator();
-    var world: GitSim.World = .{ .seed = 64, .clones = &.{.{ .name = "a" }} };
-    var sim = try GitSim.init(arena, &world, 0);
-    const cat = Catalog(GitSim).init(&sim);
+    var fx: TestRepo = .{};
+    defer fx.deinit();
+    const arena, const sim, _ = try fx.open(64);
+    const cat = Catalog(GitSim).init(sim);
     const dry = try cat.create(arena, .{ .name = "v0" }, .{ .dry_run = true });
     try testing.expect(try cat.find(arena, dry.id) == null);
 

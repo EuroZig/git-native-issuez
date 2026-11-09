@@ -13,6 +13,17 @@ fn gitIssue(sb: *Sandbox, args: []const []const u8) !Sandbox.Output {
     return sb.tool(paths.git_issue_exe, args);
 }
 
+/// `git issue args...` in another repository than the sandbox's.
+fn gitIssueIn(sb: *Sandbox, dir: []const u8, args: []const []const u8) !Sandbox.Output {
+    return sb.toolIn(dir, paths.git_issue_exe, args);
+}
+
+/// The new issue's ID, from the output of a `create` that has to succeed.
+fn createdId(out: Sandbox.Output) ![]const u8 {
+    try expectSuccess(out);
+    return std.mem.trimEnd(u8, out.stdout["Created issue ".len..], "\n");
+}
+
 fn expectFailure(out: Sandbox.Output, code: u8, stderr: []const u8) !void {
     testing.expectEqual(code, out.code) catch |err| {
         std.debug.print("stderr: {s}\n", .{out.stderr});
@@ -44,9 +55,7 @@ test "missing identity" {
 test "identity from the environment needs no config" {
     var sb = try Sandbox.init(.{});
     defer sb.deinit();
-    const created = try gitIssue(&sb, &.{ "create", "From env" });
-    try expectSuccess(created);
-    const id = std.mem.trimEnd(u8, created.stdout["Created issue ".len..], "\n");
+    const id = try createdId(try gitIssue(&sb, &.{ "create", "From env" }));
     const shown = try gitIssue(&sb, &.{ "show", id });
     try expectSuccess(shown);
     try testing.expect(std.mem.find(
@@ -140,9 +149,7 @@ test "lazygit commands" {
 test "lazygit: the menu in docs/lazygit.md works" {
     var sb = try Sandbox.init(.{});
     defer sb.deinit();
-    const hub = try std.fmt.allocPrint(sb.arena(), "{s}-hub.git", .{sb.repo});
-    try sb.git(&.{ "init", "-q", "--bare", hub });
-    try sb.git(&.{ "remote", "add", "origin", hub });
+    const hub = try sb.originHub();
 
     // n: with and without the optional priority and label.
     try expectSuccess(try gitIssue(
@@ -222,9 +229,8 @@ test "sync with a path or a URL instead of a remote's name" {
     var sb = try Sandbox.init(.{});
     defer sb.deinit();
     const arena = sb.arena();
-    const hub = try std.fmt.allocPrint(arena, "{s}-hub.git", .{sb.repo});
+    const hub = try sb.hub();
     const bob = try std.fmt.allocPrint(arena, "{s}-bob", .{sb.repo});
-    try sb.git(&.{ "init", "-q", "--bare", hub });
     try sb.git(&.{ "init", "-q", bob });
     try expectSuccess(try gitIssue(&sb, &.{ "create", "Synced by path" }));
 
@@ -255,20 +261,8 @@ test "quarantine" {
     var sb = try Sandbox.init(.{});
     defer sb.deinit();
     const arena = sb.arena();
-    const hub = try std.fmt.allocPrint(arena, "{s}-hub.git", .{sb.repo});
-    const bob = try std.fmt.allocPrint(arena, "{s}-bob", .{sb.repo});
-    try sb.git(&.{ "init", "-q", "--bare", hub });
-    try sb.git(&.{ "init", "-q", bob });
-    try sb.git(&.{ "remote", "add", "origin", hub });
-    try expectSuccess(try sb.runIn(bob, &.{ "git", "remote", "add", "origin", hub }));
-    const inBob = struct {
-        fn run(s: *Sandbox, dir: []const u8, args: []const []const u8) !Sandbox.Output {
-            var argv: std.ArrayList([]const u8) = .empty;
-            try argv.append(s.arena(), try s.exe(paths.git_issue_exe));
-            try argv.appendSlice(s.arena(), args);
-            return s.runIn(dir, argv.items);
-        }
-    }.run;
+    const hub = try sb.originHub();
+    const bob = try sb.clone("bob", hub);
 
     // Alice's issue reaches the hub.
     try expectSuccess(try gitIssue(&sb, &.{ "create", "Alice's" }));
@@ -283,7 +277,7 @@ test "quarantine" {
     const short = ref_name["refs/issues/".len..][0..7];
 
     // Bob has an unrelated issue under the same ID.
-    try expectSuccess(try inBob(&sb, bob, &.{ "create", "Bob's" }));
+    try expectSuccess(try gitIssueIn(&sb, bob, &.{ "create", "Bob's" }));
     const own = try sb.runIn(bob, &list);
     var own_parts = std.mem.tokenizeAny(u8, own.stdout, " \n");
     const own_ref = own_parts.next().?;
@@ -291,39 +285,39 @@ test "quarantine" {
     try expectSuccess(try sb.runIn(bob, &.{ "git", "update-ref", ref_name, bob_tip }));
     try expectSuccess(try sb.runIn(bob, &.{ "git", "update-ref", "-d", own_ref }));
 
-    const merged = try inBob(&sb, bob, &.{ "merge", "origin" });
+    const merged = try gitIssueIn(&sb, bob, &.{ "merge", "origin" });
     try expectSuccess(merged);
     try testing.expect(std.mem.find(u8, merged.stderr, "Quarantined ") != null);
     try testing.expect(std.mem.find(u8, merged.stderr, "git issue status") != null);
 
-    const status = try inBob(&sb, bob, &.{"status"});
+    const status = try gitIssueIn(&sb, bob, &.{"status"});
     try expectSuccess(status);
     try testing.expect(std.mem.find(u8, status.stdout, "quarantined: 1") != null);
     try testing.expect(std.mem.find(u8, status.stdout, "unrelated history") != null);
     const hint = try std.fmt.allocPrint(arena, "--accept-remote {s}", .{short});
     try testing.expect(std.mem.find(u8, status.stdout, hint) != null);
 
-    const fsck = try inBob(&sb, bob, &.{"fsck"});
+    const fsck = try gitIssueIn(&sb, bob, &.{"fsck"});
     try expectSuccess(fsck); // a sync state, not an error
     try testing.expect(std.mem.find(u8, fsck.stderr, "note: 1 issue(s) quarantined") != null);
 
     // Keep local: still unpushed, but merges stop warning.
-    try expectSuccess(try inBob(&sb, bob, &.{ "quarantine", "origin", "--keep-local", short }));
-    const quiet = try inBob(&sb, bob, &.{ "merge", "origin" });
+    try expectSuccess(
+        try gitIssueIn(&sb, bob, &.{ "quarantine", "origin", "--keep-local", short }),
+    );
+    const quiet = try gitIssueIn(&sb, bob, &.{ "merge", "origin" });
     try expectSuccess(quiet);
     try testing.expect(std.mem.find(u8, quiet.stderr, "Quarantined") == null);
     try testing.expect(std.mem.find(
         u8,
-        (try inBob(&sb, bob, &.{"status"})).stdout,
+        (try gitIssueIn(&sb, bob, &.{"status"})).stdout,
         "; kept local",
     ) != null);
 
     // Accept remote: Alice's version, Bob's kept in a ref.
-    try expectSuccess(try inBob(
-        &sb,
-        bob,
-        &.{ "quarantine", "origin", "--accept-remote", short },
-    ));
+    try expectSuccess(
+        try gitIssueIn(&sb, bob, &.{ "quarantine", "origin", "--accept-remote", short }),
+    );
     const now = try sb.runIn(bob, &.{ "git", "rev-parse", ref_name });
     try testing.expectEqualStrings(alice_tip, std.mem.trimEnd(u8, now.stdout, "\n"));
     const backup = try std.fmt.allocPrint(
@@ -335,24 +329,19 @@ test "quarantine" {
     try testing.expectEqualStrings(bob_tip, std.mem.trimEnd(u8, kept.stdout, "\n"));
     try testing.expect(std.mem.find(
         u8,
-        (try inBob(&sb, bob, &.{"status"})).stdout,
+        (try gitIssueIn(&sb, bob, &.{"status"})).stdout,
         "in sync",
     ) != null);
 
-    const again = try inBob(&sb, bob, &.{ "quarantine", "origin", "--keep-local", short });
+    const again = try gitIssueIn(&sb, bob, &.{ "quarantine", "origin", "--keep-local", short });
     try testing.expectEqual(@as(u8, 1), again.code);
 }
 
 test "upstream's fetch refspec doesn't reset unpushed changes" {
     var sb = try Sandbox.init(.{});
     defer sb.deinit();
-    const arena = sb.arena();
-    const hub = try std.fmt.allocPrint(arena, "{s}-hub.git", .{sb.repo});
-    try sb.git(&.{ "init", "-q", "--bare", hub });
-    try sb.git(&.{ "remote", "add", "origin", hub });
-    const created = try gitIssue(&sb, &.{ "create", "Shared" });
-    try expectSuccess(created);
-    const id = std.mem.trimEnd(u8, created.stdout["Created issue ".len..], "\n");
+    const hub = try sb.originHub();
+    const id = try createdId(try gitIssue(&sb, &.{ "create", "Shared" }));
     try expectSuccess(try gitIssue(&sb, &.{ "push", "origin" }));
 
     // What upstream's `git issue init` writes. A fetch through it would
@@ -376,9 +365,7 @@ test "sync fetches once" {
     var sb = try Sandbox.init(.{});
     defer sb.deinit();
     const arena = sb.arena();
-    const hub = try std.fmt.allocPrint(arena, "{s}-hub.git", .{sb.repo});
-    try sb.git(&.{ "init", "-q", "--bare", hub });
-    try sb.git(&.{ "remote", "add", "origin", hub });
+    _ = try sb.originHub();
     try expectSuccess(try gitIssue(&sb, &.{ "create", "Shared" }));
 
     // The merge's fetch serves the push: one fetch, one `git remote`.
@@ -394,10 +381,7 @@ test "sync fetches once" {
 test "remote branches named issues/ are not issues" {
     var sb = try Sandbox.init(.{});
     defer sb.deinit();
-    const arena = sb.arena();
-    const hub = try std.fmt.allocPrint(arena, "{s}-hub.git", .{sb.repo});
-    try sb.git(&.{ "init", "-q", "--bare", hub });
-    try sb.git(&.{ "remote", "add", "origin", hub });
+    _ = try sb.originHub();
     try sb.git(&.{ "commit", "-q", "--allow-empty", "-m", "Fix login" });
     try sb.git(&.{ "push", "-q", "origin", "HEAD:refs/heads/issues/123-fix-login" });
     // The default refspec tracks it as refs/remotes/origin/issues/123-fix-login.
@@ -416,9 +400,7 @@ test "a push the remote refuses" {
     var sb = try Sandbox.init(.{});
     defer sb.deinit();
     const arena = sb.arena();
-    const hub = try std.fmt.allocPrint(arena, "{s}-hub.git", .{sb.repo});
-    try sb.git(&.{ "init", "-q", "--bare", hub });
-    try sb.git(&.{ "remote", "add", "origin", hub });
+    const hub = try sb.originHub();
     const hook = try std.fmt.allocPrint(arena, "{s}/hooks/pre-receive", .{hub});
     try expectSuccess(try sb.run(&.{
         "sh", "-c",
@@ -441,9 +423,7 @@ test "push-check as a pre-receive hook, in git's quarantine" {
     var sb = try Sandbox.init(.{});
     defer sb.deinit();
     const arena = sb.arena();
-    const hub = try std.fmt.allocPrint(arena, "{s}-hub.git", .{sb.repo});
-    try sb.git(&.{ "init", "-q", "--bare", hub });
-    try sb.git(&.{ "remote", "add", "origin", hub });
+    const hub = try sb.originHub();
     const hook = try std.fmt.allocPrint(arena, "{s}/hooks/pre-receive", .{hub});
     const script = try std.fmt.allocPrint(
         arena,
@@ -533,9 +513,7 @@ test "parallel writers" {
     defer sb.deinit();
     const arena = sb.arena();
     const io = testing.io;
-    const created = try gitIssue(&sb, &.{ "create", "Contended" });
-    try expectSuccess(created);
-    const id = std.mem.trimEnd(u8, created.stdout["Created issue ".len..], "\n");
+    const id = try createdId(try gitIssue(&sb, &.{ "create", "Contended" }));
 
     // Four commenters and four label adders, all at once.
     const writers = 8;
@@ -597,23 +575,13 @@ test "sha256 and reftable" {
         try sb.git(&.{ "init", "-q", flag, repo });
         try sb.git(&.{ "init", "-q", "--bare", flag, hub });
         try expectSuccess(try sb.runIn(repo, &.{ "git", "remote", "add", "origin", hub }));
-        const run = struct {
-            fn f(s: *Sandbox, dir: []const u8, args: []const []const u8) !Sandbox.Output {
-                var argv: std.ArrayList([]const u8) = .empty;
-                try argv.append(s.arena(), try s.exe(paths.git_issue_exe));
-                try argv.appendSlice(s.arena(), args);
-                return s.runIn(dir, argv.items);
-            }
-        }.f;
-        const created = try run(&sb, repo, &.{ "create", "Formats", "-l", "bug" });
-        try expectSuccess(created);
-        const id = std.mem.trimEnd(u8, created.stdout["Created issue ".len..], "\n");
-        try expectSuccess(try run(&sb, repo, &.{ "comment", id, "-m", "hello" }));
-        try expectSuccess(try run(&sb, repo, &.{ "state", id, "--close" }));
-        try expectSuccess(try run(&sb, repo, &.{ "sync", "origin" }));
-        const listed = try run(&sb, repo, &.{ "ls", "--all" });
+        const id = try createdId(try gitIssueIn(&sb, repo, &.{ "create", "Formats", "-l", "bug" }));
+        try expectSuccess(try gitIssueIn(&sb, repo, &.{ "comment", id, "-m", "hello" }));
+        try expectSuccess(try gitIssueIn(&sb, repo, &.{ "state", id, "--close" }));
+        try expectSuccess(try gitIssueIn(&sb, repo, &.{ "sync", "origin" }));
+        const listed = try gitIssueIn(&sb, repo, &.{ "ls", "--all" });
         try testing.expect(std.mem.find(u8, listed.stdout, "[closed] Formats") != null);
-        try expectSuccess(try run(&sb, repo, &.{"fsck"}));
+        try expectSuccess(try gitIssueIn(&sb, repo, &.{"fsck"}));
         const on_hub = try sb.runIn(
             repo,
             &.{ "git", "--git-dir", hub, "for-each-ref", "refs/issues/" },
@@ -830,11 +798,6 @@ test "completions and man pages" {
 test "tree and problems" {
     var sb = try Sandbox.init(.{});
     defer sb.deinit();
-    const idOf = struct {
-        fn f(out: Sandbox.Output) []const u8 {
-            return std.mem.trimEnd(u8, out.stdout["Created issue ".len..], "\n");
-        }
-    }.f;
     // Distinct creation times: siblings are ordered by them.
     const at = struct {
         fn set(s: *Sandbox, t: []const u8) !void {
@@ -843,16 +806,16 @@ test "tree and problems" {
         }
     }.set;
     try at(&sb, "1700000001 +0000");
-    const epic = idOf(try gitIssue(&sb, &.{ "create", "Epic" }));
+    const epic = try createdId(try gitIssue(&sb, &.{ "create", "Epic" }));
     try at(&sb, "1700000002 +0000");
-    const blocker = idOf(try gitIssue(&sb, &.{ "create", "Blocker" }));
+    const blocker = try createdId(try gitIssue(&sb, &.{ "create", "Blocker" }));
     try at(&sb, "1700000003 +0000");
-    const a = idOf(try gitIssue(
+    const a = try createdId(try gitIssue(
         &sb,
         &.{ "create", "Task A", "--parent", epic, "--blocked-by", blocker },
     ));
     try at(&sb, "1700000004 +0000");
-    const b = idOf(try gitIssue(&sb, &.{ "create", "Task B", "--parent", epic }));
+    const b = try createdId(try gitIssue(&sb, &.{ "create", "Task B", "--parent", epic }));
     try expectSuccess(try gitIssue(&sb, &.{ "state", b, "--close" }));
 
     // Closed issues without open descendants show with --all only. Progress
@@ -900,28 +863,14 @@ test "tree and problems" {
 test "ls --conflicts" {
     var sb = try Sandbox.init(.{});
     defer sb.deinit();
-    const arena = sb.arena();
-    const hub = try std.fmt.allocPrint(arena, "{s}-hub.git", .{sb.repo});
-    const other = try std.fmt.allocPrint(arena, "{s}-other", .{sb.repo});
-    try sb.git(&.{ "init", "-q", "--bare", hub });
-    try sb.git(&.{ "init", "-q", other });
-    try sb.git(&.{ "remote", "add", "origin", hub });
-    try expectSuccess(try sb.runIn(other, &.{ "git", "remote", "add", "origin", hub }));
-    const inOther = struct {
-        fn run(s: *Sandbox, dir: []const u8, args: []const []const u8) !Sandbox.Output {
-            var argv: std.ArrayList([]const u8) = .empty;
-            try argv.append(s.arena(), try s.exe(paths.git_issue_exe));
-            try argv.appendSlice(s.arena(), args);
-            return s.runIn(dir, argv.items);
-        }
-    }.run;
+    const hub = try sb.originHub();
+    const other = try sb.clone("other", hub);
 
-    const created = try gitIssue(&sb, &.{ "create", "Contested", "-p", "low" });
-    const id = std.mem.trimEnd(u8, created.stdout["Created issue ".len..], "\n");
+    const id = try createdId(try gitIssue(&sb, &.{ "create", "Contested", "-p", "low" }));
     try expectSuccess(try gitIssue(&sb, &.{ "sync", "origin" }));
-    try expectSuccess(try inOther(&sb, other, &.{ "sync", "origin" }));
-    try expectSuccess(try inOther(&sb, other, &.{ "edit", id, "-p", "high" }));
-    try expectSuccess(try inOther(&sb, other, &.{ "sync", "origin" }));
+    try expectSuccess(try gitIssueIn(&sb, other, &.{ "sync", "origin" }));
+    try expectSuccess(try gitIssueIn(&sb, other, &.{ "edit", id, "-p", "high" }));
+    try expectSuccess(try gitIssueIn(&sb, other, &.{ "sync", "origin" }));
     try expectSuccess(try gitIssue(&sb, &.{ "edit", id, "-p", "critical" }));
     try expectSuccess(try gitIssue(&sb, &.{ "sync", "origin" }));
 
@@ -937,14 +886,9 @@ test "ls --conflicts" {
 test "lifecycle commands" {
     var sb = try Sandbox.init(.{});
     defer sb.deinit();
-    const idOf = struct {
-        fn f(out: Sandbox.Output) []const u8 {
-            return std.mem.trimEnd(u8, out.stdout["Created issue ".len..], "\n");
-        }
-    }.f;
-    const top = idOf(try gitIssue(&sb, &.{ "create", "Top" }));
-    const mid = idOf(try gitIssue(&sb, &.{ "create", "Mid", "--parent", top }));
-    const leaf = idOf(try gitIssue(&sb, &.{ "create", "Leaf", "--parent", mid }));
+    const top = try createdId(try gitIssue(&sb, &.{ "create", "Top" }));
+    const mid = try createdId(try gitIssue(&sb, &.{ "create", "Mid", "--parent", top }));
+    const leaf = try createdId(try gitIssue(&sb, &.{ "create", "Leaf", "--parent", mid }));
 
     try expectSuccess(try gitIssue(&sb, &.{ "close", leaf, "--reason", "completed" }));
     try expectSuccess(try gitIssue(&sb, &.{ "reopen", leaf }));
@@ -984,21 +928,8 @@ test "lifecycle commands" {
 test "milestone commands and sync" {
     var sb = try Sandbox.init(.{});
     defer sb.deinit();
-    const arena = sb.arena();
-    const hub = try std.fmt.allocPrint(arena, "{s}-hub.git", .{sb.repo});
-    const other = try std.fmt.allocPrint(arena, "{s}-other", .{sb.repo});
-    try sb.git(&.{ "init", "-q", "--bare", hub });
-    try sb.git(&.{ "init", "-q", other });
-    try sb.git(&.{ "remote", "add", "origin", hub });
-    try expectSuccess(try sb.runIn(other, &.{ "git", "remote", "add", "origin", hub }));
-    const inOther = struct {
-        fn run(s: *Sandbox, dir: []const u8, args: []const []const u8) !Sandbox.Output {
-            var argv: std.ArrayList([]const u8) = .empty;
-            try argv.append(s.arena(), try s.exe(paths.git_issue_exe));
-            try argv.appendSlice(s.arena(), args);
-            return s.runIn(dir, argv.items);
-        }
-    }.run;
+    const hub = try sb.originHub();
+    const other = try sb.clone("other", hub);
 
     const create = [_][]const u8{ "milestone", "create", "v1.0", "--due", "2026-12-01" };
     const created = try gitIssue(&sb, &create);
@@ -1011,11 +942,11 @@ test "milestone commands and sync" {
     try expectSuccess(try gitIssue(&sb, &.{ "sync", "origin" }));
 
     // The other clone gets it, completes it, pushes it back.
-    const merged = try inOther(&sb, other, &.{ "sync", "origin" });
+    const merged = try gitIssueIn(&sb, other, &.{ "sync", "origin" });
     try expectSuccess(merged);
     try testing.expect(std.mem.find(u8, merged.stdout, "Created milestone ") != null);
-    try expectSuccess(try inOther(&sb, other, &.{ "milestone", "complete", "v1.0" }));
-    try expectSuccess(try inOther(&sb, other, &.{ "sync", "origin" }));
+    try expectSuccess(try gitIssueIn(&sb, other, &.{ "milestone", "complete", "v1.0" }));
+    try expectSuccess(try gitIssueIn(&sb, other, &.{ "sync", "origin" }));
     try expectSuccess(try gitIssue(&sb, &.{ "sync", "origin" }));
 
     const ls = try gitIssue(&sb, &.{ "milestone", "ls", "--all" });
@@ -1028,15 +959,9 @@ test "milestone commands and sync" {
 test "issues in milestones" {
     var sb = try Sandbox.init(.{});
     defer sb.deinit();
-    const created = struct {
-        fn id(out: Sandbox.Output) ![]const u8 {
-            try expectSuccess(out);
-            return std.mem.trimEnd(u8, out.stdout["Created issue ".len..], "\n");
-        }
-    }.id;
     try expectSuccess(try gitIssue(&sb, &.{ "milestone", "create", "v1" }));
-    const epic = try created(try gitIssue(&sb, &.{ "create", "Epic", "--milestone", "v1" }));
-    const task = try created(try gitIssue(&sb, &.{ "create", "Task", "--parent", epic }));
+    const epic = try createdId(try gitIssue(&sb, &.{ "create", "Epic", "--milestone", "v1" }));
+    const task = try createdId(try gitIssue(&sb, &.{ "create", "Task", "--parent", epic }));
 
     // By name: the catalog ID is written next to the readable name.
     const log = try sb.run(&.{ "git", "log", "--all", "--format=%B" });
@@ -1087,9 +1012,7 @@ test "attachments" {
         "\x08\x06\x00\x00\x00\x1f\x15\xc4\x89\x00\x00\x00\x00IEND\xaeB`\x82";
     const path = try std.fmt.allocPrint(arena, "{s}/shot.png", .{sb.repo});
     try std.Io.Dir.cwd().writeFile(testing.io, .{ .sub_path = path, .data = png });
-    const created = try gitIssue(&sb, &.{ "create", "Shots" });
-    try expectSuccess(created);
-    const id = std.mem.trimEnd(u8, created.stdout["Created issue ".len..], "\n");
+    const id = try createdId(try gitIssue(&sb, &.{ "create", "Shots" }));
 
     try expectSuccess(try gitIssue(&sb, &.{ "comment", id, "-m", "Look", "--attach", path }));
     try expectFailure(
@@ -1138,21 +1061,10 @@ test "attachments over git-lfs" {
     defer sb.deinit();
     if (!have(&sb, "git-lfs")) return error.SkipZigTest;
     const arena = sb.arena();
-    const hub = try std.fmt.allocPrint(arena, "{s}-hub.git", .{sb.repo});
-    const other = try std.fmt.allocPrint(arena, "{s}-other", .{sb.repo});
+    const hub = try sb.hub();
     const url = try std.fmt.allocPrint(arena, "file://{s}", .{hub});
-    try sb.git(&.{ "init", "-q", "--bare", hub });
-    try sb.git(&.{ "init", "-q", other });
     try sb.git(&.{ "remote", "add", "origin", url });
-    try expectSuccess(try sb.runIn(other, &.{ "git", "remote", "add", "origin", url }));
-    const inOther = struct {
-        fn run(s: *Sandbox, dir: []const u8, args: []const []const u8) !Sandbox.Output {
-            var argv: std.ArrayList([]const u8) = .empty;
-            try argv.append(s.arena(), try s.exe(paths.git_issue_exe));
-            try argv.appendSlice(s.arena(), args);
-            return s.runIn(dir, argv.items);
-        }
-    }.run;
+    const other = try sb.clone("other", url);
     const png = "\x89PNG\r\n\x1a\n\x00\x00\x00\x0dIHDR\x00\x00\x00\x01\x00\x00\x00\x01" ++
         "\x08\x06\x00\x00\x00\x1f\x15\xc4\x89\x00\x00\x00\x00IEND\xaeB`\x82";
     const path = try std.fmt.allocPrint(arena, "{s}/shot.png", .{sb.repo});
@@ -1162,9 +1074,7 @@ test "attachments over git-lfs" {
     // an attachment removed before its first push.
     try expectSuccess(try sb.runIn(sb.repo, &.{ "git", "lfs", "install", "--local" }));
     try expectSuccess(try gitIssue(&sb, &.{ "init", "origin" }));
-    const created = try gitIssue(&sb, &.{ "create", "Shots" });
-    try expectSuccess(created);
-    const id = std.mem.trimEnd(u8, created.stdout["Created issue ".len..], "\n");
+    const id = try createdId(try gitIssue(&sb, &.{ "create", "Shots" }));
     // Other bytes, so its object is in no store but the derived history.
     const other_path = try std.fmt.allocPrint(arena, "{s}/old.png", .{sb.repo});
     try std.Io.Dir.cwd().writeFile(testing.io, .{ .sub_path = other_path, .data = png ++ "x" });
@@ -1178,9 +1088,9 @@ test "attachments over git-lfs" {
     const uploaded = "Uploaded 1 attachment object(s) to origin's LFS server.";
     try testing.expect(std.mem.find(u8, synced.stdout, uploaded) != null);
 
-    try expectSuccess(try inOther(&sb, other, &.{ "init", "origin" }));
-    try expectSuccess(try inOther(&sb, other, &.{ "sync", "origin" }));
-    const ls = try inOther(&sb, other, &.{ "attach", "ls", id });
+    try expectSuccess(try gitIssueIn(&sb, other, &.{ "init", "origin" }));
+    try expectSuccess(try gitIssueIn(&sb, other, &.{ "sync", "origin" }));
+    const ls = try gitIssueIn(&sb, other, &.{ "attach", "ls", id });
     try testing.expect(std.mem.find(u8, ls.stdout, "(bytes not here)") != null);
     const att = ls.stdout[0..7];
     // git-lfs reads the derived ref, so fetch rebuilds a missing one first.
@@ -1190,10 +1100,10 @@ test "attachments over git-lfs" {
     try expectSuccess(derived);
     const name = std.mem.trimEnd(u8, derived.stdout, "\n");
     try expectSuccess(try sb.runIn(other, &.{ "git", "update-ref", "-d", name }));
-    const fetched = try inOther(&sb, other, &.{ "attach", "fetch", id });
+    const fetched = try gitIssueIn(&sb, other, &.{ "attach", "fetch", id });
     try expectSuccess(fetched);
     try testing.expectEqualStrings("Fetched 1 attachment(s).\n", fetched.stdout);
-    const cat = try inOther(&sb, other, &.{ "attach", "cat", id, att });
+    const cat = try gitIssueIn(&sb, other, &.{ "attach", "cat", id, att });
     try expectSuccess(cat);
     try testing.expectEqualSlices(u8, png, cat.stdout);
 
@@ -1205,7 +1115,7 @@ test "attachments over git-lfs" {
         "-c",                    "lfs.fetchrecentcommitsdays=0", "-c",
         "lfs.pruneoffsetdays=0", "lfs",                          "prune",
     }));
-    const after = try inOther(&sb, other, &.{ "attach", "cat", id, att });
+    const after = try gitIssueIn(&sb, other, &.{ "attach", "cat", id, att });
     try expectSuccess(after);
     try testing.expectEqualSlices(u8, png, after.stdout);
 }
@@ -1220,11 +1130,9 @@ test "json output" {
             return std.json.parseFromSliceLeaky(std.json.Value, a, out.stdout, .{});
         }
     }.f;
-    const id = blk: {
-        const out = try gitIssue(&sb, &.{ "create", "Epic", "-l", "ui", "-p", "high" });
-        try expectSuccess(out);
-        break :blk std.mem.trimEnd(u8, out.stdout["Created issue ".len..], "\n");
-    };
+    const id = try createdId(
+        try gitIssue(&sb, &.{ "create", "Epic", "-l", "ui", "-p", "high" }),
+    );
     const child = try gitIssue(&sb, &.{ "create", "Child", "--parent", id, "--due", "2026-12-01" });
     try expectSuccess(child);
     try expectSuccess(try gitIssue(&sb, &.{ "comment", id, "-m", "Needle in a haystack" }));

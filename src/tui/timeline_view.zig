@@ -72,11 +72,7 @@ pub const Deps = enum {
     off,
 
     pub fn label(d: Deps) []const u8 {
-        return switch (d) {
-            .selected => "selected",
-            .all => "all",
-            .off => "off",
-        };
+        return @tagName(d);
     }
 };
 
@@ -85,10 +81,7 @@ pub const Grouping = enum {
     none,
 
     pub fn label(g: Grouping) []const u8 {
-        return switch (g) {
-            .milestone => "milestone",
-            .none => "none",
-        };
+        return @tagName(g);
     }
 };
 
@@ -674,12 +667,7 @@ pub fn draw(s: *AppState, f: ui.Frame, win: ui.Window) Allocator.Error!void {
         t.origin = c - @divFloor(t.visibleDays(), 2);
         t.center_on = null;
     }
-    if (t.follow) {
-        if (t.selected < t.scroll) t.scroll = t.selected;
-        if (t.selected >= t.scroll + t.visible) t.scroll = t.selected - t.visible + 1;
-        t.follow = false;
-    }
-    t.scroll = @min(t.scroll, @as(u32, @intCast(t.rows.len -| t.visible)));
+    ui.settleScroll(&t.scroll, &t.follow, t.selected, t.rows.len, t.visible);
 
     try drawHeader(s, f, head, today);
     if (t.rows.len == 0) {
@@ -815,103 +803,38 @@ fn isStale(t: *const State, id: []const u8) bool {
 
 fn drawBar(s: *AppState, f: ui.Frame, bar: ui.Window) Allocator.Error!void {
     const t = &s.timeline;
-    const bg: ui.Style = .{ .bg = palette.panel_bg };
-    bar.fill(.{ .style = bg });
-    var col: u16 = 1;
-    col += ui.text(
-        bar,
-        col,
-        0,
-        "/ ",
-        .{ .fg = if (s.search_focused) palette.accent else palette.muted, .bg = palette.panel_bg },
-    );
     const box_w: u16 = @min(@max(bar.width / 4, 16), 40);
-    const box = bar.child(.{ .x_off = col, .width = box_w, .height = 1 });
-    try s.tl_search.draw(
-        f.arena,
-        box,
-        .{ .bg = palette.input_bg },
-        s.search_focused,
-        "filter: words, label:x, @who, is:blocked",
-    );
-    try f.hit(box, .search);
-    col += box_w + 2;
-    const q = s.tl_query;
+    const hint = "filter: words, label:x, @who, is:blocked";
+    const x = try ui.filterBox(f, bar, &s.tl_search, s.search_focused, box_w, hint);
+    var l: ui.Line = .{ .f = f, .win = bar, .x = x };
+    const off = ui.buttonStyle(false);
     for ([_]filter.Scope{ .open, .done, .all }) |sc| {
-        col += try ui.button(
-            f,
-            bar,
-            col,
-            0,
-            sc.label(),
-            .{ .scope = sc },
-            ui.buttonStyle(q.scope == sc),
-        );
+        try l.button(sc.label(), .{ .scope = sc }, ui.buttonStyle(s.tl_query.scope == sc));
     }
-    col += 2;
+    l.x += 2;
     for (std.enums.values(Zoom)) |z| {
-        col += try ui.button(
-            f,
-            bar,
-            col,
-            0,
-            z.label(),
-            .{ .tl_zoom = z },
-            ui.buttonStyle(t.zoom == z),
-        );
+        try l.button(z.label(), .{ .tl_zoom = z }, ui.buttonStyle(t.zoom == z));
     }
-    col += 1;
-    col += try ui.button(f, bar, col, 0, "◀", .{ .tl_command = .earlier }, ui.buttonStyle(false));
-    col += try ui.button(f, bar, col, 0, "Today", .{ .tl_command = .today }, ui.buttonStyle(false));
-    col += try ui.button(f, bar, col, 0, "▶", .{ .tl_command = .later }, ui.buttonStyle(false));
-    col += 2;
-    col += try ui.button(
-        f,
-        bar,
-        col,
-        0,
-        f.fmt("Deps: {s}", .{t.deps.label()}),
-        .{ .tl_command = .deps },
-        ui.buttonStyle(false),
-    );
-    col += 1;
-    col += try ui.button(
-        f,
-        bar,
-        col,
-        0,
-        f.fmt("Group: {s}", .{t.grouping.label()}),
-        .{ .tl_command = .grouping },
-        ui.buttonStyle(false),
-    );
+    l.x += 1;
+    try l.button("◀", .{ .tl_command = .earlier }, off);
+    try l.button("Today", .{ .tl_command = .today }, off);
+    try l.button("▶", .{ .tl_command = .later }, off);
+    l.x += 2;
+    try l.button(f.fmt("Deps: {s}", .{t.deps.label()}), .{ .tl_command = .deps }, off);
+    l.x += 1;
+    try l.button(f.fmt("Group: {s}", .{t.grouping.label()}), .{ .tl_command = .grouping }, off);
     if (!t.editing) {
         const label = "✎ E edit";
         const w = bar.gwidth(label) + 2;
-        if (bar.width > col +| w +| 2) _ = try ui.button(
-            f,
-            bar,
-            bar.width - w - 1,
-            0,
-            label,
-            .{ .tl_command = .edit },
-            ui.buttonStyle(true),
-        );
+        if (bar.width > l.x +| w +| 2) {
+            l.x = bar.width - w - 1;
+            try l.button(label, .{ .tl_command = .edit }, ui.buttonStyle(true));
+        }
     }
 }
 
 const months = [_][]const u8{
-    "Jan",
-    "Feb",
-    "Mar",
-    "Apr",
-    "May",
-    "Jun",
-    "Jul",
-    "Aug",
-    "Sep",
-    "Oct",
-    "Nov",
-    "Dec",
+    "Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec",
 };
 
 fn drawHeader(s: *AppState, f: ui.Frame, head: ui.Window, today: Date) Allocator.Error!void {
@@ -987,47 +910,29 @@ fn drawLabel(
         .group => {
             const g = t.groups[r.group];
             const folded = t.isFolded(g.scope);
-            var x: u16 = 1;
-            x += ui.text(win, x, 0, if (folded) "▸ " else "▾ ", .{ .fg = palette.muted, .bg = bg });
+            var l: ui.Line = .{ .f = f, .win = win, .x = 1 };
+            l.text(if (folded) "▸ " else "▾ ", .{ .fg = palette.muted, .bg = bg });
             if (g.milestone) |n| {
-                const m = snap.milestones[n];
-                x += ui.text(win, x, 0, "◆ ", .{ .fg = palette.accent, .bg = bg });
-                x += ui.text(win, x, 0, m.name, .{ .fg = palette.accent, .bg = bg, .bold = true });
-            } else x += ui.text(
-                win,
-                x,
-                0,
-                "(no milestone)",
-                .{ .fg = palette.muted, .bg = bg, .italic = true },
-            );
-            _ = ui.text(
-                win,
-                x + 1,
-                0,
-                f.fmt("{d}", .{g.issues}),
-                .{ .fg = palette.faint, .bg = bg },
-            );
+                l.text("◆ ", .{ .fg = palette.accent, .bg = bg });
+                l.text(snap.milestones[n].name, .{ .fg = palette.accent, .bg = bg, .bold = true });
+            } else l.text("(no milestone)", .{ .fg = palette.muted, .bg = bg, .italic = true });
+            l.x += 1;
+            l.text(f.fmt("{d}", .{g.issues}), .{ .fg = palette.faint, .bg = bg });
         },
         .issue, .unscheduled_issue => {
             const i = r.issue;
             const issue = snap.issues[i];
             const done = snap.isDone(i);
-            var x: u16 = 1 + @as(u16, @min(r.depth, 6)) * 2;
-            if (t.grouping == .milestone) x += 2;
-            if (r.kind == .unscheduled_issue) x += 2;
+            var l: ui.Line = .{ .f = f, .win = win, .x = 1 + @as(u16, @min(r.depth, 6)) * 2 };
+            if (t.grouping == .milestone) l.x += 2;
+            if (r.kind == .unscheduled_issue) l.x += 2;
             const blocked = t.projection(snap).activelyBlocked(i);
-            x += ui.text(
-                win,
-                x,
-                0,
-                if (done) "✓ " else if (blocked) "⊘ " else "● ",
-                .{
-                    .fg = if (done) palette.done else if (blocked) palette.err else palette.open,
-                    .bg = bg,
-                    .dim = r.context,
-                },
-            );
-            _ = ui.text(win, x, 0, issue.title, .{
+            l.text(if (done) "✓ " else if (blocked) "⊘ " else "● ", .{
+                .fg = if (done) palette.done else if (blocked) palette.err else palette.open,
+                .bg = bg,
+                .dim = r.context,
+            });
+            l.text(issue.title, .{
                 .fg = if (done or r.context) palette.muted else .default,
                 .bg = bg,
                 .bold = selected,
@@ -1091,22 +996,13 @@ fn drawChartRow(
                 const dx = t.x(due.toDays());
                 if (dx >= 0 and dx < win.width) {
                     const moved = t.editing and isChanged(t, m.id);
-                    _ = ui.text(
-                        win,
-                        @intCast(dx),
-                        0,
-                        "◆",
-                        .{
-                            .fg = if (moved)
-                                palette.medium
-                            else if (m.status == .completed)
-                                palette.done
-                            else
-                                palette.accent,
-                            .bg = bg,
-                            .bold = true,
-                        },
-                    );
+                    const fg = if (moved)
+                        palette.medium
+                    else if (m.status == .completed)
+                        palette.done
+                    else
+                        palette.accent;
+                    _ = ui.text(win, @intCast(dx), 0, "◆", .{ .fg = fg, .bg = bg, .bold = true });
                     grid.set(y, @intCast(dx));
                 }
             }
@@ -1176,23 +1072,13 @@ fn drawChartRow(
                 },
                 .bar => {
                     // The done share of its leaves fills from the left.
-                    const share: f32 = if (snap.proj.progress(i)) |p| @as(
-                        f32,
-                        @floatFromInt(p.closed),
-                    ) / @as(f32, @floatFromInt(@max(p.total, 1))) else if (done) 1 else 0;
-                    const full_to = t.x(
-                        sp.start.toDays(),
-                    ) + @as(
-                        i32,
-                        @intFromFloat(
-                            @round(
-                                share * @as(f32, @floatFromInt(@max(
-                                    t.x(sp.end.toDays() + 1) - t.x(sp.start.toDays()),
-                                    1,
-                                ))),
-                            ),
-                        ),
-                    );
+                    const share: f32 = if (snap.proj.progress(i)) |p| blk: {
+                        const closed: f32 = @floatFromInt(p.closed);
+                        break :blk closed / @as(f32, @floatFromInt(@max(p.total, 1)));
+                    } else if (done) 1 else 0;
+                    const from = t.x(sp.start.toDays());
+                    const cover: f32 = @floatFromInt(@max(t.x(sp.end.toDays() + 1) - from, 1));
+                    const full_to = from + @as(i32, @intFromFloat(@round(share * cover)));
                     var cx = c.from;
                     while (cx <= c.to) : (cx += 1) {
                         const derived =
@@ -1284,164 +1170,79 @@ fn line(chart: ui.Window, grid: Grid, r1: u16, r2: u16, x1: i32, x2: i32, fg: va
 fn drawPanel(s: *AppState, f: ui.Frame, win: ui.Window) Allocator.Error!void {
     const t = &s.timeline;
     const snap = s.snap;
-    win.fill(.{ .style = .{ .bg = palette.bar_bg } });
-    const st: ui.Style = .{ .bg = palette.bar_bg };
+    const bg = palette.bar_bg;
+    win.fill(.{ .style = .{ .bg = bg } });
+    const st: ui.Style = .{ .bg = bg };
+    const muted: ui.Style = .{ .fg = palette.muted, .bg = bg };
+    const medium: ui.Style = .{ .fg = palette.medium, .bg = bg };
     if (t.selected >= t.rows.len) return;
     const r = t.rows[t.selected];
+    var l: ui.Line = .{ .f = f, .win = win, .x = 1 };
     switch (r.kind) {
         .group => {
             const g = t.groups[r.group];
-            const n = g.milestone orelse {
-                _ = ui.text(
-                    win,
-                    1,
-                    0,
-                    f.fmt(
-                        "Issues in no milestone: {d}, {d} without dates",
-                        .{ g.issues, g.unscheduled },
-                    ),
-                    st,
-                );
-                return;
-            };
+            const n = g.milestone orelse return l.text(f.fmt(
+                "Issues in no milestone: {d}, {d} without dates",
+                .{ g.issues, g.unscheduled },
+            ), st);
             const m = snap.milestones[n];
             const due = milestoneDue(s, n);
-            var x: u16 = 1;
-            x += ui.text(
-                win,
-                x,
-                0,
-                m.name,
-                .{ .fg = palette.accent, .bg = palette.bar_bg, .bold = true },
-            );
-            if (due) |d| x += ui.text(
-                win,
-                x,
-                0,
-                f.fmt(" · due {f}", .{d}),
-                st,
-            ) else x += ui.text(win, x, 0, " · no due date", st);
-            if (g.span) |sp| x += ui.text(
-                win,
-                x,
-                0,
-                f.fmt(" · work from {f} to {f}", .{ sp.start, sp.end }),
-                st,
-            );
+            l.text(m.name, .{ .fg = palette.accent, .bg = bg, .bold = true });
+            l.text(if (due) |d| f.fmt(" · due {f}", .{d}) else " · no due date", st);
+            if (g.span) |sp| l.text(f.fmt(" · work from {f} to {f}", .{ sp.start, sp.end }), st);
             if (g.span != null and due != null and g.span.?.end.order(due.?) == .gt) {
-                _ = ui.text(
-                    win,
-                    x,
-                    0,
-                    " · ⚠ work ends after the due date",
-                    .{ .fg = palette.medium, .bg = palette.bar_bg },
-                );
+                l.text(" · ⚠ work ends after the due date", medium);
             }
-            _ = ui.text(
-                win,
-                1,
-                1,
-                f.fmt(
-                    "{d} issues, {d} without dates · ⏎ its issues · space fold",
-                    .{ g.issues, g.unscheduled },
-                ),
-                .{ .fg = palette.muted, .bg = palette.bar_bg },
-            );
+            _ = ui.text(win, 1, 1, f.fmt(
+                "{d} issues, {d} without dates · ⏎ its issues · space fold",
+                .{ g.issues, g.unscheduled },
+            ), muted);
         },
-        .unscheduled => _ = ui.text(
-            win,
-            1,
-            0,
-            "Issues without a start or due date · space shows them",
-            .{ .fg = palette.muted, .bg = palette.bar_bg },
-        ),
+        .unscheduled => l.text("Issues without a start or due date · space shows them", muted),
         .issue, .unscheduled_issue => {
             const i = r.issue;
             const issue = snap.issues[i];
-            var x: u16 = 1;
-            x += ui.text(
-                win,
-                x,
-                0,
-                f.fmt("#{s} ", .{shortId(issue.id)}),
-                .{ .fg = palette.id, .bg = palette.bar_bg },
-            );
-            x += ui.text(win, x, 0, issue.title, .{ .bg = palette.bar_bg, .bold = true });
+            l.text(f.fmt("#{s} ", .{shortId(issue.id)}), .{ .fg = palette.id, .bg = bg });
+            l.text(issue.title, .{ .bg = bg, .bold = true });
             const d = datesOf(s, i);
             if (t.spans[i]) |sp| {
-                x += ui.text(win, x, 0, f.fmt(" · {f} → {f}", .{ sp.start, sp.end }), st);
-                if (sp.derived_start or sp.derived_end) x += ui.text(
-                    win,
-                    x,
-                    0,
-                    if (d.start == null and
-                        d.due == null) " (its work)" else " (from the estimate)",
-                    .{ .fg = palette.muted, .bg = palette.bar_bg, .italic = true },
+                l.text(f.fmt(" · {f} → {f}", .{ sp.start, sp.end }), st);
+                if (sp.derived_start or sp.derived_end) l.text(
+                    if (d.start == null and d.due == null)
+                        " (its work)"
+                    else
+                        " (from the estimate)",
+                    .{ .fg = palette.muted, .bg = bg, .italic = true },
                 );
-            } else x += ui.text(
-                win,
-                x,
-                0,
-                " · no dates",
-                .{ .fg = palette.muted, .bg = palette.bar_bg },
-            );
-            if (d.estimate_minutes) |m| x += ui.text(
-                win,
-                x,
-                0,
-                f.fmt(" · est {s}", .{ui.duration(f, m)}),
-                st,
-            );
-            if (snap.milestoneName(i)) |name| x += ui.text(
-                win,
-                x,
-                0,
-                f.fmt(" · {s}", .{name}),
-                .{ .fg = palette.accent, .bg = palette.bar_bg },
-            );
+            } else l.text(" · no dates", muted);
+            if (d.estimate_minutes) |m| l.text(f.fmt(" · est {s}", .{ui.duration(f, m)}), st);
+            if (snap.milestoneName(i)) |name| {
+                l.text(f.fmt(" · {s}", .{name}), .{ .fg = palette.accent, .bg = bg });
+            }
             // Line two: blockers and warnings.
-            var x2: u16 = 1;
+            l = .{ .f = f, .win = win, .x = 1, .y = 1 };
             const proj = t.projection(snap);
             if (t.editing and isStale(t, issue.id)) {
-                x2 += ui.text(
-                    win,
-                    x2,
-                    1,
+                l.text(
                     "! changed elsewhere since you edited it: r keeps your change, X drops it",
-                    .{ .fg = palette.err, .bg = palette.bar_bg, .bold = true },
+                    .{ .fg = palette.err, .bg = bg, .bold = true },
                 );
-                x2 += 2;
+                l.x += 2;
             }
             if (proj.blockers[i].len > 0) {
-                x2 += ui.text(
-                    win,
-                    x2,
-                    1,
-                    "blocked by",
-                    .{ .fg = palette.muted, .bg = palette.bar_bg },
-                );
-                for (proj.blockers[i]) |b| x2 += ui.text(
-                    win,
-                    x2,
-                    1,
+                l.text("blocked by", muted);
+                for (proj.blockers[i]) |b| l.text(
                     f.fmt(" #{s}", .{shortId(snap.issues[b].id)}),
-                    .{
-                        .fg = if (proj.isActive(b)) palette.err else palette.done,
-                        .bg = palette.bar_bg,
-                    },
+                    .{ .fg = if (proj.isActive(b)) palette.err else palette.done, .bg = bg },
                 );
-                x2 += 2;
+                l.x += 2;
             }
             if (proj.blocks[i].len > 0) {
-                x2 += ui.text(win, x2, 1, "blocks", .{ .fg = palette.muted, .bg = palette.bar_bg });
-                for (proj.blocks[i]) |b| x2 += ui.text(
-                    win,
-                    x2,
-                    1,
-                    f.fmt(" #{s}", .{shortId(snap.issues[b].id)}),
-                    .{ .fg = palette.medium, .bg = palette.bar_bg },
-                );
-                x2 += 2;
+                l.text("blocks", muted);
+                for (proj.blocks[i]) |b| {
+                    l.text(f.fmt(" #{s}", .{shortId(snap.issues[b].id)}), medium);
+                }
+                l.x += 2;
             }
             var wbuf: [4]schedule.Warning = undefined;
             for (warningsOf(s, i, &wbuf)) |w| {
@@ -1452,8 +1253,8 @@ fn drawPanel(s: *AppState, f: ui.Frame, win: ui.Window) Allocator.Error!void {
                     ),
                     else => f.fmt("⚠ {s}", .{w.describe()}),
                 };
-                x2 += ui.text(win, x2, 1, text, .{ .fg = palette.medium, .bg = palette.bar_bg });
-                x2 += 2;
+                l.text(text, medium);
+                l.x += 2;
             }
         },
     }
@@ -1469,43 +1270,27 @@ pub fn key(s: *AppState, k: vaxis.Key) Allocator.Error!AppState.Action {
         edit.enter(s);
         return .none;
     }
-    const sel: i64 = t.selected;
-    const page: i64 = @max(t.visible, 2) - 1;
-    if (k.matches(K.down, .{}) or k.matches('j', .{})) {
-        t.moveTo(snap, sel + 1);
-    } else if (k.matches(K.up, .{}) or k.matches('k', .{})) {
-        t.moveTo(snap, sel - 1);
-    } else if (k.matches(K.page_down, .{}) or k.matches('d', .{ .ctrl = true })) {
-        t.moveTo(snap, sel + page);
-    } else if (k.matches(K.page_up, .{}) or k.matches('u', .{ .ctrl = true })) {
-        t.moveTo(snap, sel - page);
-    } else if (k.matches(K.home, .{}) or k.matches('g', .{})) {
-        t.moveTo(snap, 0);
-    } else if (k.matches(K.end, .{}) or k.matches('G', .{})) {
-        t.moveTo(snap, @as(i64, @intCast(t.rows.len)) - 1);
+    if (ui.rowKey(k, t.selected, t.rows.len, t.visible)) |row| {
+        t.moveTo(snap, row);
     } else if (k.matches(K.left, .{}) or k.matches('h', .{}) or k.matches('(', .{})) {
         t.scrollDays(-t.zoom.unit());
     } else if (k.matches(K.right, .{}) or k.matches('l', .{}) or k.matches(')', .{})) {
         t.scrollDays(t.zoom.unit());
     } else if (k.matches(K.left, .{ .shift = true }) or k.matches('H', .{})) {
-        t.scrollDays(-@as(i32, @max(t.visibleDays() - t.zoom.unit(), 1)));
+        command(s, .earlier);
     } else if (k.matches(K.right, .{ .shift = true }) or k.matches('L', .{})) {
-        t.scrollDays(@max(t.visibleDays() - t.zoom.unit(), 1));
+        command(s, .later);
     } else if (k.matches('.', .{})) {
-        t.center_on = s.today.toDays();
+        command(s, .today);
     } else if (k.matches('z', .{})) {
         zoom(s, -1);
     } else if (k.matches('Z', .{})) {
         zoom(s, 1);
     } else if (k.matches('D', .{})) {
-        t.deps = switch (t.deps) {
-            .selected => .all,
-            .all => .off,
-            .off => .selected,
-        };
+        command(s, .deps);
         s.info("blocker lines: {s}", .{t.deps.label()});
     } else if (k.matches('v', .{})) {
-        t.grouping = if (t.grouping == .milestone) .none else .milestone;
+        command(s, .grouping);
         t.follow = true;
     } else if (k.matches(']', .{})) {
         jumpGroup(s, 1);

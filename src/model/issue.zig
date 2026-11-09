@@ -1886,15 +1886,23 @@ fn lessThan(_: void, a: []const u8, b: []const u8) bool {
 const testing = std.testing;
 
 const TestDag = struct {
-    arena: Allocator,
+    arena_state: std.heap.ArenaAllocator = .init(testing.allocator),
     commits: std.ArrayList(CommitInput) = .empty,
+
+    fn deinit(d: *TestDag) void {
+        d.arena_state.deinit();
+    }
+
+    fn arena(d: *TestDag) Allocator {
+        return d.arena_state.allocator();
+    }
 
     fn add(d: *TestDag, parents: []const usize, time: i64, message: []const u8) !usize {
         const idx = d.commits.items.len;
         var oid: Oid = .{ .object_format = .sha1, .bytes = @splat(0) };
         oid.bytes[0] = @intCast(idx + 1);
         oid.bytes[1] = 0xab;
-        const ps = try d.arena.alloc(Oid, parents.len);
+        const ps = try d.arena().alloc(Oid, parents.len);
         for (parents, ps) |p, *o| o.* = d.commits.items[p].oid;
         const sig: Signature = .{
             .name = "T",
@@ -1903,7 +1911,7 @@ const TestDag = struct {
             .tz_offset_minutes = 0,
         };
         try d.commits.append(
-            d.arena,
+            d.arena(),
             .{ .oid = oid, .parents = ps, .author = sig, .committer = sig, .message = message },
         );
         return idx;
@@ -1911,7 +1919,7 @@ const TestDag = struct {
 
     fn issue(d: *TestDag, tip: usize) !Issue {
         return materialize(
-            d.arena,
+            d.arena(),
             "a7f3b2c1-4e5d-4a8b-9c1e-2f3a4b5c6d7e",
             d.commits.items[tip].oid,
             d.commits.items,
@@ -1920,9 +1928,8 @@ const TestDag = struct {
 };
 
 test "linear history" {
-    var arena_state: std.heap.ArenaAllocator = .init(testing.allocator);
-    defer arena_state.deinit();
-    var d: TestDag = .{ .arena = arena_state.allocator() };
+    var d: TestDag = .{};
+    defer d.deinit();
     const root = try d.add(
         &.{},
         100,
@@ -1953,9 +1960,8 @@ test "linear history" {
 }
 
 test "causality beats clocks" {
-    var arena_state: std.heap.ArenaAllocator = .init(testing.allocator);
-    defer arena_state.deinit();
-    var d: TestDag = .{ .arena = arena_state.allocator() };
+    var d: TestDag = .{};
+    defer d.deinit();
     const root = try d.add(&.{}, 1000, "T\n\nState: open\nPriority: low\nFormat-Version: 1\n");
     const skewed = try d.add(&.{root}, 10, "Update priority\n\nPriority: critical\n");
     const i = try d.issue(skewed);
@@ -1964,9 +1970,8 @@ test "causality beats clocks" {
 }
 
 test "concurrent edits" {
-    var arena_state: std.heap.ArenaAllocator = .init(testing.allocator);
-    defer arena_state.deinit();
-    var d: TestDag = .{ .arena = arena_state.allocator() };
+    var d: TestDag = .{};
+    defer d.deinit();
     const root = try d.add(
         &.{},
         100,
@@ -1988,10 +1993,9 @@ test "concurrent edits" {
 }
 
 test "changesNothing: restated fields, a resolved conflict, what the fold doesn't hold" {
-    var arena_state: std.heap.ArenaAllocator = .init(testing.allocator);
-    defer arena_state.deinit();
-    const arena = arena_state.allocator();
-    var d: TestDag = .{ .arena = arena };
+    var d: TestDag = .{};
+    defer d.deinit();
+    const arena = d.arena();
     const root = try d.add(
         &.{},
         100,
@@ -2045,9 +2049,8 @@ test "changesNothing: restated fields, a resolved conflict, what the fold doesn'
 }
 
 test "restating merges" {
-    var arena_state: std.heap.ArenaAllocator = .init(testing.allocator);
-    defer arena_state.deinit();
-    var d: TestDag = .{ .arena = arena_state.allocator() };
+    var d: TestDag = .{};
+    defer d.deinit();
     const root = try d.add(&.{}, 100, "T\n\nState: open\nFormat-Version: 1\n");
     const left = try d.add(&.{root}, 200, "L\n\nPriority: high\n");
     const right = try d.add(&.{root}, 300, "R\n\nPriority: low\n");
@@ -2066,9 +2069,8 @@ test "restating merges" {
 }
 
 test "concurrent add vs remove of a label: add wins" {
-    var arena_state: std.heap.ArenaAllocator = .init(testing.allocator);
-    defer arena_state.deinit();
-    var d: TestDag = .{ .arena = arena_state.allocator() };
+    var d: TestDag = .{};
+    defer d.deinit();
     const root = try d.add(&.{}, 100, "T\n\nState: open\nLabels: a\nFormat-Version: 1\n");
     const removed = try d.add(&.{root}, 900, "R\n\nLabels: \n");
     const readded = try d.add(&.{root}, 200, "A\n\nLabels: a, b\n");
@@ -2092,9 +2094,8 @@ test "concurrent add vs remove of a label: add wins" {
 }
 
 test "a set member added on two branches survives a removal on one" {
-    var arena_state: std.heap.ArenaAllocator = .init(testing.allocator);
-    defer arena_state.deinit();
-    var d: TestDag = .{ .arena = arena_state.allocator() };
+    var d: TestDag = .{};
+    defer d.deinit();
     const root = try d.add(&.{}, 100, "T\n\nState: open\nFormat-Version: 1\n");
     const left = try d.add(&.{root}, 120, "L\n\nLabels: x\n");
     const right = try d.add(&.{root}, 180, "R\n\nLabels: x\n");
@@ -2109,9 +2110,8 @@ test "a set member added on two branches survives a removal on one" {
 }
 
 test "criss-cross merges are deterministic" {
-    var arena_state: std.heap.ArenaAllocator = .init(testing.allocator);
-    defer arena_state.deinit();
-    var d: TestDag = .{ .arena = arena_state.allocator() };
+    var d: TestDag = .{};
+    defer d.deinit();
     const root = try d.add(&.{}, 100, "T\n\nState: open\nFormat-Version: 1\n");
     const a = try d.add(&.{root}, 200, "A\n\nPriority: high\n");
     const b = try d.add(&.{root}, 300, "B\n\nAssignee: b@e.x\n");
@@ -2125,9 +2125,8 @@ test "criss-cross merges are deterministic" {
 }
 
 test "upstream merges keep X- fields" {
-    var arena_state: std.heap.ArenaAllocator = .init(testing.allocator);
-    defer arena_state.deinit();
-    var d: TestDag = .{ .arena = arena_state.allocator() };
+    var d: TestDag = .{};
+    defer d.deinit();
     const root = try d.add(
         &.{},
         100,
@@ -2142,9 +2141,8 @@ test "upstream merges keep X- fields" {
 }
 
 test "description and comment text" {
-    var arena_state: std.heap.ArenaAllocator = .init(testing.allocator);
-    defer arena_state.deinit();
-    var d: TestDag = .{ .arena = arena_state.allocator() };
+    var d: TestDag = .{};
+    defer d.deinit();
     const root = try d.add(
         &.{},
         100,
@@ -2165,9 +2163,8 @@ test "description and comment text" {
 }
 
 test "comment kinds" {
-    var arena_state: std.heap.ArenaAllocator = .init(testing.allocator);
-    defer arena_state.deinit();
-    var d: TestDag = .{ .arena = arena_state.allocator() };
+    var d: TestDag = .{};
+    defer d.deinit();
     const root = try d.add(&.{}, 100, "T\n\nState: open\nFormat-Version: 1\n");
     const one_line = try d.add(&.{root}, 200, "LGTM\n");
     const with_text = try d.add(&.{one_line}, 300, "Draft\n\nIn the wiki.\n\nPriority: high\n");
@@ -2187,7 +2184,7 @@ test "comment kinds" {
     const merge = try d.add(&.{ side, other }, 900, "Merge issue\n\nPriority: low\n");
     const i = try d.issue(merge);
     var kinds: std.ArrayList(Comment.Kind) = .empty;
-    for (i.comments) |c| try kinds.append(arena_state.allocator(), c.kind);
+    for (i.comments) |c| try kinds.append(d.arena(), c.kind);
     try testing.expectEqualSlices(Comment.Kind, &.{
         .comment, // LGTM
         .comment, // text with a field
@@ -2203,9 +2200,8 @@ test "comment kinds" {
 }
 
 test "per-commit trailers" {
-    var arena_state: std.heap.ArenaAllocator = .init(testing.allocator);
-    defer arena_state.deinit();
-    var d: TestDag = .{ .arena = arena_state.allocator() };
+    var d: TestDag = .{};
+    defer d.deinit();
     const root = try d.add(
         &.{},
         100,
@@ -2231,9 +2227,8 @@ test "per-commit trailers" {
 }
 
 test "invalid extension values" {
-    var arena_state: std.heap.ArenaAllocator = .init(testing.allocator);
-    defer arena_state.deinit();
-    var d: TestDag = .{ .arena = arena_state.allocator() };
+    var d: TestDag = .{};
+    defer d.deinit();
     const parent = "b8e4c3d2-5f6e-4b9c-8d2f-3a4b5c6d7e8f";
     const root = try d.add(&.{}, 100, "Child\n\nState: open\n" ++
         "Assignee: a7f3b2c1-4e5d-4a8b-9c1e-2f3a4b5c6d7e ada@e.x\n" ++
@@ -2262,9 +2257,8 @@ test "invalid extension values" {
 }
 
 test "blocked-by merges per member" {
-    var arena_state: std.heap.ArenaAllocator = .init(testing.allocator);
-    defer arena_state.deinit();
-    var d: TestDag = .{ .arena = arena_state.allocator() };
+    var d: TestDag = .{};
+    defer d.deinit();
     const a = "c9f5d4e3-6a7f-4cad-9e3a-4b5c6d7e8f90";
     const b = "d0a6e5f4-7b8a-4dbe-8f4b-5c6d7e8f9012";
     const c = "e1b7f6a5-8c9b-4ecf-9a5c-6d7e8f901234";
@@ -2293,21 +2287,20 @@ test "blocked-by merges per member" {
 }
 
 fn hexOf(d: *TestDag, i: usize) ![]const u8 {
-    return d.commits.items[i].oid.hexAlloc(d.arena);
+    return d.commits.items[i].oid.hexAlloc(d.arena());
 }
 
 fn eventMsg(d: *TestDag, head: []const u8, kind: []const u8, target: ?usize) ![]const u8 {
     const comment_line = if (target) |t|
-        try std.fmt.allocPrint(d.arena, "X-Comment: {s}\n", .{try hexOf(d, t)})
+        try std.fmt.allocPrint(d.arena(), "X-Comment: {s}\n", .{try hexOf(d, t)})
     else
         "";
-    return std.fmt.allocPrint(d.arena, "{s}\n\nX-Event: {s}\n{s}", .{ head, kind, comment_line });
+    return std.fmt.allocPrint(d.arena(), "{s}\n\nX-Event: {s}\n{s}", .{ head, kind, comment_line });
 }
 
 test "events" {
-    var arena_state: std.heap.ArenaAllocator = .init(testing.allocator);
-    defer arena_state.deinit();
-    var d: TestDag = .{ .arena = arena_state.allocator() };
+    var d: TestDag = .{};
+    defer d.deinit();
     const root = try d.add(&.{}, 100, "Title\n\nOld text.\n\nState: open\nFormat-Version: 1\n");
     const c1 = try d.add(&.{root}, 200, "First comment\n\nwith text\n");
     const c2 = try d.add(&.{c1}, 300, "Second comment\n");
@@ -2347,9 +2340,8 @@ test "events" {
 }
 
 test "history: every version of the description and of each comment" {
-    var arena_state: std.heap.ArenaAllocator = .init(testing.allocator);
-    defer arena_state.deinit();
-    var d: TestDag = .{ .arena = arena_state.allocator() };
+    var d: TestDag = .{};
+    defer d.deinit();
     const root = try d.add(&.{}, 100, "Title\n\nOld text.\n\nState: open\nFormat-Version: 1\n");
     const c1 = try d.add(&.{root}, 200, "First comment\n\nwith text\n");
     const e1 = try d.add(&.{c1}, 300, try eventMsg(&d, "Edit\n\nSecond take", "comment-edit", c1));
@@ -2384,9 +2376,8 @@ test "history: every version of the description and of each comment" {
 }
 
 test "changes: what each commit changed" {
-    var arena_state: std.heap.ArenaAllocator = .init(testing.allocator);
-    defer arena_state.deinit();
-    var d: TestDag = .{ .arena = arena_state.allocator() };
+    var d: TestDag = .{};
+    defer d.deinit();
     const root = try d.add(
         &.{},
         100,
@@ -2442,9 +2433,8 @@ fn hasChange(
 }
 
 test "assignees: upstream's Assignee sets them to one, a merge's restatement doesn't" {
-    var arena_state: std.heap.ArenaAllocator = .init(testing.allocator);
-    defer arena_state.deinit();
-    var d: TestDag = .{ .arena = arena_state.allocator() };
+    var d: TestDag = .{};
+    defer d.deinit();
     const root = try d.add(
         &.{},
         100,
@@ -2466,9 +2456,8 @@ test "assignees: upstream's Assignee sets them to one, a merge's restatement doe
 }
 
 test "event text with a divider line, and a lowercase description trailer" {
-    var arena_state: std.heap.ArenaAllocator = .init(testing.allocator);
-    defer arena_state.deinit();
-    var d: TestDag = .{ .arena = arena_state.allocator() };
+    var d: TestDag = .{};
+    defer d.deinit();
     const root = try d.add(
         &.{},
         100,
@@ -2497,9 +2486,8 @@ test "event text with a divider line, and a lowercase description trailer" {
 }
 
 test "concurrent and bad events" {
-    var arena_state: std.heap.ArenaAllocator = .init(testing.allocator);
-    defer arena_state.deinit();
-    var d: TestDag = .{ .arena = arena_state.allocator() };
+    var d: TestDag = .{};
+    defer d.deinit();
     const root = try d.add(&.{}, 100, "T\n\nState: open\nFormat-Version: 1\n");
     const c = try d.add(&.{root}, 200, "Comment\n");
     const left = try d.add(&.{c}, 300, try eventMsg(&d, "Edit\n\nLeft text", "comment-edit", c));
@@ -2533,9 +2521,8 @@ test "concurrent and bad events" {
 }
 
 test "attachments" {
-    var arena_state: std.heap.ArenaAllocator = .init(testing.allocator);
-    defer arena_state.deinit();
-    var d: TestDag = .{ .arena = arena_state.allocator() };
+    var d: TestDag = .{};
+    defer d.deinit();
     const id1 = "1b4e28ba-2fa1-4d3b-a3f5-ef19b5a7633b";
     const id2 = "2c5f39cb-3ab2-4e4c-b4a6-f02ac6b8744c";
     const h1 = " image/png 10 sha256:" ++ "a" ** 64 ++ " ";
@@ -2572,9 +2559,8 @@ test "attachments" {
 }
 
 test "attachment merges" {
-    var arena_state: std.heap.ArenaAllocator = .init(testing.allocator);
-    defer arena_state.deinit();
-    var d: TestDag = .{ .arena = arena_state.allocator() };
+    var d: TestDag = .{};
+    defer d.deinit();
     const id = "1b4e28ba-2fa1-4d3b-a3f5-ef19b5a7633b";
     const h = " image/png 10 sha256:" ++ "a" ** 64 ++ " ";
     const root = try d.add(&.{}, 100, "Crash\n\nState: open\nX-Attachment: " ++ id ++ h ++
@@ -2604,9 +2590,8 @@ test "attachment merges" {
 }
 
 test "a skewed clock after a merge doesn't hide a concurrent setter" {
-    var arena_state: std.heap.ArenaAllocator = .init(testing.allocator);
-    defer arena_state.deinit();
-    var d: TestDag = .{ .arena = arena_state.allocator() };
+    var d: TestDag = .{};
+    defer d.deinit();
     const root = try d.add(&.{}, 100, "T\n\nState: open\nFormat-Version: 1\n");
     const x = try d.add(&.{root}, 300, "X\n\nPriority: high\n");
     const y = try d.add(&.{root}, 200, "Y\n\nPriority: medium\n");
@@ -2622,9 +2607,8 @@ test "a skewed clock after a merge doesn't hide a concurrent setter" {
 }
 
 test "an attachment renamed on two branches survives a removal on one" {
-    var arena_state: std.heap.ArenaAllocator = .init(testing.allocator);
-    defer arena_state.deinit();
-    var d: TestDag = .{ .arena = arena_state.allocator() };
+    var d: TestDag = .{};
+    defer d.deinit();
     const id = "1b4e28ba-2fa1-4d3b-a3f5-ef19b5a7633b";
     const h = " image/png 10 sha256:" ++ "a" ** 64 ++ " ";
     const root = try d.add(&.{}, 100, "Crash\n\nState: open\nX-Attachment: " ++ id ++ h ++

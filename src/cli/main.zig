@@ -63,6 +63,7 @@ pub fn main(init: std.process.Init) u8 {
 
 test {
     _ = dispatch;
+    _ = @import("common.zig");
     _ = @import("simulate.zig");
     _ = @import("completion.zig");
     _ = @import("json.zig");

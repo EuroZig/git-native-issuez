@@ -73,10 +73,7 @@ const Work = struct {
 };
 
 test "threads: eight threads read, query and write one repo" {
-    const leaks = fixture.Leaks.start();
-    defer leaks.check();
-    var r: fixture.Repo = undefined;
-    try r.init(.{ .ops = &.{c.issuez_opt_pool_size(3)} });
+    var r = try fixture.Repo.init(.{ .ops = &.{c.issuez_opt_pool_size(3)} });
     defer r.deinit();
     var w: Work = .{ .h = r.handle, .seed = try fixture.titled(r.handle, "Seed") };
     var threads: [8]std.Thread = undefined;
@@ -84,9 +81,7 @@ test "threads: eight threads read, query and write one repo" {
     for (threads) |t| t.join();
     try testing.expectEqual(@as(u32, 0), w.failures.load(.monotonic));
     // Every create landed once; the comments are all on the seed.
-    var count: u64 = 0;
-    var q = [_]c.issuez_op{c.issuez_q_done(-1)};
-    try expect.code(c.ISSUEZ_OK, c.issuez_query_count(r.handle, &q, 1, null, &count, null), null);
+    const count = try fixture.queryCount(r.handle, &.{c.issuez_q_done(-1)});
     try testing.expectEqual(@as(u64, w.written.load(.monotonic) + 1), count);
     const seed = try fixture.load(r.handle, w.seed.idStr());
     defer c.issuez_issue_free(seed);
@@ -94,16 +89,14 @@ test "threads: eight threads read, query and write one repo" {
 }
 
 fn hang(h: *c.issuez_repo, done: *std.atomic.Value(bool)) void {
-    var out: ?*c.issuez_sync_report = null;
+    var out: ?*c.issuez_snapshot = null;
     var err: ?*c.issuez_error = null;
-    const token = c.issuez_cancel_new();
-    defer c.issuez_cancel_free(token);
-    // Holds the only session until the test cancels it.
+    // Holds the only session until its git times out.
     while (!done.load(.acquire)) {
-        _ = c.issuez_sync(h, fixture.str("origin"), null, 0, token, &out, &err);
+        _ = c.issuez_snapshot_take(h, null, &out, &err);
         c.issuez_error_free(err);
         err = null;
-        c.issuez_sync_report_free(out);
+        c.issuez_snapshot_free(out);
         out = null;
         break;
     }
@@ -115,19 +108,15 @@ fn triggerLater(t: *c.issuez_cancel) void {
 }
 
 test "threads: a call waiting for a busy pool is cancelled" {
-    const leaks = fixture.Leaks.start();
-    defer leaks.check();
-    var r: fixture.Repo = undefined;
-    try r.init(.{});
+    var r = try fixture.Repo.init(.{});
     defer r.deinit();
-    _ = try fixture.hub(&r, "hub.git");
     const made = try fixture.titled(r.handle, "Waiting");
     const slow = try fixture.slowGit(r.arena(), r.root);
     const h = try r.open(
         &.{
             c.issuez_opt_git_path(fixture.str(slow)),
             c.issuez_opt_pool_size(1),
-            fixture.opNum(c.ISSUEZ_OPT_TIMEOUT_NETWORK_MS, 3000),
+            c.issuez_opt_timeout_local_ms(3000),
         },
     );
     defer c.issuez_repo_close(h);
@@ -158,10 +147,7 @@ fn countEvent(_: ?*anyopaque, _: [*c]const c.issuez_log_event) callconv(.c) void
 }
 
 test "threads: the logger is called from several threads at once" {
-    const leaks = fixture.Leaks.start();
-    defer leaks.check();
-    var r: fixture.Repo = undefined;
-    try r.init(.{ .ops = &.{c.issuez_opt_pool_size(4)} });
+    var r = try fixture.Repo.init(.{ .ops = &.{c.issuez_opt_pool_size(4)} });
     defer r.deinit();
     var w: Work = .{ .h = r.handle, .seed = try fixture.titled(r.handle, "Seed") };
     logged.store(0, .monotonic);

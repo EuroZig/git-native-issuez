@@ -118,10 +118,10 @@ bytes as `str`, the file name as `name` and the caller's UUID, if any, as `id`,
 `REMOVE ATTACHMENTS` with a UUID, and `ISSUEZ_OPT_EDIT_COMMENT` for a
 comment edit. `ISSUEZ_OPT_ATTACHMENT_STORE 0` on open leaves the bytes to
 the caller. `issuez_issue_attachment_count`/`_at` read them back and
-`issuez_attachment_validate` checks bytes without writing. The Go binding
+`issuez_attachment_prepare` checks bytes without writing. The Go binding
 has `Edit.AddAttachment`, `RemoveAttachment`, `EditComment`,
 `WithAttachmentStore(false)`, `Issue.Attachments` and
-`Repo.ValidateAttachment`.
+`Repo.PrepareAttachment`.
 
 ### Reading
 

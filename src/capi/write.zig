@@ -206,12 +206,12 @@ pub fn issuez_ops_validate(
     out: ?*?*api.Problems,
     err: ?*?*api.Error,
 ) callconv(.c) Code {
-    const o = out orelse return rt.fail(err, .e_invalid_argument, "out is NULL", .{});
+    const o = out orelse return rt.badArgument(err, "out is NULL");
     var scratch: std.heap.ArenaAllocator = .init(rt.gpa);
     defer scratch.deinit();
     const a = scratch.allocator();
     var problems: Problems = .empty;
-    const slice = if (ops) |p| p[0..n] else &.{};
+    const slice = rt.sliceOf(api.Op, ops, n);
     switch (list) {
         .issue_create, .issue_update, .milestone_create, .milestone_update => validate(
             a,
@@ -221,10 +221,8 @@ pub fn issuez_ops_validate(
         ) catch return rt.oom(err),
         .query => _ = read.parseQuery(a, slice, &problems) catch return rt.oom(err),
         .open => repo_mod.validateOpen(a, slice, &problems) catch return rt.oom(err),
-        .sync => _ = more.parseSyncOps(a, slice, &problems) catch return rt.oom(err),
         .push_check => _ = more.parsePushOps(a, slice, &problems) catch return rt.oom(err),
-        .settings => more.validateSettings(a, slice, &problems) catch return rt.oom(err),
-        else => return rt.fail(err, .e_invalid_argument, "not an issuez_op_list", .{}),
+        else => return rt.badArgument(err, "not an issuez_op_list"),
     }
     return rt.give(o, rt.ownedProblems(problems.items), err);
 }
@@ -298,24 +296,31 @@ const Plan = struct {
     }
 };
 
-fn unsupportedField(
-    a: Allocator,
-    problems: *Problems,
-    field: Field,
-    index: i64,
-    what: []const u8,
-) !void {
-    try problems.append(a, .{
-        .kind = .incompatible,
-        .field = field,
-        .message = what,
-        .op_index = index,
-    });
+/// One value, on both specs: a field an update and a create spell alike.
+fn both(edit: anytype, create: anytype, value: anytype) void {
+    edit.* = value;
+    create.* = value;
+}
+
+/// A text field that SET or CLEAR changes; CLEAR leaves a create as it is.
+fn setText(
+    edit: *?issuez.engine.EditSpec.TextEdit,
+    create: *?[]const u8,
+    verb: Verb,
+    s: []const u8,
+) void {
+    if (verb == .clear) {
+        edit.* = .clear;
+    } else {
+        edit.* = .{ .set = s };
+        create.* = s;
+    }
 }
 
 fn plan(a: Allocator, list: api.OpList, ops: []const api.Op, problems: *Problems) !Plan {
     var p: Plan = .{};
     const creating = list == .issue_create or list == .milestone_create;
+    const whole: rt.OpCheck = .{ .a = a, .problems = problems, .index = -1 };
     for (ops, 0..) |op, i| {
         const index: i64 = @intCast(i);
         const verb: Verb = @enumFromInt(op.verb);
@@ -324,26 +329,18 @@ fn plan(a: Allocator, list: api.OpList, ops: []const api.Op, problems: *Problems
             switch (@as(Opt, @enumFromInt(op.target))) {
                 .expect => p.expect = rt.oidFrom(op.oid),
                 .subject => p.subject = s,
-                .original_author => {
-                    p.edit.original.author = s;
-                    p.create.original.author = s;
-                },
-                .original_id => {
-                    p.edit.original.id = s;
-                    p.create.original.id = s;
-                },
+                .original_author => both(&p.edit.original.author, &p.create.original.author, s),
+                .original_id => both(&p.edit.original.id, &p.create.original.id, s),
                 .edit_comment => p.edit_comment = rt.oidFrom(op.oid),
                 .expect_edits => p.expect_edits = op.num,
                 .prepared_attachment => {
                     if (attachment_fmt.parseSpec(s)) |spec| {
                         try p.attachments_prepared.append(a, spec);
                         p.has_fields = true;
-                    } else try problems.append(a, .{
-                        .kind = .bad_format,
-                        .field = .attachments,
-                        .message = "invalid prepared attachment metadata",
-                        .op_index = index,
-                    });
+                    } else {
+                        const check = whole.on(.attachments, index);
+                        try check.add(.bad_format, "invalid prepared attachment metadata");
+                    }
                 },
                 .delete_comment, .restore_comment => if (rt.oidFrom(op.oid)) |t| {
                     p.comment_event = .{
@@ -378,6 +375,7 @@ fn plan(a: Allocator, list: api.OpList, ops: []const api.Op, problems: *Problems
             }
             continue;
         }
+        const check = whole.on(field, index);
         switch (field) {
             .comment, .deleted, .reactions => {},
             .state, .fixed_by, .release, .reason => p.has_state = true,
@@ -385,13 +383,8 @@ fn plan(a: Allocator, list: api.OpList, ops: []const api.Op, problems: *Problems
         }
         switch (field) {
             .comment => {
-                if (creating) try unsupportedField(
-                    a,
-                    problems,
-                    field,
-                    index,
-                    "a new issue has no comment; use DESCRIPTION",
-                );
+                if (creating)
+                    try check.add(.incompatible, "a new issue has no comment; use DESCRIPTION");
                 p.comment = s;
             },
             .state => p.state = s,
@@ -399,18 +392,9 @@ fn plan(a: Allocator, list: api.OpList, ops: []const api.Op, problems: *Problems
             .release => p.release = s,
             .reason => p.reason = s,
             .deleted => p.deleted = op.num != 0,
-            .title => {
-                p.edit.title = s;
-                p.create.title = s;
-            },
-            .description => {
-                p.edit.description = s;
-                p.create.body = s;
-            },
-            .workflow_state => {
-                p.edit.workflow = if (verb == .clear) .clear else .{ .set = s };
-                if (verb != .clear) p.create.workflow = s;
-            },
+            .title => both(&p.edit.title, &p.create.title, s),
+            .description => both(&p.edit.description, &p.create.body, s),
+            .workflow_state => setText(&p.edit.workflow, &p.create.workflow, verb, s),
             .labels => try p.labels.apply(a, verb, s, s),
             .blocked_by => try p.blockers.apply(a, verb, s, s),
             .assignees => {
@@ -439,24 +423,16 @@ fn plan(a: Allocator, list: api.OpList, ops: []const api.Op, problems: *Problems
                     .inherit => .{ .link = .inherit },
                     else => .{ .link = .none },
                 };
-                p.edit.milestone = m;
-                p.create.milestone = m;
+                both(&p.edit.milestone, &p.create.milestone, m);
             },
-            .parent => {
-                p.edit.parent = if (verb == .clear) .clear else .{ .set = s };
-                if (verb != .clear) p.create.parent = s;
-            },
+            .parent => setText(&p.edit.parent, &p.create.parent, verb, s),
             .start_date, .due_date => {
                 const date = if (verb == .clear) null else engineDate(op.date).?;
-                const change: issuez.engine.EditSpec.DateEdit =
-                    if (date) |d| .{ .set = d } else .clear;
-                if (field == .start_date) {
-                    p.edit.start_date = change;
-                    p.create.start_date = date;
-                } else {
-                    p.edit.due_date = change;
-                    p.create.due_date = date;
-                }
+                const start = field == .start_date;
+                const edit = if (start) &p.edit.start_date else &p.edit.due_date;
+                edit.* = if (date) |d| .{ .set = d } else .clear;
+                const create = if (start) &p.create.start_date else &p.create.due_date;
+                create.* = date;
             },
             .estimate => {
                 p.edit.estimate_minutes = if (verb == .clear)
@@ -465,41 +441,24 @@ fn plan(a: Allocator, list: api.OpList, ops: []const api.Op, problems: *Problems
                     .{ .set = @intCast(op.num) };
                 if (verb != .clear) p.create.estimate_minutes = @intCast(op.num);
             },
-            .number => {
-                p.edit.number = @intCast(op.num);
-                p.create.number = @intCast(op.num);
-            },
+            .number => both(&p.edit.number, &p.create.number, @as(u64, @intCast(op.num))),
             .locked => {
-                p.edit.locked = op.num != 0;
-                p.create.locked = op.num != 0;
-                if (op.num != 0 and s.len > 0) {
-                    p.edit.lock_reason = s;
-                    p.create.lock_reason = s;
-                }
+                both(&p.edit.locked, &p.create.locked, op.num != 0);
+                if (op.num != 0 and s.len > 0) both(&p.edit.lock_reason, &p.create.lock_reason, s);
             },
-            .ref => {
-                p.edit.ref = if (verb == .clear) .clear else .{ .set = s };
-                if (verb != .clear) p.create.ref = s;
-            },
+            .ref => setText(&p.edit.ref, &p.create.ref, verb, s),
             .extra => try p.extra.append(a, .{ .key = op.name.slice(), .value = s }),
             .reactions => {
-                if (!fields_fmt.isEmoji(s)) try problems.append(a, .{
-                    .kind = .bad_format,
-                    .field = field,
-                    .value = s,
-                    .message = "an emoji is 1 to 64 bytes without whitespace or commas",
-                    .op_index = index,
-                });
+                if (!fields_fmt.isEmoji(s)) try check.addValue(
+                    .bad_format,
+                    s,
+                    "an emoji is 1 to 64 bytes without whitespace or commas",
+                );
                 p.reaction = .{ .emoji = s, .present = verb == .add };
             },
             .attachments => if (verb == .remove) {
-                if (creating) try unsupportedField(
-                    a,
-                    problems,
-                    field,
-                    index,
-                    "a new issue has no attachments to remove",
-                );
+                if (creating)
+                    try check.add(.incompatible, "a new issue has no attachments to remove");
                 try p.attachments_remove.append(a, s);
             } else {
                 const id: ?[]const u8 = if (op.id.len > 0) op.id.slice() else null;
@@ -508,31 +467,20 @@ fn plan(a: Allocator, list: api.OpList, ops: []const api.Op, problems: *Problems
             else => unreachable,
         }
     }
-    if (list == .milestone_create and p.milestone.name == null) try problems.append(a, .{
-        .kind = .missing_value,
-        .field = .name,
-        .message = "a new milestone needs a name",
-    });
+    if (list == .milestone_create and p.milestone.name == null)
+        try whole.on(.name, -1).add(.missing_value, "a new milestone needs a name");
+    const deleted = whole.on(.deleted, p.opOf(.deleted));
     if (list == .issue_create) {
-        if (p.create.title.len == 0) try problems.append(a, .{
-            .kind = .missing_value,
-            .field = .title,
-            .message = "a new issue needs a title",
-        });
-        if (p.deleted != null) try unsupportedField(
-            a,
-            problems,
-            .deleted,
-            p.opOf(.deleted),
-            "a new issue isn't deleted",
-        );
+        if (p.create.title.len == 0)
+            try whole.on(.title, -1).add(.missing_value, "a new issue needs a title");
+        if (p.deleted != null) try deleted.add(.incompatible, "a new issue isn't deleted");
     }
     if (list == .issue_update) {
         if (p.deleted != null and (p.has_state or p.has_fields or p.comment != null))
-            try unsupportedField(a, problems, .deleted, p.opOf(.deleted), "a delete or restore " ++
+            try deleted.add(.incompatible, "a delete or restore " ++
                 "can't share a commit with other changes");
         if (p.comment != null and p.edit.description != null)
-            try unsupportedField(a, problems, .comment, p.opOf(.comment), "a description edit " ++
+            try whole.on(.comment, p.opOf(.comment)).add(.incompatible, "a description edit " ++
                 "can't carry a comment: its text is the description");
         if (p.comment_event != null or p.reaction != null) {
             // A commit of its own: only EXPECT and SUBJECT (and the
@@ -543,32 +491,21 @@ fn plan(a: Allocator, list: api.OpList, ops: []const api.Op, problems: *Problems
                     op.target != @intFromEnum(Opt.expect_edits)) or
                     op.target == @intFromEnum(Field.reactions);
                 if (!own or (p.comment_event != null and p.reaction != null) or
-                    (p.edit_comment != null)) try unsupportedField(
-                    a,
-                    problems,
-                    targetField(op.target),
-                    @intCast(i),
+                    (p.edit_comment != null)) try whole.on(targetField(op.target), @intCast(i)).add(
+                    .incompatible,
                     "a comment delete, restore or reaction is a commit of its own",
                 );
             }
         }
         if (p.edit_comment != null) {
-            if (p.comment == null) try problems.append(a, .{
-                .kind = .missing_value,
-                .field = .comment,
-                .message = "a comment edit needs the comment's new text",
-            });
+            if (p.comment == null) try whole.on(.comment, -1)
+                .add(.missing_value, "a comment edit needs the comment's new text");
             // Only the comment's text and images, as its edit event takes.
             for (ops, 0..) |op, i| {
                 const alone = op.target == @intFromEnum(Field.comment) or
                     op.target == @intFromEnum(Field.attachments) or op.target >= 0x100;
-                if (!alone) try unsupportedField(
-                    a,
-                    problems,
-                    targetField(op.target),
-                    @intCast(i),
-                    "a comment edit carries only COMMENT and ATTACHMENTS",
-                );
+                if (!alone) try whole.on(targetField(op.target), @intCast(i))
+                    .add(.incompatible, "a comment edit carries only COMMENT and ATTACHMENTS");
             }
         }
     }
@@ -589,7 +526,7 @@ fn prepareAttachments(c: *Call, p: *const Plan) ![]const attachment_fmt.Spec {
     const store = Store.fromRepo(c.engine());
     const specs = try a.alloc(attachment_fmt.Spec, inputs.len);
     for (inputs, specs) |in, *spec| spec.* = try store.prepare(a, in);
-    if (c.repo.store_attachments and !c.dry_run) {
+    if (c.repo.store_attachments) {
         for (inputs, specs) |in, spec| try store.storeBytes(a, spec, in.data);
     }
     return try std.mem.concat(a, attachment_fmt.Spec, &.{ specs, p.attachments_prepared.items });
@@ -605,7 +542,7 @@ fn attachmentChanges(c: *Call, p: *const Plan) !issuez.engine.AttachmentChanges 
 fn entryChanges(after: *const read.IssueObj, commit: Oid) []const api.Change {
     const want = rt.oidOf(commit);
     for (after.timeline) |e| {
-        if (!rt.issuez_oid_eq(&e.public.commit, &want)) continue;
+        if (!rt.oidEql(&e.public.commit, &want)) continue;
         const ptr = e.changes orelse return &.{};
         return ptr[0..e.public.change_count];
     }
@@ -648,10 +585,6 @@ fn copyPerson(a: Allocator, p: ?*const api.Person) Allocator.Error!?*const api.P
     return out;
 }
 
-fn apiDate(d: fields_fmt.Date) api.Date {
-    return .{ .year = @intCast(d.year), .month = d.month, .day = d.day };
-}
-
 fn makeWrite(
     c: *Call,
     kind: api.Kind,
@@ -690,12 +623,10 @@ fn makeWrite(
         // Milestone writes spell their dates out only.
         const field: Field = @enumFromInt(ch.field);
         if (field == .due_date or field == .start_date) {
-            if (fields_fmt.Date.parse(ch.old_value.slice())) |d| o.old_date = apiDate(d);
-            if (fields_fmt.Date.parse(ch.new_value.slice())) |d| o.new_date = apiDate(d);
+            if (fields_fmt.Date.parse(ch.old_value.slice())) |d| o.old_date = rt.dateOf(d);
+            if (fields_fmt.Date.parse(ch.new_value.slice())) |d| o.new_date = rt.dateOf(d);
         }
     }
-    const person = try a.create(api.Person);
-    person.* = try rt.personOf(a, author, c.author_id);
     const wrote = new_tip != null and (old_tip == null or !old_tip.?.eql(new_tip.?));
     w.* = .{
         .arena = arena,
@@ -711,7 +642,7 @@ fn makeWrite(
             .public = .{
                 .kind = @intFromEnum(entry_kind),
                 .commit = if (wrote) rt.oidOf(new_tip.?) else .{},
-                .author = person,
+                .author = try rt.newPerson(a, author, c.author_id),
                 .at = rt.timeOf(author),
                 .comment = null,
                 .change_count = copied.len,
@@ -751,8 +682,8 @@ pub fn issuez_write_load_issue(
     out: ?*?*api.Issue,
     err: ?*?*api.Error,
 ) callconv(.c) Code {
-    const o = getWrite(w) orelse return rt.fail(err, .e_invalid_argument, "w is NULL", .{});
-    if (o.kind != .issue) return rt.fail(err, .e_invalid_argument, "not an issue write", .{});
+    const o = getWrite(w) orelse return rt.badArgument(err, "w is NULL");
+    if (o.kind != .issue) return rt.badArgument(err, "not an issue write");
     return read.issuez_issue_load_at(@ptrCast(o.repo), o.id, &o.new_tip, null, cancel, out, err);
 }
 
@@ -762,9 +693,8 @@ pub fn issuez_write_load_milestone(
     out: ?*?*api.Milestone,
     err: ?*?*api.Error,
 ) callconv(.c) Code {
-    const o = getWrite(w) orelse return rt.fail(err, .e_invalid_argument, "w is NULL", .{});
-    if (o.kind != .milestone)
-        return rt.fail(err, .e_invalid_argument, "not a milestone write", .{});
+    const o = getWrite(w) orelse return rt.badArgument(err, "w is NULL");
+    if (o.kind != .milestone) return rt.badArgument(err, "not a milestone write");
     return more.issuez_milestone_load_at(@ptrCast(o.repo), o.id, &o.new_tip, cancel, out, err);
 }
 
@@ -788,10 +718,6 @@ fn signatureOf(c: *Call, actor: ?*const api.Actor) !?Signature {
         .time = time.unix_seconds,
         .tz_offset_minutes = time.tz_offset_minutes,
     };
-}
-
-fn opSlice(p: ?[*]const api.Op, n: usize) []const api.Op {
-    return if (p) |x| x[0..n] else &.{};
 }
 
 /// Format problems first, then the plan's; INVALID_VALUE with all of them.
@@ -836,22 +762,16 @@ fn beginWrite(
     op_ptr: ?[*]const api.Op,
     n: usize,
     actor: ?*const api.Actor,
-    dry: bool,
     err: ?*?*api.Error,
 ) ?Code {
-    c.dry_run = dry;
     const a = c.arena();
-    const slice = opSlice(op_ptr, n);
+    const slice = rt.sliceOf(api.Op, op_ptr, n);
     const failed = checked(a, list, slice, c.repo.extra_prefixes, &out.plan, err) catch |e|
         return rt.failError(err, e, .{});
     if (failed) |code| return code;
     if (scopedFailed(c, slice, err)) |code| return code;
-    out.author = signatureOf(c, actor) catch return rt.fail(
-        err,
-        .e_invalid_argument,
-        "the actor needs an email, and its user_id must be a UUID",
-        .{},
-    );
+    out.author = signatureOf(c, actor) catch
+        return rt.badArgument(err, "the actor needs an email, and its user_id must be a UUID");
     out.who = out.author orelse who: {
         const identity = c.engine().identity(a, null) catch |e| return c.fail(err, e);
         break :who identity.author;
@@ -950,11 +870,7 @@ fn writeFailed(c: *Call, err: ?*?*api.Error, e: anyerror, p: *const Plan, id: []
 }
 
 fn currentTip(c: *Call, id: []const u8) ?api.Oid {
-    const name = std.fmt.allocPrint(
-        c.arena(),
-        "{s}{s}",
-        .{ issuez.engine.issue_ref_prefix, id },
-    ) catch return null;
+    const name = c.issueRef(id) catch return null;
     const tip = (c.session.backend.resolveRef(name) catch return null) orelse return null;
     return rt.oidOf(tip);
 }
@@ -1040,24 +956,11 @@ pub fn issuez_issue_create(
     out: ?*?*api.Write,
     err: ?*?*api.Error,
 ) callconv(.c) Code {
-    return issueCreateIn(repo, op_ptr, n, actor, cancel, out, err, false);
-}
-
-fn issueCreateIn(
-    repo: ?*api.Repo,
-    op_ptr: ?[*]const api.Op,
-    n: usize,
-    actor: ?*const api.Actor,
-    cancel: ?*api.Cancel,
-    out: ?*?*api.Write,
-    err: ?*?*api.Error,
-    dry: bool,
-) Code {
-    const o = out orelse return rt.fail(err, .e_invalid_argument, "out is NULL", .{});
+    const o = out orelse return rt.badArgument(err, "out is NULL");
     var c = Call.begin(repo, cancel) catch |e| return rt.failError(err, e, .{});
     defer c.end();
     var w: Begun = undefined;
-    if (beginWrite(&c, &w, .issue_create, op_ptr, n, actor, dry, err)) |code| return code;
+    if (beginWrite(&c, &w, .issue_create, op_ptr, n, actor, err)) |code| return code;
     const a = c.arena();
     const p = &w.plan;
     applySets(p);
@@ -1078,9 +981,7 @@ fn issueCreateIn(
 }
 
 fn loadObj(c: *Call, id: []const u8) !?*read.IssueObj {
-    const a = c.arena();
-    const name = try std.fmt.allocPrint(a, "{s}{s}", .{ issuez.engine.issue_ref_prefix, id });
-    const tip = (try c.session.backend.resolveRef(name)) orelse return null;
+    const tip = (try c.session.backend.resolveRef(try c.issueRef(id))) orelse return null;
     return try loadObjAt(c, id, tip);
 }
 
@@ -1103,37 +1004,18 @@ pub fn issuez_issue_update(
     out: ?*?*api.Write,
     err: ?*?*api.Error,
 ) callconv(.c) Code {
-    return issueUpdateIn(repo, id, op_ptr, n, actor, cancel, out, err, false);
-}
-
-fn issueUpdateIn(
-    repo: ?*api.Repo,
-    id: Str,
-    op_ptr: ?[*]const api.Op,
-    n: usize,
-    actor: ?*const api.Actor,
-    cancel: ?*api.Cancel,
-    out: ?*?*api.Write,
-    err: ?*?*api.Error,
-    dry: bool,
-) Code {
-    const o = out orelse return rt.fail(err, .e_invalid_argument, "out is NULL", .{});
+    const o = out orelse return rt.badArgument(err, "out is NULL");
     const ident = id.slice();
-    if (!uuid_fmt.isCanonical(ident)) return rt.fail(
-        err,
-        .e_invalid_argument,
-        "not a full issue UUID",
-        .{},
-    );
+    if (!uuid_fmt.isCanonical(ident)) return rt.badArgument(err, "not a full issue UUID");
     var c = Call.begin(repo, cancel) catch |e| return rt.failError(err, e, .{});
     defer c.end();
     var w: Begun = undefined;
-    if (beginWrite(&c, &w, .issue_update, op_ptr, n, actor, dry, err)) |code| return code;
+    if (beginWrite(&c, &w, .issue_update, op_ptr, n, actor, err)) |code| return code;
     const a = c.arena();
     const p = &w.plan;
     const engine = c.engine();
     const before = (loadObj(&c, ident) catch |e| return c.fail(err, e)) orelse
-        return rt.failWith(err, .e_not_found, .{ .subject = ident }, "no such issue", .{});
+        return rt.notFound(err, ident, "no such issue");
     const removals = p.labels.remove.items.len;
     replaceScoped(a, c.repo.exclusive_scopes, p, before.labels) catch return rt.oom(err);
     // Pinned to the tip read only where the write depends on it: a state
@@ -1152,11 +1034,7 @@ fn issueUpdateIn(
             return rt.fail(err, .e_invalid_value, "EXPECT_EDITS needs a text and a u32 count", .{});
         p.edit.expect_edits = @intCast(want);
     }
-    const ref_name = std.fmt.allocPrint(
-        a,
-        "{s}{s}",
-        .{ issuez.engine.issue_ref_prefix, ident },
-    ) catch return rt.oom(err);
+    const ref_name = c.issueRef(ident) catch return rt.oom(err);
     const expect: ?Oid = p.expect orelse if (depends) old_tip else null;
 
     p.edit.attachments = attachmentChanges(&c, p) catch |e|
@@ -1171,10 +1049,7 @@ fn issueUpdateIn(
     p.edit.message = p.subject;
     p.edit.author = w.author;
     p.edit.expect = expect;
-    const comment_event: @FieldType(
-        issuez.Update,
-        "comment_event",
-    ) = if (p.edit_comment) |t|
+    const comment_event: @FieldType(issuez.Update, "comment_event") = if (p.edit_comment) |t|
         .{ .target = t, .event = .edit }
     else if (p.comment_event) |ce|
         .{ .target = ce.target, .event = if (ce.delete) .delete else .restore }
@@ -1212,7 +1087,6 @@ fn issueUpdateIn(
 
 /// The first parent of `commit`, when it can be read.
 fn parentOf(c: *Call, commit: Oid) ?Oid {
-    if (c.dry_run) return null;
     const o = (c.session.backend.readObject(
         c.arena(),
         commit,
@@ -1220,91 +1094,6 @@ fn parentOf(c: *Call, commit: Oid) ?Oid {
     const parsed = issuez.backend.object.Commit.parse(c.arena(), commit.object_format, o.data) catch
         return null;
     return if (parsed.parents.len > 0) parsed.parents[0] else null;
-}
-
-pub fn issuez_issue_check(
-    repo: ?*api.Repo,
-    id: Str,
-    op_ptr: ?[*]const api.Op,
-    n: usize,
-    cancel: ?*api.Cancel,
-    out: ?*?*api.Problems,
-    err: ?*?*api.Error,
-) callconv(.c) Code {
-    const o = out orelse return rt.fail(err, .e_invalid_argument, "out is NULL", .{});
-    // {NULL,0}: as a create.
-    const existing: ?Str = if (id.len == 0) null else id;
-    var scratch: std.heap.ArenaAllocator = .init(rt.gpa);
-    defer scratch.deinit();
-    const a = scratch.allocator();
-    const list: api.OpList = if (existing == null) .issue_create else .issue_update;
-    var problems: Problems = .empty;
-    const slice = opSlice(op_ptr, n);
-    validate(a, list, slice, &problems) catch return rt.oom(err);
-    // Repository rules: the workflow states, references that must exist.
-    if (problems.items.len == 0) {
-        var c = Call.begin(repo, cancel) catch |e| return rt.failError(err, e, .{});
-        defer c.end();
-        repoChecks(&c, a, slice, &problems) catch |e| return c.fail(err, e);
-    }
-    // Then the write itself, guards and all, without writing.
-    if (problems.items.len == 0) {
-        var w: ?*api.Write = null;
-        var e: ?*api.Error = null;
-        const code = if (existing) |i|
-            issueUpdateIn(repo, i, op_ptr, n, &dry_actor, cancel, &w, &e, true)
-        else
-            issueCreateIn(repo, op_ptr, n, &dry_actor, cancel, &w, &e, true);
-        if (dryFailed(a, code, e, &problems, err)) |failed| return failed;
-        issuez_write_free(w);
-    }
-    return rt.give(o, rt.ownedProblems(problems.items), err);
-}
-
-/// Who a dry run writes as: it writes nothing, and needs no identity.
-const dry_actor: api.Actor = .{ .name = Str.of("issuez"), .email = Str.of("check@issuez.invalid") };
-
-/// A dry run's outcome: its problems go to `problems`; other failures
-/// (no such issue, git) are the check's own. Takes `e`.
-fn dryFailed(
-    a: Allocator,
-    code: Code,
-    e: ?*api.Error,
-    problems: *Problems,
-    err: ?*?*api.Error,
-) ?Code {
-    switch (code) {
-        .ok => return null,
-        .e_invalid_value, .e_guard, .e_limit => {
-            defer rt.issuez_error_free(e);
-            copyProblems(a, e, problems) catch return rt.oom(err);
-            return null;
-        },
-        else => {
-            if (err) |p| p.* = e else rt.issuez_error_free(e);
-            return code;
-        },
-    }
-}
-
-/// An error's problems, or one with its message, in memory of `a`.
-fn copyProblems(a: Allocator, e: ?*api.Error, problems: *Problems) !void {
-    // No error object: making it ran out of memory.
-    const list = (rt.obj(rt.ErrorObj, e) orelse return error.OutOfMemory).problems;
-    const items = if (list) |l| l.items else &.{};
-    for (items) |p| try problems.append(a, .{
-        .kind = @enumFromInt(p.kind),
-        .field = @enumFromInt(p.field),
-        .key = try a.dupe(u8, p.key.slice()),
-        .value = try a.dupe(u8, p.value.slice()),
-        .subject = try a.dupe(u8, p.subject.slice()),
-        .message = try a.dupe(u8, p.message.slice()),
-        .op_index = p.op_index,
-    });
-    if (items.len == 0) try problems.append(a, .{
-        .kind = .unknown,
-        .message = a.dupe(u8, rt.issuez_error_message(e).slice()) catch "",
-    });
 }
 
 /// INVALID_VALUE when two labels of one exclusive scope come together.
@@ -1315,88 +1104,7 @@ fn scopedFailed(c: *Call, slice: []const api.Op, err: ?*?*api.Error) ?Code {
     return invalid(err, problems.items);
 }
 
-/// `a` holds the problems: they outlive the call.
-fn repoChecks(c: *Call, a: Allocator, slice: []const api.Op, problems: *Problems) !void {
-    try scopeConflicts(a, c.repo.exclusive_scopes, slice, problems);
-    for (slice, 0..) |op, i| {
-        const index: i64 = @intCast(i);
-        if (op.target >= 0x100 or op.verb == @intFromEnum(Verb.clear)) continue;
-        const field: Field = @enumFromInt(op.target);
-        const s = op.str.slice();
-        switch (field) {
-            .workflow_state => c.repo.settings.checkWorkflow(s) catch |e|
-                try problems.append(a, rt.problemOf(e, field, index)),
-            .parent, .blocked_by => if (op.verb != @intFromEnum(Verb.remove) and (try loadObj(
-                c,
-                s,
-            )) == null)
-                try problems.append(a, rt.problemOf(error.ReferenceNotFound, field, index)),
-            .milestone => if (op.verb == @intFromEnum(Verb.set)) {
-                const m = try c.catalog().find(a, s);
-                if (m == null) {
-                    try problems.append(a, rt.problemOf(error.ReferenceNotFound, field, index));
-                } else if (m.?.status != .open) {
-                    try problems.append(a, rt.problemOf(error.MilestoneCompleted, field, index));
-                }
-            },
-            else => {},
-        }
-    }
-}
-
 // ─── Milestone writes ──────────────────────────────────────────────────
-
-fn statusOf(s: fields_fmt.MilestoneStatus) []const u8 {
-    return @tagName(s);
-}
-
-pub fn issuez_milestone_check(
-    repo: ?*api.Repo,
-    id: Str,
-    op_ptr: ?[*]const api.Op,
-    n: usize,
-    cancel: ?*api.Cancel,
-    out: ?*?*api.Problems,
-    err: ?*?*api.Error,
-) callconv(.c) Code {
-    const o = out orelse return rt.fail(err, .e_invalid_argument, "out is NULL", .{});
-    // {NULL,0}: as a create.
-    const existing: ?Str = if (id.len == 0) null else id;
-    var scratch: std.heap.ArenaAllocator = .init(rt.gpa);
-    defer scratch.deinit();
-    const a = scratch.allocator();
-    var c = Call.begin(repo, cancel) catch |e| return rt.failError(err, e, .{});
-    var ended = false;
-    defer if (!ended) c.end();
-    const list: api.OpList = if (existing == null) .milestone_create else .milestone_update;
-    var problems: Problems = .empty;
-    const slice = opSlice(op_ptr, n);
-    validate(a, list, slice, &problems) catch return rt.oom(err);
-    if (existing) |i| if (problems.items.len == 0) {
-        const m = c.catalog().find(a, i.slice()) catch |e| return c.fail(err, e);
-        if (m == null) return rt.failWith(
-            err,
-            .e_not_found,
-            .{ .subject = i.slice() },
-            "no such milestone",
-            .{},
-        );
-    };
-    // The write itself, without writing. The session goes back first.
-    c.end();
-    ended = true;
-    if (problems.items.len == 0) {
-        var w: ?*api.Write = null;
-        var e: ?*api.Error = null;
-        const code = if (existing) |i|
-            milestoneUpdateIn(repo, i, op_ptr, n, &dry_actor, cancel, &w, &e, true)
-        else
-            milestoneCreateIn(repo, op_ptr, n, &dry_actor, cancel, &w, &e, true);
-        if (dryFailed(a, code, e, &problems, err)) |failed| return failed;
-        issuez_write_free(w);
-    }
-    return rt.give(o, rt.ownedProblems(problems.items), err);
-}
 
 pub fn issuez_milestone_create(
     repo: ?*api.Repo,
@@ -1407,24 +1115,11 @@ pub fn issuez_milestone_create(
     out: ?*?*api.Write,
     err: ?*?*api.Error,
 ) callconv(.c) Code {
-    return milestoneCreateIn(repo, op_ptr, n, actor, cancel, out, err, false);
-}
-
-fn milestoneCreateIn(
-    repo: ?*api.Repo,
-    op_ptr: ?[*]const api.Op,
-    n: usize,
-    actor: ?*const api.Actor,
-    cancel: ?*api.Cancel,
-    out: ?*?*api.Write,
-    err: ?*?*api.Error,
-    dry: bool,
-) Code {
-    const o = out orelse return rt.fail(err, .e_invalid_argument, "out is NULL", .{});
+    const o = out orelse return rt.badArgument(err, "out is NULL");
     var c = Call.begin(repo, cancel) catch |e| return rt.failError(err, e, .{});
     defer c.end();
     var w: Begun = undefined;
-    if (beginWrite(&c, &w, .milestone_create, op_ptr, n, actor, dry, err)) |code| return code;
+    if (beginWrite(&c, &w, .milestone_create, op_ptr, n, actor, err)) |code| return code;
     const a = c.arena();
     const p = &w.plan;
     const catalog = c.catalog();
@@ -1461,37 +1156,18 @@ pub fn issuez_milestone_update(
     out: ?*?*api.Write,
     err: ?*?*api.Error,
 ) callconv(.c) Code {
-    return milestoneUpdateIn(repo, id, op_ptr, n, actor, cancel, out, err, false);
-}
-
-fn milestoneUpdateIn(
-    repo: ?*api.Repo,
-    id: Str,
-    op_ptr: ?[*]const api.Op,
-    n: usize,
-    actor: ?*const api.Actor,
-    cancel: ?*api.Cancel,
-    out: ?*?*api.Write,
-    err: ?*?*api.Error,
-    dry: bool,
-) Code {
-    const o = out orelse return rt.fail(err, .e_invalid_argument, "out is NULL", .{});
+    const o = out orelse return rt.badArgument(err, "out is NULL");
     const ident = id.slice();
-    if (!uuid_fmt.isCanonical(ident)) return rt.fail(
-        err,
-        .e_invalid_argument,
-        "not a full milestone UUID",
-        .{},
-    );
+    if (!uuid_fmt.isCanonical(ident)) return rt.badArgument(err, "not a full milestone UUID");
     var c = Call.begin(repo, cancel) catch |e| return rt.failError(err, e, .{});
     defer c.end();
     var w: Begun = undefined;
-    if (beginWrite(&c, &w, .milestone_update, op_ptr, n, actor, dry, err)) |code| return code;
+    if (beginWrite(&c, &w, .milestone_update, op_ptr, n, actor, err)) |code| return code;
     const a = c.arena();
     const p = &w.plan;
     const catalog = c.catalog();
     const before = (catalog.find(a, ident) catch |e| return c.fail(err, e)) orelse
-        return rt.failWith(err, .e_not_found, .{ .subject = ident }, "no such milestone", .{});
+        return rt.notFound(err, ident, "no such milestone");
     if (p.expect) |want| if (!want.eql(before.tip)) return rt.failWith(err, .e_version_mismatch, .{
         .subject = ident,
         .current_tip = rt.oidOf(before.tip),
@@ -1513,57 +1189,31 @@ fn milestoneUpdateIn(
         .expect = p.expect orelse before.tip,
     }, .{}) catch |e| return writeFailed(&c, err, e, p, ident);
     var changes: std.ArrayList(api.Change) = .empty;
-    const add = struct {
-        fn f(
-            list: *std.ArrayList(api.Change),
-            al: Allocator,
-            field: Field,
-            old: []const u8,
-            new: ?[]const u8,
-        ) !void {
-            const v = new orelse return;
-            if (std.mem.eql(u8, old, v)) return;
-            try list.append(al, .{
-                .field = @intFromEnum(field),
-                .key = Str.of(field.key()),
-                .op = @intFromEnum(if (v.len == 0) Verb.clear else Verb.set),
-                .old_value = Str.of(old),
-                .new_value = Str.of(v),
-            });
-        }
-    }.f;
-    var old_due_buf: [10]u8 = undefined;
-    const old_due: []const u8 = if (before.due) |d|
-        std.fmt.bufPrint(
-            &old_due_buf,
-            "{d:0>4}-{d:0>2}-{d:0>2}",
-            .{ d.year, d.month, d.day },
-        ) catch ""
+    const m = p.milestone;
+    const old_due = if (before.due) |d| std.fmt.allocPrint(a, "{f}", .{d}) catch "" else "";
+    const new_due: ?[]const u8 = if (m.clear_due)
+        ""
+    else if (m.due) |d|
+        std.fmt.allocPrint(a, "{f}", .{d}) catch null
     else
-        "";
-    if (tip != null) {
-        add(&changes, a, .name, before.name, p.milestone.name) catch {};
-        add(&changes, a, .description, before.description, p.milestone.description) catch {};
-        add(
-            &changes,
-            a,
-            .due_date,
-            old_due,
-            if (p.milestone.clear_due)
-                ""
-            else if (p.milestone.due) |d|
-                std.fmt.allocPrint(a, "{f}", .{d}) catch null
-            else
-                null,
-        ) catch {};
-        add(
-            &changes,
-            a,
-            .milestone_status,
-            statusOf(before.status),
-            if (p.milestone.status) |s| statusOf(s) else null,
-        ) catch {};
-    }
+        null;
+    if (tip != null) for ([_]struct { Field, []const u8, ?[]const u8 }{
+        .{ .name, before.name, m.name },
+        .{ .description, before.description, m.description },
+        .{ .due_date, old_due, new_due },
+        .{ .milestone_status, @tagName(before.status), if (m.status) |s| @tagName(s) else null },
+    }) |row| {
+        const field, const old, const new = row;
+        const value = new orelse continue;
+        if (std.mem.eql(u8, old, value)) continue;
+        changes.append(a, .{
+            .field = @intFromEnum(field),
+            .key = Str.of(field.key()),
+            .op = @intFromEnum(if (value.len == 0) Verb.clear else Verb.set),
+            .old_value = Str.of(old),
+            .new_value = Str.of(value),
+        }) catch {};
+    };
 
     return rt.give(
         o,
@@ -1576,35 +1226,9 @@ comptime {
     _ = WriteObj.freeOpaque;
 }
 
-// ─── Attachments ───────────────────────────────────────────────────────
-
-pub fn issuez_attachment_validate(
-    repo: ?*api.Repo,
-    name: Str,
-    data: Str,
-    media_type: ?*Str,
-    err: ?*?*api.Error,
-) callconv(.c) Code {
-    if (name.len == 0) return rt.failWith(err, .e_invalid_value, .{
-        .problems = &.{
-            .{ .kind = .empty, .field = .attachments, .message = "an attachment has a name" },
-        },
-    }, "an attachment has a name", .{});
-    var c = Call.begin(repo, null) catch |e| return rt.failError(err, e, .{});
-    defer c.end();
-    const store = Store.fromRepo(c.engine());
-    const media = store.validate(.{ .name = name.slice(), .data = data.slice() }) catch |e| {
-        const p: Plan = .{};
-        return writeFailed(&c, err, e, &p, "");
-    };
-    if (media_type) |m| m.* = Str.of(media.mediaType());
-    return .ok;
-}
-
 const PreparedObj = struct {
     arena: *std.heap.ArenaAllocator,
     info: api.AttachmentSpec,
-    encoded: Str,
 };
 
 pub fn issuez_attachment_prepare(
@@ -1616,35 +1240,20 @@ pub fn issuez_attachment_prepare(
     out: ?*?*api.PreparedAttachment,
     err: ?*?*api.Error,
 ) callconv(.c) Code {
-    const o = out orelse return rt.fail(err, .e_invalid_argument, "out is NULL", .{});
+    const o = out orelse return rt.badArgument(err, "out is NULL");
     var c = Call.begin(repo, cancel) catch |e| return rt.failError(err, e, .{});
     defer c.end();
     const spec = Store.fromRepo(c.engine()).prepare(c.arena(), .{
         .id = if (id.len == 0) null else id.slice(),
         .name = name.slice(),
         .data = data.slice(),
-    }) catch |e| {
-        const p: Plan = .{};
-        return writeFailed(&c, err, e, &p, "");
-    };
-    const arena = rt.newArena() catch |e| return rt.failError(err, e, .{});
-    const a = arena.allocator();
-    const p = makePrepared(a, arena, spec) catch |e| {
-        rt.freeArena(arena);
-        return rt.failError(err, e, .{});
-    };
-    o.* = @ptrCast(p);
-    return .ok;
+    }) catch |e| return writeFailed(&c, err, e, &.{}, "");
+    return rt.give(o, rt.owned(PreparedObj, makePrepared, .{spec}), err);
 }
 
-fn makePrepared(
-    a: Allocator,
-    arena: *std.heap.ArenaAllocator,
-    spec: attachment_fmt.Spec,
-) !*PreparedObj {
-    const p = try a.create(PreparedObj);
-    p.* = .{
-        .arena = arena,
+fn makePrepared(a: Allocator, spec: attachment_fmt.Spec) !PreparedObj {
+    return .{
+        .arena = undefined,
         .info = .{
             .id = try rt.dupeZ(a, spec.id),
             .name = try rt.dupeZ(a, spec.name),
@@ -1652,21 +1261,10 @@ fn makePrepared(
             .sha256 = try rt.dupeZ(a, spec.sha256.slice()),
             .size = spec.size,
         },
-        .encoded = try rt.dupeZ(a, try std.fmt.allocPrint(a, "{f}", .{spec})),
     };
-    return p;
 }
 
 const PreparedReads = rt.Reads(api.PreparedAttachment, PreparedObj);
 pub const issuez_prepared_attachment_info = PreparedReads.ref("info");
-
-pub fn issuez_prepared_attachment_op(p: ?*const api.PreparedAttachment) callconv(.c) api.Op {
-    const o = rt.obj(PreparedObj, p) orelse return .{};
-    return .{
-        .verb = @intFromEnum(Verb.add),
-        .target = @intFromEnum(Opt.prepared_attachment),
-        .str = o.encoded,
-    };
-}
 
 pub const issuez_prepared_attachment_free = PreparedReads.free();

@@ -550,10 +550,7 @@ pub fn Attachments(comptime B: type) type {
             const parents: []const Oid = if (old) |o| &.{o} else &.{};
             const oid = try self.derivedCommit(arena, issue_id, issue_tip, pointers, parents);
             const ops = try arena.alloc(contract.RefUpdate, 1);
-            ops[0] = .{ .name = name, .op = if (old) |o|
-                .{ .update = .{ .new = oid, .old = o } }
-            else
-                .{ .create = oid } };
+            ops[0] = .{ .name = name, .op = repo_mod.moveOp(old, oid) };
             return ops;
         }
 
@@ -701,10 +698,7 @@ pub fn Attachments(comptime B: type) type {
                     );
                 }
                 if (actual != null and actual.?.eql(target)) return false;
-                const op: contract.RefUpdate.Op = if (actual) |l|
-                    .{ .update = .{ .new = target, .old = l } }
-                else
-                    .{ .create = target };
+                const op = repo_mod.moveOp(actual, target);
                 self.repo.backend.updateRefs(&.{.{ .name = name, .op = op }}) catch |e| switch (e) {
                     error.RefConflict => continue,
                     else => |x| return x,
@@ -884,6 +878,7 @@ fn matches(a: Attachment, data: []const u8) bool {
 
 const testing = std.testing;
 const GitSim = @import("../backend/GitSim.zig");
+const TestRepo = @import("test_repo.zig").TestRepo;
 const samples = fmt.samples;
 
 fn latest(repo: repo_mod.Repo(GitSim), arena: Allocator, sim: *GitSim, name: []const u8) !Issue {
@@ -929,12 +924,9 @@ pub fn derivedCommitOf(
 }
 
 test "add, read, rename, remove" {
-    var arena_state: std.heap.ArenaAllocator = .init(testing.allocator);
-    defer arena_state.deinit();
-    const arena = arena_state.allocator();
-    var world: GitSim.World = .{ .seed = 61, .clones = &.{.{ .name = "a" }} };
-    var sim = try GitSim.init(arena, &world, 0);
-    const repo = repo_mod.Repo(GitSim).init(&sim);
+    var fx: TestRepo = .{};
+    defer fx.deinit();
+    const arena, const sim, const repo = try fx.open(61);
     const att = Attachments(GitSim).fromRepo(repo);
     const created = try repo.create(arena, .{ .title = "Login broken" }, .{});
     const ref = try std.fmt.allocPrint(arena, "refs/issues/{s}", .{created.id});
@@ -946,7 +938,7 @@ test "add, read, rename, remove" {
         },
         .comment = "The button is cut off.",
     }, .{});
-    var issue = try latest(repo, arena, &sim, ref);
+    var issue = try latest(repo, arena, sim, ref);
     try testing.expect(issue.tip.eql(added.tip));
     try testing.expectEqual(@as(usize, 2), issue.attachments.len);
     try testing.expectEqualStrings("shot.png", issue.attachments[0].name);
@@ -972,7 +964,7 @@ test "add, read, rename, remove" {
 
     _ = try att.rename(arena, ref, added.ids[0], "login.png", .{}, .{});
     _ = try att.remove(arena, ref, &.{added.ids[1]}, .{}, .{});
-    issue = try latest(repo, arena, &sim, ref);
+    issue = try latest(repo, arena, sim, ref);
     try testing.expectEqual(@as(usize, 1), issue.attachments.len);
     try testing.expectEqualStrings("login.png", issue.attachments[0].name);
     try testing.expectEqual(@as(usize, 1), issue.removed_attachments.len);
@@ -1006,12 +998,10 @@ test "add, read, rename, remove" {
 const DerivedOk = Attachments(GitSim).DerivedState.ok;
 
 test "limits, missing bytes, repair, orphans" {
-    var arena_state: std.heap.ArenaAllocator = .init(testing.allocator);
-    defer arena_state.deinit();
-    const arena = arena_state.allocator();
-    var world: GitSim.World = .{ .seed = 62, .clones = &.{.{ .name = "a" }} };
-    var sim = try GitSim.init(arena, &world, 0);
-    var repo = repo_mod.Repo(GitSim).init(&sim);
+    var fx: TestRepo = .{};
+    defer fx.deinit();
+    const arena, const sim, _ = try fx.open(62);
+    var repo = repo_mod.Repo(GitSim).init(sim);
     repo.limits.max_attachments = 2;
     repo.limits.max_attachment_bytes = 64;
     const att = Attachments(GitSim).fromRepo(repo);
@@ -1030,7 +1020,7 @@ test "limits, missing bytes, repair, orphans" {
 
     // Bytes only in git-lfs's store, as after a fresh clone and
     // `git lfs fetch`: read finds and adopts them.
-    var issue = try latest(repo, arena, &sim, ref);
+    var issue = try latest(repo, arena, sim, ref);
     const sha = issue.attachments[0].sha256.slice();
     for (sim.lfs.items) |*o| o.store = .git_lfs;
     switch (try att.read(arena, issue.attachments[0])) {
@@ -1064,18 +1054,15 @@ test "limits, missing bytes, repair, orphans" {
 
     // An object written by a failed add is an orphan.
     try sim.lfsWrite(fmt.Sha256.of(samples.webp).slice(), samples.webp);
-    issue = try latest(repo, arena, &sim, ref);
+    issue = try latest(repo, arena, sim, ref);
     const orphans = try att.orphans(arena, &.{issue});
     try testing.expectEqual(@as(usize, 1), orphans.len);
 }
 
 test "attachments in the commit of a write, bytes kept by the caller" {
-    var arena_state: std.heap.ArenaAllocator = .init(testing.allocator);
-    defer arena_state.deinit();
-    const arena = arena_state.allocator();
-    var world: GitSim.World = .{ .seed = 63, .clones = &.{.{ .name = "a" }} };
-    var sim = try GitSim.init(arena, &world, 0);
-    const repo = repo_mod.Repo(GitSim).init(&sim);
+    var fx: TestRepo = .{};
+    defer fx.deinit();
+    const arena, const sim, const repo = try fx.open(63);
     const att = Attachments(GitSim).fromRepo(repo);
     const host_id = "5b0c4e0e-2b8a-4f5e-9d39-6c1c1f0f2a77";
     try testing.expectError(error.InvalidValue, att.prepare(arena, .{
@@ -1101,7 +1088,7 @@ test "attachments in the commit of a write, bytes kept by the caller" {
         .{},
     );
     const ref = try std.fmt.allocPrint(arena, "refs/issues/{s}", .{created.id});
-    var issue = try latest(repo, arena, &sim, ref);
+    var issue = try latest(repo, arena, sim, ref);
     try testing.expectEqual(@as(usize, 1), issue.attachments.len);
     try testing.expect(issue.attachments[0].added_in.eql(created.tip));
     try testing.expectEqual(DerivedOk, try att.derivedState(arena, issue));
@@ -1115,7 +1102,7 @@ test "attachments in the commit of a write, bytes kept by the caller" {
         .comment = "Here it is.",
         .attachments = .{ .add = &.{photo} },
     }, .{});
-    issue = try latest(repo, arena, &sim, ref);
+    issue = try latest(repo, arena, sim, ref);
     const c = issue.comments[issue.comments.len - 1];
     try testing.expect(c.oid.eql(commented.tip));
     try testing.expectEqualStrings("Here it is.", c.subject);
@@ -1155,7 +1142,7 @@ test "attachments in the commit of a write, bytes kept by the caller" {
         .description = "No image any more.",
         .attachments = .{ .remove = &.{host_id} },
     }, .{});
-    issue = try latest(repo, arena, &sim, ref);
+    issue = try latest(repo, arena, sim, ref);
     try testing.expectEqual(@as(usize, 1), issue.attachments.len);
     try testing.expectEqualStrings("better.webp", issue.attachments[0].name);
     try testing.expectEqual(@as(usize, 2), issue.removed_attachments.len);
@@ -1174,18 +1161,15 @@ test "attachments in the commit of a write, bytes kept by the caller" {
         arena,
         (try att.readCommit(arena, alone.tip)).?.message,
     ));
-    issue = try latest(repo, arena, &sim, ref);
+    issue = try latest(repo, arena, sim, ref);
     try testing.expectEqual(@as(usize, 0), issue.attachments.len);
     try testing.expectEqual(DerivedOk, try att.derivedState(arena, issue));
 }
 
 test "add, remove, rename: a dry run stores no bytes and writes nothing" {
-    var arena_state: std.heap.ArenaAllocator = .init(testing.allocator);
-    defer arena_state.deinit();
-    const arena = arena_state.allocator();
-    var world: GitSim.World = .{ .seed = 62, .clones = &.{.{ .name = "a" }} };
-    var sim = try GitSim.init(arena, &world, 0);
-    const repo = repo_mod.Repo(GitSim).init(&sim);
+    var fx: TestRepo = .{};
+    defer fx.deinit();
+    const arena, const sim, const repo = try fx.open(62);
     const att = Attachments(GitSim).fromRepo(repo);
     const created = try repo.create(arena, .{ .title = "Shots" }, .{});
     const ref = try std.fmt.allocPrint(arena, "refs/issues/{s}", .{created.id});

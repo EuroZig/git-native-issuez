@@ -20,8 +20,8 @@
  * Ownership
  *   - Every handle a function hands back through an out parameter
  *     (`issuez_x **out`) is owned by the caller: free it with that type's
- *     issuez_x_free (NULL is a no-op). The exceptions say so: the repo is
- *     closed with issuez_repo_close, a watch ended with issuez_watch_stop.
+ *     issuez_x_free (NULL is a no-op). The exception says so: the repo is
+ *     closed with issuez_repo_close.
  *   - Everything an accessor returns (strings, `const T *` records, list
  *     items) is borrowed from the handle it came from and lives until that
  *     handle is freed.
@@ -31,7 +31,7 @@
  *
  * Types
  *   - Value types (issuez_str, issuez_oid, issuez_time, issuez_date,
- *     issuez_person, issuez_progress) are frozen and copied freely.
+ *     issuez_person) are frozen and copied freely.
  *   - Records the library returns (issue and milestone info, comments,
  *     entries, problems, ...) only ever grow at the end: read them through
  *     the pointer, never copy one by value, never allocate one. Nested lists
@@ -74,28 +74,23 @@
  *   issuez_<handle>_<verb>, the verb saying what a call does:
  *   - _open, _close        the repo (issuez_repo_open, issuez_repo_close)
  *   - _new                 a handle built from what the call is given
- *                          (issuez_cancel_new, issuez_store_new, issuez_diff_new)
+ *                          (issuez_cancel_new)
  *   - _load*               an issue or milestone, read from git
  *   - _info_of             a handle's single values, one record
  *                          (issuez_issue_info_of, issuez_milestone_info_of)
  *   - _take                a value read off the repo into a handle
- *                          (issuez_snapshot_take, issuez_label_counts_take)
- *   - plain verbs          operations (issuez_search, issuez_sync,
- *                          issuez_fsck, issuez_issue_update)
- *   - _start, _stop        a watch
+ *                          (issuez_snapshot_take)
+ *   - plain verbs          operations (issuez_query_run, issuez_issue_update)
  *   - _free                every other handle
  *   - _len, _at            the items of a list handle
  *   - _<item>_count, _<item>_at
  *                          a list inside another handle
- *                          (issuez_issue_label_count, issuez_store_issue_count);
+ *                          (issuez_issue_label_count);
  *                          a _count without an _at is a plain number
- *   - _find                one item by key, NULL or {NULL,0} for none
  *
- * Flags and choices
- *   A call's switches are a `uint32_t flags` of its issuez_<call>_flag bits
- *   (0: the defaults), never a positional bool; a choice between named
- *   outcomes is an enum. Optional strings are an issuez_str, {NULL,0} when
- *   absent; optional objects (oids, actors) a pointer, NULL when absent.
+ * Optional values
+ *   Optional strings are an issuez_str, {NULL,0} when absent; optional
+ *   objects (oids, actors) a pointer, NULL when absent.
  *
  * Threads
  *   An issuez_repo is safe to use from any number of threads at once; it
@@ -106,7 +101,7 @@
  *   Calls that touch git block. They take an `issuez_cancel *` (may be
  *   NULL): triggering it from any thread makes the call return
  *   ISSUEZ_E_CANCELLED within about 50 ms, killing a git request that is
- *   running (a fetch, a push). Writes are atomic: a write that returns
+ *   running. Writes are atomic: a write that returns
  *   CANCELLED didn't happen (a ref update, once started, isn't
  *   interrupted), and one whose commit landed returns OK. The library
  *   installs no signal handlers. It writes to
@@ -115,7 +110,7 @@
  *
  * IDs
  *   Operations take full canonical UUIDs (lowercase, hyphenated). Turn
- *   user input ("a7f3", "#12") into one with issuez_resolve. Versions and
+ *   user input ("a7f3", "#12") into one with issuez_resolve_one. Versions and
  *   commits are issuez_oid values.
  */
 #ifndef ISSUEZ_H
@@ -156,18 +151,16 @@ typedef enum issuez_code {
     ISSUEZ_E_CONTENDED = 9, /* still racing after the retry budget (limit cas_retries): final */
     ISSUEZ_E_PURGED = 10, /* the issue was purged; it can't come back */
     ISSUEZ_E_CORRUPT = 11, /* history that can't be read as an issue */
-    ISSUEZ_E_QUARANTINED = 12, /* sync: remote history was rewritten */
-    ISSUEZ_E_REJECTED = 13, /* push check refused at least one ref */
-    ISSUEZ_E_NOT_A_REPOSITORY = 14,
-    ISSUEZ_E_GIT = 15, /* git failed; see the error's git stderr */
-    ISSUEZ_E_GIT_VERSION = 16, /* git older than 2.30 */
-    ISSUEZ_E_TIMEOUT = 17,
-    ISSUEZ_E_CANCELLED = 18,
-    ISSUEZ_E_NETWORK = 19, /* fetch or push to a remote failed */
-    ISSUEZ_E_LFS = 20, /* git-lfs missing or a transfer failed */
-    ISSUEZ_E_UNSUPPORTED = 21, /* not in this build, or not possible here */
-    ISSUEZ_E_NOMEM = 22,
-    ISSUEZ_E_INTERNAL = 23, /* a bug: please report */
+    ISSUEZ_E_REJECTED = 12, /* push check refused at least one ref */
+    ISSUEZ_E_NOT_A_REPOSITORY = 13,
+    ISSUEZ_E_GIT = 14, /* git failed; see the error's git stderr */
+    ISSUEZ_E_GIT_VERSION = 15, /* git older than 2.30 */
+    ISSUEZ_E_TIMEOUT = 16,
+    ISSUEZ_E_CANCELLED = 17,
+    ISSUEZ_E_LFS = 18, /* git-lfs missing or a transfer failed */
+    ISSUEZ_E_UNSUPPORTED = 19, /* not in this build, or not possible here */
+    ISSUEZ_E_NOMEM = 20,
+    ISSUEZ_E_INTERNAL = 21, /* a bug: please report */
 } issuez_code;
 
 /*
@@ -175,8 +168,6 @@ typedef enum issuez_code {
  * Static storage.
  */
 const char *issuez_version(void);
-
-uint32_t issuez_abi_version(void);
 
 /*
  * Checks that the header and the library match: ISSUEZ_E_ABI when they don't.
@@ -214,22 +205,6 @@ typedef struct issuez_oid {
     uint8_t len; /* 20 (SHA-1), 32 (SHA-256), 0: none */
     uint8_t bytes[32];
 } issuez_oid;
-
-/* The buffer issuez_oid_hex writes: 64 hex digits and a NUL. */
-#define ISSUEZ_OID_HEX_BUFSIZE 65
-
-/*
- * Writes the lowercase hex and a NUL into buf (ISSUEZ_OID_HEX_BUFSIZE bytes).
- * Returns the hex length (40 or 64), 0 for a none oid.
- */
-size_t issuez_oid_hex(const issuez_oid *oid, char *buf);
-
-/*
- * Full hex only.
- */
-issuez_code issuez_oid_parse(issuez_str hex, issuez_oid *out, issuez_error **err);
-
-bool issuez_oid_eq(const issuez_oid *a, const issuez_oid *b);
 
 /*
  * A point in time as git records it.
@@ -269,11 +244,6 @@ typedef struct issuez_actor {
     uint64_t reserved[4]; /* zero */
 } issuez_actor;
 
-typedef struct issuez_progress {
-    uint32_t done;
-    uint32_t total;
-} issuez_progress;
-
 
 /* ---------------------------------------- Errors and problems ------------------------------ */
 
@@ -299,7 +269,7 @@ issuez_str issuez_error_message(const issuez_error *err);
 issuez_str issuez_error_subject(const issuez_error *err);
 
 /*
- * git's stderr (trimmed, bounded), for GIT, NETWORK and LFS.
+ * git's stderr (trimmed, bounded), for GIT and LFS.
  */
 issuez_str issuez_error_git_stderr(const issuez_error *err);
 
@@ -466,7 +436,7 @@ typedef enum issuez_opt {
     ISSUEZ_OPT_RESTORE_COMMENT = 263,
     /* update: oid. The comment REACTIONS ADD or REMOVE is on; without it, the issue */
     ISSUEZ_OPT_REACTION_TARGET = 264,
-    /* ADD str: a prepared attachment trailer; external storage only */
+    /* ADD str: "<id> <media_type> <size> sha256:<sha256> <name>", from issuez_prepared_attachment_info; external storage only */
     ISSUEZ_OPT_PREPARED_ATTACHMENT = 265,
     ISSUEZ_OPT_Q_DONE = 512, /* query: num 0 not done (default), 1 done, -1 any */
     ISSUEZ_OPT_Q_DELETED = 513, /* query: num 0 (default), 1, -1 */
@@ -490,23 +460,18 @@ typedef enum issuez_opt {
     /* open: SET name=str; CLEAR without name starts empty. Default: the process environment */
     ISSUEZ_OPT_ENV = 769,
     ISSUEZ_OPT_COMMITTER = 770, /* open: person (name, email). Default: git's identity */
-    /* open: ADD str; overrides git config issue.doneStates. settings: ADD str writes the states given; CLEAR unsets the key (the defaults) */
-    ISSUEZ_OPT_DONE_STATE = 771,
+    ISSUEZ_OPT_DONE_STATE = 771, /* open: ADD str; overrides git config issue.doneStates */
     ISSUEZ_OPT_WORKFLOW_STATE = 772, /* open: ADD str; overrides issue.workflowStates */
     /* open: ADD str; one "scope/x" label per issue: adding one takes the others off, two in one write are refused */
     ISSUEZ_OPT_EXCLUSIVE_SCOPE = 773,
     ISSUEZ_OPT_EXTRA_PREFIX = 774, /* open: ADD str; allowed EXTRA keys (default "X-Forgejo-") */
     ISSUEZ_OPT_POOL_SIZE = 775, /* open: num; concurrent git sessions (default 4) */
     ISSUEZ_OPT_TIMEOUT_LOCAL_MS = 776, /* open: num */
-    ISSUEZ_OPT_TIMEOUT_NETWORK_MS = 777, /* open: num */
-    ISSUEZ_OPT_LIMIT = 778, /* open: name ("max_labels", ...), num */
+    ISSUEZ_OPT_LIMIT = 777, /* open: name ("max_labels", ...), num */
     /* open: num; issues kept loaded for queries (default 10000, 0 off) */
-    ISSUEZ_OPT_CACHE_ISSUES = 779,
+    ISSUEZ_OPT_CACHE_ISSUES = 778,
     /* open: num 0/1 (default 1). 0: the caller keeps attachment bytes (a host's LFS store); writes store none and need no git-lfs */
-    ISSUEZ_OPT_ATTACHMENT_STORE = 780,
-    ISSUEZ_OPT_SYNC_PUSH = 1024, /* sync: num 0/1 (default 1) */
-    /* sync: num 0/1 (default 1); 0 pushes refs/attachments but uploads no LFS bytes */
-    ISSUEZ_OPT_SYNC_ATTACHMENTS = 1025,
+    ISSUEZ_OPT_ATTACHMENT_STORE = 779,
     ISSUEZ_OPT_PUSHER = 1280, /* push check: person; its user_id counts as pusher_user_id */
     ISSUEZ_OPT_PUSHER_EMAIL = 1281, /* push check: ADD str, the pusher's other verified emails */
     ISSUEZ_OPT_AUTHOR_POLICY = 1282, /* push check: num (issuez_author_policy) */
@@ -548,9 +513,7 @@ typedef enum issuez_op_list {
     ISSUEZ_LIST_MILESTONE_UPDATE = 4,
     ISSUEZ_LIST_QUERY = 5,
     ISSUEZ_LIST_OPEN = 6,
-    ISSUEZ_LIST_SYNC = 7,
-    ISSUEZ_LIST_PUSH_CHECK = 8,
-    ISSUEZ_LIST_SETTINGS = 9,
+    ISSUEZ_LIST_PUSH_CHECK = 7,
 } issuez_op_list;
 
 /*
@@ -579,8 +542,6 @@ issuez_cancel *issuez_cancel_new(void);
  */
 void issuez_cancel_trigger(issuez_cancel *c);
 
-bool issuez_cancel_triggered(const issuez_cancel *c);
-
 void issuez_cancel_free(issuez_cancel *c);
 
 typedef enum issuez_log_level {
@@ -594,7 +555,7 @@ typedef enum issuez_log_level {
 
 typedef struct issuez_log_event {
     uint32_t level; /* issuez_log_level */
-    issuez_str operation; /* "issue.update", "git.cat-file", "sync" */
+    issuez_str operation; /* "issue.update", "git.cat-file", "repo.open" */
     issuez_str message;
     issuez_str repo_path; /* {NULL,0} when not about a repo */
     issuez_str subject; /* issue/milestone UUID or ref, if any */
@@ -639,15 +600,6 @@ void issuez_repo_set_logger(issuez_repo *repo, issuez_log_level min_level, issue
                             void *userdata);
 
 /*
- * Deletes every ref of the library's (issues, milestones, attachments,
- * tombstones and local state) in one transaction; *dropped is how many. It
- * undoes an import into a repository that had none, with no writes running. Not
- * a purge: clones keep their copies and sync them back.
- */
-issuez_code issuez_repo_drop_all(issuez_repo *repo, issuez_cancel *cancel, size_t *dropped,
-                                 issuez_error **err);
-
-/*
  * A staging repo inheriting repo's settings and options, sharing its objects.
  * Replay with ordinary writes, then commit_import. Closing it removes its
  * private refs, also after failure. The target stays alive while staging. Do
@@ -665,41 +617,10 @@ issuez_code issuez_repo_commit_import(issuez_repo *staging, issuez_cancel *cance
                                       issuez_error **err);
 
 /*
- * Creates in repo every issue, milestone, attachment and tombstone ref from
- * has, in one transaction; *adopted is how many. An import written into a
- * scratch repository whose git uses repo's objects (GIT_OBJECT_DIRECTORY) lands
- * at once or not at all. CONTENDED when repo has one of them, CORRUPT when a
- * tip's object isn't in repo's store; nothing is taken then.
- */
-issuez_code issuez_repo_adopt_refs(issuez_repo *repo, issuez_repo *from, issuez_cancel *cancel,
-                                   size_t *adopted, issuez_error **err);
-
-/*
- * Writes git config issue.doneStates and issue.workflowStates, what a settings
- * page saves. ops: DONE_STATE and WORKFLOW_STATE, ADD each state (the key is
- * set to them) or CLEAR (the key is unset: the defaults). Every state is
- * checked first (INVALID_VALUE). Handles opened afterwards see the new
- * settings.
- */
-issuez_code issuez_settings_write(issuez_repo *repo, const issuez_op *ops, size_t n,
-                                  issuez_cancel *cancel, issuez_error **err);
-
-/*
  * The effective value of a limit ("max_attachment_bytes", "cas_retries", the
  * names ISSUEZ_OPT_LIMIT takes); false for no such limit.
  */
 bool issuez_repo_limit(const issuez_repo *repo, issuez_str name, uint64_t *out);
-
-/*
- * The effective settings, from opts or git config.
- */
-size_t issuez_repo_workflow_state_count(const issuez_repo *repo);
-
-issuez_str issuez_repo_workflow_state_at(const issuez_repo *repo, size_t i);
-
-size_t issuez_repo_done_state_count(const issuez_repo *repo);
-
-issuez_str issuez_repo_done_state_at(const issuez_repo *repo, size_t i);
 
 
 /* ---------------------------------------- Resolve and change detection --------------------- */
@@ -712,140 +633,23 @@ typedef enum issuez_kind {
     ISSUEZ_KIND_TOMBSTONE = 4,
 } issuez_kind;
 
-typedef struct issuez_matches issuez_matches;
-
-/*
- * User input to UUIDs: a full UUID, a unique prefix ("a7f3"), a number ("#12"),
- * or for milestones a name. OK with 0, 1 or more matches.
- */
-issuez_code issuez_resolve(issuez_repo *repo, issuez_kind kind, issuez_str input,
-                           issuez_cancel *cancel, issuez_matches **out, issuez_error **err);
-
-size_t issuez_matches_len(const issuez_matches *m);
-
-issuez_str issuez_matches_at(const issuez_matches *m, size_t i);
-
-void issuez_matches_free(issuez_matches *m);
-
-/*
- * Line search: the lines of what each issue says now (title, fields as `Key:
- * value`, description, comments that aren't deleted) that contain a fixed
- * string, as git issue search shows them.
- */
-typedef struct issuez_search_hit {
-    issuez_str issue_id;
-    issuez_str line;
-} issuez_search_hit;
-
-typedef enum issuez_search_flag {
-    ISSUEZ_SEARCH_FLAG_NONE = 0,
-    ISSUEZ_SEARCH_FLAG_IGNORE_CASE = 1, /* bit: ASCII case-insensitive */
-} issuez_search_flag;
-
-typedef struct issuez_search_hits issuez_search_hits;
-
-/*
- * Every hit in every issue that isn't deleted, by issue UUID. flags:
- * issuez_search_flag bits.
- */
-issuez_code issuez_search(issuez_repo *repo, issuez_str needle, uint32_t flags,
-                          issuez_cancel *cancel, issuez_search_hits **out, issuez_error **err);
-
-size_t issuez_search_hits_len(const issuez_search_hits *h);
-
-const issuez_search_hit *issuez_search_hits_at(const issuez_search_hits *h, size_t i);
-
-void issuez_search_hits_free(issuez_search_hits *h);
-
-/*
- * What pickers, filters and list views need across issues: the labels in use,
- * the people the history knows, and the shortest unique ID prefixes. Deleted
- * issues don't count in the labels and people.
- */
-typedef struct issuez_label_counts issuez_label_counts;
-typedef struct issuez_people issuez_people;
-typedef struct issuez_short_ids issuez_short_ids;
-
-typedef struct issuez_label_count {
-    issuez_str name;
-    uint32_t open; /* of them not done */
-    uint32_t total; /* issues carrying it */
-} issuez_label_count;
-
-typedef struct issuez_known_person {
-    /* the latest name they wrote under (empty for assignees only), email, user_id */
-    issuez_person person;
-    uint32_t authored; /* issues they opened */
-    uint32_t assigned; /* issues they are assigned */
-} issuez_known_person;
-
-typedef struct issuez_short_id {
-    issuez_str id; /* the full UUID */
-    issuez_str prefix; /* the shortest prefix no other issue's UUID starts with */
-} issuez_short_id;
-
-/*
- * Every label in use, by name.
- */
-issuez_code issuez_label_counts_take(issuez_repo *repo, issuez_cancel *cancel,
-                                     issuez_label_counts **out, issuez_error **err);
-
-size_t issuez_label_counts_len(const issuez_label_counts *l);
-
-const issuez_label_count *issuez_label_counts_at(const issuez_label_counts *l, size_t i);
-
-void issuez_label_counts_free(issuez_label_counts *l);
-
-/*
- * Everyone who opened or is assigned an issue, by email (compared ignoring
- * case).
- */
-issuez_code issuez_people_take(issuez_repo *repo, issuez_cancel *cancel, issuez_people **out,
-                               issuez_error **err);
-
-size_t issuez_people_len(const issuez_people *p);
-
-const issuez_known_person *issuez_people_at(const issuez_people *p, size_t i);
-
-void issuez_people_free(issuez_people *p);
-
-/*
- * For every issue, the shortest prefix of its UUID that no other issue's starts
- * with, at least min long: what a list shows so that issuez_resolve takes it.
- */
-issuez_code issuez_short_ids_take(issuez_repo *repo, size_t min, issuez_cancel *cancel,
-                                  issuez_short_ids **out, issuez_error **err);
-
-size_t issuez_short_ids_len(const issuez_short_ids *s);
-
-/*
- * In UUID order.
- */
-const issuez_short_id *issuez_short_ids_at(const issuez_short_ids *s, size_t i);
-
-/*
- * The prefix of a full UUID; {NULL,0} for one it doesn't know.
- */
-issuez_str issuez_short_ids_find(const issuez_short_ids *s, issuez_str id);
-
-void issuez_short_ids_free(issuez_short_ids *s);
-
 /* The buffer issuez_resolve_one writes: a hyphenated UUID and a NUL. */
 #define ISSUEZ_UUID_BUFSIZE 37
 
 /*
- * Exactly one, or NOT_FOUND / AMBIGUOUS. Writes the UUID and a NUL into buf
- * (ISSUEZ_UUID_BUFSIZE bytes).
+ * User input to a UUID: a full UUID, a unique prefix ("a7f3"), a number
+ * ("#12"), or for milestones a name. Exactly one, or NOT_FOUND / AMBIGUOUS.
+ * Writes the UUID and a NUL into buf (ISSUEZ_UUID_BUFSIZE bytes).
  */
 issuez_code issuez_resolve_one(issuez_repo *repo, issuez_kind kind, issuez_str input,
                                issuez_cancel *cancel, char *buf, issuez_error **err);
 
 /*
  * Snapshot: every issue and milestone ref with its tip. Cheap (no issue is
- * read), and serialisable so a host can store what it indexed.
+ * read). A host stores what it indexed in the encoding issuez_snapshot_decode
+ * reads.
  */
 typedef struct issuez_snapshot issuez_snapshot;
-typedef struct issuez_diff issuez_diff;
 
 issuez_code issuez_snapshot_take(issuez_repo *repo, issuez_cancel *cancel, issuez_snapshot **out,
                                  issuez_error **err);
@@ -860,85 +664,18 @@ size_t issuez_snapshot_len(const issuez_snapshot *s);
 void issuez_snapshot_at(const issuez_snapshot *s, size_t i, issuez_kind *kind, issuez_str *id,
                         issuez_oid *tip);
 
-bool issuez_snapshot_tip(const issuez_snapshot *s, issuez_kind kind, issuez_str id,
-                         issuez_oid *out);
-
 /*
- * A stable, versioned binary encoding. The bytes live until s is freed.
- */
-issuez_str issuez_snapshot_encode(const issuez_snapshot *s);
-
-/*
- * Empty bytes decode to an empty snapshot.
+ * The stable, versioned encoding: "issuez-snapshot 1\n", then a line "i <uuid>
+ * <tip>\n" or "m <uuid> <tip>\n" per issue or milestone, the tip in full
+ * lowercase hex. Empty bytes decode to an empty snapshot.
  */
 issuez_code issuez_snapshot_decode(issuez_str bytes, issuez_snapshot **out, issuez_error **err);
-
-typedef enum issuez_change_kind {
-    ISSUEZ_CHANGE_UNKNOWN = 0,
-    ISSUEZ_CHANGE_CREATED = 1,
-    ISSUEZ_CHANGE_UPDATED = 2,
-    ISSUEZ_CHANGE_REMOVED = 3, /* the ref is gone (purge, or another tool) */
-} issuez_change_kind;
-
-typedef struct issuez_diff_entry {
-    uint32_t kind; /* issuez_kind */
-    uint32_t change; /* issuez_change_kind */
-    issuez_str id;
-    issuez_oid old_tip; /* len 0 when created */
-    issuez_oid new_tip; /* len 0 when removed */
-} issuez_diff_entry;
-
-/*
- * old_snap may be NULL (everything is created). Pure: no git.
- */
-issuez_code issuez_diff_new(const issuez_snapshot *old_snap, const issuez_snapshot *new_snap,
-                            issuez_diff **out, issuez_error **err);
-
-size_t issuez_diff_len(const issuez_diff *d);
-
-const issuez_diff_entry *issuez_diff_at(const issuez_diff *d, size_t i);
-
-void issuez_diff_free(issuez_diff *d);
-
-
-/* ---------------------------------------- Watching ----------------------------------------- */
-/*
- * Live updates: a callback when other processes (git issue, another front end,
- * a sync) change a repository's issues on disk.
- */
-
-typedef enum issuez_watch_change {
-    ISSUEZ_WATCH_NONE = 0,
-    /* bit: issue, milestone or attachment refs moved: read them again (issuez_snapshot_take and issuez_diff_new say what) */
-    ISSUEZ_WATCH_REFS = 1,
-    /* bit: the repository's config changed, which has the issue settings */
-    ISSUEZ_WATCH_CONFIG = 2,
-} issuez_watch_change;
-
-typedef void (*issuez_watch_fn)(void *userdata, uint32_t changes);
-
-typedef struct issuez_watch issuez_watch;
-
-/*
- * Calls cb with issuez_watch_change bits once a burst of changes is quiet (and
- * at least every 400 ms while it isn't), on a thread of its own; our own writes
- * count too. cb must not call issuez_watch_stop. A changed path says something
- * may have changed, not what: read again.
- */
-issuez_code issuez_watch_start(issuez_repo *repo, issuez_watch_fn cb, void *userdata,
-                               issuez_watch **out, issuez_error **err);
-
-/*
- * No call to cb after it returns.
- */
-void issuez_watch_stop(issuez_watch *w);
 
 
 /* ---------------------------------------- Issues: read ------------------------------------- */
 
 typedef struct issuez_issue issuez_issue;
 typedef struct issuez_issue_list issuez_issue_list;
-typedef struct issuez_bytes issuez_bytes;
 
 issuez_code issuez_issue_load(issuez_repo *repo, issuez_str id, issuez_cancel *cancel,
                               issuez_issue **out, issuez_error **err);
@@ -962,41 +699,6 @@ issuez_code issuez_issue_load_at(issuez_repo *repo, issuez_str id, const issuez_
  */
 issuez_code issuez_issue_load_since(issuez_repo *repo, issuez_str id, const issuez_oid *since,
                                     issuez_cancel *cancel, issuez_issue **out, issuez_error **err);
-
-typedef enum issuez_json_flag {
-    ISSUEZ_JSON_FLAG_NONE = 0,
-    ISSUEZ_JSON_FLAG_FULL = 1, /* bit: add the description, comments and history */
-} issuez_json_flag;
-
-/*
- * The issue as git issue show --json writes it (docs/json.md;
- * ISSUEZ_JSON_FLAG_FULL adds the description, comments and history), UTF-8: one
- * call for a binding that would rather parse JSON than call every accessor.
- */
-issuez_code issuez_issue_json(issuez_repo *repo, issuez_str id, uint32_t flags,
-                              issuez_cancel *cancel, issuez_bytes **out, issuez_error **err);
-
-/*
- * A JSON array of the issues with these full UUIDs, in their order; NULL ids
- * and n 0: every issue that isn't deleted. Missing and damaged ones are left
- * out.
- */
-issuez_code issuez_issue_json_many(issuez_repo *repo, const issuez_str *ids, size_t n,
-                                   uint32_t flags, issuez_cancel *cancel, issuez_bytes **out,
-                                   issuez_error **err);
-
-typedef enum issuez_load_flag {
-    ISSUEZ_LOAD_FLAG_NONE = 0,
-    ISSUEZ_LOAD_FLAG_STRICT = 1, /* bit: a missing or damaged issue fails the call */
-} issuez_load_flag;
-
-/*
- * In the order of ids. Missing and damaged ones are skipped (see
- * issuez_issue_list_skipped_at) unless ISSUEZ_LOAD_FLAG_STRICT.
- */
-issuez_code issuez_issue_load_many(issuez_repo *repo, const issuez_str *ids, size_t n,
-                                   uint32_t flags, issuez_cancel *cancel, issuez_issue_list **out,
-                                   issuez_error **err);
 
 void issuez_issue_free(issuez_issue *issue);
 
@@ -1048,8 +750,7 @@ typedef struct issuez_issue_info {
     bool is_locked;
     issuez_str lock_reason;
     uint32_t priority; /* issuez_priority */
-    /* direct only; the effective one (through parents) is a projection answer */
-    issuez_str milestone_id;
+    issuez_str milestone_id; /* direct only, not one inherited from a parent */
     issuez_str parent_id;
     issuez_date start_date; /* zero: none */
     issuez_date due_date; /* zero: none */
@@ -1073,8 +774,6 @@ size_t issuez_issue_label_count(const issuez_issue *i);
 
 issuez_str issuez_issue_label_at(const issuez_issue *i, size_t k);
 
-bool issuez_issue_has_label(const issuez_issue *i, issuez_str label);
-
 size_t issuez_issue_assignee_count(const issuez_issue *i);
 
 const issuez_person *issuez_issue_assignee_at(const issuez_issue *i, size_t k);
@@ -1082,11 +781,6 @@ const issuez_person *issuez_issue_assignee_at(const issuez_issue *i, size_t k);
 size_t issuez_issue_blocker_count(const issuez_issue *i);
 
 issuez_str issuez_issue_blocker_at(const issuez_issue *i, size_t k);
-
-/*
- * Any trailer by key, case-insensitive, as resolved (unknown ones too).
- */
-issuez_str issuez_issue_field(const issuez_issue *i, issuez_str key);
 
 /*
  * Fields this library doesn't interpret (X-Forgejo-* and others).
@@ -1137,8 +831,6 @@ typedef struct issuez_comment {
 size_t issuez_issue_comment_count(const issuez_issue *i);
 
 const issuez_comment *issuez_issue_comment_at(const issuez_issue *i, size_t k);
-
-const issuez_comment *issuez_issue_comment_find(const issuez_issue *i, const issuez_oid *id);
 
 /*
  * The UUID of an attachment the comment's commit added; {NULL,0} past the end.
@@ -1264,12 +956,6 @@ typedef enum issuez_sort {
 issuez_code issuez_query_run(issuez_repo *repo, const issuez_op *ops, size_t n,
                              issuez_cancel *cancel, issuez_issue_list **out, issuez_error **err);
 
-/*
- * Ignores Q_LIMIT and Q_AFTER.
- */
-issuez_code issuez_query_count(issuez_repo *repo, const issuez_op *ops, size_t n,
-                               issuez_cancel *cancel, uint64_t *out, issuez_error **err);
-
 size_t issuez_issue_list_len(const issuez_issue_list *l);
 
 const issuez_issue *issuez_issue_list_at(const issuez_issue_list *l, size_t i);
@@ -1280,7 +966,7 @@ const issuez_issue *issuez_issue_list_at(const issuez_issue_list *l, size_t i);
 issuez_str issuez_issue_list_next_cursor(const issuez_issue_list *l);
 
 /*
- * Ids asked for or matched that couldn't be read (damaged).
+ * Issues matched that couldn't be read (damaged).
  */
 size_t issuez_issue_list_skipped_count(const issuez_issue_list *l);
 
@@ -1289,68 +975,12 @@ issuez_str issuez_issue_list_skipped_at(const issuez_issue_list *l, size_t i);
 void issuez_issue_list_free(issuez_issue_list *l);
 
 
-/* ---------------------------------------- Store -------------------------------------------- */
-/*
- * A live view of a repository's issues for a front end: every issue, kept up to
- * date by issuez_store_refresh, which loads only the issues whose tip moved.
- * Issue handles from it are borrowed: valid until the next refresh or free. Not
- * for concurrent use; the repo is.
- */
-
-typedef struct issuez_store issuez_store;
-
-/*
- * Empty until the first refresh.
- */
-issuez_code issuez_store_new(issuez_repo *repo, issuez_store **out, issuez_error **err);
-
-/*
- * Reads the refs and loads what moved; *changed is false when nothing did and
- * the handles stay valid.
- */
-issuez_code issuez_store_refresh(issuez_store *store, issuez_cancel *cancel, bool *changed,
-                                 issuez_error **err);
-
-/*
- * Bumped by every refresh that changed something.
- */
-uint32_t issuez_store_generation(const issuez_store *store);
-
-size_t issuez_store_issue_count(const issuez_store *store);
-
-/*
- * In UUID order; deleted ones too.
- */
-const issuez_issue *issuez_store_issue_at(const issuez_store *store, size_t i);
-
-/*
- * By full UUID; NULL for none.
- */
-const issuez_issue *issuez_store_find(const issuez_store *store, issuez_str id);
-
-size_t issuez_store_changed_count(const issuez_store *store);
-
-/*
- * UUIDs of the issues the last refresh found created, changed or deleted.
- */
-issuez_str issuez_store_changed_at(const issuez_store *store, size_t i);
-
-void issuez_store_free(issuez_store *store);
-
-
 /* ---------------------------------------- Issues: write ------------------------------------ */
 /*
  * One op list, one commit: a user action ("comment and close", "edit labels and
  * assignees", "delete") is one call. ISSUEZ_OPT_EXPECT and the other write
  * options go in the same list.
  */
-
-/*
- * Dry run: every problem the write would hit, without writing. OK with an empty
- * list: it would succeed now. id {NULL,0}: as a create.
- */
-issuez_code issuez_issue_check(issuez_repo *repo, issuez_str id, const issuez_op *ops, size_t n,
-                               issuez_cancel *cancel, issuez_problems **out, issuez_error **err);
 
 /*
  * TITLE is required.
@@ -1370,30 +1000,6 @@ issuez_code issuez_issue_update(issuez_repo *repo, issuez_str id, const issuez_o
                                 const issuez_actor *actor, issuez_cancel *cancel,
                                 issuez_write **out, issuez_error **err);
 
-/*
- * An attachment's bytes from the repository's store, checked against its
- * trailer: what a front end shows. NOT_FOUND for no such issue or attachment,
- * LFS when the bytes aren't in this clone (git lfs fetch), CORRUPT when they
- * don't match.
- */
-issuez_code issuez_attachment_read(issuez_repo *repo, issuez_str issue_id, issuez_str attachment_id,
-                                   issuez_cancel *cancel, issuez_bytes **out, issuez_error **err);
-
-/*
- * The bytes; not NUL-terminated text, binary.
- */
-issuez_str issuez_bytes_data(const issuez_bytes *b);
-
-void issuez_bytes_free(issuez_bytes *b);
-
-/*
- * Whether a write would take these bytes as an attachment (a PNG, JPEG or WebP,
- * not animated, within the repo's limits), without writing. media_type (may be
- * NULL) gets the type, a static string.
- */
-issuez_code issuez_attachment_validate(issuez_repo *repo, issuez_str name, issuez_str data,
-                                       issuez_str *media_type, issuez_error **err);
-
 typedef struct issuez_prepared_attachment issuez_prepared_attachment;
 
 typedef struct issuez_attachment_spec {
@@ -1406,8 +1012,9 @@ typedef struct issuez_attachment_spec {
 
 /*
  * Validates and hashes bytes once, sanitizes the name and chooses an ID when
- * empty. Store the bytes in the host's LFS store before using the prepared op.
- * The write requires ATTACHMENT_STORE 0 and checks metadata and limits again.
+ * empty. Store the bytes in the host's LFS store before writing
+ * ISSUEZ_OPT_PREPARED_ATTACHMENT. The write requires ATTACHMENT_STORE 0 and
+ * checks metadata and limits again.
  */
 issuez_code issuez_attachment_prepare(issuez_repo *repo, issuez_str id, issuez_str name,
                                       issuez_str data, issuez_cancel *cancel,
@@ -1418,11 +1025,6 @@ issuez_code issuez_attachment_prepare(issuez_repo *repo, issuez_str id, issuez_s
  */
 const issuez_attachment_spec *issuez_prepared_attachment_info(
     const issuez_prepared_attachment *p);
-
-/*
- * An ADD op borrowing p's metadata. Keep p until the write returns.
- */
-issuez_op issuez_prepared_attachment_op(const issuez_prepared_attachment *p);
 
 void issuez_prepared_attachment_free(issuez_prepared_attachment *p);
 
@@ -1539,12 +1141,7 @@ const issuez_problems *issuez_milestone_problems(const issuez_milestone *m);
 /*
  * Fields: NAME (required on create), DESCRIPTION, DUE_DATE, MILESTONE_STATUS
  * (COMPLETED is a GUARD problem while issues are open), plus ISSUEZ_OPT_EXPECT.
- * id {NULL,0}: as a create.
  */
-issuez_code issuez_milestone_check(issuez_repo *repo, issuez_str id, const issuez_op *ops, size_t n,
-                                   issuez_cancel *cancel, issuez_problems **out,
-                                   issuez_error **err);
-
 issuez_code issuez_milestone_create(issuez_repo *repo, const issuez_op *ops, size_t n,
                                     const issuez_actor *actor, issuez_cancel *cancel,
                                     issuez_write **out, issuez_error **err);
@@ -1554,128 +1151,15 @@ issuez_code issuez_milestone_update(issuez_repo *repo, issuez_str id, const issu
                                     issuez_write **out, issuez_error **err);
 
 
-/* ---------------------------------------- Projection --------------------------------------- */
+/* ---------------------------------------- Fsck --------------------------------------------- */
 /*
- * Answers that need several issues: tree, blockers, progress, effective
- * milestone, problems. Built from every issue, or from what one issue's answers
- * need (cheaper; the same answers for that issue).
+ * Checking the issue data, as git issue fsck does: upstream fsck's checks on
+ * every issue and milestone, attachment trailers and bytes, derived attachment
+ * refs, quarantined remote versions, and hierarchy and blocker problems.
+ * Nothing is written. With ISSUEZ_OPT_ATTACHMENT_STORE 0 the bytes are the
+ * caller's to check.
  */
 
-typedef struct issuez_projection issuez_projection;
-
-issuez_code issuez_projection_build(issuez_repo *repo, issuez_cancel *cancel,
-                                    issuez_projection **out, issuez_error **err);
-
-/*
- * What one issue's answers need: the issue, its ancestors, descendants and
- * blockers. Its answers are those of issuez_projection_build, but for whom it
- * blocks: that needs every issue.
- */
-issuez_code issuez_projection_around(issuez_repo *repo, issuez_str id, issuez_cancel *cancel,
-                                     issuez_projection **out, issuez_error **err);
-
-void issuez_projection_free(issuez_projection *p);
-
-/*
- * The issues it covers, borrowed.
- */
-const issuez_issue_list *issuez_projection_issues(const issuez_projection *p);
-
-/*
- * Roots in tree order (a broken parent makes an issue a root).
- */
-size_t issuez_projection_root_count(const issuez_projection *p);
-
-issuez_str issuez_projection_root_at(const issuez_projection *p, size_t i);
-
-size_t issuez_projection_child_count(const issuez_projection *p, issuez_str id);
-
-issuez_str issuez_projection_child_at(const issuez_projection *p, issuez_str id, size_t i);
-
-/*
- * Blockers that aren't done.
- */
-size_t issuez_projection_active_blocker_count(const issuez_projection *p, issuez_str id);
-
-issuez_str issuez_projection_active_blocker_at(
-    const issuez_projection *p, issuez_str id, size_t i);
-
-/*
- * Issues this one blocks.
- */
-size_t issuez_projection_blocking_count(const issuez_projection *p, issuez_str id);
-
-issuez_str issuez_projection_blocking_at(const issuez_projection *p, issuez_str id, size_t i);
-
-/*
- * Done and total leaves below the issue; false without sub-issues.
- */
-bool issuez_projection_progress(const issuez_projection *p, issuez_str id, issuez_progress *out);
-
-/*
- * Direct or through parents; {NULL,0} for none.
- */
-issuez_str issuez_projection_milestone_of(const issuez_projection *p, issuez_str id);
-
-issuez_progress issuez_projection_milestone_progress(
-    const issuez_projection *p, issuez_str milestone_id);
-
-/*
- * Problems across issues (missing parent, cycle, ...); id {NULL,0} for all.
- */
-const issuez_problems *issuez_projection_problems(const issuez_projection *p, issuez_str id);
-
-
-/* ---------------------------------------- Sync --------------------------------------------- */
-/*
- * Fetch, merge and push issues and milestones with a remote. Never force-pushes
- * or drops a version.
- */
-
-typedef struct issuez_sync_report issuez_sync_report;
-
-typedef enum issuez_sync_outcome {
-    ISSUEZ_SYNC_UNKNOWN = 0,
-    ISSUEZ_SYNC_UP_TO_DATE = 1,
-    ISSUEZ_SYNC_NEW = 2, /* came from the remote */
-    ISSUEZ_SYNC_FAST_FORWARD = 3,
-    ISSUEZ_SYNC_MERGED = 4,
-    ISSUEZ_SYNC_PUSHED = 5, /* ours went to the remote (also new local issues) */
-    ISSUEZ_SYNC_QUARANTINED = 6, /* remote history rewritten; see issuez_quarantine_resolve */
-    /* not reported in this version: a push that can't land fails the call */
-    ISSUEZ_SYNC_FAILED = 7,
-    ISSUEZ_SYNC_PURGED = 8, /* purged by a tombstone; the push deletes the remote's copy */
-} issuez_sync_outcome;
-
-typedef struct issuez_sync_item {
-    uint32_t kind; /* issuez_kind */
-    issuez_str id;
-    uint32_t outcome; /* issuez_sync_outcome */
-    issuez_oid local_tip; /* after the sync */
-    issuez_oid remote_tip;
-    issuez_str reason; /* for QUARANTINED and FAILED */
-} issuez_sync_item;
-
-/*
- * opts: ISSUEZ_OPT_SYNC_*. OK even when some items failed or were quarantined:
- * check the report.
- */
-issuez_code issuez_sync(issuez_repo *repo, issuez_str remote, const issuez_op *opts, size_t n_opts,
-                        issuez_cancel *cancel, issuez_sync_report **out, issuez_error **err);
-
-size_t issuez_sync_report_len(const issuez_sync_report *r);
-
-const issuez_sync_item *issuez_sync_report_at(const issuez_sync_report *r, size_t i);
-
-bool issuez_sync_report_ok(const issuez_sync_report *r);
-
-void issuez_sync_report_free(issuez_sync_report *r);
-
-/*
- * Checking the issue data (git issue fsck): upstream fsck's checks on every
- * issue and milestone, attachment trailers and bytes, derived attachment refs,
- * quarantined remote versions, and hierarchy and blocker problems.
- */
 typedef enum issuez_fsck_kind {
     ISSUEZ_FSCK_UNKNOWN = 0,
     ISSUEZ_FSCK_INTEGRITY = 1, /* error: fails one of upstream fsck's checks */
@@ -1684,14 +1168,12 @@ typedef enum issuez_fsck_kind {
     ISSUEZ_FSCK_ATTACHMENT_TRAILER = 3, /* note: an attachment trailer the history ignores */
     ISSUEZ_FSCK_ATTACHMENT_MISSING = 4, /* note: an attachment's bytes aren't in this repository */
     ISSUEZ_FSCK_ATTACHMENT_CORRUPT = 5, /* error: an attachment's stored bytes don't match it */
-    /* note: refs/attachments/<id> is missing or stale (repair rewrites it) */
-    ISSUEZ_FSCK_DERIVED_REF = 6,
-    ISSUEZ_FSCK_REPAIRED = 7, /* refs/attachments/<id> was rewritten */
-    ISSUEZ_FSCK_ATTACHMENTS_FAILED = 8, /* error: checking or repairing attachments failed */
-    ISSUEZ_FSCK_BYTES_UNCHECKED = 9, /* note: without git-lfs the bytes weren't checked */
-    ISSUEZ_FSCK_ORPHANS = 10, /* note: stored objects no issue references (failed writes) */
-    ISSUEZ_FSCK_QUARANTINED = 11, /* note: remote versions a merge refused, subject the remote */
-    ISSUEZ_FSCK_PROJECTION = 12, /* note: a hierarchy or blocker problem across issues */
+    ISSUEZ_FSCK_DERIVED_REF = 6, /* note: refs/attachments/<id> is missing or stale */
+    ISSUEZ_FSCK_ATTACHMENTS_FAILED = 7, /* error: checking attachments failed */
+    ISSUEZ_FSCK_BYTES_UNCHECKED = 8, /* note: without git-lfs the bytes weren't checked */
+    ISSUEZ_FSCK_ORPHANS = 9, /* note: stored objects no issue references (failed writes) */
+    ISSUEZ_FSCK_QUARANTINED = 10, /* note: remote versions a merge refused, subject the remote */
+    ISSUEZ_FSCK_PROJECTION = 11, /* note: a hierarchy or blocker problem across issues */
 } issuez_fsck_kind;
 
 typedef struct issuez_fsck_finding {
@@ -1702,20 +1184,10 @@ typedef struct issuez_fsck_finding {
     issuez_str message; /* one sentence without a front end's commands */
 } issuez_fsck_finding;
 
-typedef enum issuez_fsck_flag {
-    ISSUEZ_FSCK_FLAG_NONE = 0,
-    /* bit: rewrite missing or stale derived attachment refs (needs the attachment store); nothing else is written */
-    ISSUEZ_FSCK_FLAG_REPAIR = 1,
-} issuez_fsck_flag;
-
 typedef struct issuez_fsck_report issuez_fsck_report;
 
-/*
- * flags: issuez_fsck_flag bits. Without ISSUEZ_FSCK_FLAG_REPAIR nothing is
- * written.
- */
-issuez_code issuez_fsck(issuez_repo *repo, uint32_t flags, issuez_cancel *cancel,
-                        issuez_fsck_report **out, issuez_error **err);
+issuez_code issuez_fsck(issuez_repo *repo, issuez_cancel *cancel, issuez_fsck_report **out,
+                        issuez_error **err);
 
 size_t issuez_fsck_report_issue_count(const issuez_fsck_report *r);
 
@@ -1731,94 +1203,6 @@ size_t issuez_fsck_report_len(const issuez_fsck_report *r);
 const issuez_fsck_finding *issuez_fsck_report_at(const issuez_fsck_report *r, size_t i);
 
 void issuez_fsck_report_free(issuez_fsck_report *r);
-
-/*
- * Setting a remote up (git issue init): fetch refspecs that bring its issues,
- * milestones and attachment refs into refs/remotes/<remote>/, where a merge
- * takes them from. Optional: issuez_sync works without it.
- */
-typedef struct issuez_remote_setup {
-    bool configured; /* the refspecs were added now; false when they were there */
-    /* upstream's forced refspec was taken out (ISSUEZ_REMOTE_FLAG_FIX_UNSAFE) */
-    bool removed_unsafe;
-    /* the remote still has upstream's forced refspec: a plain git fetch can overwrite local issue refs */
-    bool unsafe;
-    uint64_t reserved[2]; /* the library fills it; room to grow */
-} issuez_remote_setup;
-
-typedef enum issuez_remote_flag {
-    ISSUEZ_REMOTE_FLAG_NONE = 0,
-    ISSUEZ_REMOTE_FLAG_FIX_UNSAFE = 1, /* bit: take out upstream's forced refspec */
-} issuez_remote_flag;
-
-/*
- * The remote to set up when none is named: one entry (the only remote, else
- * origin), none, or every remote when there are several and none is origin.
- */
-issuez_code issuez_remote_default(issuez_repo *repo, issuez_cancel *cancel, issuez_matches **out,
-                                  issuez_error **err);
-
-/*
- * Adds the refspecs remote lacks; idempotent. flags: issuez_remote_flag bits.
- * NOT_FOUND for no such remote.
- */
-issuez_code issuez_remote_configure(issuez_repo *repo, issuez_str remote, uint32_t flags,
-                                    issuez_cancel *cancel, issuez_remote_setup *out,
-                                    issuez_error **err);
-
-/*
- * Sync status without the network: what is quarantined from a remote and what
- * isn't pushed to it yet.
- */
-typedef enum issuez_quarantine_reason {
-    ISSUEZ_QUARANTINE_UNKNOWN = 0, /* no longer applies; the next merge clears it */
-    /* the remote issue shares no history with the local one */
-    ISSUEZ_QUARANTINE_UNRELATED_HISTORY = 1,
-    ISSUEZ_QUARANTINE_REWOUND = 2, /* the remote history was rewritten since the last merge */
-    ISSUEZ_QUARANTINE_INVALID_ISSUE = 3, /* the remote issue fails the integrity checks */
-} issuez_quarantine_reason;
-
-typedef enum issuez_quarantine_choice {
-    ISSUEZ_CHOICE_UNKNOWN = 0,
-    ISSUEZ_CHOICE_KEEP_LOCAL = 1, /* keep ours and stop reporting theirs */
-    ISSUEZ_CHOICE_TAKE_REMOTE = 2, /* take theirs; the replaced version is kept */
-} issuez_quarantine_choice;
-
-typedef struct issuez_quarantined {
-    uint32_t kind; /* issuez_kind: ISSUE or MILESTONE */
-    issuez_str id;
-    issuez_str title; /* the local title, or the remote one when it only exists there */
-    issuez_oid remote_tip; /* the refused remote version */
-    uint32_t reason; /* issuez_quarantine_reason */
-    bool kept_local; /* acknowledged (issuez_quarantine_resolve, ISSUEZ_CHOICE_KEEP_LOCAL) */
-} issuez_quarantined;
-
-typedef struct issuez_sync_status issuez_sync_status;
-
-issuez_code issuez_sync_status_take(issuez_repo *repo, issuez_str remote, issuez_cancel *cancel,
-                                    issuez_sync_status **out, issuez_error **err);
-
-size_t issuez_sync_status_quarantined_count(const issuez_sync_status *s);
-
-const issuez_quarantined *issuez_sync_status_quarantined_at(
-    const issuez_sync_status *s, size_t i);
-
-size_t issuez_sync_status_pending_count(const issuez_sync_status *s);
-
-/*
- * The UUID of an issue not pushed yet; quarantined ones aren't counted.
- */
-issuez_str issuez_sync_status_pending_at(const issuez_sync_status *s, size_t i);
-
-void issuez_sync_status_free(issuez_sync_status *s);
-
-/*
- * Keep ours, or take theirs (the replaced version is kept). INVALID_ARGUMENT
- * for ISSUEZ_CHOICE_UNKNOWN.
- */
-issuez_code issuez_quarantine_resolve(issuez_repo *repo, issuez_str remote, issuez_kind kind,
-                                      issuez_str id, issuez_quarantine_choice choice,
-                                      issuez_cancel *cancel, issuez_error **err);
 
 
 /* ---------------------------------------- Push check --------------------------------------- */
@@ -1931,8 +1315,8 @@ issuez_oid issuez_purge_result_new_tip(const issuez_purge_result *r);
 
 /*
  * Remotes whose tracking refs show they had the purged commits, one synced by
- * URL or path as the url-<hash> its refs are kept under. The next issuez_sync
- * with each replaces their copy (leased on what it fetched).
+ * URL or path as the url-<hash> its refs are kept under. The next git issue
+ * sync with each replaces their copy (leased on what it fetched).
  */
 size_t issuez_purge_result_exposed_remote_count(const issuez_purge_result *r);
 
@@ -2556,13 +1940,6 @@ static inline issuez_op issuez_opt_timeout_local_ms(int64_t v) {
     o.num = v;
     return o;
 }
-static inline issuez_op issuez_opt_timeout_network_ms(int64_t v) {
-    issuez_op o = ISSUEZ_OP_INIT;
-    o.verb = ISSUEZ_OP_SET;
-    o.target = ISSUEZ_OPT_TIMEOUT_NETWORK_MS;
-    o.num = v;
-    return o;
-}
 static inline issuez_op issuez_opt_limit(issuez_str name, int64_t value) {
     issuez_op o = ISSUEZ_OP_INIT;
     o.verb = ISSUEZ_OP_SET;
@@ -2583,20 +1960,6 @@ static inline issuez_op issuez_opt_attachment_store(bool store) {
     o.verb = ISSUEZ_OP_SET;
     o.target = ISSUEZ_OPT_ATTACHMENT_STORE;
     o.num = store;
-    return o;
-}
-static inline issuez_op issuez_opt_sync_push(bool push) {
-    issuez_op o = ISSUEZ_OP_INIT;
-    o.verb = ISSUEZ_OP_SET;
-    o.target = ISSUEZ_OPT_SYNC_PUSH;
-    o.num = push;
-    return o;
-}
-static inline issuez_op issuez_opt_sync_attachments(bool attachments) {
-    issuez_op o = ISSUEZ_OP_INIT;
-    o.verb = ISSUEZ_OP_SET;
-    o.target = ISSUEZ_OPT_SYNC_ATTACHMENTS;
-    o.num = attachments;
     return o;
 }
 #ifdef __cplusplus

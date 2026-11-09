@@ -25,10 +25,7 @@ test "issuez_code_name: every code, distinct; unknown ones" {
 
 // covers: issuez_error_code, issuez_error_message, issuez_error_subject
 test "issuez_error_free: a missing issue" {
-    const leaks = fixture.Leaks.start();
-    defer leaks.check();
-    var r: fixture.Repo = undefined;
-    try r.init(.{});
+    var r = try fixture.Repo.init(.{});
     defer r.deinit();
     const id = "0b6c4f63-6f5a-4a3e-9c2b-1d2e3f4a5b6c";
     var issue: ?*c.issuez_issue = null;
@@ -57,10 +54,7 @@ test "issuez_error_free: a missing issue" {
 }
 
 test "issuez_error_current_tip: a stale expect reports the tip now" {
-    const leaks = fixture.Leaks.start();
-    defer leaks.check();
-    var r: fixture.Repo = undefined;
-    try r.init(.{});
+    var r = try fixture.Repo.init(.{});
     defer r.deinit();
     const made = try fixture.titled(r.handle, "Racy");
     const now = try fixture.update(
@@ -84,7 +78,7 @@ test "issuez_error_current_tip: a stale expect reports the tip now" {
     try expect.code(c.ISSUEZ_E_VERSION_MISMATCH, rc, err);
     var tip: c.issuez_oid = undefined;
     try testing.expect(c.issuez_error_current_tip(err, &tip));
-    try testing.expect(c.issuez_oid_eq(&tip, &now));
+    try testing.expect(fixture.oidEql(tip, now));
     try testing.expect(c.issuez_error_current_tip(err, null));
     try expect.str(made.idSlice(), c.issuez_error_subject(err));
     c.issuez_error_free(err);
@@ -92,10 +86,7 @@ test "issuez_error_current_tip: a stale expect reports the tip now" {
 }
 
 test "issuez_error_problems, issuez_problems_len, issuez_problems_at: every bad value at once" {
-    const leaks = fixture.Leaks.start();
-    defer leaks.check();
-    var r: fixture.Repo = undefined;
-    try r.init(.{});
+    var r = try fixture.Repo.init(.{});
     defer r.deinit();
     const bad = [_]c.issuez_op{
         c.issuez_set_title(fixture.str("two\nlines")),
@@ -124,10 +115,7 @@ test "issuez_error_problems, issuez_problems_len, issuez_problems_at: every bad 
 }
 
 test "issuez_error_write: a cancelled write didn't happen" {
-    const leaks = fixture.Leaks.start();
-    defer leaks.check();
-    var r: fixture.Repo = undefined;
-    try r.init(.{});
+    var r = try fixture.Repo.init(.{});
     defer r.deinit();
     const cancel = c.issuez_cancel_new();
     defer c.issuez_cancel_free(cancel);
@@ -140,10 +128,28 @@ test "issuez_error_write: a cancelled write didn't happen" {
     try testing.expect(c.issuez_error_write(err) == null);
     try testing.expect(c.issuez_error_write(null) == null);
     c.issuez_error_free(err);
-    var count: u64 = 99;
-    var all = [_]c.issuez_op{c.issuez_q_done(-1)};
-    try expect.code(c.ISSUEZ_OK, c.issuez_query_count(r.handle, &all, 1, null, &count, null), null);
+    const count = try fixture.queryCount(r.handle, &.{c.issuez_q_done(-1)});
     try testing.expectEqual(@as(u64, 0), count);
+}
+
+test "issuez_error_git_stderr: what a failing git said" {
+    var r = try fixture.Repo.init(.{});
+    defer r.deinit();
+    const refusing = try fixture.script(r.arena(), r.root, "refusing-git",
+        \\#!/bin/sh
+        \\for a; do [ "$a" = for-each-ref ] && { echo "no refs here" >&2; exit 1; }; done
+        \\exec git "$@"
+        \\
+    );
+    const h = try r.open(&.{c.issuez_opt_git_path(fixture.str(refusing))});
+    defer c.issuez_repo_close(h);
+    var snap: ?*c.issuez_snapshot = null;
+    var err: ?*c.issuez_error = null;
+    try expect.code(c.ISSUEZ_E_GIT, c.issuez_snapshot_take(h, null, &snap, &err), err);
+    defer c.issuez_error_free(err);
+    const said = c.issuez_error_git_stderr(err);
+    try testing.expect(std.mem.find(u8, fixture.slice(said), "no refs here") != null);
+    try expect.terminated(said);
 }
 
 test "issuez_field_key: trailer keys" {
@@ -164,12 +170,9 @@ test "issuez_field_key: trailer keys" {
 }
 
 test "issuez_error_problems: the field and value the library refused" {
-    const leaks = fixture.Leaks.start();
-    defer leaks.check();
-    var r: fixture.Repo = undefined;
     var limit = fixture.opNum(c.ISSUEZ_OPT_LIMIT, 4);
     limit.name = fixture.str("max_title_bytes");
-    try r.init(.{ .ops = &.{limit} });
+    var r = try fixture.Repo.init(.{ .ops = &.{limit} });
     defer r.deinit();
     const h = r.handle;
     const made = try fixture.titled(h, "Okay");

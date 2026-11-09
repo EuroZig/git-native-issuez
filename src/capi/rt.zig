@@ -89,10 +89,6 @@ pub fn issuez_version() callconv(.c) [*:0]const u8 {
     return version_z;
 }
 
-pub fn issuez_abi_version() callconv(.c) u32 {
-    return api.abi_version;
-}
-
 /// The header's ABI version works with this library: the same major, and
 /// a minor no newer than ours (before 1.0, the same minor).
 pub fn compatible(header: u32) bool {
@@ -200,6 +196,18 @@ pub fn optZ(arena: Allocator, s: ?[]const u8) Allocator.Error!Str {
     return if (s) |v| dupeZ(arena, v) else .{};
 }
 
+/// Copies of `list`, each with a NUL after it.
+pub fn strs(arena: Allocator, list: []const []const u8) Allocator.Error![]const Str {
+    const out = try arena.alloc(Str, list.len);
+    for (list, out) |s, *o| o.* = try dupeZ(arena, s);
+    return out;
+}
+
+/// A C array: `n` items at `p`, none at NULL.
+pub fn sliceOf(comptime T: type, p: ?[*]const T, n: usize) []const T {
+    return if (p) |x| x[0..n] else &.{};
+}
+
 /// A handle's object from its opaque pointer.
 pub fn obj(comptime T: type, p: anytype) ?*T {
     const raw = p orelse return null;
@@ -297,11 +305,15 @@ pub fn Reads(comptime H: type, comptime Obj: type) type {
     };
 }
 
-pub fn handle(comptime H: type, p: anytype) *H {
-    return @ptrCast(p);
+/// The tag of `To` named as `from` is, for an enum that mirrors another: a
+/// tag missing from `To` doesn't compile.
+pub fn mirrored(comptime To: type, from: anytype) To {
+    return switch (from) {
+        inline else => |tag| @field(To, @tagName(tag)),
+    };
 }
 
-pub fn constHandle(comptime H: type, p: anytype) *const H {
+pub fn handle(comptime H: type, p: anytype) *H {
     return @ptrCast(p);
 }
 
@@ -340,43 +352,23 @@ pub fn personOf(
     };
 }
 
-pub fn issuez_oid_hex(oid: ?*const api.Oid, buf_or_null: ?[*]u8) callconv(.c) usize {
-    const buf = buf_or_null orelse return 0;
-    const o = oid orelse {
-        buf[0] = 0;
-        return 0;
-    };
-    const n: usize = switch (o.len) {
-        20, 32 => o.len,
-        else => {
-            buf[0] = 0;
-            return 0;
-        },
-    };
-    const hex = std.fmt.bytesToHex(o.bytes, .lower);
-    @memcpy(buf[0 .. n * 2], hex[0 .. n * 2]);
-    buf[n * 2] = 0;
-    return n * 2;
+/// `personOf`, in a record of its own.
+pub fn newPerson(
+    arena: Allocator,
+    sig: issuez.backend.object.Signature,
+    id: ?[]const u8,
+) Allocator.Error!*const api.Person {
+    const person = try arena.create(api.Person);
+    person.* = try personOf(arena, sig, id);
+    return person;
 }
 
-pub fn issuez_oid_parse(hex: Str, out: ?*api.Oid, err: ?*?*api.Error) callconv(.c) Code {
-    const o = out orelse return fail(err, .e_invalid_argument, "out is NULL", .{});
-    const text = hex.slice();
-    const format: issuez.backend.object.ObjectFormat = switch (text.len) {
-        40 => .sha1,
-        64 => .sha256,
-        else => return fail(err, .e_invalid_argument, "not a full object ID", .{}),
-    };
-    const oid = issuez.backend.object.Oid.parseHex(format, text) catch
-        return fail(err, .e_invalid_argument, "not a full object ID", .{});
-    o.* = oidOf(oid);
-    return .ok;
+pub fn dateOf(d: issuez.format.fields.Date) api.Date {
+    return .{ .year = @intCast(d.year), .month = d.month, .day = d.day };
 }
 
-pub fn issuez_oid_eq(a: ?*const api.Oid, b: ?*const api.Oid) callconv(.c) bool {
-    const x = a orelse return b == null;
-    const y = b orelse return false;
-    return x.len == y.len and std.mem.eql(u8, x.bytes[0..x.len], y.bytes[0..y.len]);
+pub fn oidEql(a: *const api.Oid, b: *const api.Oid) bool {
+    return a.len == b.len and std.mem.eql(u8, a.bytes[0..a.len], b.bytes[0..b.len]);
 }
 
 // ─── Problems ──────────────────────────────────────────────────────────
@@ -409,6 +401,11 @@ pub const OpCheck = struct {
 
     pub fn at(a: Allocator, problems: *Problems, index: usize) OpCheck {
         return .{ .a = a, .problems = problems, .index = @intCast(index) };
+    }
+
+    /// The same list's problems about `field` of the op at `index`; -1: no one op's.
+    pub fn on(c: OpCheck, field: api.Field, index: i64) OpCheck {
+        return .{ .a = c.a, .problems = c.problems, .index = index, .field = field };
     }
 
     pub fn add(c: OpCheck, kind: api.ProblemKind, message: []const u8) !void {
@@ -453,22 +450,19 @@ pub fn problem(arena: Allocator, p: ProblemSpec) Allocator.Error!api.Problem {
 
 /// A new owned list, for `issuez_problems **out`.
 pub fn ownedProblems(items: []const ProblemSpec) Allocator.Error!*ProblemList {
-    const arena = try newArena();
-    errdefer freeArena(arena);
-    const a = arena.allocator();
-    const list = try a.create(ProblemList);
-    const out = try a.alloc(api.Problem, items.len);
-    for (items, out) |p, *o| o.* = try problem(a, p);
-    list.* = .{ .arena = arena, .items = out };
-    return list;
+    return owned(ProblemList, problemList, .{items});
 }
 
 pub fn borrowedProblems(arena: Allocator, items: []const ProblemSpec) Allocator.Error!*ProblemList {
     const list = try arena.create(ProblemList);
+    list.* = try problemList(arena, items);
+    return list;
+}
+
+fn problemList(arena: Allocator, items: []const ProblemSpec) Allocator.Error!ProblemList {
     const out = try arena.alloc(api.Problem, items.len);
     for (items, out) |p, *o| o.* = try problem(arena, p);
-    list.* = .{ .items = out };
-    return list;
+    return .{ .items = out };
 }
 
 const ProblemListReads = Reads(api.Problems, ProblemList);
@@ -514,6 +508,23 @@ pub fn fail(err: ?*?*api.Error, code: Code, comptime fmt: []const u8, args: anyt
     return failWith(err, code, .{}, fmt, args);
 }
 
+pub fn badArgument(err: ?*?*api.Error, comptime message: []const u8) Code {
+    return fail(err, .e_invalid_argument, message, .{});
+}
+
+pub fn notFound(err: ?*?*api.Error, subject: []const u8, comptime message: []const u8) Code {
+    return failWith(err, .e_not_found, .{ .subject = subject }, message, .{});
+}
+
+/// INVALID_VALUE with the problems an op list has.
+pub fn badOps(
+    err: ?*?*api.Error,
+    problems: []const ProblemSpec,
+    comptime message: []const u8,
+) Code {
+    return failWith(err, .e_invalid_value, .{ .problems = problems }, message, .{});
+}
+
 pub fn oom(err: ?*?*api.Error) Code {
     return fail(err, .e_nomem, "out of memory", .{});
 }
@@ -522,18 +533,6 @@ pub fn oom(err: ?*?*api.Error) Code {
 pub fn give(out: anytype, made: anytype, err: ?*?*api.Error) Code {
     out.* = @ptrCast(made catch |e| return failError(err, e, .{}));
     return .ok;
-}
-
-/// Whether flags has a bit the flag enum F doesn't define: a call fails
-/// such flags with INVALID_ARGUMENT rather than ignore what was asked.
-pub fn unknownFlags(comptime F: type, flags: u32) bool {
-    comptime var known: u32 = 0;
-    inline for (@typeInfo(F).@"enum".fields) |field| known |= field.value;
-    return flags & ~known != 0;
-}
-
-pub fn hasFlag(flags: u32, flag: anytype) bool {
-    return flags & @intFromEnum(flag) != 0;
 }
 
 pub fn failWith(
@@ -620,7 +619,6 @@ pub fn codeOf(e: anyerror) Code {
         error.GitSpawnFailed, error.GitFailed, error.OutputTooLong, error.StoreFailed => .e_git,
         error.GitTooOld => .e_git_version,
         error.NotARepository => .e_not_a_repository,
-        error.FetchFailed, error.PushFailed => .e_network,
         error.LfsUnavailable, error.LfsTransferFailed, error.LfsUploadFailed => .e_lfs,
         error.AttachmentTooLarge, error.TooManyAttachments => .e_limit,
         error.UnsupportedType,
@@ -645,7 +643,6 @@ pub fn codeOf(e: anyerror) Code {
         error.IssueDisappeared,
         error.ReferenceNotFound,
         error.CommentNotFound,
-        error.NotQuarantined,
         => .e_not_found,
         error.ParentIsSelf,
         error.ParentCycle,
@@ -674,7 +671,7 @@ pub fn codeOf(e: anyerror) Code {
         error.IdentityUnknown,
         => .e_invalid_value,
         error.InvalidLimits, error.InvalidIssueRef, error.UnknownKind => .e_invalid_argument,
-        error.AttachmentsUnsupported, error.LeasedPushUnsupported => .e_unsupported,
+        error.AttachmentsUnsupported => .e_unsupported,
         else => .e_internal,
     };
 }
@@ -729,6 +726,26 @@ pub fn freeArena(arena: *std.heap.ArenaAllocator) void {
     gpa.destroy(arena);
 }
 
+/// A handle in an arena of its own: `build`, given the arena, makes the
+/// object, and the handle's `arena` is set after it. A failure frees the arena.
+pub fn owned(comptime Obj: type, comptime build: anytype, args: anytype) !*Obj {
+    const arena = try newArena();
+    errdefer freeArena(arena);
+    const a = arena.allocator();
+    const made = try a.create(Obj);
+    made.* = try @call(.auto, build, .{a} ++ args);
+    made.arena = arena;
+    return made;
+}
+
+/// A handle that is nothing but a list.
+pub fn Items(comptime T: type) type {
+    return struct {
+        arena: *std.heap.ArenaAllocator,
+        items: []const T,
+    };
+}
+
 // ─── Cancel ────────────────────────────────────────────────────────────
 
 pub const CancelObj = struct {
@@ -746,11 +763,6 @@ pub fn issuez_cancel_trigger(c: ?*api.Cancel) callconv(.c) void {
     t.triggered.store(true, .release);
 }
 
-pub fn issuez_cancel_triggered(c: ?*const api.Cancel) callconv(.c) bool {
-    const t = obj(CancelObj, c) orelse return false;
-    return t.triggered.load(.acquire);
-}
-
 pub fn issuez_cancel_free(c: ?*api.Cancel) callconv(.c) void {
     const t = obj(CancelObj, c) orelse return;
     gpa.destroy(t);
@@ -762,7 +774,8 @@ pub fn hasReserved(x: anytype) bool {
 }
 
 pub fn cancelled(c: ?*api.Cancel) bool {
-    return issuez_cancel_triggered(c);
+    const t = obj(CancelObj, c) orelse return false;
+    return t.triggered.load(.acquire);
 }
 
 /// What a running git request watches, so triggering kills it.

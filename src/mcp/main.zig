@@ -261,18 +261,9 @@ pub fn main(
             out.writeAll(help) catch {};
             return 0;
         } else if (std.mem.eql(u8, arg, "--repo")) {
-            i += 1;
-            if (i == args.len) {
-                err.writeAll("error: --repo requires a value\n") catch {};
-                return 1;
-            }
-            path = args[i];
+            path = value(args, &i, err) orelse return 1;
         } else {
-            err.print(
-                "error: unknown option '{s}'\nRun 'git issue mcp --help' for usage.\n",
-                .{arg},
-            ) catch {};
-            return 1;
+            return unknownOption(err, arg);
         }
     }
 
@@ -329,11 +320,7 @@ fn installMain(
                 return 1;
             };
         } else {
-            err.print(
-                "error: unknown option '{s}'\nRun 'git issue mcp --help' for usage.\n",
-                .{arg},
-            ) catch {};
-            return 1;
+            return unknownOption(err, arg);
         }
     }
     var arena_state: std.heap.ArenaAllocator = .init(gpa);
@@ -342,6 +329,14 @@ fn installMain(
         err.print("error: git issue mcp install: {t}\n", .{e}) catch {};
         return 1;
     };
+}
+
+fn unknownOption(err: *std.Io.Writer, arg: []const u8) u8 {
+    err.print(
+        "error: unknown option '{s}'\nRun 'git issue mcp --help' for usage.\n",
+        .{arg},
+    ) catch {};
+    return 1;
 }
 
 /// The value after option `args[i.*]`, which `i` then points to.

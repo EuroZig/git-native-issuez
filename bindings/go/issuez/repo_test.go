@@ -2,7 +2,6 @@ package issuez_test
 
 import (
 	"bytes"
-	"context"
 	"errors"
 	"maps"
 	"os"
@@ -282,26 +281,8 @@ func TestWithPoolSize(t *testing.T) {
 		})
 	}
 	wg.Wait()
-	if n, err := r.Count(t.Context(), issuez.Query{}); err != nil || n != 4 {
-		t.Errorf("count %d: %v", n, err)
-	}
-}
-
-func TestWithNetworkTimeout(t *testing.T) {
-	dir := initRepo(t)
-	git(t, dir, "remote", "add", "origin", filepath.Join(t.TempDir(), "hub.git"))
-	slow := script(t, t.TempDir(), "slow-git", "for a; do [ \"$a\" = fetch ] && exec sleep 30; done\nexec git \"$@\"\n")
-	r := open(t, dir, issuez.WithGit(slow), issuez.WithNetworkTimeout(200*time.Millisecond))
-	start := time.Now()
-	_, err := r.Sync(t.Context(), "origin", issuez.SyncOptions{})
-	// The library's deadline: cancelled, but not by a context.
-	var e *issuez.Error
-	if !errors.As(err, &e) || e.Code != issuez.CodeTimeout || !issuez.IsCancelled(err) ||
-		errors.Is(err, context.DeadlineExceeded) {
-		t.Fatalf("sync: %v", err)
-	}
-	if time.Since(start) > 5*time.Second {
-		t.Errorf("timed out after %v", time.Since(start))
+	if page, err := r.Query(t.Context(), issuez.Query{}); err != nil || len(page.Issues) != 4 {
+		t.Errorf("count %d: %v", len(page.Issues), err)
 	}
 }
 
@@ -340,7 +321,7 @@ func TestWithCacheIssues(t *testing.T) {
 			}
 		})
 		defer issuez.SetDefaultLogger(issuez.LogOff, nil)
-		if _, err := r.Count(t.Context(), issuez.Query{}); err != nil {
+		if _, err := r.Query(t.Context(), issuez.Query{}); err != nil {
 			t.Fatal(err)
 		}
 		mu.Lock()
@@ -360,7 +341,7 @@ func TestWithCacheIssues(t *testing.T) {
 	}
 }
 
-func TestRepo_Resolve(t *testing.T) {
+func TestRepo_ResolveOne_forms(t *testing.T) {
 	ctx := t.Context()
 	r := newRepo(t)
 	w, err := r.Create(ctx, new(issuez.Edit).SetTitle("Numbered").SetNumber(12), ada)
@@ -375,37 +356,29 @@ func TestRepo_Resolve(t *testing.T) {
 		name  string
 		kind  issuez.Kind
 		input string
-		want  []string
+		want  string // "": not found
 	}{
-		{"uuid", issuez.KindIssue, w.ID, []string{w.ID}},
-		{"prefix", issuez.KindIssue, w.ID[:8], []string{w.ID}},
-		{"number", issuez.KindIssue, "#12", []string{w.ID}},
-		{"no number", issuez.KindIssue, "#13", nil},
-		{"milestone name", issuez.KindMilestone, "v1.0", []string{m.ID}},
-		{"milestone prefix", issuez.KindMilestone, m.ID[:8], []string{m.ID}},
-		{"wrong kind", issuez.KindMilestone, w.ID, nil},
+		{"uuid", issuez.KindIssue, w.ID, w.ID},
+		{"prefix", issuez.KindIssue, w.ID[:8], w.ID},
+		{"number", issuez.KindIssue, "#12", w.ID},
+		{"no number", issuez.KindIssue, "#13", ""},
+		{"milestone name", issuez.KindMilestone, "v1.0", m.ID},
+		{"milestone prefix", issuez.KindMilestone, m.ID[:8], m.ID},
+		{"wrong kind", issuez.KindMilestone, w.ID, ""},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			got, err := r.Resolve(ctx, tt.kind, tt.input)
-			if err != nil {
-				t.Fatal(err)
+			got, err := r.ResolveOne(ctx, tt.kind, tt.input)
+			if tt.want == "" {
+				if !errors.Is(err, issuez.ErrNotFound) {
+					t.Errorf("got %q, %v", got, err)
+				}
+				return
 			}
-			if !slices.Equal(got, tt.want) {
-				t.Errorf("got %v, want %v", got, tt.want)
+			if err != nil || got != tt.want {
+				t.Errorf("got %q, %v, want %q", got, err, tt.want)
 			}
 		})
-	}
-	// Several: a prefix two IDs share.
-	var ids []string
-	for len(ids) < 2 {
-		x := create(t, r, "Another")
-		if ids, err = r.Resolve(ctx, issuez.KindIssue, x.ID[:1]); err != nil {
-			t.Fatal(err)
-		}
-	}
-	if !slices.IsSorted(ids) {
-		t.Errorf("not sorted: %v", ids)
 	}
 }
 
@@ -523,73 +496,6 @@ func TestRepo_Limit(t *testing.T) {
 	r.Close()
 	if _, ok := r.Limit("max_labels"); ok {
 		t.Error("a closed repo")
-	}
-}
-
-func TestRepo_DropAll(t *testing.T) {
-	ctx := t.Context()
-	r := newRepo(t)
-	create(t, r, "One")
-	if _, err := r.CreateMilestone(ctx, new(issuez.MilestoneEdit).SetName("v1"), ada); err != nil {
-		t.Fatal(err)
-	}
-	n, err := r.DropAll(ctx)
-	if err != nil || n < 2 {
-		t.Fatalf("DropAll() = %d, %v", n, err)
-	}
-	if s, err := r.Snapshot(ctx); err != nil || len(s.Tips) != 0 {
-		t.Errorf("left: %v %v", s, err)
-	}
-	if n, err := r.DropAll(ctx); err != nil || n != 0 {
-		t.Errorf("again: %d %v", n, err)
-	}
-}
-
-func TestRepo_AdoptRefs(t *testing.T) {
-	ctx := t.Context()
-	dir := initRepo(t)
-	main := open(t, dir)
-	scratchDir := initRepo(t, "--bare")
-	scratch := open(t, scratchDir, issuez.WithEnvOverrides("GIT_OBJECT_DIRECTORY="+filepath.Join(main.GitDir(), "objects")))
-	w := create(t, scratch, "Imported")
-	if n, err := main.AdoptRefs(ctx, scratch); err != nil || n != 1 {
-		t.Fatalf("AdoptRefs() = %d, %v", n, err)
-	}
-	if i, err := main.Load(ctx, w.ID); err != nil || i.Title != "Imported" {
-		t.Errorf("adopted: %v %v", i, err)
-	}
-	var e *issuez.Error
-	if _, err := main.AdoptRefs(ctx, scratch); !errors.As(err, &e) || e.Code != issuez.CodeContended {
-		t.Errorf("again: %v", err)
-	}
-	own := newRepo(t)
-	create(t, own, "Elsewhere")
-	if _, err := main.AdoptRefs(ctx, own); !errors.As(err, &e) || e.Code != issuez.CodeCorrupt {
-		t.Errorf("objects of its own: %v", err)
-	}
-}
-
-func TestRepo_WriteSettings(t *testing.T) {
-	ctx := t.Context()
-	dir := initRepo(t)
-	r := open(t, dir)
-	if err := r.WriteSettings(ctx, issuez.Settings{DoneStates: []string{"wontfix", "cancelled"}, WorkflowStates: []string{"todo", "doing"}}); err != nil {
-		t.Fatal(err)
-	}
-	if got := git(t, dir, "config", "issue.workflowStates"); got != "todo, doing" {
-		t.Errorf("workflow states: %q", got)
-	}
-	if err := r.WriteSettings(ctx, issuez.Settings{WorkflowStates: []string{}}); err != nil {
-		t.Fatal(err)
-	}
-	if got := git(t, dir, "config", "--get", "--default", "unset", "issue.workflowStates"); got != "unset" {
-		t.Errorf("unset: %q", got)
-	}
-	if got := git(t, dir, "config", "issue.doneStates"); got != "wontfix, cancelled" {
-		t.Errorf("done states kept: %q", got)
-	}
-	if err := r.WriteSettings(ctx, issuez.Settings{DoneStates: []string{"open"}}); !errors.Is(err, issuez.ErrInvalidValue) {
-		t.Errorf("open as done: %v", err)
 	}
 }
 

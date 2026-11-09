@@ -6,39 +6,43 @@ const fixture = @import("fixture.zig");
 const expect = @import("expect.zig");
 const c = fixture.c;
 
-fn checkProblems(
-    repo: *c.issuez_repo,
-    id: ?c.issuez_str,
-    ops: []const c.issuez_op,
-) !std.ArrayList(c.issuez_problem) {
-    var ps: ?*c.issuez_problems = null;
+/// The kind of the first problem a create (no id) or an update is refused for.
+fn refusedFor(repo: *c.issuez_repo, id: ?c.issuez_str, ops: []const c.issuez_op) !u32 {
+    var w: ?*c.issuez_write = null;
     var err: ?*c.issuez_error = null;
-    try expect.code(
-        c.ISSUEZ_OK,
-        c.issuez_issue_check(repo, id orelse .{}, ops.ptr, ops.len, null, &ps, &err),
-        err,
-    );
-    defer c.issuez_problems_free(ps);
-    var out: std.ArrayList(c.issuez_problem) = .empty;
-    for (0..c.issuez_problems_len(ps)) |i| try out.append(
-        testing.allocator,
-        c.issuez_problems_at(ps, i).*,
-    );
-    return out;
+    const rc = if (id) |i|
+        fixture.updateRc(repo, i, ops, &fixture.ada, null, &w, &err)
+    else
+        c.issuez_issue_create(repo, ops.ptr, ops.len, &fixture.ada, null, &w, &err);
+    defer c.issuez_error_free(err);
+    if (rc == c.ISSUEZ_OK) {
+        c.issuez_write_free(w);
+        return error.NotRefused;
+    }
+    try testing.expect(rc == c.ISSUEZ_E_GUARD or rc == c.ISSUEZ_E_INVALID_VALUE);
+    const problems = c.issuez_error_problems(err);
+    try testing.expect(c.issuez_problems_len(problems) > 0);
+    return c.issuez_problems_at(problems, 0).*.kind;
 }
 
 fn snapshotBytes(repo: *c.issuez_repo, a: std.mem.Allocator) ![]const u8 {
     var s: ?*c.issuez_snapshot = null;
     try expect.code(c.ISSUEZ_OK, c.issuez_snapshot_take(repo, null, &s, null), null);
     defer c.issuez_snapshot_free(s);
-    return a.dupe(u8, fixture.slice(c.issuez_snapshot_encode(s)));
+    var text: std.Io.Writer.Allocating = .init(a);
+    for (0..c.issuez_snapshot_len(s)) |i| {
+        var kind: c.issuez_kind = undefined;
+        var id: c.issuez_str = undefined;
+        var tip: c.issuez_oid = undefined;
+        c.issuez_snapshot_at(s, i, &kind, &id, &tip);
+        const hex = fixture.oidHex(tip);
+        try text.writer.print("{d} {s} {s}\n", .{ kind, fixture.slice(id), hex[0 .. tip.len * 2] });
+    }
+    return text.written();
 }
 
-test "issuez_issue_check: every guard, nothing written" {
-    const leaks = fixture.Leaks.start();
-    defer leaks.check();
-    var r: fixture.Repo = undefined;
-    try r.init(.{});
+test "issuez_issue_update: every guard refuses with its problem, nothing written" {
+    var r = try fixture.Repo.init(.{});
     defer r.deinit();
     const h = r.handle;
     const closed = try fixture.create(
@@ -85,14 +89,6 @@ test "issuez_issue_check: every guard, nothing written" {
         .{ parent.idStr(), &.{c.issuez_set_parent(child.idStr())}, c.ISSUEZ_PROBLEM_CYCLE },
         .{
             null,
-            &.{
-                c.issuez_set_title(fixture.str("Orphan")),
-                c.issuez_set_parent(fixture.str(missing)),
-            },
-            c.ISSUEZ_PROBLEM_MISSING_TARGET,
-        },
-        .{
-            null,
             &.{ c.issuez_set_title(fixture.str("Late")), c.issuez_set_milestone(done.idStr()) },
             c.ISSUEZ_PROBLEM_MILESTONE_CLOSED,
         },
@@ -111,51 +107,36 @@ test "issuez_issue_check: every guard, nothing written" {
         },
     };
     for (cases, 0..) |case, i| {
-        var ps = try checkProblems(h, case[0], case[1]);
-        defer ps.deinit(testing.allocator);
-        testing.expect(ps.items.len > 0) catch |e| {
-            std.debug.print("check case {d}: no problem\n", .{i});
-            return e;
-        };
-        testing.expectEqual(case[2], ps.items[0].kind) catch |e| {
-            for (ps.items) |pp| std.debug.print(
-                "check case {d}: kind {d} field {d} op {d} '{s}' value '{s}'\n",
-                .{
-                    i,
-                    pp.kind,
-                    pp.field,
-                    pp.op_index,
-                    fixture.slice(pp.message),
-                    fixture.slice(pp.value),
-                },
-            );
+        testing.expectEqual(case[2], try refusedFor(h, case[0], case[1])) catch |e| {
+            std.debug.print("refused case {d}\n", .{i});
             return e;
         };
     }
-    var fine = try checkProblems(h, null, &.{c.issuez_set_title(fixture.str("Fine"))});
-    defer fine.deinit(testing.allocator);
-    try testing.expectEqual(@as(usize, 0), fine.items.len);
-    var fine_update = try checkProblems(h, child.idStr(), &.{c.issuez_add_label(fixture.str("x"))});
-    defer fine_update.deinit(testing.allocator);
-    try testing.expectEqual(@as(usize, 0), fine_update.items.len);
     // Nothing was written.
     try testing.expectEqualStrings(before, try snapshotBytes(h, r.arena()));
-    // A missing issue is the check's own error.
-    var ps: ?*c.issuez_problems = null;
-    const missing_id = fixture.str(missing);
+    // A missing issue or parent is an error of its own.
     try expect.code(
         c.ISSUEZ_E_NOT_FOUND,
-        c.issuez_issue_check(h, missing_id, null, 0, null, &ps, &err),
+        fixture.updateRc(h, fixture.str(missing), &.{}, &fixture.ada, null, &w, &err),
         err,
     );
     c.issuez_error_free(err);
+    err = null;
+    const orphan = [_]c.issuez_op{
+        c.issuez_set_title(fixture.str("Orphan")),
+        c.issuez_set_parent(fixture.str(missing)),
+    };
+    try expect.code(
+        c.ISSUEZ_E_NOT_FOUND,
+        c.issuez_issue_create(h, &orphan, orphan.len, &fixture.ada, null, &w, &err),
+        err,
+    );
+    c.issuez_error_free(err);
+    try testing.expectEqualStrings(before, try snapshotBytes(h, r.arena()));
 }
 
 test "issuez_issue_create: minimal, dated, closed, refused" {
-    const leaks = fixture.Leaks.start();
-    defer leaks.check();
-    var r: fixture.Repo = undefined;
-    try r.init(.{});
+    var r = try fixture.Repo.init(.{});
     defer r.deinit();
     const h = r.handle;
     const when: c.issuez_time = .{ .unix_seconds = 1_500_000_000, .tz_offset_minutes = 120 };
@@ -316,10 +297,7 @@ test "issuez_issue_create: minimal, dated, closed, refused" {
 }
 
 test "issuez_issue_update: set, clear, add, remove, with a comment, missing" {
-    const leaks = fixture.Leaks.start();
-    defer leaks.check();
-    var r: fixture.Repo = undefined;
-    try r.init(.{});
+    var r = try fixture.Repo.init(.{});
     defer r.deinit();
     const h = r.handle;
     const other = try fixture.titled(h, "Other");
@@ -345,12 +323,7 @@ test "issuez_issue_update: set, clear, add, remove, with a comment, missing" {
     });
     var i = try fixture.load(h, id);
     try expect.str("After", c.issuez_issue_info_of(i).*.title);
-    try testing.expect(
-        c.issuez_issue_has_label(
-            i,
-            fixture.str("b"),
-        ) and !c.issuez_issue_has_label(i, fixture.str("a")),
-    );
+    try testing.expect(fixture.hasLabel(i, "b") and !fixture.hasLabel(i, "a"));
     try testing.expectEqual(
         @as(u32, c.ISSUEZ_PRIORITY_UNKNOWN),
         c.issuez_issue_info_of(i).*.priority,
@@ -410,16 +383,13 @@ test "issuez_issue_update: set, clear, add, remove, with a comment, missing" {
     );
     try testing.expect(!c.issuez_write_wrote(w));
     const kept = c.issuez_write_new_tip(w);
-    try testing.expect(c.issuez_oid_eq(&kept, &last));
+    try testing.expect(fixture.oidEql(kept, last));
     try testing.expectEqual(@as(usize, 0), c.issuez_write_entry(w).*.change_count);
     c.issuez_write_free(w);
 }
 
 test "issuez_issue_update: a comment's edit, delete and restore; the root" {
-    const leaks = fixture.Leaks.start();
-    defer leaks.check();
-    var r: fixture.Repo = undefined;
-    try r.init(.{});
+    var r = try fixture.Repo.init(.{});
     defer r.deinit();
     const h = r.handle;
     const made = try fixture.titled(h, "Talk");
@@ -511,10 +481,7 @@ test "issuez_issue_update: a comment's edit, delete and restore; the root" {
 }
 
 test "issuez_write_wrote: a reaction added, taken back, on a comment" {
-    const leaks = fixture.Leaks.start();
-    defer leaks.check();
-    var r: fixture.Repo = undefined;
-    try r.init(.{});
+    var r = try fixture.Repo.init(.{});
     defer r.deinit();
     const h = r.handle;
     const made = try fixture.titled(h, "Liked");
@@ -609,10 +576,7 @@ test "issuez_write_wrote: a reaction added, taken back, on a comment" {
 // covers: issuez_write_kind, issuez_write_id, issuez_write_commit, issuez_write_old_tip
 // covers: issuez_write_new_tip, issuez_write_entry, issuez_write_load_issue
 test "issuez_write_free: receipts" {
-    const leaks = fixture.Leaks.start();
-    defer leaks.check();
-    var r: fixture.Repo = undefined;
-    try r.init(.{});
+    var r = try fixture.Repo.init(.{});
     defer r.deinit();
     const h = r.handle;
     const ops = [_]c.issuez_op{
@@ -631,7 +595,7 @@ test "issuez_write_free: receipts" {
     try testing.expectEqual(@as(u8, 0), c.issuez_write_old_tip(w).len);
     const created_tip = c.issuez_write_new_tip(w);
     const created_commit = c.issuez_write_commit(w);
-    try testing.expect(c.issuez_oid_eq(&created_tip, &created_commit));
+    try testing.expect(fixture.oidEql(created_tip, created_commit));
     const e = c.issuez_write_entry(w).*;
     try testing.expectEqual(@as(u32, c.ISSUEZ_ENTRY_CREATED), e.kind);
     try testing.expect(e.change_count >= 1);
@@ -644,7 +608,7 @@ test "issuez_write_free: receipts" {
         null,
     );
     const old_tip = c.issuez_write_old_tip(w);
-    try testing.expect(c.issuez_oid_eq(&old_tip, &created_tip));
+    try testing.expect(fixture.oidEql(old_tip, created_tip));
     const ue = c.issuez_write_entry(w).*;
     try testing.expectEqual(@as(u32, c.ISSUEZ_ENTRY_UPDATE), ue.kind);
     try testing.expectEqual(@as(usize, 1), ue.change_count);
@@ -655,7 +619,7 @@ test "issuez_write_free: receipts" {
     try expect.code(c.ISSUEZ_OK, c.issuez_write_load_issue(w, null, &issue, null), null);
     const tip = c.issuez_issue_info_of(issue).*.tip;
     const new_tip = c.issuez_write_new_tip(w);
-    try testing.expect(c.issuez_oid_eq(&tip, &new_tip));
+    try testing.expect(fixture.oidEql(tip, new_tip));
     c.issuez_issue_free(issue);
     c.issuez_write_free(w);
 
@@ -679,10 +643,7 @@ test "issuez_write_free: receipts" {
 }
 
 test "issuez_write_retries: a concurrent write in between makes one retry" {
-    const leaks = fixture.Leaks.start();
-    defer leaks.check();
-    var r: fixture.Repo = undefined;
-    try r.init(.{});
+    var r = try fixture.Repo.init(.{});
     defer r.deinit();
     const made = try fixture.titled(r.handle, "Raced");
     const ref = try std.fmt.allocPrint(r.arena(), "refs/issues/{s}", .{made.idSlice()});
@@ -738,10 +699,7 @@ test "issuez_write_retries: a concurrent write in between makes one retry" {
 }
 
 test "issuez_issue_update: EXPECT_EDITS, a text's version that other changes don't touch" {
-    const leaks = fixture.Leaks.start();
-    defer leaks.check();
-    var r: fixture.Repo = undefined;
-    try r.init(.{});
+    var r = try fixture.Repo.init(.{});
     defer r.deinit();
     const h = r.handle;
     const made = try fixture.create(
@@ -795,5 +753,5 @@ test "issuez_issue_update: EXPECT_EDITS, a text's version that other changes don
     const i = try fixture.load(h, id);
     defer c.issuez_issue_free(i);
     try expect.str("v1", c.issuez_issue_info_of(i).*.description);
-    try expect.str("c1", c.issuez_issue_comment_find(i, &said.commit).*.text);
+    try expect.str("c1", fixture.findComment(i, said.commit).?.text);
 }

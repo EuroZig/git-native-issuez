@@ -70,8 +70,6 @@ func (v FsckKind) String() string {
 		return "attachment_corrupt"
 	case FsckDerivedRef:
 		return "derived_ref"
-	case FsckRepaired:
-		return "repaired"
 	case FsckAttachmentsFailed:
 		return "attachments_failed"
 	case FsckBytesUnchecked:
@@ -246,21 +244,6 @@ func (v PushAction) String() string {
 	return "PushAction(" + strconv.Itoa(int(v)) + ")"
 }
 
-// String is the value's name, "cleared" for QuarantineCleared.
-func (v QuarantineReason) String() string {
-	switch v {
-	case QuarantineCleared:
-		return "cleared"
-	case QuarantineUnrelatedHistory:
-		return "unrelated_history"
-	case QuarantineRewound:
-		return "rewound"
-	case QuarantineInvalidIssue:
-		return "invalid_issue"
-	}
-	return "QuarantineReason(" + strconv.Itoa(int(v)) + ")"
-}
-
 // String is the value's name, "original" for RevisionOriginal.
 func (v RevisionKind) String() string {
 	switch v {
@@ -295,29 +278,6 @@ func (v Sort) String() string {
 		return "state"
 	}
 	return "Sort(" + strconv.Itoa(int(v)) + ")"
-}
-
-// String is the value's name, "up_to_date" for SyncUpToDate.
-func (v SyncOutcome) String() string {
-	switch v {
-	case SyncUpToDate:
-		return "up_to_date"
-	case SyncNew:
-		return "new"
-	case SyncFastForward:
-		return "fast_forward"
-	case SyncMerged:
-		return "merged"
-	case SyncPushed:
-		return "pushed"
-	case SyncQuarantined:
-		return "quarantined"
-	case SyncFailed:
-		return "failed"
-	case SyncPurged:
-		return "purged"
-	}
-	return "SyncOutcome(" + strconv.Itoa(int(v)) + ")"
 }
 
 // String is the value's name, "default" for TriDefault.

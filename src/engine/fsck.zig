@@ -17,6 +17,9 @@ pub const Options = struct {
     /// Rewrite derived attachment refs that are missing or stale. Needs
     /// the attachment store (git-lfs with GitProcess).
     repair: bool = false,
+    /// False for a host that keeps attachment bytes itself: they are
+    /// neither read nor noted, and the repository's store isn't looked at.
+    check_bytes: bool = true,
 };
 
 pub fn Fsck(comptime B: type) type {
@@ -187,7 +190,11 @@ pub fn Fsck(comptime B: type) type {
             out: *std.ArrayList(Event),
         ) Allocator.Error!void {
             var issues: std.ArrayList(issue_model.Issue) = .empty;
-            const check_bytes = if (att.ready(arena)) |_| true else |e| switch (e) {
+            const check_bytes = if (!options.check_bytes)
+                false
+            else if (att.ready(arena)) |_|
+                true
+            else |e| switch (e) {
                 error.LfsUnavailable => false,
                 error.AttachmentsUnsupported => return,
                 error.OutOfMemory => return error.OutOfMemory,
@@ -206,7 +213,7 @@ pub fn Fsck(comptime B: type) type {
                         .{ .attachment_trailer = .{ .id = issue.id, .problem = p } },
                     );
                 if (issue.attachments.len == 0 and issue.removed_attachments.len == 0) continue;
-                if (!check_bytes) unchecked = true;
+                if (!check_bytes and options.check_bytes) unchecked = true;
                 const entries: []const @import("attachments.zig").Entry = if (!check_bytes)
                     &.{}
                 else

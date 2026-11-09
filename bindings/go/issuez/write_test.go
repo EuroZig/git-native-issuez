@@ -85,8 +85,15 @@ func TestRepo_Create(t *testing.T) {
 		w.Entry.Kind != issuez.EntryCreated || w.Issue != nil {
 		t.Errorf("receipt: %+v", w)
 	}
-	if _, err := r.Create(ctx, new(issuez.Edit).AddLabel("no title"), ada); !errors.Is(err, issuez.ErrInvalidValue) {
+	_, err = r.Create(ctx, new(issuez.Edit).AddLabel("no title"), ada)
+	var refused *issuez.Error
+	if !errors.Is(err, issuez.ErrInvalidValue) || !errors.As(err, &refused) || refused.Problems[0].Field != issuez.FieldTitle {
 		t.Errorf("no title: %v", err)
+	}
+	// Reads the repository: a parent that doesn't exist.
+	_, err = r.Create(ctx, new(issuez.Edit).SetTitle("Child").SetParent("0b6c4f63-6f5a-4a3e-9c2b-1d2e3f4a5b6c"), ada)
+	if !errors.Is(err, issuez.ErrNotFound) {
+		t.Errorf("missing parent: %v", err)
 	}
 	if _, err := r.Create(ctx, nil, ada); !errors.Is(err, issuez.ErrInvalidValue) {
 		t.Errorf("nil edit: %v", err)
@@ -122,6 +129,22 @@ func TestRepo_Update(t *testing.T) {
 	ctx := t.Context()
 	r := newRepo(t)
 	w := create(t, r, "Before")
+	const missing = "0b6c4f63-6f5a-4a3e-9c2b-1d2e3f4a5b6c"
+	// Refused for what the repository says: nothing is written.
+	_, err := r.Update(ctx, w.ID, new(issuez.Edit).SetParent(missing), ada)
+	if !errors.Is(err, issuez.ErrNotFound) {
+		t.Errorf("missing parent: %v", err)
+	}
+	if i, _ := r.Load(ctx, w.ID); i.Tip != w.NewTip {
+		t.Error("a refused update wrote")
+	}
+	if _, err := r.Update(ctx, missing, new(issuez.Edit).AddLabel("x"), ada); !errors.Is(err, issuez.ErrNotFound) {
+		t.Errorf("missing issue: %v", err)
+	}
+	var refused *issuez.Error
+	if _, err := r.Update(ctx, "", new(issuez.Edit).AddLabel("x"), ada); !errors.As(err, &refused) || refused.Code != issuez.CodeInvalidArgument {
+		t.Errorf("no id: %v", err)
+	}
 	u, err := r.Update(ctx, w.ID, new(issuez.Edit).SetTitle("After"), ada, issuez.ExpectTip(w.NewTip))
 	if err != nil {
 		t.Fatal(err)
@@ -207,50 +230,6 @@ func TestExpectTip(t *testing.T) {
 	}
 	if _, err := r.UpdateMilestone(ctx, m.ID, new(issuez.MilestoneEdit).SetName("v2"), ada, issuez.ExpectTip(m.NewTip)); err != nil {
 		t.Errorf("milestone, current: %v", err)
-	}
-}
-
-func TestRepo_CheckCreate(t *testing.T) {
-	ctx := t.Context()
-	r := newRepo(t)
-	if p, err := r.CheckCreate(ctx, new(issuez.Edit).SetTitle("Fine")); err != nil || p != nil {
-		t.Errorf("fine create: %v %+v", err, p)
-	}
-	p, err := r.CheckCreate(ctx, new(issuez.Edit).AddLabel("no title"))
-	if err != nil || len(p) == 0 || p[0].Field != issuez.FieldTitle {
-		t.Errorf("no title: %v %+v", err, p)
-	}
-	// Reads the repository: a parent that doesn't exist.
-	p, err = r.CheckCreate(ctx, new(issuez.Edit).SetTitle("Child").SetParent("0b6c4f63-6f5a-4a3e-9c2b-1d2e3f4a5b6c"))
-	if err != nil || len(p) != 1 || p[0].Field != issuez.FieldParent {
-		t.Errorf("missing parent: %v %+v", err, p)
-	}
-	if n, _ := r.Count(ctx, issuez.Query{}); n != 0 {
-		t.Error("CheckCreate wrote")
-	}
-}
-
-func TestRepo_CheckUpdate(t *testing.T) {
-	ctx := t.Context()
-	r := newRepo(t)
-	w := create(t, r, "Checked")
-	// A parent that doesn't exist; nothing is written.
-	p, err := r.CheckUpdate(ctx, w.ID, new(issuez.Edit).SetParent("0b6c4f63-6f5a-4a3e-9c2b-1d2e3f4a5b6c"))
-	if err != nil || len(p) != 1 || p[0].Field != issuez.FieldParent {
-		t.Errorf("missing parent: %v %+v", err, p)
-	}
-	if p, err := r.CheckUpdate(ctx, w.ID, new(issuez.Edit).AddLabel("x"), issuez.ExpectTip(w.NewTip)); err != nil || p != nil {
-		t.Errorf("fine update: %v %+v", err, p)
-	}
-	if i, _ := r.Load(ctx, w.ID); i.Tip != w.NewTip {
-		t.Error("CheckUpdate wrote")
-	}
-	if _, err := r.CheckUpdate(ctx, "0b6c4f63-6f5a-4a3e-9c2b-1d2e3f4a5b6c", new(issuez.Edit).AddLabel("x")); !errors.Is(err, issuez.ErrNotFound) {
-		t.Errorf("missing issue: %v", err)
-	}
-	var e *issuez.Error
-	if _, err := r.CheckUpdate(ctx, "", new(issuez.Edit).AddLabel("x")); !errors.As(err, &e) || e.Code != issuez.CodeInvalidArgument {
-		t.Errorf("no id: %v", err)
 	}
 }
 

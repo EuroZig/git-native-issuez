@@ -58,32 +58,20 @@ pub fn main(comptime B: type, ctx: *context.Context(B), argv: []const []const u8
     var message: ?[]const u8 = null;
     var all = false;
     var as_json = false;
-    var args: common.Args = .{ .list = argv[1..] };
-    while (args.next()) |arg| {
-        if (!args.isOption(arg)) {
-            if (args.was_separator) continue;
-            words.append(arena, arg) catch return common.oom(ctx.err);
-        } else if (common.isHelp(arg)) {
-            ctx.out.writeAll(help) catch {};
-            return common.exit_ok;
-        } else if (std.mem.eql(u8, arg, "--name")) {
-            name = args.value(ctx.err, arg) orelse return common.exit_error;
-        } else if (std.mem.eql(u8, arg, "--due")) {
-            due = args.value(ctx.err, arg) orelse return common.exit_error;
-        } else if (std.mem.eql(u8, arg, "--no-due")) {
-            due = "";
-        } else if (std.mem.eql(u8, arg, "--description")) {
-            description = args.value(ctx.err, arg) orelse return common.exit_error;
-        } else if (std.mem.eql(u8, arg, "-m") or std.mem.eql(u8, arg, "--message")) {
-            message = args.value(ctx.err, "-m") orelse return common.exit_error;
-        } else if (std.mem.eql(u8, arg, "-a") or std.mem.eql(u8, arg, "--all")) {
-            all = true;
-        } else if (std.mem.eql(u8, arg, "--json")) {
-            as_json = true;
-        } else {
-            return common.unknownOption(ctx.err, "milestone", arg);
-        }
-    }
+    if (common.parseArgs(ctx, argv[1..], .{
+        .command = "milestone",
+        .help = help,
+        .positionals = .{ .words = &words },
+        .flags = &.{
+            .{ "--name", .{ .text = &name } },
+            .{ "--due", .{ .text = &due } },
+            .{ "--no-due", .{ .constant = .{ &due, "" } } },
+            .{ "--description", .{ .text = &description } },
+            .{ "-m --message", .{ .text = &message } },
+            .{ "-a --all", .{ .on = &all } },
+            .{ "--json", .{ .on = &as_json } },
+        },
+    })) |exit| return exit;
     // `--no-due` is "".
     var due_date: ?issuez.format.fields.Date = null;
 

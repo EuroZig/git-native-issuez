@@ -5,12 +5,9 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"errors"
-	"fmt"
-	"os"
 	"os/exec"
 	"path/filepath"
 	"reflect"
-	"slices"
 	"strings"
 	"testing"
 
@@ -57,213 +54,6 @@ func commitOn(t *testing.T, dir, ref, msg string, move bool) issuez.OID {
 	return o
 }
 
-// withHub gives r a bare remote "origin" and returns its path.
-func withHub(t *testing.T, r *issuez.Repo) string {
-	t.Helper()
-	hub := initRepo(t, "--bare")
-	git(t, r.GitDir(), "remote", "add", "origin", hub)
-	return hub
-}
-
-// clone is a second repository with hub as origin, opened.
-func clone(t *testing.T, hub string) *issuez.Repo {
-	t.Helper()
-	dir := initRepo(t)
-	git(t, dir, "remote", "add", "origin", hub)
-	return open(t, dir)
-}
-
-func mustSync(t *testing.T, r *issuez.Repo, opts issuez.SyncOptions) *issuez.SyncReport {
-	t.Helper()
-	rep, err := r.Sync(context.Background(), "origin", opts)
-	if err != nil {
-		t.Fatal(err)
-	}
-	return rep
-}
-
-func outcomeOf(rep *issuez.SyncReport, id string) (issuez.SyncOutcome, bool) {
-	for _, it := range rep.Items {
-		if it.ID == id {
-			return it.Outcome, true
-		}
-	}
-	return 0, false
-}
-
-// tree is E (in M) > C1 > G, E > C2 (closed); X blocked by B1 (open) and
-// B2 (closed); O with a parent that isn't there; P and Q each other's
-// parent.
-type tree struct {
-	r                                   *issuez.Repo
-	m, e, c1, c2, g, x, b1, b2, o, p, q string
-}
-
-func newTree(t *testing.T) *tree {
-	t.Helper()
-	ctx := context.Background()
-	r := newRepo(t)
-	mk := func(e *issuez.Edit) string {
-		t.Helper()
-		w, err := r.Create(ctx, e, ada)
-		if err != nil {
-			t.Fatal(err)
-		}
-		return w.ID
-	}
-	m, err := r.CreateMilestone(ctx, new(issuez.MilestoneEdit).SetName("M"), ada)
-	if err != nil {
-		t.Fatal(err)
-	}
-	tr := &tree{r: r, m: m.ID}
-	tr.e = mk(new(issuez.Edit).SetTitle("E").SetMilestone(tr.m))
-	tr.c1 = mk(new(issuez.Edit).SetTitle("C1").SetParent(tr.e).InheritMilestone())
-	tr.g = mk(new(issuez.Edit).SetTitle("G").SetParent(tr.c1).InheritMilestone())
-	tr.c2 = mk(new(issuez.Edit).SetTitle("C2").SetParent(tr.e).InheritMilestone().SetState("closed"))
-	tr.b1 = mk(new(issuez.Edit).SetTitle("B1"))
-	tr.b2 = mk(new(issuez.Edit).SetTitle("B2").SetState("closed"))
-	tr.x = mk(new(issuez.Edit).SetTitle("X").AddBlocker(tr.b1).AddBlocker(tr.b2))
-	tr.o = mk(new(issuez.Edit).SetTitle("O"))
-	tr.p = mk(new(issuez.Edit).SetTitle("P"))
-	tr.q = mk(new(issuez.Edit).SetTitle("Q"))
-	dir := r.GitDir()
-	commitOn(t, dir, "refs/issues/"+tr.o, "Parent\n\nX-Parent: "+missingID, true)
-	commitOn(t, dir, "refs/issues/"+tr.p, "Parent\n\nX-Parent: "+tr.q, true)
-	commitOn(t, dir, "refs/issues/"+tr.q, "Parent\n\nX-Parent: "+tr.p, true)
-	return tr
-}
-
-// sorted copies l, sorted: the tests don't depend on sibling order.
-func sorted(l []string) []string {
-	l = slices.Clone(l)
-	slices.Sort(l)
-	return l
-}
-
-func TestRepo_Projection(t *testing.T) {
-	t.Parallel()
-	tr := newTree(t)
-	p, err := tr.r.Projection(context.Background(), issuez.ProjectionOptions{})
-	if err != nil {
-		t.Fatal(err)
-	}
-	if len(p.Issues) != 10 {
-		t.Errorf("issues: %d", len(p.Issues))
-	}
-
-	t.Run("tree", func(t *testing.T) {
-		// A missing parent makes O a root; P and Q, in a cycle, are none.
-		for _, id := range []string{tr.e, tr.x, tr.b1, tr.b2, tr.o} {
-			if !slices.Contains(p.Roots, id) {
-				t.Errorf("root %s missing from %v", id, p.Roots)
-			}
-		}
-		for _, id := range []string{tr.c1, tr.g, tr.c2} {
-			if slices.Contains(p.Roots, id) {
-				t.Errorf("child %s is a root", id)
-			}
-		}
-		want := map[string][]string{tr.e: sorted([]string{tr.c1, tr.c2}), tr.c1: {tr.g}}
-		for id, kids := range want {
-			if got := sorted(p.Children[id]); !reflect.DeepEqual(got, kids) {
-				t.Errorf("children of %s: %v, want %v", id, got, kids)
-			}
-		}
-		if _, ok := p.Children[tr.g]; ok {
-			t.Errorf("leaf G has children: %v", p.Children[tr.g])
-		}
-	})
-
-	t.Run("blockers", func(t *testing.T) {
-		if got := p.ActiveBlockers[tr.x]; !reflect.DeepEqual(got, []string{tr.b1}) {
-			t.Errorf("active blockers of X: %v", got)
-		}
-		for _, b := range []string{tr.b1, tr.b2} {
-			if got := p.Blocking[b]; !reflect.DeepEqual(got, []string{tr.x}) {
-				t.Errorf("%s blocks %v", b, got)
-			}
-		}
-		if _, ok := p.ActiveBlockers[tr.e]; ok {
-			t.Errorf("E has blockers: %v", p.ActiveBlockers[tr.e])
-		}
-	})
-
-	t.Run("progress", func(t *testing.T) {
-		want := map[string]issuez.Progress{tr.e: {Done: 1, Total: 2}, tr.c1: {Done: 0, Total: 1}}
-		for id, pr := range want {
-			if p.Progress[id] != pr {
-				t.Errorf("progress of %s: %+v, want %+v", id, p.Progress[id], pr)
-			}
-		}
-		if pr, ok := p.Progress[tr.g]; ok {
-			t.Errorf("leaf G has progress %+v", pr)
-		}
-		for _, id := range []string{tr.e, tr.c1, tr.g, tr.c2} {
-			if p.MilestoneOf[id] != tr.m {
-				t.Errorf("milestone of %s: %q", id, p.MilestoneOf[id])
-			}
-		}
-		if m, ok := p.MilestoneOf[tr.x]; ok {
-			t.Errorf("X in milestone %q", m)
-		}
-		if got := p.MilestoneProgress[tr.m]; got != (issuez.Progress{Done: 1, Total: 2}) {
-			t.Errorf("milestone progress: %+v", got)
-		}
-	})
-
-	t.Run("problems", func(t *testing.T) {
-		kinds := map[issuez.ProblemKind]bool{}
-		for _, pr := range p.Problems {
-			kinds[pr.Kind] = true
-		}
-		if !kinds[issuez.ProblemMissingTarget] || !kinds[issuez.ProblemCycle] {
-			t.Errorf("problems: %+v", p.Problems)
-		}
-	})
-}
-
-func TestProjectionOptions_Around(t *testing.T) {
-	t.Parallel()
-	ctx := context.Background()
-	tr := newTree(t)
-	all, err := tr.r.Projection(ctx, issuez.ProjectionOptions{})
-	if err != nil {
-		t.Fatal(err)
-	}
-	for _, tt := range []struct {
-		name string
-		id   string
-	}{{"leaf", tr.g}, {"parent", tr.e}, {"blocked", tr.x}, {"blocker", tr.b1}} {
-		t.Run(tt.name, func(t *testing.T) {
-			p, err := tr.r.Projection(ctx, issuez.ProjectionOptions{Around: tt.id})
-			if err != nil {
-				t.Fatal(err)
-			}
-			if len(p.Issues) >= len(all.Issues) {
-				t.Errorf("around %s: %d issues, all %d", tt.name, len(p.Issues), len(all.Issues))
-			}
-			id := tt.id
-			if got, want := sorted(p.Children[id]), sorted(all.Children[id]); !reflect.DeepEqual(got, want) {
-				t.Errorf("children: %v, want %v", got, want)
-			}
-			if got, want := p.ActiveBlockers[id], all.ActiveBlockers[id]; !reflect.DeepEqual(got, want) {
-				t.Errorf("active blockers: %v, want %v", got, want)
-			}
-			// Who it blocks needs every issue.
-			if got := p.Blocking[id]; len(got) != 0 {
-				t.Errorf("blocking: %v", got)
-			}
-			if p.Progress[id] != all.Progress[id] || p.MilestoneOf[id] != all.MilestoneOf[id] {
-				t.Errorf("progress %+v milestone %q, want %+v %q",
-					p.Progress[id], p.MilestoneOf[id], all.Progress[id], all.MilestoneOf[id])
-			}
-		})
-	}
-	if _, err := tr.r.Projection(ctx, issuez.ProjectionOptions{Around: missingID}); !errors.Is(err, issuez.ErrNotFound) {
-		t.Errorf("around a missing issue: %v", err)
-	}
-}
-
 func TestRepo_PurgeComment(t *testing.T) {
 	t.Parallel()
 	ctx := context.Background()
@@ -276,8 +66,9 @@ func TestRepo_PurgeComment(t *testing.T) {
 	if _, err := r.Update(ctx, w.ID, new(issuez.Edit).AddComment("Fine"), ada); err != nil {
 		t.Fatal(err)
 	}
-	withHub(t, r)
-	mustSync(t, r, issuez.SyncOptions{})
+	// What syncing with origin leaves: a tracking ref for the issue it has.
+	git(t, r.GitDir(), "remote", "add", "origin", initRepo(t, "--bare"))
+	git(t, r.GitDir(), "update-ref", "refs/remotes/origin/issues/"+w.ID, w.NewTip.String())
 	ref := "refs/issues/" + w.ID
 
 	res, err := r.PurgeComment(ctx, w.ID, bad.Commit, ada, "abuse")
@@ -327,128 +118,6 @@ func TestRepo_PurgeIssue(t *testing.T) {
 			t.Errorf("missing issue: %v", err)
 		}
 	})
-}
-
-func TestRepo_Sync(t *testing.T) {
-	t.Parallel()
-	ctx := context.Background()
-
-	t.Run("push", func(t *testing.T) {
-		t.Parallel()
-		a := newRepo(t)
-		w := create(t, a, "Shared")
-		withHub(t, a)
-		rep := mustSync(t, a, issuez.SyncOptions{})
-		if len(rep.Items) != 1 || rep.Items[0] != (issuez.SyncItem{
-			Kind: issuez.KindIssue, ID: w.ID, Outcome: issuez.SyncPushed, LocalTip: w.NewTip,
-			RemoteTip: w.NewTip,
-		}) || !rep.OK {
-			t.Errorf("push: %+v", rep)
-		}
-	})
-
-	t.Run("no push", func(t *testing.T) {
-		t.Parallel()
-		r := newRepo(t)
-		w := create(t, r, "Local")
-		hub := withHub(t, r)
-		if _, ok := outcomeOf(mustSync(t, r, issuez.SyncOptions{NoPush: true}), w.ID); ok {
-			t.Error("reported a local-only issue")
-		}
-		if got := git(t, hub, "for-each-ref", "refs/issues/"); got != "" {
-			t.Errorf("hub has %s", got)
-		}
-	})
-
-	t.Run("quarantine", func(t *testing.T) {
-		t.Parallel()
-		a := newRepo(t)
-		w := create(t, a, "Rewritten")
-		hub := withHub(t, a)
-		mustSync(t, a, issuez.SyncOptions{})
-		git(t, hub, "update-ref", "-d", "refs/issues/"+w.ID)
-		commitOn(t, hub, "refs/issues/"+w.ID, "Started over\n\nState: open\nFormat-Version: 1", true)
-		rep := mustSync(t, a, issuez.SyncOptions{})
-		var item issuez.SyncItem
-		for _, it := range rep.Items {
-			if it.ID == w.ID {
-				item = it
-			}
-		}
-		if rep.OK || item.Outcome != issuez.SyncQuarantined || item.Reason == "" {
-			t.Errorf("rewound hub: %+v", rep)
-		}
-		st, err := a.SyncStatus(ctx, "origin")
-		if err != nil || len(st.Quarantined) != 1 {
-			t.Fatalf("SyncStatus() = %+v, %v", st, err)
-		}
-		tip := strings.TrimSpace(git(t, hub, "rev-parse", "refs/issues/"+w.ID))
-		q := st.Quarantined[0]
-		if q.Kind != issuez.KindIssue || q.ID != w.ID || q.Title != "Rewritten" || q.RemoteTip.String() != tip ||
-			q.Reason != issuez.QuarantineUnrelatedHistory || q.KeptLocal {
-			t.Errorf("quarantined: %+v, the hub's tip %s", q, tip)
-		}
-	})
-
-	t.Run("errors", func(t *testing.T) {
-		t.Parallel()
-		r := newRepo(t)
-		create(t, r, "Refused")
-		hub := withHub(t, r)
-		script(t, filepath.Join(hub, "hooks"), "pre-receive", "echo 'no issues here' >&2\nexit 1\n")
-		_, err := r.Sync(ctx, "origin", issuez.SyncOptions{})
-		var e *issuez.Error
-		if !errors.As(err, &e) || e.Code != issuez.CodeNetwork || !strings.Contains(e.GitStderr, "no issues here") {
-			t.Errorf("refusing hub: %v", err)
-		}
-		if _, err := r.Sync(ctx, "no-such-remote", issuez.SyncOptions{}); !errors.As(err, &e) {
-			t.Errorf("unknown remote: %v", err)
-		}
-		cancelled, cancel := context.WithCancel(ctx)
-		cancel()
-		if _, err := r.Sync(cancelled, "origin", issuez.SyncOptions{}); !issuez.IsCancelled(err) {
-			t.Errorf("cancelled: %v", err)
-		}
-	})
-
-	// The derived ref of an issue with an attachment goes along; with
-	// git-lfs the bytes too, unless NoAttachments.
-	for _, upload := range []bool{false, true} {
-		t.Run(fmt.Sprintf("attachments upload=%v", upload), func(t *testing.T) {
-			t.Parallel()
-			if upload {
-				if err := exec.Command("git", "lfs", "version").Run(); err != nil {
-					t.Skip("no git-lfs")
-				}
-			}
-			r := newRepo(t)
-			w := create(t, r, "With a screenshot")
-			// An attachment as `git issue attach` writes it: the bytes in
-			// the issuez store, the trailer on a commit.
-			data := []byte("not really a png")
-			sum := sha256.Sum256(data)
-			sha := hex.EncodeToString(sum[:])
-			store := filepath.Join(r.GitDir(), "issuez", "lfs", "objects", sha[0:2], sha[2:4])
-			if err := os.MkdirAll(store, 0o755); err != nil {
-				t.Fatal(err)
-			}
-			if err := os.WriteFile(filepath.Join(store, sha), data, 0o644); err != nil {
-				t.Fatal(err)
-			}
-			msg := fmt.Sprintf("Add attachment\n\nX-Attachment: %s image/png %d sha256:%s shot.png",
-				missingID, len(data), sha)
-			commitOn(t, r.GitDir(), "refs/issues/"+w.ID, msg, true)
-			hub := withHub(t, r)
-			mustSync(t, r, issuez.SyncOptions{NoAttachments: !upload})
-			if revParse(t, hub, "refs/attachments/"+w.ID).IsZero() {
-				t.Error("no derived ref on the hub")
-			}
-			_, err := os.Stat(filepath.Join(hub, "lfs", "objects", sha[0:2], sha[2:4], sha))
-			if upload != (err == nil) {
-				t.Errorf("bytes on the hub: %v", err == nil)
-			}
-		})
-	}
 }
 
 // pushFix is a host and a client that would push to it, the push read as
@@ -742,60 +411,16 @@ func TestPushVerdict_authorsAndAttachments(t *testing.T) {
 	}
 }
 
-func TestRepo_SyncStatus(t *testing.T) {
-	r := newRepo(t)
-	w := create(t, r, "Unpushed")
-	withHub(t, r)
-	st, err := r.SyncStatus(t.Context(), "origin")
-	if err != nil || len(st.Pending) != 1 || st.Pending[0] != w.ID || len(st.Quarantined) != 0 {
-		t.Errorf("SyncStatus() = %+v, %v", st, err)
-	}
-	mustSync(t, r, issuez.SyncOptions{})
-	if st, err := r.SyncStatus(t.Context(), "origin"); err != nil || len(st.Pending) != 0 {
-		t.Errorf("after a sync: %+v, %v", st, err)
-	}
-}
-
-func TestRepo_Search(t *testing.T) {
-	r := newRepo(t)
-	w := create(t, r, "Login crashes")
-	create(t, r, "Other")
-	hits, err := r.Search(t.Context(), "login", issuez.SearchOptions{IgnoreCase: true})
-	if err != nil || len(hits) != 1 || hits[0] != (issuez.SearchHit{IssueID: w.ID, Line: "Login crashes"}) {
-		t.Errorf("Search() = %+v, %v", hits, err)
-	}
-}
-
-func TestRepo_DefaultRemotes(t *testing.T) {
-	r := newRepo(t)
-	if names, err := r.DefaultRemotes(t.Context()); err != nil || len(names) != 0 {
-		t.Errorf("no remotes: %v %v", names, err)
-	}
-	withHub(t, r)
-	if names, err := r.DefaultRemotes(t.Context()); err != nil || len(names) != 1 || names[0] != "origin" {
-		t.Errorf("origin: %v %v", names, err)
-	}
-}
-
-func TestRepo_ConfigureRemote(t *testing.T) {
-	r := newRepo(t)
-	withHub(t, r)
-	s, err := r.ConfigureRemote(t.Context(), "origin", issuez.RemoteOptions{})
-	if err != nil || !s.Configured || s.Unsafe {
-		t.Errorf("first: %+v %v", s, err)
-	}
-	if s, err := r.ConfigureRemote(t.Context(), "origin", issuez.RemoteOptions{}); err != nil || s.Configured {
-		t.Errorf("again: %+v %v", s, err)
-	}
-	if _, err := r.ConfigureRemote(t.Context(), "upstream", issuez.RemoteOptions{}); !errors.Is(err, issuez.ErrNotFound) {
-		t.Errorf("unknown: %v", err)
-	}
+// refState is every ref and how many objects there are, loose or packed.
+func refState(t *testing.T, dir string) string {
+	t.Helper()
+	return git(t, dir, "for-each-ref") + git(t, dir, "count-objects", "-v")
 }
 
 func TestRepo_Fsck(t *testing.T) {
 	r := newRepo(t)
-	create(t, r, "Fine")
-	rep, err := r.Fsck(t.Context(), issuez.FsckOptions{})
+	w := create(t, r, "Fine")
+	rep, err := r.Fsck(t.Context())
 	if err != nil || rep.Issues != 1 || rep.Errors != 0 {
 		t.Fatalf("clean: %+v %v", rep, err)
 	}
@@ -803,8 +428,35 @@ func TestRepo_Fsck(t *testing.T) {
 	tree := git(t, dir, "hash-object", "-t", "tree", "-w", "/dev/null")
 	commit := git(t, dir, "commit-tree", tree, "-m", "Odd")
 	git(t, dir, "update-ref", "refs/issues/not-a-uuid", commit)
-	rep, err = r.Fsck(t.Context(), issuez.FsckOptions{})
-	if err != nil || rep.Errors == 0 || len(rep.Findings) == 0 || rep.Findings[0].Kind != issuez.FsckIntegrity || rep.Findings[0].Subject != "not-a-uuid" {
-		t.Errorf("damaged: %+v %v", rep, err)
+	// A problem across issues is a note.
+	commitOn(t, dir, "refs/issues/"+w.ID, "Parent\n\nX-Parent: "+missingID, true)
+	before := refState(t, dir)
+	rep, err = r.Fsck(t.Context())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if rep.Errors == 0 || len(rep.Findings) < 2 {
+		t.Fatalf("damaged: %+v", rep)
+	}
+	var integrity, across bool
+	for _, f := range rep.Findings {
+		integrity = integrity || f.Kind == issuez.FsckIntegrity && f.IsError && f.Subject == "not-a-uuid" && f.SubjectKind == issuez.KindIssue
+		across = across || f.Kind == issuez.FsckProjection && !f.IsError && f.Subject == w.ID
+	}
+	if !integrity || !across {
+		t.Errorf("findings: %+v", rep.Findings)
+	}
+	if after := refState(t, dir); after != before {
+		t.Errorf("fsck wrote:\n%s\nwas:\n%s", after, before)
+	}
+}
+
+// TestRepo_Fsck_cancelled: the call fails, with no report of what it got to.
+func TestRepo_Fsck_cancelled(t *testing.T) {
+	r := newRepo(t)
+	ctx, cancel := context.WithCancel(t.Context())
+	cancel()
+	if rep, err := r.Fsck(ctx); !issuez.IsCancelled(err) || rep != nil {
+		t.Errorf("%+v %v", rep, err)
 	}
 }

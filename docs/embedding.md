@@ -82,9 +82,15 @@ int rc = issuez_attachment_prepare(repo, ISSUEZ_STR(""), name, bytes,
                                   cancel, &prepared, &err);
 /* Check rc. Store bytes using issuez_prepared_attachment_info(prepared):
    id, sanitized name, media_type, size and sha256. */
+/* The op's str is "<id> <media_type> <size> sha256:<sha256> <name>", from the
+   same info. */
+issuez_op attachment = ISSUEZ_OP_INIT;
+attachment.verb = ISSUEZ_OP_ADD;
+attachment.target = ISSUEZ_OPT_PREPARED_ATTACHMENT;
+attachment.str = encoded;
 issuez_op ops[] = {
     issuez_set_title(ISSUEZ_STR("An image")),
-    issuez_prepared_attachment_op(prepared),
+    attachment,
 };
 issuez_write *w = NULL;
 rc = issuez_issue_create(repo, ops, 2, &actor, cancel, &w, &err);
@@ -92,8 +98,7 @@ issuez_prepared_attachment_free(prepared);
 /* Check rc; free w when done. */
 ```
 
-The prepared op borrows its metadata. Keep its handle until the write
-returns. The writer checks metadata, attachment counts and limits, but
+The writer checks metadata, attachment counts and limits, but
 trusts the host to have stored the validated bytes. Prepared metadata is
 rejected when repository-local byte storage is enabled.
 

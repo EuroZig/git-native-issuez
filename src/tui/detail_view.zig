@@ -161,6 +161,20 @@ const Canvas = struct {
         return c.win.child(.{ .y_off = @intCast(c.y - c.scroll), .height = 1 });
     }
 
+    /// The next row with one text on it, if in view.
+    fn text(c: *Canvas, indent: u16, s: []const u8, style: ui.Style) void {
+        if (c.line()) |l| _ = ui.text(l, indent, 0, s, style);
+    }
+
+    /// The next row of an item, marked when focused, with one text on it.
+    fn itemText(c: *Canvas, span: Span, s: []const u8, style: ui.Style) void {
+        const l = c.line() orelse return;
+        l.fill(.{ .style = itemStyle(span) });
+        var st = style;
+        st.bg = itemStyle(span).bg;
+        _ = ui.text(l, 2, 0, s, st);
+    }
+
     fn skip(c: *Canvas, n: u32) void {
         c.y += n;
     }
@@ -274,13 +288,12 @@ fn drawActions(s: *AppState, f: ui.Frame, bar: ui.Window, i: u32) Allocator.Erro
         .{ .add_existing, "+ Existing  A" },
         .{ .toggle, if (done) "↺ Reopen  x" else "✓ Close  x" },
     };
-    var x: u16 = 1;
+    var l: ui.Line = .{ .f = f, .win = bar, .x = 1 };
     for (buttons) |b| {
         const index: u16 = @intCast(d.items.items.len);
         try d.items.append(s.gpa, b[0]);
-        const active = b[0] == .add_child;
-        x += try ui.button(f, bar, x, 0, b[1], .{ .item = index }, ui.buttonStyle(active));
-        x += 1;
+        try l.button(b[1], .{ .item = index }, ui.buttonStyle(b[0] == .add_child));
+        l.x += 1;
     }
 }
 
@@ -301,61 +314,35 @@ fn drawContent(c: *Canvas, i: u32) Allocator.Error!void {
         const span = try c.begin(.title);
         const rows = try text_mod.layout(f.arena, issue.title, w -| 2);
         for (rows) |r| if (c.line()) |l| {
-            l.fill(.{ .style = itemStyle(span) });
-            _ = ui.text(
-                l,
-                0,
-                0,
-                issue.title[r.start..r.end],
-                .{ .bold = true, .bg = itemStyle(span).bg },
-            );
+            const st = itemStyle(span);
+            l.fill(.{ .style = st });
+            _ = ui.text(l, 0, 0, issue.title[r.start..r.end], .{ .bold = true, .bg = st.bg });
         };
         try c.end(span);
     }
-    if (c.line()) |l| {
-        var x: u16 = 0;
+    if (c.line()) |row| {
+        var l: ui.Line = .{ .f = f, .win = row };
         const badge_bg: vaxis.Color = if (done) palette.done else palette.open;
-        ui.word(
-            l,
-            &x,
-            0,
+        l.word(
             f.fmt(" {s} ", .{issue.state.text()}),
             .{ .fg = .{ .index = 16 }, .bg = badge_bg, .bold = true },
         );
-        if (snap.proj.workflow(i)) |wf| ui.word(l, &x, 0, wf, .{ .fg = palette.accent });
-        ui.word(l, &x, 0, f.fmt("#{s}", .{shortId(issue.id)}), .{ .fg = palette.id });
-        if (issue.number) |num| ui.word(
-            l,
-            &x,
-            0,
-            f.fmt("#{d}", .{num}),
-            .{ .fg = palette.id, .bold = true },
-        );
+        if (snap.proj.workflow(i)) |wf| l.word(wf, .{ .fg = palette.accent });
+        l.word(f.fmt("#{s}", .{shortId(issue.id)}), .{ .fg = palette.id });
+        if (issue.number) |num| l.word(f.fmt("#{d}", .{num}), .{ .fg = palette.id, .bold = true });
         const updated = ui.ago(f, issue.updated);
-        ui.word(l, &x, 0, f.fmt("opened by {s} on {s}, updated {s}{s}", .{
+        l.word(f.fmt("opened by {s} on {s}, updated {s}{s}", .{
             issue.author.name,
             ui.date(f, issue.created),
             updated,
             if (std.ascii.isDigit(updated[0]) and updated.len < 5) " ago" else "",
         }), .{ .fg = palette.muted });
-        if (snap.proj.activelyBlocked(i)) ui.word(
-            l,
-            &x,
-            0,
-            "⊘ blocked",
-            .{ .fg = palette.err, .bold = true },
-        );
-        if (issue.deleted) ui.word(
-            l,
-            &x,
-            0,
+        if (snap.proj.activelyBlocked(i)) l.word("⊘ blocked", .{ .fg = palette.err, .bold = true });
+        if (issue.deleted) l.word(
             " deleted ",
             .{ .fg = .{ .index = 16 }, .bg = palette.err, .bold = true },
         );
-        if (issue.locked) ui.word(
-            l,
-            &x,
-            0,
+        if (issue.locked) l.word(
             " locked ",
             .{ .fg = .{ .index = 16 }, .bg = palette.medium, .bold = true },
         );
@@ -371,15 +358,8 @@ fn drawContent(c: *Canvas, i: u32) Allocator.Error!void {
             f.fmt("imported from {s}", .{a}));
         const rx = try reactionsText(f, issue, null);
         if (rx.len > 0) try parts.append(f.arena, rx);
-        if (parts.items.len > 0) if (c.line()) |l| {
-            _ = ui.text(
-                l,
-                0,
-                0,
-                try std.mem.join(f.arena, " · ", parts.items),
-                .{ .fg = palette.muted },
-            );
-        };
+        const joined = try std.mem.join(f.arena, " · ", parts.items);
+        if (parts.items.len > 0) c.text(0, joined, .{ .fg = palette.muted });
     }
     c.skip(1);
 
@@ -390,51 +370,26 @@ fn drawContent(c: *Canvas, i: u32) Allocator.Error!void {
     // Where it stands with the remote.
     if (snap.remote.name) |remote| {
         if (snap.remote.isQuarantined(issue.id)) {
-            if (c.line()) |l| _ = ui.text(
-                l,
-                0,
+            c.text(
                 0,
                 f.fmt("! {s} refused the remote's version: Y shows why and what to do", .{remote}),
                 .{ .fg = palette.err },
             );
             c.skip(1);
         } else if (snap.remote.unpushed.get(issue.id)) |new| {
-            if (c.line()) |l| _ = ui.text(
-                l,
-                0,
-                0,
-                f.fmt(
-                    "↑ {s} on {s} yet: y syncs",
-                    .{ if (new) "not" else "these changes aren't", remote },
-                ),
-                .{ .fg = palette.muted },
-            );
+            const what = if (new) "not" else "these changes aren't";
+            const note = f.fmt("↑ {s} on {s} yet: y syncs", .{ what, remote });
+            c.text(0, note, .{ .fg = palette.muted });
             c.skip(1);
         }
     }
 
     // Problems and conflicts.
-    for (snap.proj.problemsOf(i)) |p| if (c.line()) |l| {
-        _ = ui.text(
-            l,
-            0,
-            0,
-            f.fmt("⚠ {f}", .{p}),
-            .{ .fg = palette.err },
-        );
-    };
-    for (issue.conflicts) |cf| if (c.line()) |l| {
-        _ = ui.text(
-            l,
-            0,
-            0,
-            f.fmt(
-                "⚠ concurrent edits to {f}: kept '{s}', lost '{s}'",
-                .{ cf.target, cf.value, cf.lost },
-            ),
-            .{ .fg = palette.medium },
-        );
-    };
+    for (snap.proj.problemsOf(i)) |p| c.text(0, f.fmt("⚠ {f}", .{p}), .{ .fg = palette.err });
+    for (issue.conflicts) |cf| c.text(0, f.fmt(
+        "⚠ concurrent edits to {f}: kept '{s}', lost '{s}'",
+        .{ cf.target, cf.value, cf.lost },
+    ), .{ .fg = palette.medium });
     if (snap.proj.problemsOf(i).len > 0 or issue.conflicts.len > 0) c.skip(1);
 
     // Description.
@@ -442,16 +397,11 @@ fn drawContent(c: *Canvas, i: u32) Allocator.Error!void {
         const span = try c.begin(.description);
         try sectionHeader(c, span, "Description", "✎ edit  e");
         if (std.mem.trim(u8, issue.description, " \n").len == 0) {
-            if (c.line()) |l| {
-                l.fill(.{ .style = itemStyle(span) });
-                _ = ui.text(
-                    l,
-                    2,
-                    0,
-                    "No description. Click or press e to write one.",
-                    .{ .fg = palette.faint, .italic = true, .bg = itemStyle(span).bg },
-                );
-            }
+            c.itemText(
+                span,
+                "No description. Click or press e to write one.",
+                .{ .fg = palette.faint, .italic = true },
+            );
         } else try paragraph(c, issue.description, 2, .{});
         try c.end(span);
     }
@@ -466,33 +416,20 @@ fn drawContent(c: *Canvas, i: u32) Allocator.Error!void {
         else
             f.fmt("Sub-issues  {d}", .{kids.len});
         try sectionHeader(c, span, title, "+ new sub-issue  a");
-        if (kids.len == 0) if (c.line()) |l| {
-            l.fill(.{ .style = itemStyle(span) });
-            _ = ui.text(
-                l,
-                2,
-                0,
-                "None yet. Click or press a to break this issue down.",
-                .{ .fg = palette.faint, .italic = true, .bg = itemStyle(span).bg },
-            );
-        };
+        if (kids.len == 0) c.itemText(
+            span,
+            "None yet. Click or press a to break this issue down.",
+            .{ .fg = palette.faint, .italic = true },
+        );
         try c.end(span);
         if (snap.proj.progress(i)) |p| if (c.line()) |l| progressBar(l, p);
         for (kids) |k| try issueLine(c, k, "");
         const existing = try c.begin(.add_existing);
-        if (c.line()) |l| {
-            l.fill(.{ .style = itemStyle(existing) });
-            _ = ui.text(
-                l,
-                2,
-                0,
-                "+ add existing issues  A",
-                .{
-                    .fg = if (existing.focused) palette.accent else palette.muted,
-                    .bg = itemStyle(existing).bg,
-                },
-            );
-        }
+        c.itemText(
+            existing,
+            "+ add existing issues  A",
+            .{ .fg = if (existing.focused) palette.accent else palette.muted },
+        );
         try c.end(existing);
     }
     c.skip(1);
@@ -502,13 +439,7 @@ fn drawContent(c: *Canvas, i: u32) Allocator.Error!void {
     const blocks = snap.proj.blocks[i];
     const parent = snap.proj.parent[i];
     if (parent != none or blockers.len > 0 or blocks.len > 0) {
-        if (c.line()) |l| _ = ui.text(
-            l,
-            0,
-            0,
-            "Relations",
-            .{ .fg = palette.accent, .bold = true },
-        );
+        c.text(0, "Relations", .{ .fg = palette.accent, .bold = true });
         if (parent != none) try issueLine(c, parent, "parent     ");
         for (blockers) |b| try issueLine(c, b, "blocked by ");
         for (blocks) |b| try issueLine(c, b, "blocks     ");
@@ -528,44 +459,34 @@ fn drawContent(c: *Canvas, i: u32) Allocator.Error!void {
             if (cm.deleted) continue;
             const when = ui.ago(f, cm.author.time);
             if (cm.kind == .update) {
-                if (c.line()) |l| {
-                    var x: u16 = 2;
-                    ui.word(l, &x, 0, "·", .{ .fg = palette.faint });
-                    ui.word(l, &x, 0, cm.author.name, .{ .fg = palette.muted });
-                    ui.word(l, &x, 0, cm.subject, .{ .fg = palette.muted });
-                    ui.word(l, &x, 0, when, .{ .fg = palette.faint });
+                if (c.line()) |row| {
+                    var l: ui.Line = .{ .f = f, .win = row, .x = 2 };
+                    l.word("·", .{ .fg = palette.faint });
+                    l.word(cm.author.name, .{ .fg = palette.muted });
+                    l.word(cm.subject, .{ .fg = palette.muted });
+                    l.word(when, .{ .fg = palette.faint });
                 }
                 continue;
             }
             c.skip(1);
-            if (c.line()) |l| {
-                var x: u16 = 2;
-                ui.word(l, &x, 0, cm.author.name, .{ .bold = true });
-                ui.word(l, &x, 0, when, .{ .fg = palette.muted });
-                if (cm.original_author) |a| ui.word(
-                    l,
-                    &x,
-                    0,
-                    f.fmt("(via {s})", .{a}),
-                    .{ .fg = palette.faint },
-                );
-                if (cm.edited) ui.word(l, &x, 0, "(edited)", .{ .fg = palette.faint });
-                if (cm.purged) ui.word(l, &x, 0, "(purged)", .{ .fg = palette.err });
-                if (cm.state_change) |st| ui.word(
-                    l,
-                    &x,
-                    0,
-                    f.fmt("→ {s}", .{st.text()}),
-                    .{ .fg = palette.done },
-                );
+            if (c.line()) |row| {
+                var l: ui.Line = .{ .f = f, .win = row, .x = 2 };
+                l.word(cm.author.name, .{ .bold = true });
+                l.word(when, .{ .fg = palette.muted });
+                if (cm.original_author) |a| {
+                    l.word(f.fmt("(via {s})", .{a}), .{ .fg = palette.faint });
+                }
+                if (cm.edited) l.word("(edited)", .{ .fg = palette.faint });
+                if (cm.purged) l.word("(purged)", .{ .fg = palette.err });
+                if (cm.state_change) |st| {
+                    l.word(f.fmt("→ {s}", .{st.text()}), .{ .fg = palette.done });
+                }
             }
             const body = try std.mem.join(f.arena, "\n", cm.body);
             const shown = if (std.mem.trim(u8, body, " \n").len == 0) cm.subject else body;
             try paragraph(c, std.mem.trimEnd(u8, shown, "\n"), 4, .{});
             const rx = try reactionsText(f, issue, cm.oid);
-            if (rx.len > 0) if (c.line()) |l| {
-                _ = ui.text(l, 4, 0, rx, .{ .fg = palette.muted });
-            };
+            if (rx.len > 0) c.text(4, rx, .{ .fg = palette.muted });
         }
     }
     c.skip(1);
@@ -635,40 +556,40 @@ fn issueLine(c: *Canvas, k: u32, prefix: []const u8) Allocator.Error!void {
     const issue = snap.issues[k];
     const done = snap.isDone(k);
     const span = try c.begin(.{ .open = k });
-    if (c.line()) |l| {
+    if (c.line()) |row| {
         const bg = itemStyle(span).bg;
-        l.fill(.{ .style = itemStyle(span) });
-        var x: u16 = 2;
-        if (prefix.len > 0) ui.word(l, &x, 0, prefix, .{ .fg = palette.muted, .bg = bg });
+        row.fill(.{ .style = itemStyle(span) });
+        var l: ui.Line = .{ .f = c.f, .win = row, .x = 2 };
+        if (prefix.len > 0) l.word(prefix, .{ .fg = palette.muted, .bg = bg });
         const blocked = snap.proj.activelyBlocked(k);
         const glyph = if (issue.deleted) "✗" else if (done) "✓" else if (blocked) "⊘" else "●";
-        ui.word(l, &x, 0, glyph, .{
+        l.word(glyph, .{
             .fg = if (issue.deleted) palette.err else if (done) palette.done else palette.open,
             .bg = bg,
         });
-        ui.word(l, &x, 0, shortId(issue.id), .{ .fg = palette.id, .bg = bg });
+        l.word(shortId(issue.id), .{ .fg = palette.id, .bg = bg });
         const workflow = snap.proj.workflow(k) orelse issue.state.text();
         const state = if (done) issue.state.text() else workflow;
         const right = c.f.fmt("{s}  {s}", .{ issue.field("Priority") orelse "", state });
-        const rw = l.gwidth(right);
-        const title_win = l.child(.{ .width = l.width -| rw -| 2 });
-        _ = ui.text(title_win, x, 0, issue.title, .{
+        const rw = row.gwidth(right);
+        const title_win = row.child(.{ .width = row.width -| rw -| 2 });
+        _ = ui.text(title_win, l.x, 0, issue.title, .{
             .fg = if (done or issue.deleted) palette.muted else .default,
             .bg = bg,
             .bold = span.focused,
             .strikethrough = issue.deleted,
         });
         if (snap.proj.progress(k)) |p| {
-            const tw = l.gwidth(issue.title);
+            const tw = row.gwidth(issue.title);
             _ = ui.text(
                 title_win,
-                x + tw + 1,
+                l.x + tw + 1,
                 0,
                 c.f.fmt("{d}/{d}", .{ p.closed, p.total }),
                 .{ .fg = palette.muted, .bg = bg },
             );
         }
-        _ = ui.text(l, l.width -| rw, 0, right, .{ .fg = palette.muted, .bg = bg });
+        _ = ui.text(row, row.width -| rw, 0, right, .{ .fg = palette.muted, .bg = bg });
     }
     try c.end(span);
 }
@@ -687,19 +608,7 @@ fn sortedChildren(arena: Allocator, snap: *const Snapshot, i: u32) Allocator.Err
     return out.items;
 }
 
-const field_order = [_]Field{
-    .state,
-    .workflow,
-    .priority,
-    .assignee,
-    .labels,
-    .milestone,
-    .parent,
-    .blocked_by,
-    .start,
-    .due,
-    .estimate,
-};
+const field_order = std.enums.values(Field);
 
 fn drawFields(c: *Canvas, i: u32) Allocator.Error!void {
     const two = c.win.width >= 90;
@@ -746,13 +655,10 @@ fn drawField(c: *Canvas, cell: ui.Window, i: u32, field: Field, focused: bool) v
     const empty: ui.Style = .{ .fg = palette.faint, .bg = bg };
     const plain: ui.Style = .{ .bg = bg };
     switch (field) {
-        .state => _ = ui.text(
-            v,
-            0,
-            0,
-            issue.state.text(),
-            .{ .fg = if (snap.isDone(i)) palette.done else palette.open, .bg = bg, .bold = true },
-        ),
+        .state => {
+            const fg = if (snap.isDone(i)) palette.done else palette.open;
+            _ = ui.text(v, 0, 0, issue.state.text(), .{ .fg = fg, .bg = bg, .bold = true });
+        },
         .workflow => {
             if (snap.proj.workflow(i)) |wf| {
                 const x = ui.text(v, 0, 0, wf, .{ .fg = palette.accent, .bg = bg });
@@ -761,13 +667,8 @@ fn drawField(c: *Canvas, cell: ui.Window, i: u32, field: Field, focused: bool) v
         },
         .priority => {
             const p = issue.field("Priority");
-            _ = ui.text(
-                v,
-                0,
-                0,
-                p orelse unset,
-                if (p != null) .{ .fg = ui.priorityColor(p), .bg = bg, .bold = true } else empty,
-            );
+            const set: ui.Style = .{ .fg = ui.priorityColor(p), .bg = bg, .bold = true };
+            _ = fieldValue(v, p, set, empty);
         },
         .assignee => {
             // Everyone assigned; upstream's single `Assignee` otherwise.
@@ -777,34 +678,21 @@ fn drawField(c: *Canvas, cell: ui.Window, i: u32, field: Field, focused: bool) v
                 std.mem.join(f.arena, ", ", emails.items) catch ""
             else
                 issue.field("Assignee") orelse "";
-            _ = ui.text(
-                v,
-                0,
-                0,
-                if (shown.len > 0) shown else unset,
-                if (shown.len > 0) plain else empty,
-            );
+            _ = fieldValue(v, if (shown.len > 0) shown else null, plain, empty);
         },
         .labels => {
             if (issue.labels.len == 0) {
                 _ = ui.text(v, 0, 0, unset, empty);
                 return;
             }
-            var x: u16 = 0;
+            var l: ui.Line = .{ .f = f, .win = v };
             for (issue.labels) |lab| {
-                x += ui.text(
-                    v,
-                    x,
-                    0,
-                    f.fmt(" {s} ", .{lab}),
-                    .{ .fg = .{ .index = 16 }, .bg = palette.label },
-                );
-                x += 1;
+                l.word(f.fmt(" {s} ", .{lab}), .{ .fg = .{ .index = 16 }, .bg = palette.label });
             }
         },
         .milestone => {
             const m = snap.milestoneName(i);
-            const x = ui.text(v, 0, 0, m orelse unset, if (m != null) plain else empty);
+            const x = fieldValue(v, m, plain, empty);
             if (m != null and issue.milestone_id == null and snap.proj.milestone[i] != null) {
                 _ = ui.text(v, x + 1, 0, "(inherited)", empty);
             }
@@ -814,14 +702,9 @@ fn drawField(c: *Canvas, cell: ui.Window, i: u32, field: Field, focused: bool) v
             if (p == none) {
                 _ = ui.text(v, 0, 0, unset, empty);
             } else {
-                const x = ui.text(
-                    v,
-                    0,
-                    0,
-                    shortId(snap.issues[p].id),
-                    .{ .fg = palette.id, .bg = bg },
-                );
-                _ = ui.text(v, x + 1, 0, snap.issues[p].title, plain);
+                var l: ui.Line = .{ .f = f, .win = v };
+                l.word(shortId(snap.issues[p].id), .{ .fg = palette.id, .bg = bg });
+                l.text(snap.issues[p].title, plain);
             }
         },
         .blocked_by => {
@@ -830,37 +713,27 @@ fn drawField(c: *Canvas, cell: ui.Window, i: u32, field: Field, focused: bool) v
                 _ = ui.text(v, 0, 0, unset, empty);
                 return;
             }
-            var x: u16 = 0;
-            for (bs) |b| {
-                const st: ui.Style = .{
-                    .fg = if (snap.proj.isActive(b)) palette.err else palette.muted,
-                    .bg = bg,
-                    .strikethrough = !snap.proj.isActive(b),
-                };
-                x += ui.text(v, x, 0, shortId(snap.issues[b].id), st);
-                x += 1;
-            }
+            var l: ui.Line = .{ .f = f, .win = v };
+            for (bs) |b| l.word(shortId(snap.issues[b].id), .{
+                .fg = if (snap.proj.isActive(b)) palette.err else palette.muted,
+                .bg = bg,
+                .strikethrough = !snap.proj.isActive(b),
+            });
         },
-        .start => dateValue(f, v, issue.start_date, empty, plain),
-        .due => dateValue(f, v, issue.due_date, empty, plain),
-        .estimate => if (issue.estimate_minutes) |m| {
-            _ = ui.text(v, 0, 0, ui.duration(f, m), plain);
-        } else {
-            _ = ui.text(v, 0, 0, unset, empty);
+        .start, .due => {
+            const d = if (field == .start) issue.start_date else issue.due_date;
+            _ = fieldValue(v, if (d) |date| f.fmt("{f}", .{date}) else null, plain, empty);
+        },
+        .estimate => {
+            const m = issue.estimate_minutes;
+            _ = fieldValue(v, if (m) |minutes| ui.duration(f, minutes) else null, plain, empty);
         },
     }
 }
 
-fn dateValue(
-    f: ui.Frame,
-    v: ui.Window,
-    d: ?issuez.format.fields.Date,
-    empty: ui.Style,
-    plain: ui.Style,
-) void {
-    if (d) |date| {
-        _ = ui.text(v, 0, 0, f.fmt("{f}", .{date}), plain);
-    } else _ = ui.text(v, 0, 0, unset, empty);
+/// A field's value, or what an empty one shows. Returns the columns used.
+fn fieldValue(v: ui.Window, value: ?[]const u8, set: ui.Style, empty: ui.Style) u16 {
+    return ui.text(v, 0, 0, value orelse unset, if (value != null) set else empty);
 }
 
 pub fn key(s: *AppState, k: vaxis.Key) Allocator.Error!AppState.Action {
@@ -999,17 +872,13 @@ pub fn openAdoptPicker(s: *AppState, i: u32) void {
         "Add sub-issues to #{s}",
         .{shortId(snap.issues[i].id)},
     ) catch "Add sub-issues";
-    s.openModal(
-        .{
-            .picker = .{
-                .title = title,
-                .items = items,
-                .multi = true,
-                .purpose = .{ .adopt = .of(snap.issues[i].id) },
-                .verb = "Add",
-            },
-        },
-    );
+    s.openModal(.{ .picker = .{
+        .title = title,
+        .items = items,
+        .multi = true,
+        .purpose = .{ .adopt = .of(snap.issues[i].id) },
+        .verb = "Add",
+    } });
 }
 
 /// Whether `k` is `i`'s parent, its parent's, and so on.

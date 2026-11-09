@@ -31,26 +31,13 @@ pub fn main(comptime B: type, ctx: *context.Context(B), argv: []const []const u8
     const arena = ctx.arena;
     var remote_arg: ?[]const u8 = null;
     var fix = false;
-    var args: common.Args = .{ .list = argv };
-    while (args.next()) |arg| {
-        if (!args.isOption(arg)) {
-            if (args.was_separator) continue;
-            // Upstream silently takes the last one.
-            if (remote_arg != null) return common.missing(
-                ctx.err,
-                "init",
-                "only one remote can be given",
-            );
-            remote_arg = arg;
-        } else if (common.isHelp(arg)) {
-            ctx.out.writeAll(help) catch {};
-            return common.exit_ok;
-        } else if (std.mem.eql(u8, arg, "--fix-refspec")) {
-            fix = true;
-        } else {
-            return common.unknownOption(ctx.err, "init", arg);
-        }
-    }
+    if (common.parseArgs(ctx, argv, .{
+        .command = "init",
+        .help = help,
+        // Upstream silently takes the last one.
+        .positionals = .{ .only = .{ &remote_arg, "only one remote can be given" } },
+        .flags = &.{.{ "--fix-refspec", .{ .on = &fix } }},
+    })) |exit| return exit;
 
     const repo = common.openRepoQuiet(B, ctx) orelse return common.exit_fatal;
     const backend = repo.backend;

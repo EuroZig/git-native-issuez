@@ -59,6 +59,12 @@ pub fn refFor(
     return std.fmt.allocPrint(arena, "{s}{s}", .{ prefix, ref_or_id });
 }
 
+/// Internal: the library's own plumbing, not API; it may change.
+/// What moves a ref to `new`: an update from `old`, or a create with none.
+pub fn moveOp(old: ?Oid, new: Oid) contract.RefUpdate.Op {
+    return if (old) |o| .{ .update = .{ .new = new, .old = o } } else .{ .create = new };
+}
+
 /// Every namespace of the library's refs, shared and local, as `dropAll`
 /// empties them; the first four are the shared ones, as `adoptFrom` takes
 /// them. Remote-tracking copies (`refs/remotes/`) aren't ours.
@@ -96,10 +102,7 @@ pub const Guarded = struct {
     ) Allocator.Error![]const contract.RefUpdate {
         var out: std.ArrayList(contract.RefUpdate) = .empty;
         try out.appendSlice(arena, g.verify);
-        for (g.bump) |b| try out.append(arena, .{ .name = b.name, .op = if (b.old) |old|
-            .{ .update = .{ .new = new, .old = old } }
-        else
-            .{ .create = new } });
+        for (g.bump) |b| try out.append(arena, .{ .name = b.name, .op = moveOp(b.old, new) });
         return out.items;
     }
 };
@@ -936,14 +939,7 @@ pub fn Repo(comptime B: type) type {
             if (all.len > self.limits.max_guard_scan) return error.GuardScanTooLarge;
             var out: std.ArrayList(Issue) = .empty;
             for (all) |r| {
-                try out.append(arena, self.load(arena, r) catch |err| switch (err) {
-                    error.CorruptIssue,
-                    error.HistoryTooLong,
-                    error.MissingParent,
-                    error.NoRoot,
-                    => continue,
-                    else => |e| return e,
-                });
+                if (try self.loadReadable(arena, r)) |issue| try out.append(arena, issue);
             }
             return out.items;
         }
@@ -963,21 +959,9 @@ pub fn Repo(comptime B: type) type {
                 if (ep.kind == .dangling) return self.loadForGuards(arena);
             }
 
-            var out: std.ArrayList(Issue) = .empty;
-            var have: std.StringHashMapUnmanaged(void) = .empty;
-            try out.append(arena, center);
-            try have.put(arena, center.id, {});
-            const Add = struct {
-                fn f(
-                    o: *std.ArrayList(Issue),
-                    h: *std.StringHashMapUnmanaged(void),
-                    a: Allocator,
-                    issue: Issue,
-                ) !void {
-                    if ((try h.getOrPut(a, issue.id)).found_existing) return;
-                    try o.append(a, issue);
-                }
-            }.f;
+            // By ID, in the order they're found.
+            var out: std.array_hash_map.String(Issue) = .empty;
+            try out.put(arena, center.id, center);
 
             // Up. Each walk has its own `seen`: in a parent cycle the
             // ancestors are descendants too.
@@ -987,7 +971,7 @@ pub fn Repo(comptime B: type) type {
             while (up) |id| {
                 if ((try seen.getOrPut(arena, id)).found_existing) break;
                 const issue = (try self.loadById(arena, id)) orelse break;
-                try Add(&out, &have, arena, issue);
+                _ = try out.getOrPutValue(arena, issue.id, issue);
                 up = issue.parent;
             }
 
@@ -1003,15 +987,8 @@ pub fn Repo(comptime B: type) type {
                 for (kids.items) |r| {
                     if ((try seen.getOrPut(arena, r.id())).found_existing) continue;
                     const issue = index.loaded.get(r.id()) orelse
-                        self.load(arena, r) catch |err| switch (err) {
-                        error.CorruptIssue,
-                        error.HistoryTooLong,
-                        error.MissingParent,
-                        error.NoRoot,
-                        => continue,
-                        else => |e| return e,
-                    };
-                    try Add(&out, &have, arena, issue);
+                        (try self.loadReadable(arena, r)) orelse continue;
+                    _ = try out.getOrPutValue(arena, issue.id, issue);
                     try stack.append(arena, issue.id);
                 }
             }
@@ -1024,31 +1001,23 @@ pub fn Repo(comptime B: type) type {
             while (blocked.pop()) |x| for (x.blocked_by) |id| {
                 if ((try seen.getOrPut(arena, id)).found_existing) continue;
                 const issue = (try self.loadById(arena, id)) orelse continue;
-                try Add(&out, &have, arena, issue);
+                _ = try out.getOrPutValue(arena, issue.id, issue);
                 try blocked.append(arena, issue);
             };
 
             // Whoever shares a number with one of them: a duplicate is a
             // problem of both.
-            const loaded = out.items.len;
-            for (0..loaded) |k| {
-                const n = out.items[k].number orelse continue;
+            for (0..out.count()) |k| {
+                const n = out.values()[k].number orelse continue;
                 const owners = index.numbers.get(n) orelse continue;
                 for (owners.items) |r| {
-                    if (have.contains(r.id())) continue;
+                    if (out.contains(r.id())) continue;
                     const issue = index.loaded.get(r.id()) orelse
-                        self.load(arena, r) catch |err| switch (err) {
-                        error.CorruptIssue,
-                        error.HistoryTooLong,
-                        error.MissingParent,
-                        error.NoRoot,
-                        => continue,
-                        else => |e| return e,
-                    };
-                    try Add(&out, &have, arena, issue);
+                        (try self.loadReadable(arena, r)) orelse continue;
+                    _ = try out.getOrPutValue(arena, issue.id, issue);
                 }
             }
-            return out.items;
+            return out.values();
         }
 
         /// Null when there's no such issue, or it can't be loaded.
@@ -1056,7 +1025,13 @@ pub fn Repo(comptime B: type) type {
             if (!uuid_fmt.isCanonical(id)) return null;
             const name = try refNameOf(arena, id);
             const tip = (try self.backend.resolveRef(name)) orelse return null;
-            return self.load(arena, .{ .name = name, .tip = tip }) catch |err| switch (err) {
+            return self.loadReadable(arena, .{ .name = name, .tip = tip });
+        }
+
+        /// Null when its history can't be read: what guards skip, as fsck
+        /// reports it.
+        fn loadReadable(self: Self, arena: Allocator, ref: IssueRef) LoadError!?Issue {
+            return self.load(arena, ref) catch |err| switch (err) {
                 error.CorruptIssue,
                 error.HistoryTooLong,
                 error.MissingParent,
@@ -1388,11 +1363,7 @@ pub fn Repo(comptime B: type) type {
                 var random: [16]u8 = undefined;
                 self.backend.randomBytes(&random);
                 const id = uuid_fmt.Uuid.fromRandom(random);
-                const name = try std.fmt.allocPrint(
-                    arena,
-                    "{s}{s}",
-                    .{ issue_ref_prefix, id.slice() },
-                );
+                const name = try refNameOf(arena, id.slice());
                 var ops: std.ArrayList(contract.RefUpdate) = .empty;
                 try ops.append(arena, .{ .name = name, .op = .{ .create = oid } });
                 try ops.appendSlice(arena, try guarded.ops(arena, oid));
@@ -2065,9 +2036,6 @@ pub fn Repo(comptime B: type) type {
                 )) return error.DuplicateEdit;
                 out[n].changes = try self.checkEdit(arena, e.spec);
             }
-            const any_expect = for (edits) |e| {
-                if (e.spec.expect != null) break true;
-            } else false;
 
             var attempt: u8 = 0;
             while (attempt < self.limits.cas_retries) : (attempt += 1) {
@@ -2119,7 +2087,7 @@ pub fn Repo(comptime B: type) type {
                     );
                 }
                 var verify: std.ArrayList(contract.RefUpdate) = .empty;
-                var bumps: std.ArrayList(struct { name: []const u8, old: ?Oid }) = .empty;
+                var bumps: std.ArrayList(Guarded.Bump) = .empty;
                 var cache: ?Guarded.ParentCache = null;
                 for (edits, currents, 0..) |e, current, n| {
                     const builder: EditBuilder = .{
@@ -2140,7 +2108,7 @@ pub fn Repo(comptime B: type) type {
                         const seen = for (bumps.items) |x| {
                             if (std.mem.eql(u8, x.name, b.name)) break true;
                         } else false;
-                        if (!seen) try bumps.append(arena, .{ .name = b.name, .old = b.old });
+                        if (!seen) try bumps.append(arena, b);
                     }
                     if (guarded.parent_cache) |c| cache = c;
                 }
@@ -2163,11 +2131,7 @@ pub fn Repo(comptime B: type) type {
                     } else try ops.append(arena, v);
                 }
                 for (bumps.items) |b| {
-                    const op: contract.RefUpdate.Op = if (b.old) |old|
-                        .{ .update = .{ .new = out[0].tip, .old = old } }
-                    else
-                        .{ .create = out[0].tip };
-                    try ops.append(arena, .{ .name = b.name, .op = op });
+                    try ops.append(arena, .{ .name = b.name, .op = moveOp(b.old, out[0].tip) });
                 }
                 // Every check and guard ran; the commits are only hashed.
                 if (self.call.dry_run) return out;
@@ -2180,7 +2144,7 @@ pub fn Repo(comptime B: type) type {
                     break :written false;
                 };
                 if (conflict) {
-                    if (any_expect) for (edits) |e| if (e.spec.expect) |want| {
+                    for (edits) |e| if (e.spec.expect) |want| {
                         const now = (try self.backend.resolveRef(e.ref_name)) orelse
                             return error.IssueDisappeared;
                         if (!now.eql(want)) return error.VersionMismatch;
@@ -2802,7 +2766,7 @@ pub fn Repo(comptime B: type) type {
                 if (g.batch) |b| if (b.get(id)) |issue| return issue;
                 g.scanned += 1;
                 if (g.scanned > g.repo.limits.max_guard_scan) return error.GuardScanTooLarge;
-                const name = try std.fmt.allocPrint(g.arena, "{s}{s}", .{ issue_ref_prefix, id });
+                const name = try refNameOf(g.arena, id);
                 const found: ?Issue = if (uuid_fmt.isCanonical(id))
                     if (try g.repo.backend.resolveRef(name)) |tip| blk: {
                         try g.pin(name, id, tip);
@@ -2921,14 +2885,7 @@ pub fn Repo(comptime B: type) type {
                 if (index.children.get(id)) |kids| for (kids.items) |r| {
                     const batched = if (g.batch) |b| b.get(r.id()) else null;
                     const issue = batched orelse index.loaded.get(r.id()) orelse
-                        g.repo.load(g.arena, r) catch |err| switch (err) {
-                        error.CorruptIssue,
-                        error.HistoryTooLong,
-                        error.MissingParent,
-                        error.NoRoot,
-                        => continue,
-                        else => |e| return e,
-                    };
+                        (try g.repo.loadReadable(g.arena, r)) orelse continue;
                     try out.append(g.arena, issue);
                 };
                 try g.children.put(g.arena, id, out.items);
@@ -2949,12 +2906,7 @@ pub fn Repo(comptime B: type) type {
                     for (try g.childrenOf(it.id)) |c| {
                         if ((try seen.getOrPut(g.arena, c.id)).found_existing) continue;
                         try out.append(g.arena, c);
-                        const name = try std.fmt.allocPrint(
-                            g.arena,
-                            "{s}{s}",
-                            .{ issue_ref_prefix, c.id },
-                        );
-                        try g.pin(name, c.id, c.tip);
+                        try g.pin(try refNameOf(g.arena, c.id), c.id, c.tip);
                         height.* = @max(height.*, it.depth + 1);
                         try stack.append(g.arena, .{ .id = c.id, .depth = it.depth + 1 });
                     }
@@ -2998,16 +2950,9 @@ pub fn Repo(comptime B: type) type {
                     number = entry.?.number;
                     break :blk entry.?.parent;
                 } else blk: {
-                    const issue = self.load(arena, r) catch |err| switch (err) {
-                        error.CorruptIssue,
-                        error.HistoryTooLong,
-                        error.MissingParent,
-                        error.NoRoot,
-                        => {
-                            unloadable += 1;
-                            continue;
-                        },
-                        else => |e| return e,
+                    const issue = (try self.loadReadable(arena, r)) orelse {
+                        unloadable += 1;
+                        continue;
                     };
                     try index.loaded.put(arena, id, issue);
                     number = issue.number;
@@ -3096,10 +3041,9 @@ pub fn Repo(comptime B: type) type {
         fn writeParentCacheOrFail(self: Self, old: ?Oid, text: []const u8) Error!void {
             const oid = try self.backend.writeObject(.blob, text);
             if (old != null and old.?.eql(oid)) return;
-            self.backend.updateRefs(&.{.{ .name = parent_cache_ref, .op = if (old) |o|
-                .{ .update = .{ .new = oid, .old = o } }
-            else
-                .{ .create = oid } }}) catch |err| switch (err) {
+            self.backend.updateRefs(&.{
+                .{ .name = parent_cache_ref, .op = moveOp(old, oid) },
+            }) catch |err| switch (err) {
                 error.RefConflict => {}, // someone else refreshed it
                 else => |e| return e,
             };
@@ -3404,7 +3348,9 @@ pub fn Repo(comptime B: type) type {
     };
 }
 
-fn refNameOf(arena: Allocator, id: []const u8) Allocator.Error![]const u8 {
+/// Internal: the library's own plumbing, not API; it may change.
+/// `refs/issues/<id>`.
+pub fn refNameOf(arena: Allocator, id: []const u8) Allocator.Error![]const u8 {
     return std.fmt.allocPrint(arena, "{s}{s}", .{ issue_ref_prefix, id });
 }
 

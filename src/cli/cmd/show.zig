@@ -40,38 +40,21 @@ pub fn main(comptime B: type, ctx: *context.Context(B), argv: []const []const u8
     var ids = false;
     var with_history = false;
     var as_json = false;
-    var args: common.Args = .{ .list = argv };
-    while (args.next()) |arg| {
-        if (!args.isOption(arg)) {
-            if (args.was_separator) continue;
-            if (issue_prefix == null) issue_prefix = arg;
-        } else if (common.isHelp(arg)) {
-            ctx.out.writeAll(help) catch {};
-            return common.exit_ok;
-        } else if (std.mem.eql(u8, arg, "--ids")) {
-            ids = true;
-        } else if (std.mem.eql(u8, arg, "--history")) {
-            with_history = true;
-        } else if (std.mem.eql(u8, arg, "--json")) {
-            as_json = true;
-        } else {
-            return common.unknownOption(ctx.err, "show", arg);
-        }
-    }
-    const prefix = issue_prefix orelse return common.missing(
-        ctx.err,
-        "show",
-        "issue ID is required",
-    );
+    if (common.parseArgs(ctx, argv, .{
+        .command = "show",
+        .help = help,
+        .positionals = .{ .first = &issue_prefix },
+        .flags = &.{
+            .{ "--ids", .{ .on = &ids } },
+            .{ "--history", .{ .on = &with_history } },
+            .{ "--json", .{ .on = &as_json } },
+        },
+    })) |exit| return exit;
+    const prefix = issue_prefix orelse
+        return common.missing(ctx.err, "show", "issue ID is required");
 
     const repo = common.openRepo(B, ctx) orelse return common.exit_fatal;
-    const ref = common.resolveOne(
-        B,
-        repo,
-        arena,
-        ctx.err,
-        prefix,
-    ) orelse return common.exit_error;
+    const ref = common.resolveOne(B, repo, arena, ctx.err, prefix) orelse return common.exit_error;
     const issue = repo.load(arena, ref) catch |e| return common.repoFailed(B, ctx, e);
 
     if (as_json) {

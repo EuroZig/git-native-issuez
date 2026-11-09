@@ -44,35 +44,31 @@ pub fn main(comptime B: type, ctx: *context.Context(B), argv: []const []const u8
     var ids: std.ArrayList([]const u8) = .empty;
     var words: std.ArrayList([]const u8) = .empty;
     var quiet = false;
-    var args: common.Args = .{ .list = argv };
-    while (args.next()) |arg| {
-        if (!args.isOption(arg)) {
-            words.append(arena, arg) catch return common.oom(ctx.err);
-        } else if (common.isHelp(arg)) {
-            ctx.out.writeAll(help) catch {};
-            return common.exit_ok;
-        } else if (std.mem.eql(u8, arg, "--pusher-email")) {
-            const e = args.value(ctx.err, arg) orelse return common.exit_error;
-            emails.append(arena, e) catch return common.oom(ctx.err);
-        } else if (std.mem.eql(u8, arg, "--pusher-id")) {
-            const id = args.value(ctx.err, arg) orelse return common.exit_error;
+    const flags = [_]common.Flag{
+        .{ "--pusher-email", .{ .list = &emails } },
+        .{ "--allow-numbers", .{ .on = &policy.allow_numbers } },
+        .{ "--allow-purge", .{ .on = &policy.allow_purge } },
+        .{ "-q --quiet", .{ .on = &quiet } },
+    };
+    var parser = common.argParser(ctx, argv, .{
+        .command = "push-check",
+        .help = help,
+        .positionals = .{ .words_and_separator = &words },
+        .flags = &flags,
+    });
+    while (parser.next()) |arg| {
+        if (common.isFlag(arg, "--pusher-id")) {
+            const id = parser.value(arg) orelse return common.exit_error;
             if (!uuid_fmt.isCanonical(id))
                 return common.fail(ctx.err, "error: --pusher-id needs a UUID\n");
             ids.append(arena, id) catch return common.oom(ctx.err);
-        } else if (std.mem.eql(u8, arg, "--authors")) {
-            const v = args.value(ctx.err, arg) orelse return common.exit_error;
+        } else if (common.isFlag(arg, "--authors")) {
+            const v = parser.value(arg) orelse return common.exit_error;
             policy.author_policy = std.meta.stringToEnum(check_mod.AuthorPolicy, v) orelse
                 return common.fail(ctx.err, "error: --authors is any, warn or enforce\n");
-        } else if (std.mem.eql(u8, arg, "--allow-numbers")) {
-            policy.allow_numbers = true;
-        } else if (std.mem.eql(u8, arg, "--allow-purge")) {
-            policy.allow_purge = true;
-        } else if (std.mem.eql(u8, arg, "-q") or std.mem.eql(u8, arg, "--quiet")) {
-            quiet = true;
-        } else {
-            return common.unknownOption(ctx.err, "push-check", arg);
-        }
+        } else return parser.unknown(arg);
     }
+    if (parser.exit) |exit| return exit;
     policy.pusher_emails = emails.items;
     policy.pusher_ids = ids.items;
     if (policy.author_policy != .any and emails.items.len == 0) return common.fail(

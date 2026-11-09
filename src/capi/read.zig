@@ -19,6 +19,7 @@ const Issue = issuez.model.issue.Issue;
 const core_fmt = issuez.format.core;
 const view = issuez.view;
 const fields_fmt = issuez.format.fields;
+const uuid_fmt = issuez.format.uuid;
 const authorIdAt = issuez.model.issue.authorIdAt;
 const Call = repo_mod.Call;
 const RepoObj = repo_mod.RepoObj;
@@ -54,7 +55,6 @@ pub const IssueObj = struct {
     labels: []const Str,
     assignees: []const api.Person,
     blockers: []const Str,
-    fields: []const ExtraField,
     extra: []const ExtraField,
     problems: *rt.ProblemList,
     comments: []const CommentObj,
@@ -84,10 +84,6 @@ fn isKnown(key: []const u8) bool {
     return false;
 }
 
-fn dateOf(d: issuez.format.fields.Date) api.Date {
-    return .{ .year = @intCast(d.year), .month = d.month, .day = d.day };
-}
-
 /// Settings a record depends on.
 pub const Context = struct {
     done_states: []const []const u8,
@@ -107,13 +103,16 @@ pub fn workflowOf(issue: Issue, ctx: Context) ?[]const u8 {
     return if (ctx.workflow_states.len > 0) ctx.workflow_states[0] else null;
 }
 
+fn priorityOf(issue: Issue) api.Priority {
+    return if (issue.priority) |p| rt.mirrored(api.Priority, p) else .unknown;
+}
+
 pub fn numberOf(issue: Issue) ?u64 {
     return issue.number;
 }
 
 pub fn build(a: Allocator, issue: Issue, ctx: Context) Allocator.Error!IssueObj {
-    const author = try a.create(api.Person);
-    author.* = try rt.personOf(a, issue.author, issue.author_id);
+    const author = try rt.newPerson(a, issue.author, issue.author_id);
     const created: api.Time = .{
         .unix_seconds = issue.created,
         .tz_offset_minutes = issue.author.tz_offset_minutes,
@@ -124,21 +123,15 @@ pub fn build(a: Allocator, issue: Issue, ctx: Context) Allocator.Error!IssueObj 
         .other => |t| if (std.mem.eql(u8, t, "open")) .open else .other,
     };
 
-    var labels = try a.alloc(Str, issue.labels.len);
-    for (issue.labels, 0..) |l, i| labels[i] = try rt.dupeZ(a, l);
-    var blockers = try a.alloc(Str, issue.blocked_by.len);
-    for (issue.blocked_by, 0..) |b, i| blockers[i] = try rt.dupeZ(a, b);
     const assignees = try a.alloc(api.Person, issue.assignees.len);
     for (issue.assignees, assignees) |as, *o| o.* = .{
         .email = try rt.dupeZ(a, as.email),
         .user_id = try rt.optZ(a, as.uuid),
     };
-    var fields: std.ArrayList(ExtraField) = .empty;
     var extra: std.ArrayList(ExtraField) = .empty;
     for (issue.fields) |f| {
-        const e: ExtraField = .{ .key = try rt.dupeZ(a, f.key), .value = try rt.dupeZ(a, f.value) };
-        try fields.append(a, e);
-        if (!isKnown(f.key)) try extra.append(a, e);
+        if (isKnown(f.key)) continue;
+        try extra.append(a, .{ .key = try rt.dupeZ(a, f.key), .value = try rt.dupeZ(a, f.value) });
     }
 
     var problems: rt.Problems = .empty;
@@ -173,12 +166,6 @@ pub fn build(a: Allocator, issue: Issue, ctx: Context) Allocator.Error!IssueObj 
     var comment_of: std.ArrayList(?usize) = .empty;
     const people = try a.alloc(api.Person, issue.comments.len);
     const closure = view.closure(issue, ctx.done_states);
-    var closed_by: ?*const api.Person = null;
-    if (closure) |cl| {
-        const by = try a.create(api.Person);
-        by.* = try rt.personOf(a, cl.at, cl.author_id);
-        closed_by = by;
-    }
     for (issue.comments, people) |c, *person| {
         person.* = try rt.personOf(a, c.author, authorIdAt(issue.author_ids, c.oid));
         const at = rt.timeOf(c.author);
@@ -186,8 +173,7 @@ pub fn build(a: Allocator, issue: Issue, ctx: Context) Allocator.Error!IssueObj 
             try comment_of.append(a, null);
             continue;
         }
-        const ids = try a.alloc(Str, c.attachments.len);
-        for (c.attachments, ids) |x, *o| o.* = try rt.dupeZ(a, x);
+        const ids = try rt.strs(a, c.attachments);
         const body = try std.mem.join(a, "\n", c.body);
         const full = if (body.len == 0)
             c.subject
@@ -228,8 +214,7 @@ pub fn build(a: Allocator, issue: Issue, ctx: Context) Allocator.Error!IssueObj 
         .changes = created_changes.ptr,
     });
     for (issue.steps) |step| {
-        const person = try a.create(api.Person);
-        person.* = try rt.personOf(a, step.author, authorIdAt(issue.author_ids, step.oid));
+        const person = try rt.newPerson(a, step.author, authorIdAt(issue.author_ids, step.oid));
         var entry: api.Entry = .{
             .kind = 0,
             .commit = rt.oidOf(step.oid),
@@ -251,17 +236,10 @@ pub fn build(a: Allocator, issue: Issue, ctx: Context) Allocator.Error!IssueObj 
                 if (comment_of.items[k]) |ci| entry.comment = &comments.items[ci].public;
             },
             .event => |e| {
-                const kind: api.EntryKind = switch (e.kind) {
-                    .description_edit => .description_edit,
-                    .comment_edit => .comment_edit,
-                    .comment_delete => .comment_delete,
-                    .comment_restore => .comment_restore,
-                    .reaction => .reaction,
-                };
-                entry.kind = @intFromEnum(kind);
+                entry.kind = @intFromEnum(rt.mirrored(api.EntryKind, e.kind));
                 if (e.target) |t| for (comments.items) |*c| {
                     const oid = rt.oidOf(t);
-                    if (rt.issuez_oid_eq(&c.public.id, &oid)) entry.comment = &c.public;
+                    if (rt.oidEql(&c.public.id, &oid)) entry.comment = &c.public;
                 };
             },
         }
@@ -294,8 +272,7 @@ pub fn build(a: Allocator, issue: Issue, ctx: Context) Allocator.Error!IssueObj 
             issue.removed_attachments[k - issue.attachments.len]
         else
             issue.attachments[k];
-        const by = try a.create(api.Person);
-        by.* = try rt.personOf(a, x.added_by, authorIdAt(issue.author_ids, x.added_in));
+        const by = try rt.newPerson(a, x.added_by, authorIdAt(issue.author_ids, x.added_in));
         const owner = view.ownerOf(issue, x.added_in);
         o.* = .{
             .comment = if (owner.comment) |cm| rt.oidOf(cm) else .{},
@@ -331,7 +308,7 @@ pub fn build(a: Allocator, issue: Issue, ctx: Context) Allocator.Error!IssueObj 
             .state_name = try rt.dupeZ(a, issue.state.text()),
             .is_done = issue.state.isDone(ctx.done_states),
             .workflow_state = try rt.optZ(a, workflowOf(issue, ctx)),
-            .closed_by = closed_by,
+            .closed_by = if (closure) |cl| try rt.newPerson(a, cl.at, cl.author_id) else null,
             .closed_at = if (closure) |cl| rt.timeOf(cl.at) else .{},
             .fixed_by = try rt.optZ(a, issue.field("Fixed-By")),
             .release = try rt.optZ(a, issue.field("Release")),
@@ -339,16 +316,11 @@ pub fn build(a: Allocator, issue: Issue, ctx: Context) Allocator.Error!IssueObj 
             .is_deleted = issue.deleted,
             .is_locked = issue.locked,
             .lock_reason = try rt.optZ(a, issue.lock_reason),
-            .priority = @intFromEnum(@as(api.Priority, if (issue.priority) |p| switch (p) {
-                .low => .low,
-                .medium => .medium,
-                .high => .high,
-                .critical => .critical,
-            } else .unknown)),
+            .priority = @intFromEnum(priorityOf(issue)),
             .milestone_id = try rt.optZ(a, issue.milestone_id),
             .parent_id = try rt.optZ(a, issue.parent),
-            .start_date = if (issue.start_date) |d| dateOf(d) else .{},
-            .due_date = if (issue.due_date) |d| dateOf(d) else .{},
+            .start_date = if (issue.start_date) |d| rt.dateOf(d) else .{},
+            .due_date = if (issue.due_date) |d| rt.dateOf(d) else .{},
             .has_estimate_minutes = issue.estimate_minutes != null,
             .estimate_minutes = issue.estimate_minutes orelse 0,
             .ref = try rt.optZ(a, issue.ref),
@@ -357,10 +329,9 @@ pub fn build(a: Allocator, issue: Issue, ctx: Context) Allocator.Error!IssueObj 
             .rewritten = false,
         },
         .attachments = attachments,
-        .labels = labels,
+        .labels = try rt.strs(a, issue.labels),
         .assignees = assignees,
-        .blockers = blockers,
-        .fields = fields.items,
+        .blockers = try rt.strs(a, issue.blocked_by),
         .extra = extra.items,
         .problems = try rt.borrowedProblems(a, problems.items),
         .comments = comments.items,
@@ -398,31 +369,20 @@ pub fn changesOf(
     const typed = try view.changes(a, list, cx);
     const out = try a.alloc(api.Change, typed.len);
     for (typed, out) |c, *o| o.* = .{
-        .field = @intFromEnum(fieldOf(c.field)),
+        .field = @intFromEnum(rt.mirrored(api.Field, c.field)),
         .key = try rt.dupeZ(a, c.key),
-        .op = @intFromEnum(@as(api.Verb, switch (c.op) {
-            .set => .set,
-            .clear => .clear,
-            .add => .add,
-            .remove => .remove,
-        })),
+        .op = @intFromEnum(rt.mirrored(api.Verb, c.op)),
         .old_value = try rt.optZ(a, c.old),
         .new_value = try rt.optZ(a, c.new),
         .old_person = try personOfAssignee(a, c.old_person),
         .new_person = try personOfAssignee(a, c.new_person),
-        .old_date = if (c.old_date) |d| dateOf(d) else .{},
-        .new_date = if (c.new_date) |d| dateOf(d) else .{},
+        .old_date = if (c.old_date) |d| rt.dateOf(d) else .{},
+        .new_date = if (c.new_date) |d| rt.dateOf(d) else .{},
         .old_done = c.old_done,
         .new_done = c.new_done,
         .reason = if (c.field == .locked) try rt.optZ(a, c.reason) else .{},
     };
     return out;
-}
-
-fn fieldOf(f: view.Field) api.Field {
-    return switch (f) {
-        inline else => |tag| @field(api.Field, @tagName(tag)),
-    };
 }
 
 fn personOfAssignee(
@@ -442,18 +402,11 @@ fn revisionsOf(
 ) Allocator.Error![]const api.Revision {
     const out = try a.alloc(api.Revision, list.len);
     for (list, out) |r, *o| {
-        const who = try a.create(api.Person);
-        who.* = try rt.personOf(a, r.author, authorIdAt(author_ids, r.oid));
         o.* = .{
             .commit = rt.oidOf(r.oid),
-            .author = who,
+            .author = try rt.newPerson(a, r.author, authorIdAt(author_ids, r.oid)),
             .at = rt.timeOf(r.author),
-            .kind = @intFromEnum(@as(api.RevisionKind, switch (r.kind) {
-                .original => .original,
-                .edit => .edit,
-                .delete => .delete,
-                .restore => .restore,
-            })),
+            .kind = @intFromEnum(rt.mirrored(api.RevisionKind, r.kind)),
             .text = try rt.dupeZ(a, r.text),
         };
     }
@@ -462,13 +415,7 @@ fn revisionsOf(
 
 /// An issue handle of its own.
 pub fn ownedIssue(issue: Issue, ctx: Context) Allocator.Error!*IssueObj {
-    const arena = try rt.newArena();
-    errdefer rt.freeArena(arena);
-    const a = arena.allocator();
-    const obj = try a.create(IssueObj);
-    obj.* = try build(a, issue, ctx);
-    obj.arena = arena;
-    return obj;
+    return rt.owned(IssueObj, build, .{ issue, ctx });
 }
 
 fn get(i: ?*const api.Issue) ?*IssueObj {
@@ -486,20 +433,10 @@ const IssueReads = rt.Reads(api.Issue, IssueObj);
 pub const issuez_issue_info_of = IssueReads.ref("info");
 pub const issuez_issue_label_count = IssueReads.count("labels");
 pub const issuez_issue_label_at = IssueReads.at("labels");
-pub fn issuez_issue_has_label(i: ?*const api.Issue, label: Str) callconv(.c) bool {
-    const o = get(i) orelse return false;
-    for (o.labels) |l| if (std.mem.eql(u8, l.slice(), label.slice())) return true;
-    return false;
-}
 pub const issuez_issue_assignee_count = IssueReads.count("assignees");
 pub const issuez_issue_assignee_at = IssueReads.refAt("assignees");
 pub const issuez_issue_blocker_count = IssueReads.count("blockers");
 pub const issuez_issue_blocker_at = IssueReads.at("blockers");
-pub fn issuez_issue_field(i: ?*const api.Issue, key: Str) callconv(.c) Str {
-    const o = get(i) orelse return .{};
-    for (o.fields) |f| if (std.ascii.eqlIgnoreCase(f.key.slice(), key.slice())) return f.value;
-    return .{};
-}
 pub const issuez_issue_extra_count = IssueReads.count("extra");
 pub fn issuez_issue_extra_at(
     i: ?*const api.Issue,
@@ -520,7 +457,7 @@ pub fn issuez_issue_problems(i: ?*const api.Issue) callconv(.c) ?*const api.Prob
     return @ptrCast(o.problems);
 }
 fn reactionIsOn(rx: *const ReactionObj, comment: ?*const api.Oid) bool {
-    return if (comment) |c| rx.has_target and rt.issuez_oid_eq(&rx.target, c) else !rx.has_target;
+    return if (comment) |c| rx.has_target and rt.oidEql(&rx.target, c) else !rx.has_target;
 }
 
 pub fn issuez_issue_reaction_count(
@@ -558,14 +495,6 @@ pub fn issuez_reaction_user_at(r: ?*const api.Reaction, k: usize) callconv(.c) ?
 
 pub const issuez_issue_comment_count = IssueReads.count("comments");
 pub const issuez_issue_comment_at = IssueReads.publicAt("comments");
-pub fn issuez_issue_comment_find(
-    i: ?*const api.Issue,
-    id: ?*const api.Oid,
-) callconv(.c) ?*const api.Comment {
-    const o = get(i) orelse return null;
-    for (o.comments) |*c| if (rt.issuez_oid_eq(&c.public.id, id)) return &c.public;
-    return null;
-}
 pub fn issuez_comment_attachment_at(cm: ?*const api.Comment, k: usize) callconv(.c) Str {
     const p = cm orelse return .{};
     const obj: *const CommentObj = @fieldParentPtr("public", p);
@@ -582,9 +511,9 @@ pub fn issuez_entry_change_at(e: ?*const api.Entry, k: usize) callconv(.c) ?*con
     return &entry.changes.?[k];
 }
 fn historyOf(o: *const IssueObj, comment: ?*const api.Oid) []const api.Revision {
-    if (comment == null) return o.description_history;
+    const id = comment orelse return o.description_history;
     for (o.comments, o.comment_histories) |c, h| {
-        if (rt.issuez_oid_eq(&c.public.id, comment)) return h;
+        if (rt.oidEql(&c.public.id, id)) return h;
     }
     return &.{};
 }
@@ -609,7 +538,7 @@ pub fn issuez_issue_history_at(
 
 // ─── Loading ───────────────────────────────────────────────────────────
 
-pub fn isDamaged(e: anyerror) bool {
+fn isDamaged(e: anyerror) bool {
     return switch (e) {
         error.CorruptIssue, error.HistoryTooLong, error.MissingParent, error.NoRoot => true,
         else => false,
@@ -623,20 +552,7 @@ pub fn issuez_issue_load(
     out: ?*?*api.Issue,
     err: ?*?*api.Error,
 ) callconv(.c) Code {
-    const o = out orelse return rt.fail(err, .e_invalid_argument, "out is NULL", .{});
-    if (!issuez.format.uuid.isCanonical(id.slice()))
-        return rt.fail(err, .e_invalid_argument, "not a full issue UUID", .{});
-    var c = Call.begin(repo, cancel) catch |e| return rt.failError(err, e, .{});
-    defer c.end();
-    const issue = loadOne(&c, id.slice()) catch |e| return c.fail(err, e);
-    const found = issue orelse return rt.failWith(
-        err,
-        .e_not_found,
-        .{ .subject = id.slice() },
-        "no such issue",
-        .{},
-    );
-    return rt.give(o, ownedIssue(found, .of(c.repo)), err);
+    return issuez_issue_load_since(repo, id, null, cancel, out, err);
 }
 
 pub fn issuez_issue_load_at(
@@ -648,22 +564,20 @@ pub fn issuez_issue_load_at(
     out: ?*?*api.Issue,
     err: ?*?*api.Error,
 ) callconv(.c) Code {
-    const o = out orelse return rt.fail(err, .e_invalid_argument, "out is NULL", .{});
+    const o = out orelse return rt.badArgument(err, "out is NULL");
     const t = rt.oidFrom((tip orelse
-        return rt.fail(err, .e_invalid_argument, "tip is NULL", .{})).*) orelse
-        return rt.fail(err, .e_invalid_argument, "tip is invalid", .{});
-    if (!issuez.format.uuid.isCanonical(id.slice()))
-        return rt.fail(err, .e_invalid_argument, "not a full issue UUID", .{});
+        return rt.badArgument(err, "tip is NULL")).*) orelse
+        return rt.badArgument(err, "tip is invalid");
+    if (!uuid_fmt.isCanonical(id.slice())) return rt.badArgument(err, "not a full issue UUID");
     var c = Call.begin(repo, cancel) catch |e| return rt.failError(err, e, .{});
     defer c.end();
     if (t.object_format != c.session.backend.objectFormat())
-        return rt.fail(err, .e_invalid_argument, "tip uses another object format", .{});
+        return rt.badArgument(err, "tip uses another object format");
     const name = issuez.engine.refFor(
         c.arena(),
         issuez.engine.issue_ref_prefix,
         id.slice(),
-    ) catch |e|
-        return c.fail(err, e);
+    ) catch |e| return c.fail(err, e);
     const found = c.engine().load(c.arena(), .{ .name = name, .tip = t }) catch |e|
         return c.fail(err, e);
     const obj = ownedIssue(found, .of(c.repo)) catch |e| return rt.failError(err, e, .{});
@@ -683,19 +597,12 @@ pub fn issuez_issue_load_since(
     out: ?*?*api.Issue,
     err: ?*?*api.Error,
 ) callconv(.c) Code {
-    const o = out orelse return rt.fail(err, .e_invalid_argument, "out is NULL", .{});
-    if (!issuez.format.uuid.isCanonical(id.slice()))
-        return rt.fail(err, .e_invalid_argument, "not a full issue UUID", .{});
+    const o = out orelse return rt.badArgument(err, "out is NULL");
+    if (!uuid_fmt.isCanonical(id.slice())) return rt.badArgument(err, "not a full issue UUID");
     var c = Call.begin(repo, cancel) catch |e| return rt.failError(err, e, .{});
     defer c.end();
     const issue = loadOne(&c, id.slice()) catch |e| return c.fail(err, e);
-    const found = issue orelse return rt.failWith(
-        err,
-        .e_not_found,
-        .{ .subject = id.slice() },
-        "no such issue",
-        .{},
-    );
+    const found = issue orelse return rt.notFound(err, id.slice(), "no such issue");
     const obj = ownedIssue(found, .of(c.repo)) catch |e| return rt.failError(err, e, .{});
     if (since) |s| markNew(&c, obj, s.*) catch |e| {
         issuez_issue_free(@ptrCast(obj));
@@ -709,7 +616,7 @@ pub fn issuez_issue_load_since(
 /// when since isn't in the history.
 fn markNew(c: *Call, obj: *IssueObj, since: api.Oid) !void {
     const in_history = for (obj.timeline) |e| {
-        if (rt.issuez_oid_eq(&e.public.commit, &since)) break true;
+        if (rt.oidEql(&e.public.commit, &since)) break true;
     } else false;
     const entries: []EntryObj = @constCast(obj.timeline);
     if (!in_history) {
@@ -726,7 +633,7 @@ fn markNew(c: *Call, obj: *IssueObj, since: api.Oid) !void {
 
 fn loadOne(c: *Call, id: []const u8) !?Issue {
     const a = c.arena();
-    const name = try std.fmt.allocPrint(a, "{s}{s}", .{ issuez.engine.issue_ref_prefix, id });
+    const name = try c.issueRef(id);
     const tip = (try c.session.backend.resolveRef(name)) orelse return null;
     return try c.engine().load(a, .{ .name = name, .tip = tip });
 }
@@ -736,71 +643,19 @@ pub const ListObj = struct {
     issues: []const IssueObj,
     skipped: []const Str,
     next: Str = .{},
-    /// Lists inside other handles (a projection's) aren't freed alone.
-    borrowed: bool = false,
     /// Cache entries the issues were built from, released with the list.
     held: []const *cache_mod.Entry = &.{},
 };
 
-fn makeList(issues: []const Issue, skipped: []const []const u8, ctx: Context) !*ListObj {
-    const arena = try rt.newArena();
-    errdefer rt.freeArena(arena);
-    const a = arena.allocator();
-    const list = try a.create(ListObj);
+fn makeList(
+    a: Allocator,
+    issues: []const Issue,
+    skipped: []const []const u8,
+    ctx: Context,
+) !ListObj {
     const objs = try a.alloc(IssueObj, issues.len);
     for (issues, objs) |i, *o| o.* = try build(a, i, ctx);
-    const sk = try a.alloc(Str, skipped.len);
-    for (skipped, sk) |s, *o| o.* = try rt.dupeZ(a, s);
-    list.* = .{ .arena = arena, .issues = objs, .skipped = sk };
-    return list;
-}
-
-pub fn issuez_issue_load_many(
-    repo: ?*api.Repo,
-    ids: ?[*]const Str,
-    n: usize,
-    flags: u32,
-    cancel: ?*api.Cancel,
-    out: ?*?*api.IssueList,
-    err: ?*?*api.Error,
-) callconv(.c) Code {
-    const o = out orelse return rt.fail(err, .e_invalid_argument, "out is NULL", .{});
-    if (rt.unknownFlags(api.LoadFlag, flags))
-        return rt.fail(err, .e_invalid_argument, "unknown flags", .{});
-    const strict = rt.hasFlag(flags, api.LoadFlag.strict);
-    var c = Call.begin(repo, cancel) catch |e| return rt.failError(err, e, .{});
-    defer c.end();
-    const a = c.arena();
-    var issues: std.ArrayList(Issue) = .empty;
-    var skipped: std.ArrayList([]const u8) = .empty;
-    const list = if (ids) |p| p[0..n] else &.{};
-    for (list) |id| {
-        const text = id.slice();
-        if (!issuez.format.uuid.isCanonical(text)) {
-            if (strict) return rt.failWith(
-                err,
-                .e_invalid_argument,
-                .{ .subject = text },
-                "not a full issue UUID",
-                .{},
-            );
-            skipped.append(a, text) catch return rt.oom(err);
-            continue;
-        }
-        const found = loadOne(&c, text) catch |e| {
-            if (strict or !isDamaged(e)) return c.fail(err, e);
-            skipped.append(a, text) catch return rt.oom(err);
-            continue;
-        };
-        if (found) |issue| {
-            issues.append(a, issue) catch return rt.oom(err);
-        } else if (strict) {
-            return rt.failWith(err, .e_not_found, .{ .subject = text }, "no such issue", .{});
-        } else {
-            skipped.append(a, text) catch return rt.oom(err);
-        }
-    }
-    return rt.give(o, makeList(issues.items, skipped.items, .of(c.repo)), err);
+    return .{ .arena = undefined, .issues = objs, .skipped = try rt.strs(a, skipped) };
 }
 
 /// Every issue that loads; the damaged ones by ID.
@@ -824,7 +679,6 @@ pub const issuez_issue_list_skipped_count = ListReads.count("skipped");
 pub const issuez_issue_list_skipped_at = ListReads.at("skipped");
 pub fn issuez_issue_list_free(l: ?*api.IssueList) callconv(.c) void {
     const list = rt.obj(ListObj, l) orelse return;
-    if (list.borrowed) return;
     for (list.held) |e| e.release();
     rt.freeArena(list.arena);
 }
@@ -965,12 +819,7 @@ fn matches(
         issue.author.email,
     )) return false;
     if (q.priorities.items.len > 0) {
-        const p: api.Priority = if (issue.priority) |v| switch (v) {
-            .low => .low,
-            .medium => .medium,
-            .high => .high,
-            .critical => .critical,
-        } else .unknown;
+        const p = priorityOf(issue);
         if (std.mem.indexOfScalar(api.Priority, q.priorities.items, p) == null) return false;
     }
     if (q.parent) |p| if (!std.mem.eql(u8, issue.parent orelse "", p)) return false;
@@ -1024,16 +873,16 @@ fn lessThan(s: SortCtx, x: Issue, y: Issue) bool {
     return std.mem.lessThan(u8, x.id, y.id);
 }
 
-fn runQuery(c: *Call, ops: []const api.Op, err: ?*?*api.Error, page: bool) !union(enum) {
+fn runQuery(c: *Call, ops: []const api.Op, err: ?*?*api.Error) !union(enum) {
     failed: Code,
     list: struct { matched: []Issue, skipped: []const []const u8, next: ?usize },
 } {
     const a = c.arena();
     var problems: rt.Problems = .empty;
     const q = try parseQuery(a, ops, &problems);
-    if (problems.items.len > 0) return .{ .failed = rt.failWith(err, .e_invalid_value, .{
-        .problems = problems.items,
-    }, "invalid query", .{}) };
+    if (problems.items.len > 0) {
+        return .{ .failed = rt.badOps(err, problems.items, "invalid query") };
+    }
     var skipped: std.ArrayList([]const u8) = .empty;
     const all = try loadEvery(c, &skipped);
     const ctx: Context = .of(c.repo);
@@ -1057,11 +906,6 @@ fn runQuery(c: *Call, ops: []const api.Op, err: ?*?*api.Error, page: bool) !unio
         SortCtx{ .order = q.order, .ascending = q.ascending, .ctx = ctx },
         lessThan,
     );
-    if (!page) return .{ .list = .{
-        .matched = matched.items,
-        .skipped = skipped.items,
-        .next = null,
-    } };
     const start = @min(q.offset, matched.items.len);
     const end = @min(start + q.limit, matched.items.len);
     return .{ .list = .{
@@ -1079,23 +923,17 @@ pub fn issuez_query_run(
     out: ?*?*api.IssueList,
     err: ?*?*api.Error,
 ) callconv(.c) Code {
-    const o = out orelse return rt.fail(err, .e_invalid_argument, "out is NULL", .{});
+    const o = out orelse return rt.badArgument(err, "out is NULL");
     var c = Call.begin(repo, cancel) catch |e| return rt.failError(err, e, .{});
     defer c.end();
-    const result = runQuery(
-        &c,
-        if (ops) |p| p[0..n] else &.{},
-        err,
-        true,
-    ) catch |e| return c.fail(err, e);
+    const result = runQuery(&c, rt.sliceOf(api.Op, ops, n), err) catch |e|
+        return c.fail(err, e);
     switch (result) {
         .failed => |code| return code,
         .list => |l| {
-            const list = makeList(
-                l.matched,
-                l.skipped,
-                .of(c.repo),
-            ) catch |e| return rt.failError(err, e, .{});
+            const ctx: Context = .of(c.repo);
+            const list = rt.owned(ListObj, makeList, .{ l.matched, l.skipped, ctx }) catch |e|
+                return rt.failError(err, e, .{});
             list.held = list.arena.allocator().dupe(*cache_mod.Entry, c.held.items) catch {
                 rt.freeArena(list.arena);
                 return rt.oom(err);
@@ -1112,38 +950,7 @@ pub fn issuez_query_run(
     }
 }
 
-pub fn issuez_query_count(
-    repo: ?*api.Repo,
-    ops: ?[*]const api.Op,
-    n: usize,
-    cancel: ?*api.Cancel,
-    out: ?*u64,
-    err: ?*?*api.Error,
-) callconv(.c) Code {
-    const o = out orelse return rt.fail(err, .e_invalid_argument, "out is NULL", .{});
-    var c = Call.begin(repo, cancel) catch |e| return rt.failError(err, e, .{});
-    defer c.end();
-    const result = runQuery(
-        &c,
-        if (ops) |p| p[0..n] else &.{},
-        err,
-        false,
-    ) catch |e| return c.fail(err, e);
-    switch (result) {
-        .failed => |code| return code,
-        .list => |l| {
-            o.* = l.matched.len;
-            return .ok;
-        },
-    }
-}
-
 // ─── Resolve ───────────────────────────────────────────────────────────
-
-pub const MatchesObj = struct {
-    arena: *std.heap.ArenaAllocator,
-    ids: []const Str,
-};
 
 fn resolveIds(c: *Call, kind: api.Kind, input: []const u8) ![]const []const u8 {
     const a = c.arena();
@@ -1167,38 +974,6 @@ fn resolveIds(c: *Call, kind: api.Kind, input: []const u8) ![]const []const u8 {
     return out.items;
 }
 
-pub fn issuez_resolve(
-    repo: ?*api.Repo,
-    kind: api.Kind,
-    input: Str,
-    cancel: ?*api.Cancel,
-    out: ?*?*api.Matches,
-    err: ?*?*api.Error,
-) callconv(.c) Code {
-    const o = out orelse return rt.fail(err, .e_invalid_argument, "out is NULL", .{});
-    if (input.len == 0) return rt.fail(err, .e_invalid_argument, "input is empty", .{});
-    var c = Call.begin(repo, cancel) catch |e| return rt.failError(err, e, .{});
-    defer c.end();
-    const ids = resolveIds(&c, kind, input.slice()) catch |e| return c.fail(err, e);
-    return rt.give(o, makeMatches(ids), err);
-}
-
-pub fn makeMatches(ids: []const []const u8) !*MatchesObj {
-    const arena = try rt.newArena();
-    errdefer rt.freeArena(arena);
-    const a = arena.allocator();
-    const m = try a.create(MatchesObj);
-    const out = try a.alloc(Str, ids.len);
-    for (ids, out) |id, *s| s.* = try rt.dupeZ(a, id);
-    m.* = .{ .arena = arena, .ids = out };
-    return m;
-}
-
-const MatchesReads = rt.Reads(api.Matches, MatchesObj);
-pub const issuez_matches_len = MatchesReads.count("ids");
-pub const issuez_matches_at = MatchesReads.at("ids");
-pub const issuez_matches_free = MatchesReads.free();
-
 pub fn issuez_resolve_one(
     repo: ?*api.Repo,
     kind: api.Kind,
@@ -1207,20 +982,14 @@ pub fn issuez_resolve_one(
     buf_or_null: ?[*]u8,
     err: ?*?*api.Error,
 ) callconv(.c) Code {
-    const buf = buf_or_null orelse return rt.fail(err, .e_invalid_argument, "buf is NULL", .{});
+    const buf = buf_or_null orelse return rt.badArgument(err, "buf is NULL");
     buf[0] = 0;
-    if (input.len == 0) return rt.fail(err, .e_invalid_argument, "input is empty", .{});
+    if (input.len == 0) return rt.badArgument(err, "input is empty");
     var c = Call.begin(repo, cancel) catch |e| return rt.failError(err, e, .{});
     defer c.end();
     const ids = resolveIds(&c, kind, input.slice()) catch |e| return c.fail(err, e);
     switch (ids.len) {
-        0 => return rt.failWith(
-            err,
-            .e_not_found,
-            .{ .subject = input.slice() },
-            "nothing matches",
-            .{},
-        ),
+        0 => return rt.notFound(err, input.slice(), "nothing matches"),
         1 => {
             @memcpy(buf[0..ids[0].len], ids[0]);
             buf[ids[0].len] = 0;
@@ -1235,154 +1004,3 @@ pub fn issuez_resolve_one(
         ),
     }
 }
-
-// ─── Across issues ─────────────────────────────────────────────────────
-
-const query_mod = issuez.query;
-
-/// Every live issue, through the cache; damaged ones are left out.
-fn liveIssues(c: *Call) ![]Issue {
-    var skipped: std.ArrayList([]const u8) = .empty;
-    return loadEvery(c, &skipped);
-}
-
-pub const LabelCountsObj = struct {
-    arena: *std.heap.ArenaAllocator,
-    items: []const api.LabelCount,
-};
-
-pub fn issuez_label_counts_take(
-    repo: ?*api.Repo,
-    cancel: ?*api.Cancel,
-    out: ?*?*api.LabelCounts,
-    err: ?*?*api.Error,
-) callconv(.c) Code {
-    const o = out orelse return rt.fail(err, .e_invalid_argument, "out is NULL", .{});
-    var c = Call.begin(repo, cancel) catch |e| return rt.failError(err, e, .{});
-    defer c.end();
-    const issues = liveIssues(&c) catch |e| return c.fail(err, e);
-    const counts = query_mod.labelCounts(c.arena(), issues, c.repo.settings.done_states) catch |e|
-        return rt.failError(err, e, .{});
-    return rt.give(o, labelCountsObj(counts), err);
-}
-
-fn labelCountsObj(counts: []const query_mod.LabelCount) !*LabelCountsObj {
-    const arena = try rt.newArena();
-    errdefer rt.freeArena(arena);
-    const a = arena.allocator();
-    const items = try a.alloc(api.LabelCount, counts.len);
-    for (counts, items) |x, *y| y.* = .{
-        .name = try rt.dupeZ(a, x.name),
-        .open = x.open,
-        .total = x.total,
-    };
-    const obj = try a.create(LabelCountsObj);
-    obj.* = .{ .arena = arena, .items = items };
-    return obj;
-}
-
-const LabelCountsReads = rt.Reads(api.LabelCounts, LabelCountsObj);
-pub const issuez_label_counts_len = LabelCountsReads.count("items");
-pub const issuez_label_counts_at = LabelCountsReads.refAt("items");
-pub const issuez_label_counts_free = LabelCountsReads.free();
-
-pub const PeopleObj = struct {
-    arena: *std.heap.ArenaAllocator,
-    items: []const api.KnownPerson,
-};
-
-pub fn issuez_people_take(
-    repo: ?*api.Repo,
-    cancel: ?*api.Cancel,
-    out: ?*?*api.People,
-    err: ?*?*api.Error,
-) callconv(.c) Code {
-    const o = out orelse return rt.fail(err, .e_invalid_argument, "out is NULL", .{});
-    var c = Call.begin(repo, cancel) catch |e| return rt.failError(err, e, .{});
-    defer c.end();
-    const issues = liveIssues(&c) catch |e| return c.fail(err, e);
-    const who = query_mod.people(c.arena(), issues) catch |e| return rt.failError(err, e, .{});
-    return rt.give(o, peopleObj(who), err);
-}
-
-fn peopleObj(who: []const query_mod.Person) !*PeopleObj {
-    const arena = try rt.newArena();
-    errdefer rt.freeArena(arena);
-    const a = arena.allocator();
-    const items = try a.alloc(api.KnownPerson, who.len);
-    for (who, items) |x, *y| y.* = .{
-        .person = .{
-            .name = try rt.optZ(a, x.name),
-            .email = try rt.dupeZ(a, x.email),
-            .user_id = try rt.optZ(a, x.user_id),
-        },
-        .authored = x.authored,
-        .assigned = x.assigned,
-    };
-    const obj = try a.create(PeopleObj);
-    obj.* = .{ .arena = arena, .items = items };
-    return obj;
-}
-
-const PeopleReads = rt.Reads(api.People, PeopleObj);
-pub const issuez_people_len = PeopleReads.count("items");
-pub const issuez_people_at = PeopleReads.refAt("items");
-pub const issuez_people_free = PeopleReads.free();
-
-pub const ShortIdsObj = struct {
-    arena: *std.heap.ArenaAllocator,
-    items: []const api.ShortId,
-};
-
-pub fn issuez_short_ids_take(
-    repo: ?*api.Repo,
-    min: usize,
-    cancel: ?*api.Cancel,
-    out: ?*?*api.ShortIds,
-    err: ?*?*api.Error,
-) callconv(.c) Code {
-    const o = out orelse return rt.fail(err, .e_invalid_argument, "out is NULL", .{});
-    var c = Call.begin(repo, cancel) catch |e| return rt.failError(err, e, .{});
-    defer c.end();
-    const a = c.arena();
-    // Refs are sorted by name, so by UUID.
-    const refs = c.engine().refs(a) catch |e| return c.fail(err, e);
-    const ids = a.alloc([]const u8, refs.len) catch return rt.oom(err);
-    for (refs, ids) |r, *id| id.* = r.id();
-    const shorts = query_mod.shortIds(a, ids, min) catch return rt.oom(err);
-    return rt.give(o, shortIdsObj(ids, shorts), err);
-}
-
-fn shortIdsObj(ids: []const []const u8, shorts: []const []const u8) !*ShortIdsObj {
-    const arena = try rt.newArena();
-    errdefer rt.freeArena(arena);
-    const a = arena.allocator();
-    const items = try a.alloc(api.ShortId, ids.len);
-    for (ids, shorts, items) |id, sh, *item| item.* = .{
-        .id = try rt.dupeZ(a, id),
-        .prefix = try rt.dupeZ(a, sh),
-    };
-    const obj = try a.create(ShortIdsObj);
-    obj.* = .{ .arena = arena, .items = items };
-    return obj;
-}
-
-const ShortIdsReads = rt.Reads(api.ShortIds, ShortIdsObj);
-pub const issuez_short_ids_len = ShortIdsReads.count("items");
-pub const issuez_short_ids_at = ShortIdsReads.refAt("items");
-pub fn issuez_short_ids_find(s: ?*const api.ShortIds, id: Str) callconv(.c) Str {
-    const o = rt.obj(ShortIdsObj, s) orelse return .{};
-    const want = id.slice();
-    var lo: usize = 0;
-    var hi: usize = o.items.len;
-    while (lo < hi) {
-        const mid = (lo + hi) / 2;
-        switch (std.mem.order(u8, o.items[mid].id.slice(), want)) {
-            .eq => return o.items[mid].prefix,
-            .lt => lo = mid + 1,
-            .gt => hi = mid,
-        }
-    }
-    return .{};
-}
-pub const issuez_short_ids_free = ShortIdsReads.free();

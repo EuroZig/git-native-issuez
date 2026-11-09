@@ -7,7 +7,6 @@ import (
 	"errors"
 	"fmt"
 	"os"
-	"os/exec"
 	"path/filepath"
 	"strconv"
 	"strings"
@@ -19,32 +18,33 @@ import (
 )
 
 // TestCancelRunningGit stops a git that hangs: the call returns soon
-// after its context ends, not at the network timeout.
+// after its context ends, not at the local timeout.
 func TestCancelRunningGit(t *testing.T) {
 	dir := t.TempDir()
 	slow := filepath.Join(dir, "slow-git")
-	script := "#!/bin/sh\nfor a; do [ \"$a\" = fetch ] && exec sleep 30; done\nexec git \"$@\"\n"
+	hang := filepath.Join(dir, "hang")
+	script := "#!/bin/sh\nif [ -e " + hang + " ]; then for a; do [ \"$a\" = for-each-ref ] && exec sleep 30; done; fi\nexec git \"$@\"\n"
 	if err := os.WriteFile(slow, []byte(script), 0o755); err != nil {
 		t.Fatal(err)
 	}
 	r := newRepo(t, issuez.WithGit(slow))
-	hub := filepath.Join(dir, "hub.git")
-	for _, args := range [][]string{{"init", "-q", "--bare", hub}, {"-C", r.GitDir(), "remote", "add", "origin", hub}} {
-		if out, err := exec.Command("git", args...).CombinedOutput(); err != nil {
-			t.Fatalf("git %v: %v\n%s", args, err, out)
-		}
+	if err := os.WriteFile(hang, nil, 0o644); err != nil {
+		t.Fatal(err)
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), 300*time.Millisecond)
 	defer cancel()
 	start := time.Now()
-	_, err := r.Sync(ctx, "origin", issuez.SyncOptions{})
+	_, err := r.Snapshot(ctx)
 	if !issuez.IsCancelled(err) || !errors.Is(err, context.DeadlineExceeded) {
-		t.Fatalf("sync: %v", err)
+		t.Fatalf("snapshot: %v", err)
 	}
 	if took := time.Since(start); took > 5*time.Second {
 		t.Errorf("cancelled after %v", took)
 	}
 	// The handle still works.
+	if err := os.Remove(hang); err != nil {
+		t.Fatal(err)
+	}
 	if _, err := r.Snapshot(context.Background()); err != nil {
 		t.Errorf("after the cancel: %v", err)
 	}

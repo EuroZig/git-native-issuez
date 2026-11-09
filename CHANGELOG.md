@@ -36,10 +36,9 @@ the on-disk format only grew.
   `EditSpec.attachments`; `Attachments.prepare` and `storeBytes`). In the C API, ADD and REMOVE
   ATTACHMENTS in issue op lists, `ISSUEZ_OPT_EDIT_COMMENT`,
   `ISSUEZ_OPT_ATTACHMENT_STORE` (a host keeps the bytes),
-  `issuez_issue_attachment_count`/`_at` and `issuez_attachment_validate`;
+  and `issuez_issue_attachment_count`/`_at`;
   in Go, `Edit.AddAttachment`, `RemoveAttachment`, `EditComment`,
-  `WithAttachmentStore`, `Issue.Attachments` and
-  `Repo.ValidateAttachment`.
+  `WithAttachmentStore` and `Issue.Attachments`.
 - `X-Author-Id: <uuid>` (format.md §2): an actor's `user_id` goes on every
   commit it writes, and comes back as the author's `user_id` on issues,
   comments, timeline entries and receipts (Go `Person.UserID`). Hosts map
@@ -60,10 +59,9 @@ the on-disk format only grew.
   fails under 95% statement coverage.
 - Go: `SetDefaultLogger` with `LogLevel` and `LogEvent`, `WithCacheIssues`, and
   the problem kinds it didn't name yet.
-- `WriteOptions.dry_run`: a write runs every check, guards included, and writes
-  nothing. `issuez_issue_check` and `issuez_milestone_check` use it, so a
-  dry run now reports guard problems too (closed ancestor, open
-  sub-issues, cycles, numbers taken, closed milestones).
+- `WriteOptions.dry_run`: a write runs every check, guards included (closed
+  ancestor, open sub-issues, cycles, numbers taken, closed milestones), and
+  writes nothing.
 - Issues and milestones can be created closed (or in any state, with
   `Fixed-By`, `Release`, `Reason`) and completed or retired, on their
   root commit: imports bring them that way. `CreateSpec.state`,
@@ -77,14 +75,10 @@ the on-disk format only grew.
 - TUI: the detail view shows the number, a lock and its reason, the ref,
   where an imported issue or comment came from, every assignee, reactions
   and purged comments.
-- C API: `issuez_projection_build` loads issues through the repo's cache.
-- C API: cancelling a call kills a git request that is running (a fetch,
-  a push) within about 50 ms; `issuez_sync` uploads attachments through
-  git-lfs, and `ISSUEZ_OPT_SYNC_ATTACHMENTS` 0 (`SyncOptions.NoAttachments`
-  in Go) pushes the derived refs without the bytes; a repo handle keeps
-  issues loaded by tip (`ISSUEZ_OPT_CACHE_ISSUES`), so queries load only
-  issues that changed; `issuez_write_retries` reports the write's CAS
-  retries (`Receipt.retries` in the library).
+- C API: cancelling a call kills a git request that is running within about
+  50 ms; a repo handle keeps issues loaded by tip (`ISSUEZ_OPT_CACHE_ISSUES`),
+  so queries load only issues that changed; `issuez_write_retries` reports
+  the write's CAS retries (`Receipt.retries` in the library).
 - Push check, for a host's pre-receive hook ([docs/format.md](docs/format.md)
   §11): `git issue push-check [--authors any|warn|enforce] [--pusher-email
   <email>]... [--pusher-id <uuid>]... [--allow-numbers] [--allow-purge]` reads
@@ -107,7 +101,7 @@ the on-disk format only grew.
   with the one push that isn't a fast-forward, leased on what was fetched.
   `purged` per comment in `--json`; `Purge(B)` in the library, the backend
   op `pushLeased`, `issuez_purge_issue`/`_comment` in the C API,
-  `PurgeIssue`/`PurgeComment` in the Go binding, `ISSUEZ_SYNC_PURGED`.
+  `PurgeIssue`/`PurgeComment` in the Go binding.
 - Reactions: `git issue react <id> <emoji> [--on <comment>] [--undo]`,
   event commits with `X-Event: reaction` and `X-Reaction: +<emoji>` or
   `-<emoji>`, per (target, emoji, author) merged like a set member
@@ -234,11 +228,9 @@ the on-disk format only grew.
   `issuez_push_verdict_attachment_at`; Go `PushVerdict.Attachments`).
   Go timeline entries name the author of the comment they add or touch
   (`Entry.CommentAuthor`).
-- `issuez_repo_drop_all` (Go `Repo.DropAll`, library `Repo.dropAll`):
-  every ref of the library's deleted in one transaction, to undo an
+- `Repo.dropAll`: every ref of the library's deleted in one transaction, to undo an
   import into a repository that had none.
-- `issuez_repo_adopt_refs` (Go `Repo.AdoptRefs`, library
-  `Repo.adoptFrom`): a repository takes every issue, milestone,
+- `Repo.adoptFrom`: a repository takes every issue, milestone,
   attachment and tombstone ref of another in one transaction. An import
   written into a scratch repository that uses this one's objects lands
   at once or not at all.
@@ -249,39 +241,25 @@ the on-disk format only grew.
   `issuez_edit_comment`, `issuez_expect_edits`, the query helpers
   `issuez_q_deleted`, `_workflow_state`, `_no_labels`, `_author`,
   `_priority`, `_milestone`, `_parent`, `_blocked`, `_updated`, `_text`,
-  `_order`, and the open and sync options `issuez_opt_env`,
+  `_order`, and the open options `issuez_opt_env`,
   `_done_state`, `_workflow_state`, `_exclusive_scope`, `_extra_prefix`,
-  `_timeout_local_ms`, `_timeout_network_ms`, `_limit`, `_cache_issues`,
-  `_attachment_store`, `_sync_push`, `_sync_attachments`.
-- `issuez_attachment_read` with the `issuez_bytes` handle (Go
-  `Repo.ReadAttachment`): an attachment's bytes from the repository's
-  store, checked, for front ends that show images.
+  `_timeout_local_ms`, `_limit`, `_cache_issues`, `_attachment_store`.
 - Across issues, for pickers, filters and lists: the labels in use with
   counts, the people the history knows (authors and assignees), and the
   shortest unique ID prefixes. In the library `query.labelCounts`,
-  `query.people`, `query.shortIds`; in the C API
-  `issuez_label_counts_take`, `issuez_people_take`,
-  `issuez_short_ids_take` with their accessors; in Go
-  `Repo.LabelCounts`, `Repo.People`, `Repo.ShortIDs`.
+  `query.people`, `query.shortIds`.
 - Writing the settings: `settings.write` (done and workflow states into
-  git config, checked), `issuez_settings_write` with the op list
-  `ISSUEZ_LIST_SETTINGS`, Go `Repo.WriteSettings`.
+  git config, checked).
 - `issuez_repo_set_logger` (Go `Repo.SetLogger`): a repo's own logger
   for its calls, in place of the process-wide one, so a host serving many
   repositories, or tests running side by side, can tell their events
   apart.
-- C API and Go: sync status without the network
-  (`issuez_sync_status_take`, Go `Repo.SyncStatus`: quarantined versions
-  with their reason, issues not pushed yet) and line search
-  (`issuez_search`, Go `Repo.Search`), as `git issue status` and
-  `git issue search` show them.
 - Setting a remote up for issues is the library's (`remote.default`,
-  `remote.configure`), not the CLI's; `git issue init` calls it. In the
-  C API `issuez_remote_default` and `issuez_remote_configure`, in Go
-  `Repo.DefaultRemotes` and `Repo.ConfigureRemote`.
+  `remote.configure`), not the CLI's; `git issue init` calls it.
 - Fsck is the library's (`fsck.Fsck(B).run`, a report of events with
   `describe`); `git issue fsck` renders it with the same output. In the
-  C API `issuez_fsck` with its report, in Go `Repo.Fsck`.
+  C API `issuez_fsck` with its report, in Go `Repo.Fsck`: they write nothing,
+  and leave the bytes alone when the host keeps them (`check_bytes`).
 - `Repo.open(arena, backend)` and `Repo.fromSettings(backend, settings)`: a
   repo with git config's issue settings applied (`Repo.settings`),
   refusing an invalid `issue.doneStates` (`error.InvalidDoneStates`).
@@ -301,23 +279,11 @@ the on-disk format only grew.
   `issuez_remove_reaction`, `issuez_reaction_target`), so every write
   to an issue goes through `issuez_issue_update`. Go `Edit.DeleteComment`,
   `Edit.RestoreComment`, `Edit.React`.
-- An issue as the documented JSON from the C API (`issuez_issue_json`,
-  `issuez_issue_json_many`) and Go (`Repo.LoadJSON`, `Repo.LoadManyJSON`): one
-  call for bindings that would rather parse JSON than call every
-  accessor, and for hosts that pass the JSON on.
-- Live updates through the C API and Go: `issuez_watch_start` and
-  `issuez_watch_stop` (Go `Repo.Watch`, `Watcher.Stop`) call back when
-  other processes change a repository's issues or settings on disk, as
-  the TUI's watcher does.
 - `issuez.Store(B)`: a live view of a repository (every issue and
   milestone with the projection, `Snapshot.find`, `resolve`,
   `milestoneName`), whose `refresh` reloads only the issues whose refs
   moved and says what changed. The TUI's store is built on it, so a
   change elsewhere no longer reloads every issue.
-- C API `issuez_store` (`_new`, `_refresh`, `_issue_count`/`_at`,
-  `_find`, `_changed_count`/`_at`, `_generation`, `_free`) and Go
-  `Repo.NewStore` with `Store.Refresh`, `Issues`, `Find`: the live view
-  through the bindings, loading and copying only the issues that moved.
 - `issuez.view`: an issue as front ends show it, worked out once: its
   closure (who closed it, when), timeline entries with their comment and
   per-field typed changes, and each attachment's comment. The C API reads
@@ -331,7 +297,7 @@ the on-disk format only grew.
   it (`milestones`, `sync`, `attachments`, `purge`, `pushCheck`, `fsck`,
   `store`, `configureRemote`). `Sync.fromRepo` keeps a repo's settings.
 - `closed` in issue JSON (`ls`, `show`, `tree`, `search --json`,
-  `issuez_issue_json`, MCP issues): who closed a done issue, when, and
+  MCP issues): who closed a done issue, when, and
   the commit (`issuez.view.closure`); `null` while it is open.
 - TUI: `M` lists the open milestones with their progress and filters the
   list and board by the one chosen (or by none).
@@ -342,9 +308,8 @@ the on-disk format only grew.
 - `examples/c/quickstart.c`, the C API's quickstart: `zig build
   example-c-quickstart`; `test-capi` runs it too.
 - Go: every enum has a `String` method, its value's name in snake case
-  (`SyncUpToDate` prints `up_to_date`, `PriorityNone` `none`), generated
-  by `internal/enumgen` (`go generate`); `WatchChange` prints its set
-  (`refs|config`).
+  (`PushFastForward` prints `fast_forward`, `PriorityNone` `none`), generated
+  by `internal/enumgen` (`go generate`).
 - Go: `Repo.All(ctx, q)`, an `iter.Seq2[*Issue, error]` over every page
   of a query: `for issue, err := range repo.All(ctx, q)`.
 
@@ -747,5 +712,5 @@ The first release; everything below is new.
 ### Known limitations
 
 - Not tested on Windows or with git 2.30.
-- Not yet checked: Forgejo's LFS garbage collection with pointers only in
+- Not yet checked: a forge's LFS garbage collection with pointers only in
   `refs/attachments/*`.

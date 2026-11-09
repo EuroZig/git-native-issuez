@@ -60,7 +60,7 @@ pub const Problem = struct {
     description: []const u8,
 };
 
-pub const Progress = struct { closed: u32, total: u32 };
+pub const Progress = issuez.projection.Progress;
 
 /// Who closed a done issue, and when (`issuez.view.closure`).
 pub const Closed = struct {
@@ -72,7 +72,7 @@ pub const Closed = struct {
 };
 
 /// A trailer field, as written.
-pub const Field = struct { key: []const u8, value: []const u8 };
+pub const Field = issuez.engine.HostField;
 
 pub const Issue = struct {
     id: []const u8,
@@ -683,8 +683,6 @@ pub fn Handler(comptime Repos: type) type {
             h.repos.close(s.backend);
         }
 
-        /// A date as given (`2026-12-01`, `today`, `+3d`, `fri`, `eom`), as
-        /// git stores it; empty stays empty, for clearing.
         /// A date as typed (`2026-12-01`, `today`, `+3d`, `fri`, `eom`).
         fn date(
             h: *Self,
@@ -768,9 +766,8 @@ pub fn Handler(comptime Repos: type) type {
             var comments: std.ArrayList(Comment) = .empty;
             for (issue.comments) |c| {
                 if (c.deleted) continue;
-                const hex = c.oid.hex();
                 try comments.append(arena, .{
-                    .id = try arena.dupe(u8, hex.slice()),
+                    .id = try oidText(arena, c.oid),
                     .kind = c.kind,
                     .author = try person(arena, c.author),
                     .date = try time(arena, c.author.time, c.author.tz_offset_minutes),
@@ -831,11 +828,10 @@ pub fn Handler(comptime Repos: type) type {
                 .emoji = args.emoji,
                 .present = !args.undo,
             }, .{}) catch |e| return s.fail(ctx, e);
-            const version = if (tip.wrote) blk: {
-                const hex = tip.tip.hex();
-                break :blk try arena.dupe(u8, hex.slice());
-            } else null;
-            return .{ .id = ref.id(), .version = version };
+            return .{
+                .id = ref.id(),
+                .version = if (tip.wrote) try oidText(arena, tip.tip) else null,
+            };
         }
 
         pub fn searchIssues(h: *Self, ctx: *mcp.Context, args: SearchArgs) !SearchResult {
@@ -892,7 +888,6 @@ pub fn Handler(comptime Repos: type) type {
             var out: std.ArrayList(Milestone) = .empty;
             for (all) |m| {
                 if (!args.all and m.status != .open) continue;
-                const p = try proj.milestoneProgress(arena, m.id);
                 try out.append(arena, .{
                     .id = try text(arena, m.id),
                     .short_id = try text(arena, uuid.shortId(m.id)),
@@ -900,7 +895,7 @@ pub fn Handler(comptime Repos: type) type {
                     .status = @tagName(m.status),
                     .due = if (m.due) |d| try std.fmt.allocPrint(arena, "{f}", .{d}) else null,
                     .description = try text(arena, m.description),
-                    .progress = .{ .closed = p.closed, .total = p.total },
+                    .progress = try proj.milestoneProgress(arena, m.id),
                 });
             }
             return .{ .milestones = out.items };
@@ -911,11 +906,7 @@ pub fn Handler(comptime Repos: type) type {
             const s = try h.open(ctx, args.repo);
             defer h.close(s);
 
-            var blockers: std.ArrayList([]const u8) = .empty;
-            for (args.blocked_by) |b| try blockers.append(
-                arena,
-                (try resolveIssue(ctx, s, b)).id(),
-            );
+            const blockers = try resolveIssues(ctx, s, args.blocked_by);
             if (args.workflow) |w| try checkWorkflow(ctx, s.settings, w);
             const ms = try chooseMilestone(ctx, s, .{
                 .name = args.milestone,
@@ -932,19 +923,18 @@ pub fn Handler(comptime Repos: type) type {
                 .priority = args.priority,
                 .milestone = ms.edit(),
                 .parent = if (args.parent) |p| (try resolveIssue(ctx, s, p)).id() else null,
-                .blocked_by = blockers.items,
+                .blocked_by = blockers,
                 .start_date = if (args.start) |d| try h.date(ctx, s, "start", d) else null,
                 .due_date = if (args.due) |d| try h.date(ctx, s, "due", d) else null,
                 .estimate_minutes = if (args.estimate) |e| try duration(ctx, e) else null,
                 .workflow = args.workflow,
-                .extra = try hostFields(arena, args.fields),
+                .extra = args.fields,
                 .original = .{ .author = args.original_author, .id = args.original_id },
             }, .{}) catch |e| return s.fail(ctx, e);
-            const hex = created.tip.hex();
             return .{
                 .id = try arena.dupe(u8, created.id),
                 .short_id = try arena.dupe(u8, issuez.shortId(created.id)),
-                .version = try arena.dupe(u8, hex.slice()),
+                .version = try oidText(arena, created.tip),
             };
         }
 
@@ -959,8 +949,7 @@ pub fn Handler(comptime Repos: type) type {
                 .original = .{ .author = args.original_author, .id = args.original_id },
                 .expect = try expectVersion(ctx, s.backend, args.expect_version),
             }, .{}) catch |e| return s.fail(ctx, e);
-            const hex = tip.tip.hex();
-            const version = try arena.dupe(u8, hex.slice());
+            const version = try oidText(arena, tip.tip);
             return .{ .id = ref.id(), .version = version, .comment_id = version };
         }
 
@@ -988,7 +977,7 @@ pub fn Handler(comptime Repos: type) type {
                 .workflow = .fromInput(args.workflow),
                 .message = args.message,
                 .comment = args.comment,
-                .extra = try hostFields(arena, args.fields),
+                .extra = args.fields,
                 .expect = try expectVersion(ctx, s.backend, args.expect_version),
             };
             if (args.priority) |p| spec.priority = if (p.len == 0) .clear else .{
@@ -1006,15 +995,8 @@ pub fn Handler(comptime Repos: type) type {
                 .clear
             else
                 .{ .set = (try resolveIssue(ctx, s, p)).id() };
-            var add: std.ArrayList([]const u8) = .empty;
-            for (args.add_blocked_by) |b| try add.append(arena, (try resolveIssue(ctx, s, b)).id());
-            spec.add_blocked_by = add.items;
-            var remove: std.ArrayList([]const u8) = .empty;
-            for (args.remove_blocked_by) |b| try remove.append(
-                arena,
-                (try resolveIssue(ctx, s, b)).id(),
-            );
-            spec.remove_blocked_by = remove.items;
+            spec.add_blocked_by = try resolveIssues(ctx, s, args.add_blocked_by);
+            spec.remove_blocked_by = try resolveIssues(ctx, s, args.remove_blocked_by);
             const milestone_set = args.milestone != null or args.milestone_id != null or
                 args.milestone_mode != null;
             if (milestone_set) {
@@ -1032,10 +1014,9 @@ pub fn Handler(comptime Repos: type) type {
             const result = s.repo.edit(arena, ref.name, spec, .{}) catch |e| return s.fail(ctx, e);
             const changes = try arena.alloc([]const u8, result.changes.len);
             for (result.changes, changes) |c, *out| out.* = c.name();
-            const hex = result.tip.hex();
             return .{
                 .id = ref.id(),
-                .version = try arena.dupe(u8, hex.slice()),
+                .version = try oidText(arena, result.tip),
                 .changes = changes,
             };
         }
@@ -1053,8 +1034,7 @@ pub fn Handler(comptime Repos: type) type {
             ctx: *mcp.Context,
             params: mcp.types.ReadResourceRequestParams,
         ) !mcp.types.ReadResourceResult {
-            const uri = ResourceUri.parse(params.uri) orelse
-                return ctx.fail(error.ResourceNotFound, "no resource '{s}'", .{params.uri});
+            const uri = ResourceUri.parse(params.uri) orelse return noResource(ctx, params.uri);
             const json = switch (uri) {
                 .issues => try resourceJson(ctx, try h.listIssues(ctx, .{})),
                 .milestones => try resourceJson(ctx, try h.listMilestones(ctx, .{})),
@@ -1084,8 +1064,7 @@ pub fn Handler(comptime Repos: type) type {
             ctx: *mcp.Context,
             params: mcp.types.SubscribeRequestParams,
         ) !mcp.types.EmptyResult {
-            if (ResourceUri.parse(params.uri) == null)
-                return ctx.fail(error.ResourceNotFound, "no resource '{s}'", .{params.uri});
+            if (ResourceUri.parse(params.uri) == null) return noResource(ctx, params.uri);
             if (@hasDecl(Repos, "watch")) try h.repos.watch(ctx, &h.subscriptions);
             h.subscriptions.add(ctx.io, params.uri) catch |e| return switch (e) {
                 error.TooManySubscriptions => ctx.fail(
@@ -1093,11 +1072,7 @@ pub fn Handler(comptime Repos: type) type {
                     "at most {d} subscriptions",
                     .{Subscriptions.max},
                 ),
-                error.UriTooLong => ctx.fail(
-                    error.ResourceNotFound,
-                    "no resource '{s}'",
-                    .{params.uri},
-                ),
+                error.UriTooLong => noResource(ctx, params.uri),
             };
             return .{};
         }
@@ -1109,6 +1084,10 @@ pub fn Handler(comptime Repos: type) type {
         ) mcp.types.EmptyResult {
             h.subscriptions.remove(ctx.io, params.uri);
             return .{};
+        }
+
+        fn noResource(ctx: *mcp.Context, uri: []const u8) anyerror {
+            return ctx.fail(error.ResourceNotFound, "no resource '{s}'", .{uri});
         }
 
         fn resourceJson(ctx: *mcp.Context, value: anytype) ![]const u8 {
@@ -1132,35 +1111,25 @@ pub fn Handler(comptime Repos: type) type {
             const ref = try resolveIssue(ctx, s, args.id);
             const state = core.State.parse(args.state);
             const expect = try expectVersion(ctx, s.backend, args.expect_version);
-            if (args.comment) |comment_text| {
-                const result = s.repo.edit(arena, ref.name, .{
-                    .state = state,
-                    .fixed_by = args.fixed_by,
-                    .release = args.release,
-                    .reason = args.reason,
-                    .comment = comment_text,
-                    .message = args.message,
-                    .expect = expect,
-                }, .{}) catch |e| return s.fail(ctx, e);
-                const hex = result.tip.hex();
-                return .{
-                    .id = ref.id(),
-                    .version = try arena.dupe(u8, hex.slice()),
-                    .state = state.text(),
-                };
-            }
-            const tip = s.repo.setState(arena, ref.name, .{
+            const tip = if (args.comment) |comment_text| (s.repo.edit(arena, ref.name, .{
+                .state = state,
+                .fixed_by = args.fixed_by,
+                .release = args.release,
+                .reason = args.reason,
+                .comment = comment_text,
+                .message = args.message,
+                .expect = expect,
+            }, .{}) catch |e| return s.fail(ctx, e)).tip else (s.repo.setState(arena, ref.name, .{
                 .state = state,
                 .message = args.message,
                 .fixed_by = args.fixed_by,
                 .release = args.release,
                 .reason = args.reason,
-                .expect = try expectVersion(ctx, s.backend, args.expect_version),
-            }, .{}) catch |e| return s.fail(ctx, e);
-            const hex = tip.tip.hex();
+                .expect = expect,
+            }, .{}) catch |e| return s.fail(ctx, e)).tip;
             return .{
                 .id = ref.id(),
-                .version = try arena.dupe(u8, hex.slice()),
+                .version = try oidText(arena, tip),
                 .state = state.text(),
             };
         }
@@ -1252,6 +1221,17 @@ pub fn Handler(comptime Repos: type) type {
             }
         }
 
+        /// Their full IDs.
+        fn resolveIssues(
+            ctx: *mcp.Context,
+            s: Session,
+            prefixes: []const []const u8,
+        ) ![]const []const u8 {
+            const ids = try ctx.arena.alloc([]const u8, prefixes.len);
+            for (prefixes, ids) |p, *id| id.* = (try resolveIssue(ctx, s, p)).id();
+            return ids;
+        }
+
         fn expectVersion(ctx: *mcp.Context, backend: *B, version: ?[]const u8) !?Oid {
             const v = version orelse return null;
             return Oid.parseHex(backend.objectFormat(), v) catch
@@ -1268,11 +1248,10 @@ pub fn Handler(comptime Repos: type) type {
             i: issuez.engine.Issue,
             proj: Projection,
         ) !Issue {
-            const hex = i.tip.hex();
             var out: Issue = .{
                 .id = try text(arena, i.id),
                 .short_id = try text(arena, uuid.shortId(i.id)),
-                .version = try arena.dupe(u8, hex.slice()),
+                .version = try oidText(arena, i.tip),
                 .title = try text(arena, i.title),
                 .state = try text(arena, i.state.text()),
                 .done = s.repo.isDone(i),
@@ -1282,7 +1261,7 @@ pub fn Handler(comptime Repos: type) type {
                     arena,
                     if (i.assignee) |a| a.email else i.field("Assignee"),
                 ),
-                .assignees = try assigneeEmails(arena, i),
+                .assignees = try emails(arena, i.assignees),
                 .number = i.number,
                 .locked = i.locked,
                 .lock_reason = try optionalText(arena, i.lock_reason),
@@ -1307,21 +1286,17 @@ pub fn Handler(comptime Repos: type) type {
                 .attachments = i.attachments.len,
             };
             if (issuez.view.closure(i, s.repo.doneStates())) |c| {
-                const commit = c.commit.hex();
                 out.closed = .{
                     .author = try person(arena, c.at),
                     .author_id = try optionalText(arena, c.author_id),
                     .date = try time(arena, c.at.time, c.at.tz_offset_minutes),
-                    .commit = try arena.dupe(u8, commit.slice()),
+                    .commit = try oidText(arena, c.commit),
                 };
             }
             if (proj.find(i.id)) |idx| {
                 out.effective_milestone_id = try optionalText(arena, proj.milestone[idx]);
                 out.effective_workflow = try optionalText(arena, proj.workflow(idx));
-                if (proj.progress(idx)) |p| out.progress = .{
-                    .closed = p.closed,
-                    .total = p.total,
-                };
+                out.progress = proj.progress(idx);
                 out.blocked = proj.activelyBlocked(idx);
                 const problems = proj.problemsOf(idx);
                 const list = try arena.alloc(Problem, problems.len);
@@ -1511,18 +1486,21 @@ pub fn failWith(
 
 /// Text as a JSON string must be UTF-8; git allows any bytes. Others become
 /// U+FFFD.
-fn assigneeEmails(
-    arena: Allocator,
-    i: issuez.model.issue.Issue,
-) Allocator.Error![]const []const u8 {
-    const out = try arena.alloc([]const u8, i.assignees.len);
-    for (i.assignees, out) |a, *o| o.* = try text(arena, a.email);
-    return out;
-}
-
 fn text(arena: Allocator, s: []const u8) Allocator.Error![]const u8 {
     if (std.unicode.utf8ValidateSlice(s)) return s;
     return std.fmt.allocPrint(arena, "{f}", .{std.unicode.fmtUtf8(s)});
+}
+
+/// Of anyone with an `email`: assignees, those who reacted.
+fn emails(arena: Allocator, list: anytype) Allocator.Error![]const []const u8 {
+    const out = try arena.alloc([]const u8, list.len);
+    for (list, out) |p, *o| o.* = try text(arena, p.email);
+    return out;
+}
+
+fn oidText(arena: Allocator, oid: Oid) Allocator.Error![]const u8 {
+    const hex = oid.hex();
+    return arena.dupe(u8, hex.slice());
 }
 
 fn optionalText(arena: Allocator, s: ?[]const u8) Allocator.Error!?[]const u8 {
@@ -1532,15 +1510,6 @@ fn optionalText(arena: Allocator, s: ?[]const u8) Allocator.Error!?[]const u8 {
 fn texts(arena: Allocator, list: []const []const u8) Allocator.Error![]const []const u8 {
     const out = try arena.alloc([]const u8, list.len);
     for (list, out) |s, *o| o.* = try text(arena, s);
-    return out;
-}
-
-fn hostFields(
-    arena: Allocator,
-    list: []const Field,
-) Allocator.Error![]const issuez.engine.HostField {
-    const out = try arena.alloc(issuez.engine.HostField, list.len);
-    for (list, out) |f, *o| o.* = .{ .key = f.key, .value = f.value };
     return out;
 }
 
@@ -1554,9 +1523,10 @@ fn reactionsOn(
     for (issue.reactions) |r| {
         const same = if (r.target) |t| (target != null and t.eql(target.?)) else target == null;
         if (!same) continue;
-        const users = try arena.alloc([]const u8, r.users.len);
-        for (r.users, users) |u, *o| o.* = try text(arena, u.email);
-        try out.append(arena, .{ .emoji = try text(arena, r.emoji), .users = users });
+        try out.append(arena, .{
+            .emoji = try text(arena, r.emoji),
+            .users = try emails(arena, r.users),
+        });
     }
     return out.items;
 }

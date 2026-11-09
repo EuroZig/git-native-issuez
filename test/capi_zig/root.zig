@@ -7,7 +7,6 @@ test {
     _ = @import("version_test.zig");
     _ = @import("hosting_test.zig");
     _ = @import("abi_test.zig");
-    _ = @import("types_test.zig");
     _ = @import("errors_test.zig");
     _ = @import("ops_test.zig");
     _ = @import("cancel_test.zig");
@@ -17,8 +16,6 @@ test {
     _ = @import("query_test.zig");
     _ = @import("issue_write_test.zig");
     _ = @import("milestone_test.zig");
-    _ = @import("projection_test.zig");
-    _ = @import("sync_test.zig");
     _ = @import("push_check_test.zig");
     _ = @import("purge_test.zig");
     _ = @import("attachment_test.zig");

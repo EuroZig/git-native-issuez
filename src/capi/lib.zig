@@ -12,8 +12,6 @@ const impls = .{
     @import("read.zig"),
     @import("write.zig"),
     @import("more.zig"),
-    @import("watch.zig"),
-    @import("store.zig"),
 };
 
 comptime {

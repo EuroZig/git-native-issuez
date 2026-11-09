@@ -565,11 +565,10 @@ pub fn Sync(comptime B: type) type {
 
                 const deferred = attempt == 0 and local != null and new_tip != null;
                 if (new_tip) |t| {
-                    const op: contract.RefUpdate.Op = if (local_tip) |old|
-                        .{ .update = .{ .new = t, .old = old } }
-                    else
-                        .{ .create = t };
-                    const update: contract.RefUpdate = .{ .name = local_name, .op = op };
+                    const update: contract.RefUpdate = .{
+                        .name = local_name,
+                        .op = repo_mod.moveOp(local_tip, t),
+                    };
                     if (deferred) try local.?.append(arena, .{
                         .update = update,
                         .records = records,
@@ -657,10 +656,7 @@ pub fn Sync(comptime B: type) type {
                     break :blk try self.mergeTombstoneCommit(arena, m, r.oid);
                 } else r.oid;
                 const name = try localRef(arena, .purged, id);
-                const op: contract.RefUpdate.Op = if (mine) |m|
-                    .{ .update = .{ .new = new, .old = m } }
-                else
-                    .{ .create = new };
+                const op = repo_mod.moveOp(mine, new);
                 self.b().updateRefs(&.{.{ .name = name, .op = op }}) catch |err| switch (err) {
                     // A purge here at the same time: the next merge.
                     error.RefConflict => continue,
@@ -886,10 +882,7 @@ pub fn Sync(comptime B: type) type {
 
             fn set(bt: *Batch, arena: Allocator, name: []const u8, old: ?Oid, new: Oid) !void {
                 if (old) |o| if (o.eql(new)) return;
-                try bt.ops.append(arena, .{ .name = name, .op = if (old) |o|
-                    .{ .update = .{ .new = new, .old = o } }
-                else
-                    .{ .create = new } });
+                try bt.ops.append(arena, .{ .name = name, .op = repo_mod.moveOp(old, new) });
             }
 
             fn delete(bt: *Batch, arena: Allocator, name: []const u8, old: ?Oid) !void {
@@ -1957,10 +1950,7 @@ pub fn Sync(comptime B: type) type {
             while (attempt < self.repo.limits.cas_retries) : (attempt += 1) {
                 const current = try self.b().resolveRef(name);
                 if (current != null and current.?.eql(value)) return;
-                const op: contract.RefUpdate.Op = if (current) |c| .{ .update = .{
-                    .new = value,
-                    .old = c,
-                } } else .{ .create = value };
+                const op = repo_mod.moveOp(current, value);
                 self.b().updateRefs(&.{.{ .name = name, .op = op }}) catch |err| switch (err) {
                     error.RefConflict => continue,
                     else => |e| return e,

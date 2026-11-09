@@ -99,8 +99,6 @@ func TestEnumsHaveGoConstants(t *testing.T) {
 	internal := map[string]bool{
 		"issuez_op_list": true, // Edit.Validate picks the list
 		"issuez_state":   true, // Issue.State is the state's name
-		// The binding doesn't wrap issuez_quarantine_resolve.
-		"issuez_quarantine_choice": true,
 	}
 	exempt := map[string]bool{
 		"ISSUEZ_OPT_PUSHER": true, // PushPolicy.PusherEmails covers it
@@ -141,9 +139,7 @@ func TestEnumsHaveGoConstants(t *testing.T) {
 			continue
 		}
 		for _, v := range ty.Values {
-			// A flags enum's zero is no flag: the binding passes 0.
-			none := strings.HasSuffix(v.Name, "_FLAG_NONE")
-			if strings.HasSuffix(v.Name, "_UNKNOWN") || none || exempt[v.Name] || used[v.Name] {
+			if strings.HasSuffix(v.Name, "_UNKNOWN") || exempt[v.Name] || used[v.Name] {
 				continue
 			}
 			t.Errorf("%s (%s) has no Go constant", v.Name, ty.Name)

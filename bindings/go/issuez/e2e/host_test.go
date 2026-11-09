@@ -6,13 +6,13 @@ import (
 	"maps"
 	"slices"
 	"testing"
+	"time"
 
 	"github.com/EuroZig/git-native-issuez/bindings/go/issuez"
 )
 
 // index is the host's search index: what it learns from Snapshot and
-// Diff after each push, loaded with LoadMany (a host's post-receive
-// flow).
+// Diff after each push, loaded with Load (a host's post-receive flow).
 type index struct {
 	r      *issuez.Repo
 	last   *issuez.Snapshot
@@ -37,22 +37,16 @@ func (x *index) refresh(t *testing.T) []issuez.DiffEntry {
 	}
 	diff := issuez.Diff(x.last, kept)
 	x.last = kept
-	var ids []string
 	for _, d := range diff {
 		switch {
 		case d.Kind != issuez.KindIssue:
 		case d.Change == issuez.ChangeRemoved:
 			delete(x.issues, d.ID)
 		default:
-			ids = append(ids, d.ID)
-		}
-	}
-	if len(ids) > 0 {
-		loaded, skipped, err := x.r.LoadMany(bg, ids, issuez.Strict())
-		if err != nil || len(skipped) != 0 {
-			t.Fatalf("LoadMany: %v, skipped %v", err, skipped)
-		}
-		for _, i := range loaded {
+			i, err := x.r.Load(bg, d.ID)
+			if err != nil {
+				t.Fatalf("Load %s: %v", d.ID, err)
+			}
 			x.issues[i.ID] = i
 		}
 	}
@@ -69,7 +63,7 @@ func changes(diff []issuez.DiffEntry) map[issuez.RefKey]issuez.ChangeKind {
 }
 
 // TestHostAndClients: CLI clients push to a hub; the host indexes each
-// push with Snapshot, Diff and LoadMany, and its own writes reach the
+// push with Snapshot, Diff and Load, and its own writes reach the
 // clients on their next sync.
 func TestHostAndClients(t *testing.T) {
 	hub := newHub(t)
@@ -151,4 +145,52 @@ func TestHostAndClients(t *testing.T) {
 			t.Errorf("client sees %+v", s)
 		}
 	})
+}
+
+// TestSinceAcrossAMerge: a client merges another's earlier comment into its
+// history, and Since says it's new though the timeline puts it before the
+// tip seen.
+func TestSinceAcrossAMerge(t *testing.T) {
+	hub := newHub(t)
+	ada := newClient(t, hub, "Ada")
+	bob := newClient(t, hub, "Bob")
+	id := create(t, ada, "Merged")
+	cli(t, ada, "sync", "origin")
+	cli(t, bob, "sync", "origin")
+	a, b := openHost(t, ada), openHost(t, bob)
+	early := host
+	early.At = time.Now().Add(-time.Hour)
+	fromB, err := b.Update(bg, id, new(issuez.Edit).AddComment("From B, written earlier"), early)
+	if err != nil {
+		t.Fatal(err)
+	}
+	cli(t, bob, "sync", "origin")
+	// The timeline orders by commit time, in seconds.
+	time.Sleep(1100 * time.Millisecond)
+	seen, err := a.Update(bg, id, new(issuez.Edit).AddComment("From A"), host)
+	if err != nil {
+		t.Fatal(err)
+	}
+	cli(t, ada, "sync", "origin")
+	i, err := a.Load(bg, id, issuez.Since(seen.NewTip))
+	if err != nil {
+		t.Fatal(err)
+	}
+	at := map[issuez.OID]int{}
+	for k, e := range i.Timeline {
+		at[e.Commit] = k
+	}
+	if at[fromB.Commit] > at[seen.Commit] {
+		t.Fatal("B's comment doesn't come first: the case isn't tested")
+	}
+	var sawB bool
+	for _, e := range i.NewEntries() {
+		if e.Commit == seen.Commit {
+			t.Error("the tip seen is new")
+		}
+		sawB = sawB || e.Commit == fromB.Commit
+	}
+	if !sawB || i.Rewritten {
+		t.Errorf("B's comment isn't new: %+v", i.NewEntries())
+	}
 }

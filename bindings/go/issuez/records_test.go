@@ -14,20 +14,9 @@ const apiJSON = "../../../docs/issuez-api.json"
 // every C field, and what the Go side does with it. A field the C API adds
 // fails the test until it is read here (or left out, saying why).
 var handWritten = map[string]map[string]string{
-	"issuez_search_hit":   {"issue_id": "SearchHit.IssueID", "line": "SearchHit.Line"},
-	"issuez_label_count":  {"name": "LabelCount.Name", "open": "LabelCount.Open", "total": "LabelCount.Total"},
-	"issuez_known_person": {"person": "KnownPerson.Person", "authored": "KnownPerson.Authored", "assigned": "KnownPerson.Assigned"},
-	"issuez_sync_item": {
-		"kind": "SyncItem.Kind", "id": "SyncItem.ID", "outcome": "SyncItem.Outcome",
-		"local_tip": "SyncItem.LocalTip", "remote_tip": "SyncItem.RemoteTip", "reason": "SyncItem.Reason",
-	},
 	"issuez_fsck_finding": {
 		"kind": "FsckFinding.Kind", "is_error": "FsckFinding.IsError", "subject_kind": "FsckFinding.SubjectKind",
 		"subject": "FsckFinding.Subject", "message": "FsckFinding.Message",
-	},
-	"issuez_quarantined": {
-		"kind": "Quarantined.Kind", "id": "Quarantined.ID", "title": "Quarantined.Title",
-		"remote_tip": "Quarantined.RemoteTip", "reason": "Quarantined.Reason", "kept_local": "Quarantined.KeptLocal",
 	},
 	"issuez_attachment": {
 		"id": "Attachment.ID", "media_type": "Attachment.MediaType", "size": "Attachment.Size",
@@ -37,11 +26,9 @@ var handWritten = map[string]map[string]string{
 	},
 	"issuez_attachment_spec": {"id": "AttachmentSpec.ID", "name": "AttachmentSpec.Name",
 		"media_type": "AttachmentSpec.MediaType", "sha256": "AttachmentSpec.SHA256", "size": "AttachmentSpec.Size"},
-	"issuez_short_id": {"id": "Repo.ShortIDs", "prefix": "Repo.ShortIDs"},
-	"issuez_time":     {"unix_seconds": "goTime", "tz_offset_minutes": "goTime"},
-	"issuez_date":     {"year": "goDate", "month": "goDate", "day": "goDate"},
-	"issuez_person":   {"name": "goPerson", "email": "goPerson", "user_id": "goPerson"},
-	"issuez_progress": {"done": "Progress", "total": "Progress"},
+	"issuez_time":   {"unix_seconds": "goTime", "tz_offset_minutes": "goTime"},
+	"issuez_date":   {"year": "goDate", "month": "goDate", "day": "goDate"},
+	"issuez_person": {"name": "goPerson", "email": "goPerson", "user_id": "goPerson"},
 	"issuez_problem": {
 		"kind": "Problem.Kind", "field": "Problem.Field", "key": "Problem.Key",
 		"value": "Problem.Value", "subject": "Problem.Subject", "message": "Problem.Message",
@@ -52,12 +39,6 @@ var handWritten = map[string]map[string]string{
 		"message": "LogEvent.Message", "repo_path": "LogEvent.RepoPath",
 		"subject": "LogEvent.Subject", "duration_ns": "LogEvent.Duration (a time.Duration)",
 		"attempt": "LogEvent.Attempt",
-	},
-	"issuez_diff_entry": {
-		"kind": "DiffEntry.RefKey", "id": "DiffEntry.RefKey",
-		"change":  "left out: Diff compares Snapshots in Go",
-		"old_tip": "left out: Diff compares Snapshots in Go",
-		"new_tip": "left out: Diff compares Snapshots in Go",
 	},
 	"issuez_reaction": {"emoji": "Reaction.Emoji", "user_count": "Reaction.Users"},
 	"issuez_issue_info": {
@@ -105,10 +86,6 @@ var handWritten = map[string]map[string]string{
 	"issuez_revision": {
 		"commit": "Revision.Commit", "author": "Revision.Author", "at": "Revision.At",
 		"kind": "Revision.Kind", "text": "Revision.Text (Previous from the one before)",
-	},
-	"issuez_remote_setup": {
-		"configured": "RemoteSetup.Configured", "removed_unsafe": "RemoteSetup.RemovedUnsafe",
-		"unsafe": "RemoteSetup.Unsafe", "reserved": "left out: room to grow",
 	},
 	"issuez_push_verdict": {
 		"ref": "PushVerdict.Ref", "kind": "PushVerdict.Kind", "id": "PushVerdict.ID",

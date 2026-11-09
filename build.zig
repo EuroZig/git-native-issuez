@@ -1277,9 +1277,6 @@ fn capiLib(
 ) *std.Build.Step.Compile {
     const options = b.addOptions();
     options.addOption(bool, "debug", debug);
-    // Live updates, when nightwatch is fetched (issuez_watch_start).
-    const nightwatch = b.lazyDependency("nightwatch", .{ .target = target, .optimize = optimize });
-    options.addOption(bool, "watch", nightwatch != null);
     const issuez = b.createModule(.{
         .root_source_file = b.path("src/root.zig"),
         .target = target,
@@ -1303,13 +1300,6 @@ fn capiLib(
             },
         }),
     });
-    if (nightwatch) |nw| lib.root_module.addImport("RepoWatcher", b.createModule(.{
-        .root_source_file = b.path("src/watch/RepoWatcher.zig"),
-        .target = target,
-        .optimize = optimize,
-        .pic = true,
-        .imports = &.{.{ .name = "nightwatch", .module = nw.module("nightwatch") }},
-    }));
     // The host links it with its own toolchain, which has no Zig runtime.
     lib.bundle_compiler_rt = true;
     return lib;

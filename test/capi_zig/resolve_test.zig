@@ -1,4 +1,4 @@
-//! Resolving input, snapshots and diffs.
+//! Resolving input and snapshots.
 
 const std = @import("std");
 const testing = std.testing;
@@ -6,12 +6,8 @@ const fixture = @import("fixture.zig");
 const expect = @import("expect.zig");
 const c = fixture.c;
 
-// covers: issuez_matches_len, issuez_matches_at, issuez_matches_free
-test "issuez_resolve: UUIDs, prefixes, numbers, names" {
-    const leaks = fixture.Leaks.start();
-    defer leaks.check();
-    var r: fixture.Repo = undefined;
-    try r.init(.{});
+test "issuez_resolve_one: UUIDs, prefixes, numbers, names" {
+    var r = try fixture.Repo.init(.{});
     defer r.deinit();
     const one = try fixture.create(
         r.handle,
@@ -20,54 +16,40 @@ test "issuez_resolve: UUIDs, prefixes, numbers, names" {
     _ = try fixture.titled(r.handle, "Two");
     const m = try fixture.milestone(r.handle, "v1.0");
 
-    const cases = [_]struct { c.issuez_kind, []const u8, []const []const u8 }{
-        .{ c.ISSUEZ_KIND_ISSUE, one.idSlice(), &.{one.idSlice()} },
-        .{ c.ISSUEZ_KIND_ISSUE, one.idSlice()[0..8], &.{one.idSlice()} },
-        .{ c.ISSUEZ_KIND_ISSUE, "#12", &.{one.idSlice()} },
-        .{ c.ISSUEZ_KIND_ISSUE, "#13", &.{} },
-        .{ c.ISSUEZ_KIND_ISSUE, "ffffffff", &.{} },
-        .{ c.ISSUEZ_KIND_MILESTONE, "v1.0", &.{m.idSlice()} },
-        .{ c.ISSUEZ_KIND_MILESTONE, m.idSlice()[0..6], &.{m.idSlice()} },
-        .{ c.ISSUEZ_KIND_MILESTONE, "v2", &.{} },
+    const cases = [_]struct { c.issuez_kind, []const u8, ?[]const u8 }{
+        .{ c.ISSUEZ_KIND_ISSUE, one.idSlice(), one.idSlice() },
+        .{ c.ISSUEZ_KIND_ISSUE, one.idSlice()[0..8], one.idSlice() },
+        .{ c.ISSUEZ_KIND_ISSUE, "#12", one.idSlice() },
+        .{ c.ISSUEZ_KIND_ISSUE, "#13", null },
+        .{ c.ISSUEZ_KIND_ISSUE, "ffffffff", null },
+        .{ c.ISSUEZ_KIND_MILESTONE, "v1.0", m.idSlice() },
+        .{ c.ISSUEZ_KIND_MILESTONE, m.idSlice()[0..6], m.idSlice() },
+        .{ c.ISSUEZ_KIND_MILESTONE, "v2", null },
     };
     for (cases) |case| {
-        const got = try fixture.resolve(r.handle, case[0], case[1]);
-        defer fixture.freeAll(got);
-        try testing.expectEqual(case[2].len, got.len);
-        for (case[2]) |want| {
-            const found = for (got) |g| {
-                if (std.mem.eql(u8, g, want)) break true;
-            } else false;
-            try testing.expect(found);
+        var buf: [37]u8 = undefined;
+        const rc = c.issuez_resolve_one(r.handle, case[0], fixture.str(case[1]), null, &buf, null);
+        if (case[2]) |want| {
+            try expect.code(c.ISSUEZ_OK, rc, null);
+            try testing.expectEqualStrings(want, std.mem.sliceTo(&buf, 0));
+        } else {
+            try expect.code(c.ISSUEZ_E_NOT_FOUND, rc, null);
         }
     }
-    var mm: ?*c.issuez_matches = null;
-    try expect.code(
-        c.ISSUEZ_OK,
-        c.issuez_resolve(r.handle, c.ISSUEZ_KIND_ISSUE, fixture.str("#12"), null, &mm, null),
-        null,
-    );
-    try expect.terminated(c.issuez_matches_at(mm, 0));
-    try expect.str("", c.issuez_matches_at(mm, 1));
-    c.issuez_matches_free(mm);
-    c.issuez_matches_free(null);
-    try testing.expectEqual(@as(usize, 0), c.issuez_matches_len(null));
+    var buf: [37]u8 = undefined;
     var err: ?*c.issuez_error = null;
     try expect.code(
         c.ISSUEZ_E_INVALID_ARGUMENT,
-        c.issuez_resolve(r.handle, c.ISSUEZ_KIND_TOMBSTONE, fixture.str("x"), null, &mm, &err),
+        c.issuez_resolve_one(r.handle, c.ISSUEZ_KIND_TOMBSTONE, fixture.str("x"), null, &buf, &err),
         err,
     );
     c.issuez_error_free(err);
 }
 
-test "issuez_resolve: a number two issues were given" {
-    const leaks = fixture.Leaks.start();
-    defer leaks.check();
-    var r: fixture.Repo = undefined;
-    try r.init(.{});
+test "issuez_resolve_one: a number two issues were given" {
+    var r = try fixture.Repo.init(.{});
     defer r.deinit();
-    const a = try fixture.create(
+    _ = try fixture.create(
         r.handle,
         &.{ c.issuez_set_title(fixture.str("A")), c.issuez_set_number(5) },
     );
@@ -77,17 +59,16 @@ test "issuez_resolve: a number two issues were given" {
     const tree = try r.git(&.{ "hash-object", "-t", "tree", "-w", "/dev/null" });
     const tip = try r.git(&.{ "commit-tree", tree, "-p", ref, "-m", "Number\n\nX-Number: 5" });
     _ = try r.git(&.{ "update-ref", ref, tip });
-    const got = try fixture.resolve(r.handle, c.ISSUEZ_KIND_ISSUE, "#5");
-    defer fixture.freeAll(got);
-    try testing.expectEqual(@as(usize, 2), got.len);
-    _ = a;
+    var buf: [37]u8 = undefined;
+    try expect.code(
+        c.ISSUEZ_E_AMBIGUOUS,
+        c.issuez_resolve_one(r.handle, c.ISSUEZ_KIND_ISSUE, fixture.str("#5"), null, &buf, null),
+        null,
+    );
 }
 
 test "issuez_resolve_one: one, none, several" {
-    const leaks = fixture.Leaks.start();
-    defer leaks.check();
-    var r: fixture.Repo = undefined;
-    try r.init(.{});
+    var r = try fixture.Repo.init(.{});
     defer r.deinit();
     const one = try fixture.titled(r.handle, "One");
     // 17 issues: two share their first hex digit.
@@ -151,12 +132,9 @@ fn take(repo: *c.issuez_repo) !*c.issuez_snapshot {
     return s.?;
 }
 
-// covers: issuez_snapshot_free, issuez_snapshot_len, issuez_snapshot_at, issuez_snapshot_tip
+// covers: issuez_snapshot_free, issuez_snapshot_len, issuez_snapshot_at
 test "issuez_snapshot_take: every ref, sorted" {
-    const leaks = fixture.Leaks.start();
-    defer leaks.check();
-    var r: fixture.Repo = undefined;
-    try r.init(.{});
+    var r = try fixture.Repo.init(.{});
     defer r.deinit();
     const empty = try take(r.handle);
     try testing.expectEqual(@as(usize, 0), c.issuez_snapshot_len(empty));
@@ -197,50 +175,71 @@ test "issuez_snapshot_take: every ref, sorted" {
         try expect.str("", id);
         try testing.expectEqual(@as(u8, 0), t.len);
     }
-    var tip: c.issuez_oid = undefined;
-    try testing.expect(c.issuez_snapshot_tip(s, c.ISSUEZ_KIND_ISSUE, first.idStr(), &tip));
-    try testing.expect(c.issuez_oid_eq(&tip, &first.tip));
-    try testing.expect(c.issuez_snapshot_tip(s, c.ISSUEZ_KIND_MILESTONE, m.idStr(), &tip));
-    try testing.expect(!c.issuez_snapshot_tip(s, c.ISSUEZ_KIND_MILESTONE, second.idStr(), &tip));
-    try testing.expect(!c.issuez_snapshot_tip(null, c.ISSUEZ_KIND_ISSUE, second.idStr(), &tip));
+    // Every ref, each with its tip.
+    for ([_]struct { c.issuez_kind, *const fixture.Created }{
+        .{ c.ISSUEZ_KIND_ISSUE, &first },
+        .{ c.ISSUEZ_KIND_ISSUE, &second },
+        .{ c.ISSUEZ_KIND_MILESTONE, &m },
+    }) |want| {
+        var found = false;
+        for (0..3) |i| {
+            var kind: c.issuez_kind = undefined;
+            var id: c.issuez_str = undefined;
+            var tip: c.issuez_oid = undefined;
+            c.issuez_snapshot_at(s, i, &kind, &id, &tip);
+            if (kind != want[0] or !std.mem.eql(u8, fixture.slice(id), want[1].idSlice())) continue;
+            try testing.expect(fixture.oidEql(tip, want[1].tip));
+            found = true;
+        }
+        try testing.expect(found);
+    }
     try testing.expectEqual(@as(usize, 0), c.issuez_snapshot_len(null));
     c.issuez_snapshot_free(null);
 }
 
-test "issuez_snapshot_encode, issuez_snapshot_decode: round trip, empty, garbage" {
+test "issuez_snapshot_decode: the encoding, sorted; empty; garbage" {
     const leaks = fixture.Leaks.start();
     defer leaks.check();
-    var r: fixture.Repo = undefined;
-    try r.init(.{});
-    defer r.deinit();
-    _ = try fixture.titled(r.handle, "One");
-    _ = try fixture.milestone(r.handle, "v1");
-    const s = try take(r.handle);
-    defer c.issuez_snapshot_free(s);
-    const bytes = c.issuez_snapshot_encode(s);
-    try testing.expect(bytes.len > 0);
-    // Stable: a second snapshot of the same refs encodes the same.
-    const again = try take(r.handle);
-    defer c.issuez_snapshot_free(again);
-    try testing.expectEqualStrings(
-        fixture.slice(bytes),
-        fixture.slice(c.issuez_snapshot_encode(again)),
-    );
+    const issue = "0b6c4f63-6f5a-4a3e-9c2b-1d2e3f4a5b6c";
+    const other = "1b6c4f63-6f5a-4a3e-9c2b-1d2e3f4a5b6c";
+    const sha1 = "5186cff79af42ee5c6a80d822eec95a842832b34";
+    const sha256 = "a7f3" ++ "0" ** 56 ++ "beef";
+    const line = "i " ++ issue ++ " " ++ sha1 ++ "\n";
+    const bytes = "issuez-snapshot 1\n" ++
+        "m " ++ other ++ " " ++ sha256 ++ "\n" ++
+        "i " ++ other ++ " " ++ sha1 ++ "\n" ++
+        line;
 
-    var back: ?*c.issuez_snapshot = null;
-    try expect.code(c.ISSUEZ_OK, c.issuez_snapshot_decode(bytes, &back, null), null);
-    defer c.issuez_snapshot_free(back);
-    var d: ?*c.issuez_diff = null;
-    try expect.code(c.ISSUEZ_OK, c.issuez_diff_new(s, back, &d, null), null);
-    try testing.expectEqual(@as(usize, 0), c.issuez_diff_len(d));
-    c.issuez_diff_free(d);
+    var s: ?*c.issuez_snapshot = null;
+    try expect.code(c.ISSUEZ_OK, c.issuez_snapshot_decode(fixture.str(bytes), &s, null), null);
+    defer c.issuez_snapshot_free(s);
+    try testing.expectEqual(@as(usize, 3), c.issuez_snapshot_len(s));
+    for ([_]struct { c.issuez_kind, []const u8, []const u8 }{
+        .{ c.ISSUEZ_KIND_ISSUE, issue, sha1 },
+        .{ c.ISSUEZ_KIND_ISSUE, other, sha1 },
+        .{ c.ISSUEZ_KIND_MILESTONE, other, sha256 },
+    }, 0..) |want, i| {
+        var kind: c.issuez_kind = undefined;
+        var id: c.issuez_str = undefined;
+        var tip: c.issuez_oid = undefined;
+        c.issuez_snapshot_at(s, i, &kind, &id, &tip);
+        try testing.expectEqual(want[0], kind);
+        try expect.str(want[1], id);
+        try testing.expect(fixture.oidEql(tip, try fixture.oidParse(want[2])));
+    }
 
     var empty: ?*c.issuez_snapshot = null;
     try expect.code(c.ISSUEZ_OK, c.issuez_snapshot_decode(fixture.str(""), &empty, null), null);
     try testing.expectEqual(@as(usize, 0), c.issuez_snapshot_len(empty));
     c.issuez_snapshot_free(empty);
-    const text = fixture.slice(bytes);
-    const garbage = [_][]const u8{ "garbage", "issuez-snapshot 9\n", text[0 .. text.len - 3] };
+    const garbage = [_][]const u8{
+        "garbage",
+        "issuez-snapshot 9\n",
+        bytes[0 .. bytes.len - 3],
+        "issuez-snapshot 1\nx " ++ issue ++ " " ++ sha1 ++ "\n",
+        "issuez-snapshot 1\ni a7f3 " ++ sha1 ++ "\n",
+        "issuez-snapshot 1\ni " ++ issue ++ " 5186CFF79AF42EE5C6A80D822EEC95A842832B34\n",
+    };
     for (garbage) |g| {
         var out: ?*c.issuez_snapshot = null;
         var err: ?*c.issuez_error = null;
@@ -254,79 +253,31 @@ test "issuez_snapshot_encode, issuez_snapshot_decode: round trip, empty, garbage
     }
 }
 
-// covers: issuez_diff_len, issuez_diff_at, issuez_diff_free
-test "issuez_diff_new: created, updated, removed" {
-    const leaks = fixture.Leaks.start();
-    defer leaks.check();
-    var r: fixture.Repo = undefined;
-    try r.init(.{});
+test "issuez_snapshot_decode: the refs a snapshot took, as Go encodes them" {
+    var r = try fixture.Repo.init(.{});
     defer r.deinit();
-    const kept = try fixture.titled(r.handle, "Kept");
-    const changed = try fixture.titled(r.handle, "Changed");
-    const gone = try fixture.titled(r.handle, "Gone");
-    const before = try take(r.handle);
-    defer c.issuez_snapshot_free(before);
-
-    var d: ?*c.issuez_diff = null;
-    try expect.code(c.ISSUEZ_OK, c.issuez_diff_new(null, before, &d, null), null);
-    try testing.expectEqual(@as(usize, 3), c.issuez_diff_len(d));
-    for (0..3) |i| try testing.expectEqual(
-        @as(u32, c.ISSUEZ_CHANGE_CREATED),
-        c.issuez_diff_at(d, i).*.change,
-    );
-    c.issuez_diff_free(d);
-
-    const new_tip = try fixture.update(
-        r.handle,
-        changed.idStr(),
-        &.{c.issuez_add_label(fixture.str("x"))},
-    );
-    var pr: ?*c.issuez_purge_result = null;
-    try expect.code(
-        c.ISSUEZ_OK,
-        c.issuez_purge_issue(
-            r.handle,
-            gone.idStr(),
-            &fixture.ada,
-            fixture.str(""),
-            null,
-            &pr,
-            null,
-        ),
-        null,
-    );
-    c.issuez_purge_result_free(pr);
+    const x = try fixture.titled(r.handle, "One");
     const m = try fixture.milestone(r.handle, "v1");
-    const after = try take(r.handle);
-    defer c.issuez_snapshot_free(after);
-    try expect.code(c.ISSUEZ_OK, c.issuez_diff_new(before, after, &d, null), null);
-    defer c.issuez_diff_free(d);
-    try testing.expectEqual(@as(usize, 3), c.issuez_diff_len(d));
-    var seen: u8 = 0;
-    for (0..3) |i| {
-        const e = c.issuez_diff_at(d, i).*;
-        try expect.terminated(e.id);
-        const id = fixture.slice(e.id);
-        if (std.mem.eql(u8, id, changed.idSlice())) {
-            try testing.expectEqual(@as(u32, c.ISSUEZ_CHANGE_UPDATED), e.change);
-            try testing.expect(c.issuez_oid_eq(&e.old_tip, &changed.tip));
-            try testing.expect(c.issuez_oid_eq(&e.new_tip, &new_tip));
-            seen |= 1;
-        } else if (std.mem.eql(u8, id, gone.idSlice())) {
-            try testing.expectEqual(@as(u32, c.ISSUEZ_CHANGE_REMOVED), e.change);
-            try testing.expectEqual(@as(u8, 0), e.new_tip.len);
-            seen |= 2;
-        } else if (std.mem.eql(u8, id, m.idSlice())) {
-            try testing.expectEqual(@as(u32, c.ISSUEZ_CHANGE_CREATED), e.change);
-            try testing.expectEqual(@as(u32, c.ISSUEZ_KIND_MILESTONE), e.kind);
-            try testing.expectEqual(@as(u8, 0), e.old_tip.len);
-            seen |= 4;
-        }
+    const taken = try take(r.handle);
+    defer c.issuez_snapshot_free(taken);
+    const bytes = try std.fmt.allocPrint(r.arena(), "issuez-snapshot 1\ni {s} {s}\nm {s} {s}\n", .{
+        x.idSlice(),
+        fixture.oidHex(x.tip)[0 .. x.tip.len * 2],
+        m.idSlice(),
+        fixture.oidHex(m.tip)[0 .. m.tip.len * 2],
+    });
+    var back: ?*c.issuez_snapshot = null;
+    try expect.code(c.ISSUEZ_OK, c.issuez_snapshot_decode(fixture.str(bytes), &back, null), null);
+    defer c.issuez_snapshot_free(back);
+    try testing.expectEqual(c.issuez_snapshot_len(taken), c.issuez_snapshot_len(back));
+    for (0..c.issuez_snapshot_len(back)) |i| {
+        var kinds: [2]c.issuez_kind = undefined;
+        var ids: [2]c.issuez_str = undefined;
+        var tips: [2]c.issuez_oid = undefined;
+        c.issuez_snapshot_at(taken, i, &kinds[0], &ids[0], &tips[0]);
+        c.issuez_snapshot_at(back, i, &kinds[1], &ids[1], &tips[1]);
+        try testing.expectEqual(kinds[0], kinds[1]);
+        try testing.expectEqualStrings(fixture.slice(ids[0]), fixture.slice(ids[1]));
+        try testing.expect(fixture.oidEql(tips[0], tips[1]));
     }
-    try testing.expectEqual(@as(u8, 7), seen);
-    try testing.expect(c.issuez_diff_at(d, 3) == null);
-    _ = kept;
-    try expect.code(c.ISSUEZ_E_INVALID_ARGUMENT, c.issuez_diff_new(before, null, &d, null), null);
-    c.issuez_diff_free(null);
-    try testing.expectEqual(@as(usize, 0), c.issuez_diff_len(null));
 }

@@ -715,7 +715,7 @@ fn checkSync(
         const id = r.name["refs/issues/".len..];
         const qref = try std.fmt.allocPrint(arena, "{s}{s}", .{ qprefix, id });
         if (la.ref(qref) != null) {
-            try checkQuarantine(arena, lb, r.name, r.oid, report);
+            try checkQuarantine(lb, r.name, r.oid, report);
             continue;
         }
         const tomb = try purge.of(la, id);
@@ -910,7 +910,6 @@ fn splitSet(arena: Allocator, value: []const u8) Allocator.Error![]const []const
 /// Only unrelated histories, or a remote that lost what we merged before,
 /// justify a quarantine.
 fn checkQuarantine(
-    arena: Allocator,
     local: commands.Clone,
     name: []const u8,
     remote_tip: []const u8,
@@ -920,40 +919,19 @@ fn checkQuarantine(
     // With shared history only a rewrite does, and then neither tip can
     // contain the other: a fast-forward merges, and a remote reset to a tip
     // the local issue has loses nothing.
-    if (!try sharesHistory(arena, local, local_tip, remote_tip)) return;
+    if (!try sharesHistory(local, local_tip, remote_tip)) return;
     if (try isAncestorIn(local, local_tip, remote_tip))
         try report.fail("quarantined {s} although it fast-forwards", .{name});
     if (try isAncestorIn(local, remote_tip, local_tip))
         try report.fail("quarantined {s} although the local issue has the remote tip", .{name});
 }
 
-fn sharesHistory(
-    arena: Allocator,
-    c: commands.Clone,
-    a: []const u8,
-    b: []const u8,
-) Allocator.Error!bool {
-    const ancestors_a = try closure(arena, c, a);
-    const ancestors_b = try closure(arena, c, b);
+fn sharesHistory(c: commands.Clone, a: []const u8, b: []const u8) Allocator.Error!bool {
+    const ancestors_a = try c.reach(a);
+    const ancestors_b = try c.reach(b);
     var it = ancestors_a.keyIterator();
     while (it.next()) |k| if (ancestors_b.contains(k.*)) return true;
     return false;
-}
-
-fn closure(
-    arena: Allocator,
-    c: commands.Clone,
-    tip: []const u8,
-) Allocator.Error!std.StringHashMapUnmanaged(void) {
-    var set: std.StringHashMapUnmanaged(void) = .empty;
-    var stack: std.ArrayList([]const u8) = .empty;
-    try stack.append(arena, tip);
-    while (stack.pop()) |hex| {
-        if ((try set.getOrPut(arena, hex)).found_existing) continue;
-        const cm = c.commit(hex) orelse continue;
-        for (cm.parents) |p| try stack.append(arena, try p.hexAlloc(arena));
-    }
-    return set;
 }
 
 /// `now` contains `old` rewritten by the tombstone's purged comments.
@@ -975,7 +953,7 @@ fn isAncestorIn(
     descendant: []const u8,
 ) Allocator.Error!bool {
     if (std.mem.eql(u8, ancestor, descendant)) return true;
-    const set = try closure(c.arena, c, descendant);
+    const set = try c.reach(descendant);
     return set.contains(ancestor);
 }
 
@@ -1653,19 +1631,14 @@ fn commentCommits(
     tip: []const u8,
 ) Allocator.Error![]const []const u8 {
     var out: std.ArrayList([]const u8) = .empty;
-    var seen: std.StringHashMapUnmanaged(void) = .empty;
-    var stack: std.ArrayList([]const u8) = .empty;
-    try stack.append(arena, tip);
-    while (stack.pop()) |hex| {
-        if ((try seen.getOrPut(arena, hex)).found_existing) continue;
-        const cm = c.commit(hex) orelse continue;
-        const block = try commands.trailersOf(arena, cm.message);
+    var walk = try c.walk(tip);
+    while (try walk.next()) |x| {
+        const block = try commands.trailersOf(arena, x.commit.message);
         var event = false;
         for (block.trailers) |t| if (std.ascii.eqlIgnoreCase(t.key, "X-Event")) {
             event = true;
         };
-        if (cm.parents.len == 1 and !event) try out.append(arena, hex);
-        for (cm.parents) |p| try stack.append(arena, try p.hexAlloc(arena));
+        if (x.commit.parents.len == 1 and !event) try out.append(arena, x.hex);
     }
     return out.items;
 }

@@ -26,21 +26,12 @@ pub fn main(comptime B: type, ctx: *context.Context(B), argv: []const []const u8
     const arena = ctx.arena;
     var only: ?[]const u8 = null;
     var as_json = false;
-    var args: common.Args = .{ .list = argv };
-    while (args.next()) |arg| {
-        if (!args.isOption(arg)) {
-            if (args.was_separator) continue;
-            if (only != null) return common.missing(ctx.err, "status", "only one remote");
-            only = arg;
-        } else if (common.isHelp(arg)) {
-            ctx.out.writeAll(help) catch {};
-            return common.exit_ok;
-        } else if (std.mem.eql(u8, arg, "--json")) {
-            as_json = true;
-        } else {
-            return common.unknownOption(ctx.err, "status", arg);
-        }
-    }
+    if (common.parseArgs(ctx, argv, .{
+        .command = "status",
+        .help = help,
+        .positionals = .{ .only = .{ &only, "only one remote" } },
+        .flags = &.{.{ "--json", .{ .on = &as_json } }},
+    })) |exit| return exit;
 
     const repo = common.openRepo(B, ctx) orelse return common.exit_fatal;
     const s = issuez.Sync(B).init(repo.backend);

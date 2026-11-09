@@ -24,8 +24,9 @@ const Rich = struct {
     issue: *c.issuez_issue,
     plain: *c.issuez_issue,
 
-    fn init(rich: *Rich) !void {
-        try rich.r.init(.{});
+    fn init() !Rich {
+        var rich: Rich = undefined;
+        rich.r = try fixture.Repo.init(.{});
         errdefer rich.r.deinit();
         const h = rich.r.handle;
         const parent = try fixture.titled(h, "Parent");
@@ -172,6 +173,7 @@ const Rich = struct {
         try fixture.foreignCommit(&rich.r, rich.bare.idSlice(), "Due\n\nX-Due-Date: someday");
         rich.issue = try fixture.load(h, id);
         rich.plain = try fixture.load(h, rich.bare.idStr());
+        return rich;
     }
 
     fn deinit(rich: *Rich) void {
@@ -182,10 +184,7 @@ const Rich = struct {
 };
 
 test "issuez_issue_load, issuez_issue_free: by UUID, missing, not a UUID, damaged" {
-    const leaks = fixture.Leaks.start();
-    defer leaks.check();
-    var r: fixture.Repo = undefined;
-    try r.init(.{});
+    var r = try fixture.Repo.init(.{});
     defer r.deinit();
     const made = try fixture.titled(r.handle, "Loaded");
     const issue = try fixture.load(r.handle, made.idStr());
@@ -218,58 +217,6 @@ test "issuez_issue_load, issuez_issue_free: by UUID, missing, not a UUID, damage
     c.issuez_error_free(err);
 }
 
-test "issuez_issue_load_many: found, missing, strict" {
-    const leaks = fixture.Leaks.start();
-    defer leaks.check();
-    var r: fixture.Repo = undefined;
-    try r.init(.{});
-    defer r.deinit();
-    const a = try fixture.titled(r.handle, "A");
-    const b = try fixture.titled(r.handle, "B");
-    const missing = "0b6c4f63-6f5a-4a3e-9c2b-1d2e3f4a5b6c";
-    const ids = [_]c.issuez_str{ a.idStr(), fixture.str(missing), b.idStr(), a.idStr() };
-    var list: ?*c.issuez_issue_list = null;
-    try expect.code(
-        c.ISSUEZ_OK,
-        c.issuez_issue_load_many(r.handle, &ids, ids.len, 0, null, &list, null),
-        null,
-    );
-    try testing.expectEqual(@as(usize, 3), c.issuez_issue_list_len(list));
-    try expect.str("A", c.issuez_issue_info_of(c.issuez_issue_list_at(list, 0)).*.title);
-    try expect.str("B", c.issuez_issue_info_of(c.issuez_issue_list_at(list, 1)).*.title);
-    try testing.expectEqual(@as(usize, 1), c.issuez_issue_list_skipped_count(list));
-    try expect.str(missing, c.issuez_issue_list_skipped_at(list, 0));
-    c.issuez_issue_list_free(list);
-    var err: ?*c.issuez_error = null;
-    try expect.code(
-        c.ISSUEZ_E_NOT_FOUND,
-        c.issuez_issue_load_many(
-            r.handle,
-            &ids,
-            ids.len,
-            c.ISSUEZ_LOAD_FLAG_STRICT,
-            null,
-            &list,
-            &err,
-        ),
-        err,
-    );
-    try expect.str(missing, c.issuez_error_subject(err));
-    c.issuez_error_free(err);
-    try expect.code(
-        c.ISSUEZ_OK,
-        c.issuez_issue_load_many(r.handle, null, 0, c.ISSUEZ_LOAD_FLAG_STRICT, null, &list, null),
-        null,
-    );
-    try testing.expectEqual(@as(usize, 0), c.issuez_issue_list_len(list));
-    c.issuez_issue_list_free(list);
-    try expect.code(
-        c.ISSUEZ_E_INVALID_ARGUMENT,
-        c.issuez_issue_load_many(r.handle, null, 0, 1 << 31, null, &list, null),
-        null,
-    );
-}
-
 const lin_id = "7d1f0a34-2b6c-4e8d-a1f3-9c0b5d7e6f21";
 
 /// Someone writing at a time and in a zone of their own.
@@ -290,10 +237,7 @@ fn at(
 
 // C fills the record by hand: no two fields here hold the same value, so a swapped field fails.
 test "issuez_issue_info_of: every value of a closed, locked issue" {
-    const leaks = fixture.Leaks.start();
-    defer leaks.check();
-    var r: fixture.Repo = undefined;
-    try r.init(.{});
+    var r = try fixture.Repo.init(.{});
     defer r.deinit();
     const h = r.handle;
     const parent = try fixture.titled(h, "Parent");
@@ -404,10 +348,7 @@ test "issuez_issue_info_of: every value of a closed, locked issue" {
 }
 
 test "issuez_issue_info_of: a deleted open issue with nothing else set, and NULL" {
-    const leaks = fixture.Leaks.start();
-    defer leaks.check();
-    var r: fixture.Repo = undefined;
-    try r.init(.{});
+    var r = try fixture.Repo.init(.{});
     defer r.deinit();
     const h = r.handle;
     const x = try fixture.titled(h, "Bare");
@@ -440,10 +381,7 @@ test "issuez_issue_info_of: a deleted open issue with nothing else set, and NULL
 }
 
 test "issuez_issue_info_of: each optional is there on its own, an estimate of 0 included" {
-    const leaks = fixture.Leaks.start();
-    defer leaks.check();
-    var r: fixture.Repo = undefined;
-    try r.init(.{});
+    var r = try fixture.Repo.init(.{});
     defer r.deinit();
     const h = r.handle;
     const zero = try fixture.create(h, &.{
@@ -472,10 +410,7 @@ test "issuez_issue_info_of: each optional is there on its own, an estimate of 0 
 }
 
 test "issuez_issue_info_of: a done state of the repo, then reopened" {
-    const leaks = fixture.Leaks.start();
-    defer leaks.check();
-    var r: fixture.Repo = undefined;
-    try r.init(.{});
+    var r = try fixture.Repo.init(.{});
     defer r.deinit();
     const h = r.handle;
     const x = try fixture.create(h, &.{
@@ -498,21 +433,18 @@ test "issuez_issue_info_of: a done state of the repo, then reopened" {
     try expect.str("ready", open.*.workflow_state);
 }
 
-// covers: issuez_issue_label_at, issuez_issue_has_label, issuez_issue_assignee_count
+// covers: issuez_issue_label_at, issuez_issue_assignee_count
 // covers: issuez_issue_assignee_at
 test "issuez_issue_label_count: sets" {
-    const leaks = fixture.Leaks.start();
-    defer leaks.check();
-    var rich: Rich = undefined;
-    try rich.init();
+    var rich = try Rich.init();
     defer rich.deinit();
     const i = rich.issue;
     try testing.expectEqual(@as(usize, 2), c.issuez_issue_label_count(i));
     try expect.str("bug", c.issuez_issue_label_at(i, 0));
     try expect.str("ui", c.issuez_issue_label_at(i, 1));
     try expect.str("", c.issuez_issue_label_at(i, 2));
-    try testing.expect(c.issuez_issue_has_label(i, fixture.str("ui")));
-    try testing.expect(!c.issuez_issue_has_label(i, fixture.str("UI")));
+    try testing.expect(fixture.hasLabel(i, "ui"));
+    try testing.expect(!fixture.hasLabel(i, "UI"));
     try testing.expectEqual(@as(usize, 0), c.issuez_issue_label_count(rich.plain));
     try testing.expectEqual(@as(usize, 2), c.issuez_issue_assignee_count(i));
     const first = c.issuez_issue_assignee_at(i, 0).*;
@@ -526,10 +458,7 @@ test "issuez_issue_label_count: sets" {
 
 // covers: issuez_issue_blocker_at
 test "issuez_issue_blocker_count: relations" {
-    const leaks = fixture.Leaks.start();
-    defer leaks.check();
-    var rich: Rich = undefined;
-    try rich.init();
+    var rich = try Rich.init();
     defer rich.deinit();
     const i = rich.issue;
     try testing.expectEqual(@as(usize, 1), c.issuez_issue_blocker_count(i));
@@ -537,17 +466,11 @@ test "issuez_issue_blocker_count: relations" {
     try expect.str("", c.issuez_issue_blocker_at(i, 1));
 }
 
-// covers: issuez_issue_extra_count, issuez_issue_extra_at
-test "issuez_issue_field: trailers" {
-    const leaks = fixture.Leaks.start();
-    defer leaks.check();
-    var rich: Rich = undefined;
-    try rich.init();
+// covers: issuez_issue_extra_at
+test "issuez_issue_extra_count: trailers the library doesn't interpret" {
+    var rich = try Rich.init();
     defer rich.deinit();
     const i = rich.issue;
-    try expect.str("high", c.issuez_issue_field(i, fixture.str("Priority")));
-    try expect.str("3", c.issuez_issue_field(i, fixture.str("X-Forgejo-Project")));
-    try expect.str("", c.issuez_issue_field(i, fixture.str("No-Such-Key")));
     try testing.expectEqual(@as(usize, 1), c.issuez_issue_extra_count(i));
     var key: c.issuez_str = undefined;
     var value: c.issuez_str = undefined;
@@ -560,10 +483,7 @@ test "issuez_issue_field: trailers" {
 }
 
 test "issuez_issue_problems: a value another tool wrote that doesn't parse" {
-    const leaks = fixture.Leaks.start();
-    defer leaks.check();
-    var rich: Rich = undefined;
-    try rich.init();
+    var rich = try Rich.init();
     defer rich.deinit();
     try testing.expectEqual(
         @as(usize, 0),
@@ -582,10 +502,7 @@ test "issuez_issue_problems: a value another tool wrote that doesn't parse" {
 
 // covers: issuez_issue_reaction_at, issuez_reaction_user_at
 test "issuez_issue_reaction_count: on the issue and on a comment" {
-    const leaks = fixture.Leaks.start();
-    defer leaks.check();
-    var rich: Rich = undefined;
-    try rich.init();
+    var rich = try Rich.init();
     defer rich.deinit();
     const i = rich.issue;
     try testing.expectEqual(@as(usize, 1), c.issuez_issue_reaction_count(i, null));
@@ -601,17 +518,14 @@ test "issuez_issue_reaction_count: on the issue and on a comment" {
     try testing.expectEqual(@as(usize, 0), c.issuez_issue_reaction_count(rich.plain, null));
 }
 
-// covers: issuez_issue_comment_at, issuez_issue_comment_find
+// covers: issuez_issue_comment_at
 test "issuez_issue_comment_count: edited, restored, purged, deleted" {
-    const leaks = fixture.Leaks.start();
-    defer leaks.check();
-    var rich: Rich = undefined;
-    try rich.init();
+    var rich = try Rich.init();
     defer rich.deinit();
     const i = rich.issue;
     try testing.expectEqual(@as(usize, 4), c.issuez_issue_comment_count(i));
     const first = c.issuez_issue_comment_at(i, 0).*;
-    try testing.expect(c.issuez_oid_eq(&first.id, &rich.c1));
+    try testing.expect(fixture.oidEql(first.id, rich.c1));
     try expect.str("Second take", first.text);
     try testing.expect(first.edited and !first.deleted and !first.purged);
     try testing.expect(first.updated.unix_seconds >= first.created.unix_seconds);
@@ -627,19 +541,14 @@ test "issuez_issue_comment_count: edited, restored, purged, deleted" {
     try testing.expect(fourth.deleted);
     try expect.str("Spam", fourth.text);
     try testing.expect(c.issuez_issue_comment_at(i, 4) == null);
-    const found = c.issuez_issue_comment_find(i, &rich.c2);
-    try expect.str("Hidden for a while", found.*.text);
-    const none = std.mem.zeroes(c.issuez_oid);
-    try testing.expect(c.issuez_issue_comment_find(i, &none) == null);
+    const found = fixture.findComment(i, rich.c2);
+    try expect.str("Hidden for a while", found.?.text);
     try testing.expectEqual(@as(usize, 0), c.issuez_issue_comment_count(rich.plain));
 }
 
 // covers: issuez_issue_timeline_at, issuez_entry_change_at
 test "issuez_issue_timeline_count: every kind of step" {
-    const leaks = fixture.Leaks.start();
-    defer leaks.check();
-    var rich: Rich = undefined;
-    try rich.init();
+    var rich = try Rich.init();
     defer rich.deinit();
     const i = rich.issue;
     const n = c.issuez_issue_timeline_count(i);
@@ -662,7 +571,7 @@ test "issuez_issue_timeline_count: every kind of step" {
             else => {},
         }
         if (e.kind == c.ISSUEZ_ENTRY_COMMENT_EDIT) try testing.expect(
-            c.issuez_oid_eq(&e.comment.*.id, &rich.c1),
+            fixture.oidEql(e.comment.*.id, rich.c1),
         );
         for (0..e.change_count) |j| {
             const ch = c.issuez_entry_change_at(c.issuez_issue_timeline_at(i, k), j).*;
@@ -690,10 +599,7 @@ test "issuez_issue_timeline_count: every kind of step" {
 
 // covers: issuez_issue_history_at
 test "issuez_issue_history_count: the description and comments, version by version" {
-    const leaks = fixture.Leaks.start();
-    defer leaks.check();
-    var rich: Rich = undefined;
-    try rich.init();
+    var rich = try Rich.init();
     defer rich.deinit();
     const i = rich.issue;
     try testing.expectEqual(@as(usize, 2), c.issuez_issue_history_count(i, null));
@@ -727,10 +633,7 @@ test "issuez_issue_history_count: the description and comments, version by versi
 }
 
 test "issuez_issue_load_since: entries new since a tip" {
-    const leaks = fixture.Leaks.start();
-    defer leaks.check();
-    var r: fixture.Repo = undefined;
-    try r.init(.{});
+    var r = try fixture.Repo.init(.{});
     defer r.deinit();
     const h = r.handle;
     const x = try fixture.titled(h, "Since");
@@ -749,7 +652,7 @@ test "issuez_issue_load_since: entries new since a tip" {
     try testing.expect(!c.issuez_issue_timeline_at(i, 0).*.is_new);
     try testing.expect(!c.issuez_issue_timeline_at(i, 1).*.is_new);
     const last = c.issuez_issue_timeline_at(i, 2).*;
-    try testing.expect(last.is_new and c.issuez_oid_eq(&last.commit, &second.commit));
+    try testing.expect(last.is_new and fixture.oidEql(last.commit, second.commit));
     c.issuez_issue_free(i);
 
     // No since: every entry is new, as from issuez_issue_load.
@@ -794,10 +697,7 @@ fn changeOf(list: []const c.issuez_change, field: c_uint) ?c.issuez_change {
 }
 
 test "issuez_entry_change_at: one change per field, unsaid values filled in, typed values" {
-    const leaks = fixture.Leaks.start();
-    defer leaks.check();
-    var r: fixture.Repo = undefined;
-    try r.init(.{});
+    var r = try fixture.Repo.init(.{});
     defer r.deinit();
     const h = r.handle;
     const x = try fixture.titled(h, "First title");
@@ -848,79 +748,4 @@ test "issuez_entry_change_at: one change per field, unsaid values filled in, typ
     const state = changeOf(changesAt(i, 5), c.ISSUEZ_FIELD_STATE).?;
     try expect.str("open", state.old_value);
     try testing.expect(!state.old_done and state.new_done);
-}
-
-test "issuez_issue_json, issuez_issue_json_many: the documented JSON" {
-    const leaks = fixture.Leaks.start();
-    defer leaks.check();
-    var r: fixture.Repo = undefined;
-    try r.init(.{});
-    defer r.deinit();
-    const h = r.handle;
-    const x = try fixture.create(
-        h,
-        &.{
-            c.issuez_set_title(fixture.str("As JSON")),
-            c.issuez_set_description(fixture.str("Body")),
-        },
-    );
-    const y = try fixture.titled(h, "Second");
-    var b: ?*c.issuez_bytes = null;
-    try expect.code(
-        c.ISSUEZ_E_INVALID_ARGUMENT,
-        c.issuez_issue_json(h, x.idStr(), 1 << 31, null, &b, null),
-        null,
-    );
-    try expect.code(
-        c.ISSUEZ_OK,
-        c.issuez_issue_json(h, x.idStr(), c.ISSUEZ_JSON_FLAG_FULL, null, &b, null),
-        null,
-    );
-    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
-    defer arena.deinit();
-    const one = try std.json.parseFromSliceLeaky(
-        std.json.Value,
-        arena.allocator(),
-        fixture.slice(c.issuez_bytes_data(b)),
-        .{},
-    );
-    c.issuez_bytes_free(b);
-    try testing.expectEqualStrings("As JSON", one.object.get("title").?.string);
-    try testing.expectEqualStrings("Body", one.object.get("description").?.string);
-    const ids = [_]c.issuez_str{ y.idStr(), x.idStr() };
-    try expect.code(
-        c.ISSUEZ_OK,
-        c.issuez_issue_json_many(h, &ids, ids.len, 0, null, &b, null),
-        null,
-    );
-    const two = try std.json.parseFromSliceLeaky(
-        std.json.Value,
-        arena.allocator(),
-        fixture.slice(c.issuez_bytes_data(b)),
-        .{},
-    );
-    c.issuez_bytes_free(b);
-    try testing.expectEqual(@as(usize, 2), two.array.items.len);
-    try testing.expectEqualStrings("Second", two.array.items[0].object.get("title").?.string);
-    try expect.code(c.ISSUEZ_OK, c.issuez_issue_json_many(h, null, 0, 0, null, &b, null), null);
-    const all = try std.json.parseFromSliceLeaky(
-        std.json.Value,
-        arena.allocator(),
-        fixture.slice(c.issuez_bytes_data(b)),
-        .{},
-    );
-    c.issuez_bytes_free(b);
-    try testing.expectEqual(@as(usize, 2), all.array.items.len);
-    try expect.code(
-        c.ISSUEZ_E_NOT_FOUND,
-        c.issuez_issue_json(
-            h,
-            fixture.str("0b6c4f63-6f5a-4a3e-9c2b-1d2e3f4a5b6c"),
-            0,
-            null,
-            &b,
-            null,
-        ),
-        null,
-    );
 }

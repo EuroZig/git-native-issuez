@@ -160,6 +160,24 @@ func TestRepo_PrepareAttachment(t *testing.T) {
 	if _, err := r.PrepareAttachment(t.Context(), "", "bad.png", []byte("no image")); err == nil {
 		t.Fatal("accepted invalid image")
 	}
+	// Refused the way a write refuses them.
+	var e *issuez.Error
+	if _, err := r.PrepareAttachment(t.Context(), "", "a.gif", []byte("GIF89a")); !errors.As(err, &e) || e.Code != issuez.CodeInvalidValue {
+		t.Errorf("gif: %v", err)
+	}
+	small := open(t, r.GitDir(), issuez.WithLimit("max_attachment_bytes", 8))
+	if _, err := small.PrepareAttachment(t.Context(), "", "a.png", png); !errors.As(err, &e) || e.Code != issuez.CodeLimit {
+		t.Errorf("too large: %v", err)
+	}
+	// The pointer is the one a write stores.
+	stored, err := newRepo(t).Create(t.Context(), new(issuez.Edit).SetTitle("Pointer").AddAttachment("", "a.png", png), ada, issuez.Reload())
+	if err != nil || stored.Issue.Attachments[0].SHA256 != a.SHA256 || stored.Issue.Attachments[0].Size != a.Size {
+		t.Errorf("stored %+v, prepared %+v: %v", stored, a, err)
+	}
+	r.Close()
+	if _, err := r.PrepareAttachment(t.Context(), "", "a.png", png); err == nil {
+		t.Error("closed repo")
+	}
 }
 
 func TestEdit_AddPreparedAttachment(t *testing.T) {
@@ -280,10 +298,9 @@ func TestImport_CommitConflict(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer stage.Close()
-	create(t, stage.Repo, "First")
-	if _, err := r.AdoptRefs(ctx, stage.Repo); err != nil {
-		t.Fatal(err)
-	}
+	first := create(t, stage.Repo, "First")
+	// The target has that issue by now, as if another writer got there first.
+	git(t, r.GitDir(), "update-ref", "refs/issues/"+first.ID, first.NewTip.String())
 	second := create(t, stage.Repo, "Second")
 	if _, err := stage.Commit(ctx); err == nil {
 		t.Fatal("overwrote existing refs")

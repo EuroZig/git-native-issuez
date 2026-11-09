@@ -31,29 +31,22 @@ pub fn main(comptime B: type, ctx: *context.Context(B), argv: []const []const u8
     var remote: ?[]const u8 = null;
     var how: ?issuez.sync.Resolution = null;
     var prefix: ?[]const u8 = null;
-    var args: common.Args = .{ .list = argv };
-    while (args.next()) |arg| {
-        if (!args.isOption(arg)) {
-            if (args.was_separator) continue;
-            if (remote != null) return common.missing(ctx.err, "quarantine", "unexpected argument");
-            remote = arg;
-        } else if (common.isHelp(arg)) {
-            ctx.out.writeAll(help) catch {};
-            return common.exit_ok;
-        } else if (std.mem.eql(u8, arg, "--accept-remote") or
-            std.mem.eql(u8, arg, "--keep-local"))
-        {
-            if (how != null) return common.missing(
-                ctx.err,
-                "quarantine",
-                "give one of --accept-remote or --keep-local",
-            );
-            how = if (std.mem.eql(u8, arg, "--accept-remote")) .accept_remote else .keep_local;
-            prefix = args.value(ctx.err, arg) orelse return common.exit_error;
-        } else {
-            return common.unknownOption(ctx.err, "quarantine", arg);
-        }
+    var parser = common.argParser(ctx, argv, .{
+        .command = "quarantine",
+        .help = help,
+        .positionals = .{ .only = .{ &remote, "unexpected argument" } },
+    });
+    while (parser.next()) |arg| {
+        if (!common.isFlag(arg, "--accept-remote --keep-local")) return parser.unknown(arg);
+        if (how != null) return common.missing(
+            ctx.err,
+            "quarantine",
+            "give one of --accept-remote or --keep-local",
+        );
+        how = if (std.mem.eql(u8, arg, "--accept-remote")) .accept_remote else .keep_local;
+        prefix = parser.value(arg) orelse return common.exit_error;
     }
+    if (parser.exit) |exit| return exit;
     const r = remote orelse return common.missing(ctx.err, "quarantine", "remote name is required");
     const resolution = how orelse return common.missing(
         ctx.err,

@@ -46,6 +46,15 @@ const Repo = struct {
     fn open(r: *Repo, gpa: Allocator) !GitProcess {
         return GitProcess.open(io, gpa, .{ .path = r.path, .environ_map = &r.env });
     }
+
+    /// `origin` is `hub`, by absolute path.
+    fn addOrigin(r: *Repo, gpa: Allocator, hub: *const Repo) !void {
+        const cwd = try std.process.currentPathAlloc(io, gpa);
+        defer gpa.free(cwd);
+        const url = try std.fmt.allocPrint(gpa, "{s}/{s}", .{ cwd, hub.path });
+        defer gpa.free(url);
+        try runGit(gpa, &r.env, r.path, &.{ "git", "remote", "add", "origin", url });
+    }
 };
 
 /// Deterministic identity, no user/system config influence.
@@ -413,10 +422,8 @@ test "push and fetch" {
     defer a.deinit(gpa);
     var b = try Repo.init(gpa, &.{});
     defer b.deinit(gpa);
-    const cwd = try std.process.currentPathAlloc(io, arena);
-    const hub_url = try std.fmt.allocPrint(arena, "{s}/{s}", .{ cwd, hub.path });
-    try runGit(gpa, &a.env, a.path, &.{ "git", "remote", "add", "origin", hub_url });
-    try runGit(gpa, &b.env, b.path, &.{ "git", "remote", "add", "origin", hub_url });
+    try a.addOrigin(gpa, &hub);
+    try b.addOrigin(gpa, &hub);
 
     var ga = try a.open(gpa);
     defer ga.close();
@@ -550,9 +557,7 @@ test "fetch with prune" {
     defer hub.deinit(gpa);
     var b = try Repo.init(gpa, &.{});
     defer b.deinit(gpa);
-    const cwd = try std.process.currentPathAlloc(io, arena);
-    const hub_url = try std.fmt.allocPrint(arena, "{s}/{s}", .{ cwd, hub.path });
-    try runGit(gpa, &b.env, b.path, &.{ "git", "remote", "add", "origin", hub_url });
+    try b.addOrigin(gpa, &hub);
 
     var gh = try hub.open(gpa);
     defer gh.close();
@@ -599,9 +604,7 @@ test "leased push replaces and deletes, and refuses a stale lease" {
     defer hub.deinit(gpa);
     var a = try Repo.init(gpa, &.{});
     defer a.deinit(gpa);
-    const cwd = try std.process.currentPathAlloc(io, arena);
-    const hub_url = try std.fmt.allocPrint(arena, "{s}/{s}", .{ cwd, hub.path });
-    try runGit(gpa, &a.env, a.path, &.{ "git", "remote", "add", "origin", hub_url });
+    try a.addOrigin(gpa, &hub);
     var ga = try a.open(gpa);
     defer ga.close();
 
@@ -652,9 +655,8 @@ test "pre-push hook" {
     defer hub.deinit(gpa);
     var a = try Repo.init(gpa, &.{});
     defer a.deinit(gpa);
+    try a.addOrigin(gpa, &hub);
     const cwd = try std.process.currentPathAlloc(io, arena);
-    const hub_url = try std.fmt.allocPrint(arena, "{s}/{s}", .{ cwd, hub.path });
-    try runGit(gpa, &a.env, a.path, &.{ "git", "remote", "add", "origin", hub_url });
 
     // The hook records the refs it is told about. It refuses while
     // `refuse` exists.
@@ -702,9 +704,7 @@ test "a hung git times out" {
     defer hub.deinit(gpa);
     var a = try Repo.init(gpa, &.{});
     defer a.deinit(gpa);
-    const cwd = try std.process.currentPathAlloc(io, arena);
-    const hub_url = try std.fmt.allocPrint(arena, "{s}/{s}", .{ cwd, hub.path });
-    try runGit(gpa, &a.env, a.path, &.{ "git", "remote", "add", "origin", hub_url });
+    try a.addOrigin(gpa, &hub);
     // Would hold back the sessions' answers.
     try a.env.put("GIT_FLUSH", "0");
 

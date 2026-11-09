@@ -168,10 +168,7 @@ fn drawColumn(s: *AppState, f: ui.Frame, win: ui.Window, c: u16) Allocator.Error
     }
     // Scroll the selected card into view.
     const top = &b.scroll[c];
-    if (b.follow and c == b.column) {
-        if (b.index < top.*) top.* = b.index;
-        if (b.index >= top.* + b.visible) top.* = b.index - b.visible + 1;
-    }
+    if (b.follow and c == b.column) ui.keepInView(top, b.index, b.visible);
     top.* = @min(top.*, @as(u32, @intCast(col.cards.len -| b.visible)));
     var n: u32 = 0;
     while (n < b.visible and top.* + n < col.cards.len) : (n += 1) {
@@ -229,40 +226,16 @@ fn drawCard(
     const inner = win.child(.{ .x_off = 2, .width = win.width -| 3 });
 
     // ID, priority, progress.
-    var x: u16 = 0;
-    x += ui.text(
-        inner,
-        x,
-        0,
-        issuez.format.uuid.shortId(issue.id),
-        .{ .fg = palette.id, .bg = bg },
-    );
+    var l: ui.Line = .{ .f = f, .win = inner };
+    l.text(issuez.format.uuid.shortId(issue.id), .{ .fg = palette.id, .bg = bg });
     if (s.snap.remote.isQuarantined(issue.id)) {
-        x += ui.text(inner, x, 0, "!", .{ .fg = palette.err, .bg = bg, .bold = true });
-    } else if (s.snap.remote.isUnpushed(issue.id)) x += ui.text(
-        inner,
-        x,
-        0,
-        "↑",
-        .{ .fg = palette.faint, .bg = bg },
-    );
-    x += 1;
-    if (issue.field("Priority")) |p| {
-        x += ui.text(inner, x, 0, p, .{ .fg = ui.priorityColor(p), .bg = bg });
-        x += 1;
-    }
-    if (snap.proj.activelyBlocked(i)) {
-        x += ui.text(inner, x, 0, "blocked", .{ .fg = palette.err, .bg = bg });
-        x += 1;
-    }
+        l.text("!", .{ .fg = palette.err, .bg = bg, .bold = true });
+    } else if (s.snap.remote.isUnpushed(issue.id)) l.text("↑", .{ .fg = palette.faint, .bg = bg });
+    l.x += 1;
+    if (issue.field("Priority")) |p| l.word(p, .{ .fg = ui.priorityColor(p), .bg = bg });
+    if (snap.proj.activelyBlocked(i)) l.word("blocked", .{ .fg = palette.err, .bg = bg });
     if (snap.proj.progress(i)) |p| {
-        _ = ui.text(
-            inner,
-            x,
-            0,
-            f.fmt("{d}/{d}", .{ p.closed, p.total }),
-            .{ .fg = palette.muted, .bg = bg },
-        );
+        l.text(f.fmt("{d}/{d}", .{ p.closed, p.total }), .{ .fg = palette.muted, .bg = bg });
     }
 
     // Title, two rows.
@@ -279,11 +252,10 @@ fn drawCard(
     if (rows.len > 2) _ = ui.text(inner, inner.width -| 1, 2, "…", ts);
 
     // Labels, assignee.
-    x = 0;
-    for (issue.labels) |l| {
-        if (x >= inner.width) break;
-        x += ui.text(inner, x, 3, l, .{ .fg = palette.label, .bg = bg });
-        x += 1;
+    l = .{ .f = f, .win = inner, .y = 3 };
+    for (issue.labels) |label| {
+        if (l.x >= inner.width) break;
+        l.word(label, .{ .fg = palette.label, .bg = bg });
     }
     if (issue.assignee) |a| {
         const who = f.fmt(
@@ -291,7 +263,7 @@ fn drawCard(
             .{a.email[0 .. std.mem.findScalar(u8, a.email, '@') orelse a.email.len]},
         );
         const ww = inner.gwidth(who);
-        if (x + ww < inner.width) _ = ui.text(
+        if (l.x + ww < inner.width) _ = ui.text(
             inner,
             inner.width - ww,
             3,

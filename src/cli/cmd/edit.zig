@@ -48,7 +48,6 @@ pub fn main(comptime B: type, ctx: *context.Context(B), argv: []const []const u8
     var issue_prefix: ?[]const u8 = null;
     var spec: issuez.engine.EditSpec = .{};
     var set_labels: std.ArrayList([]const u8) = .empty;
-    var labels_given = false;
     var add: std.ArrayList([]const u8) = .empty;
     var remove: std.ArrayList([]const u8) = .empty;
     var ext: ext_flags.Flags = .{};
@@ -59,162 +58,93 @@ pub fn main(comptime B: type, ctx: *context.Context(B), argv: []const []const u8
     var milestone: ?[]const u8 = null;
     var remove_assignees: std.ArrayList([]const u8) = .empty;
 
-    var args: common.Args = .{ .list = argv };
-    while (args.next()) |arg| {
-        if (!args.isOption(arg)) {
-            if (args.was_separator) continue;
-            if (issue_prefix == null) issue_prefix = arg;
-        } else if (common.isHelp(arg)) {
-            ctx.out.writeAll(help) catch {};
-            return common.exit_ok;
-        } else if (std.mem.eql(u8, arg, "-t") or std.mem.eql(u8, arg, "--title")) {
-            const v = args.value(ctx.err, "-t") orelse return common.exit_error;
-            if (common.hasNewline(v)) return common.fail(
-                ctx.err,
-                "error: title must not contain newlines\n",
-            );
-            if (std.mem.trim(u8, v, " \t").len == 0) return common.fail(
-                ctx.err,
-                "error: title must not be empty\n",
-            );
+    const flags = [_]common.Flag{
+        .{ "-l --label", .{ .label = &set_labels } },
+        .{ "--add-label", .{ .label = &add } },
+        .{ "--milestone", .{ .line = .{ &milestone, "milestone" } } },
+        .{ "-m --message", .{ .text = &spec.message } },
+        .{ "--description", .{ .list = &description } },
+        .{ "-c --comment", .{ .list = &comment } },
+        .{ "--fixed-by", .{ .line = .{ &spec.fixed_by, "--fixed-by value" } } },
+        .{ "--release", .{ .line = .{ &spec.release, "--release value" } } },
+        .{ "--reason", .{ .line = .{ &spec.reason, "--reason value" } } },
+        .{ "--unblock", .{ .list = &ext.unblock } },
+    } ++ ext.table();
+    var parser = common.argParser(ctx, argv, .{
+        .command = "edit",
+        .help = help,
+        .positionals = .{ .first = &issue_prefix },
+        .flags = &flags,
+    });
+    while (parser.next()) |arg| {
+        if (common.isFlag(arg, "-t --title")) {
+            const v = parser.value("-t") orelse return common.exit_error;
+            if (common.hasNewline(v))
+                return common.fail(ctx.err, "error: title must not contain newlines\n");
+            if (std.mem.trim(u8, v, " \t").len == 0)
+                return common.fail(ctx.err, "error: title must not be empty\n");
             spec.title = v;
-        } else if (std.mem.eql(u8, arg, "-l") or std.mem.eql(u8, arg, "--label") or
-            std.mem.eql(u8, arg, "--add-label") or std.mem.eql(u8, arg, "--remove-label"))
-        {
-            const flag = if (std.mem.eql(u8, arg, "--label")) "-l" else arg;
-            const v = args.value(ctx.err, flag) orelse return common.exit_error;
-            if (common.hasNewline(v)) return common.fail(
-                ctx.err,
-                "error: label must not contain newlines\n",
-            );
-            if (!std.mem.eql(
-                u8,
-                arg,
-                "--remove-label",
-            ) and std.mem.findScalar(u8, v, ',') != null) {
-                ctx.err.print(
-                    "error: label '{s}' contains a comma (use multiple -l flags instead)\n",
-                    .{v},
-                ) catch {};
-                return common.exit_error;
-            }
-            const list = if (std.mem.eql(u8, arg, "--add-label"))
-                &add
-            else if (std.mem.eql(u8, arg, "--remove-label"))
-                &remove
-            else blk: {
-                labels_given = true;
-                break :blk &set_labels;
-            };
-            if (std.mem.eql(u8, arg, "--remove-label")) {
-                // Like upstream, a comma-separated value removes each label.
-                var it = std.mem.splitScalar(u8, v, ',');
-                while (it.next()) |part| list.append(
-                    arena,
-                    std.mem.trim(u8, part, " \t"),
-                ) catch return common.oom(ctx.err);
-            } else {
-                list.append(arena, v) catch return common.oom(ctx.err);
-            }
-        } else if (std.mem.eql(u8, arg, "-a") or std.mem.eql(u8, arg, "--assignee")) {
-            const v = args.value(ctx.err, "-a") orelse return common.exit_error;
-            if (common.hasNewline(v)) return common.fail(
-                ctx.err,
-                "error: assignee must not contain newlines\n",
-            );
-            if (v.len == 0) {
-                spec.set_assignees = &.{};
-            } else {
-                if (!common.validateAssignee(ctx.err, v)) return common.exit_error;
+        } else if (common.isFlag(arg, "--remove-label")) {
+            const v = parser.value(arg) orelse return common.exit_error;
+            if (common.hasNewline(v))
+                return common.fail(ctx.err, "error: label must not contain newlines\n");
+            // Like upstream, a comma-separated value removes each label.
+            var it = std.mem.splitScalar(u8, v, ',');
+            while (it.next()) |part| remove.append(
+                arena,
+                std.mem.trim(u8, part, " \t"),
+            ) catch return common.oom(ctx.err);
+        } else if (common.isFlag(arg, "-a --assignee")) {
+            const v = parser.value("-a") orelse return common.exit_error;
+            if (!common.validateAssigneeLine(ctx.err, v)) return common.exit_error;
+            spec.set_assignees = &.{};
+            if (v.len > 0) {
                 const one = arena.alloc(issuez.format.fields.Assignee, 1) catch
                     return common.oom(ctx.err);
                 one[0] = common.assigneeOf(v);
                 spec.set_assignees = one;
             }
-        } else if (std.mem.eql(u8, arg, "--lock") or std.mem.eql(u8, arg, "--unlock")) {
+        } else if (common.isFlag(arg, "--lock --unlock")) {
             spec.locked = std.mem.eql(u8, arg, "--lock");
-        } else if (std.mem.eql(u8, arg, "--lock-reason")) {
-            const v = args.value(ctx.err, arg) orelse return common.exit_error;
-            if (common.hasNewline(v)) return common.fail(
-                ctx.err,
-                "error: lock reason must be one line\n",
-            );
-            spec.lock_reason = v;
-        } else if (std.mem.eql(u8, arg, "--ref")) {
-            const v = args.value(ctx.err, arg) orelse return common.exit_error;
+        } else if (common.isFlag(arg, "--lock-reason")) {
+            spec.lock_reason = parser.value(arg) orelse return common.exit_error;
+            if (common.hasNewline(spec.lock_reason.?))
+                return common.fail(ctx.err, "error: lock reason must be one line\n");
+        } else if (common.isFlag(arg, "--ref")) {
+            const v = parser.value(arg) orelse return common.exit_error;
             if (v.len > 0 and !issuez.format.fields.isRefName(v))
                 return common.fail(ctx.err, "error: --ref takes a branch or tag name\n");
             spec.ref = .fromInput(v);
-        } else if (std.mem.eql(u8, arg, "--number")) {
-            const v = args.value(ctx.err, arg) orelse return common.exit_error;
-            spec.number = issuez.format.fields.parseNumber(v) orelse
-                return common.fail(
-                    ctx.err,
-                    "error: a number is a decimal from 1, without leading zeros\n",
-                );
-        } else if (std.mem.eql(u8, arg, "--add-assignee") or std.mem.eql(u8, arg, "--unassign")) {
-            const v = args.value(ctx.err, arg) orelse return common.exit_error;
-            if (common.hasNewline(v)) return common.fail(
-                ctx.err,
-                "error: assignee must not contain newlines\n",
-            );
-            if (std.mem.eql(u8, arg, "--add-assignee")) {
-                if (!common.validateAssignee(ctx.err, v)) return common.exit_error;
-                if (v.len > 0) add_assignees.append(arena, common.assigneeOf(v)) catch
-                    return common.oom(ctx.err);
-            } else remove_assignees.append(arena, v) catch return common.oom(ctx.err);
-        } else if (std.mem.eql(u8, arg, "-p") or std.mem.eql(u8, arg, "--priority")) {
-            const v = args.value(ctx.err, "-p") orelse return common.exit_error;
-            const p = core.Priority.parse(v) orelse return common.fail(
-                ctx.err,
-                "error: priority must be low, medium, high, or critical\n",
-            );
+        } else if (common.isFlag(arg, "--number")) {
+            const v = parser.value(arg) orelse return common.exit_error;
+            spec.number = common.numberOf(ctx.err, v) orelse return common.exit_error;
+        } else if (common.isFlag(arg, "--add-assignee")) {
+            const v = parser.value(arg) orelse return common.exit_error;
+            if (!common.validateAssigneeLine(ctx.err, v)) return common.exit_error;
+            if (v.len > 0) add_assignees.append(arena, common.assigneeOf(v)) catch
+                return common.oom(ctx.err);
+        } else if (common.isFlag(arg, "--unassign")) {
+            const v = parser.value(arg) orelse return common.exit_error;
+            if (common.hasNewline(v))
+                return common.fail(ctx.err, "error: assignee must not contain newlines\n");
+            remove_assignees.append(arena, v) catch return common.oom(ctx.err);
+        } else if (common.isFlag(arg, "-p --priority")) {
+            const v = parser.value("-p") orelse return common.exit_error;
+            const p = common.priorityOf(ctx.err, v) orelse return common.exit_error;
             spec.priority = .{ .set = p };
-        } else if (std.mem.eql(u8, arg, "--milestone")) {
-            const v = args.value(ctx.err, "--milestone") orelse return common.exit_error;
-            if (common.hasNewline(v)) return common.fail(
-                ctx.err,
-                "error: milestone must not contain newlines\n",
-            );
-            milestone = v;
-        } else if (std.mem.eql(u8, arg, "-m") or std.mem.eql(u8, arg, "--message")) {
-            spec.message = args.value(ctx.err, "-m") orelse return common.exit_error;
-        } else if (std.mem.eql(u8, arg, "--description")) {
-            const v = args.value(ctx.err, arg) orelse return common.exit_error;
-            description.append(arena, v) catch return common.oom(ctx.err);
-        } else if (std.mem.eql(u8, arg, "-c") or std.mem.eql(u8, arg, "--comment")) {
-            const v = args.value(ctx.err, "-c") orelse return common.exit_error;
-            comment.append(arena, v) catch return common.oom(ctx.err);
-        } else if (std.mem.eql(u8, arg, "--state")) {
-            const v = args.value(ctx.err, arg) orelse return common.exit_error;
+        } else if (common.isFlag(arg, "--state")) {
+            const v = parser.value(arg) orelse return common.exit_error;
             if (!core.isState(v)) return common.fail(
                 ctx.err,
                 "error: state must contain only alphanumeric characters, hyphens, or underscores\n",
             );
             spec.state = core.State.parse(v);
-        } else if (std.mem.eql(u8, arg, "--fixed-by") or std.mem.eql(u8, arg, "--release") or
-            std.mem.eql(u8, arg, "--reason"))
-        {
-            const v = args.value(ctx.err, arg) orelse return common.exit_error;
-            if (common.hasNewline(v)) {
-                ctx.err.print("error: {s} value must not contain newlines\n", .{arg}) catch {};
-                return common.exit_error;
-            }
-            if (std.mem.eql(u8, arg, "--fixed-by")) spec.fixed_by = v;
-            if (std.mem.eql(u8, arg, "--release")) spec.release = v;
-            if (std.mem.eql(u8, arg, "--reason")) spec.reason = v;
-        } else switch (ext.parse(arena, ctx.err, &args, arg, true)) {
-            .yes => {},
-            .failed => return common.exit_error,
-            .no => return common.unknownOption(ctx.err, "edit", arg),
-        }
+        } else if (!ext.clear(arg)) return parser.unknown(arg);
     }
-    const prefix = issue_prefix orelse return common.missing(
-        ctx.err,
-        "edit",
-        "issue ID is required",
-    );
-    if (labels_given) spec.set_labels = set_labels.items;
+    if (parser.exit) |exit| return exit;
+    const prefix = issue_prefix orelse
+        return common.missing(ctx.err, "edit", "issue ID is required");
+    if (set_labels.items.len > 0) spec.set_labels = set_labels.items;
     spec.add_labels = add.items;
     spec.remove_labels = remove.items;
     spec.add_assignees = add_assignees.items;
@@ -246,13 +176,7 @@ pub fn main(comptime B: type, ctx: *context.Context(B), argv: []const []const u8
     );
 
     const repo = common.openRepo(B, ctx) orelse return common.exit_fatal;
-    const ref = common.resolveOne(
-        B,
-        repo,
-        arena,
-        ctx.err,
-        prefix,
-    ) orelse return common.exit_error;
+    const ref = common.resolveOne(B, repo, arena, ctx.err, prefix) orelse return common.exit_error;
     const x = ext.resolve(B, ctx, repo) orelse return common.exit_error;
     const current = repo.load(arena, ref) catch |e| return common.repoFailed(B, ctx, e);
     const ms = ext_flags.resolveMilestone(B, ctx, repo, ext, milestone, current) orelse

@@ -23,42 +23,51 @@ const SimRepos = struct {
 const Server = tools.Server(SimRepos, "0.0.0-test");
 
 const Harness = struct {
+    arena_state: std.heap.ArenaAllocator,
     arena: std.mem.Allocator,
+    world: GitSim.World,
+    sim: GitSim,
+    repos: SimRepos,
+    handler: tools.Handler(SimRepos),
     server: Server,
-    next_id: u32 = 1,
+    next_id: u32,
 
-    /// The `result` of a `tools/call`.
-    fn call(h: *Harness, name: []const u8, arguments: []const u8) !std.json.ObjectMap {
-        const id = h.next_id;
-        h.next_id += 1;
-        const msg = try std.fmt.allocPrint(
-            h.arena,
-            "{{\"jsonrpc\":\"2.0\",\"id\":{d},\"method\":\"tools/call\"," ++
-                "\"params\":{{\"name\":\"{s}\",\"arguments\":{s}}}}}",
-            .{ id, name, arguments },
-        );
-        var reader: std.Io.Reader = .fixed("");
-        var out: std.Io.Writer.Allocating = .init(h.arena);
-        var stream: mcp.Transport.Stream = .init(&reader, &out.writer);
-        try h.server.handleMessage(testing.io, testing.allocator, &stream.transport, msg);
-        const response = try std.json.parseFromSliceLeaky(
-            std.json.Value,
-            h.arena,
-            out.written(),
-            .{},
-        );
-        return response.object.get("result").?.object;
+    /// A server before `initialize`, on one simulated clone that is Ada's.
+    fn createUninitialized() !*Harness {
+        const h = try testing.allocator.create(Harness);
+        errdefer testing.allocator.destroy(h);
+        h.arena_state = .init(testing.allocator);
+        errdefer h.arena_state.deinit();
+        h.arena = h.arena_state.allocator();
+        h.world = .{
+            .identity = .{ .name = "Ada", .email = "ada@example.invalid" },
+            .clones = &.{.{ .name = "local" }},
+        };
+        h.sim = try GitSim.init(h.arena, &h.world, 0);
+        h.repos = .{ .sim = &h.sim };
+        h.handler = .{ .repos = &h.repos };
+        h.server = .init(&h.handler);
+        h.next_id = 1;
+        return h;
     }
 
-    /// The response to a request.
-    fn send(h: *Harness, method: []const u8, params: []const u8) !std.json.ObjectMap {
-        const id = h.next_id;
-        h.next_id += 1;
-        const msg = try std.fmt.allocPrint(
-            h.arena,
-            "{{\"jsonrpc\":\"2.0\",\"id\":{d},\"method\":\"{s}\",\"params\":{s}}}",
-            .{ id, method, params },
-        );
+    fn create() !*Harness {
+        const h = try createUninitialized();
+        h.server.connection.markInitialized(.{
+            .protocolVersion = mcp.types.latest_protocol_version,
+            .capabilities = .{},
+            .clientInfo = .{ .name = "test", .version = "0" },
+        });
+        return h;
+    }
+
+    fn destroy(h: *Harness) void {
+        h.arena_state.deinit();
+        testing.allocator.destroy(h);
+    }
+
+    /// The parsed response to one JSON-RPC message.
+    fn raw(h: *Harness, msg: []const u8) !std.json.ObjectMap {
         var reader: std.Io.Reader = .fixed("");
         var out: std.Io.Writer.Allocating = .init(h.arena);
         var stream: mcp.Transport.Stream = .init(&reader, &out.writer);
@@ -70,6 +79,31 @@ const Harness = struct {
             .{},
         );
         return response.object;
+    }
+
+    /// The `result` of a `tools/call`.
+    fn call(h: *Harness, name: []const u8, arguments: []const u8) !std.json.ObjectMap {
+        const id = h.next_id;
+        h.next_id += 1;
+        const msg = try std.fmt.allocPrint(
+            h.arena,
+            "{{\"jsonrpc\":\"2.0\",\"id\":{d},\"method\":\"tools/call\"," ++
+                "\"params\":{{\"name\":\"{s}\",\"arguments\":{s}}}}}",
+            .{ id, name, arguments },
+        );
+        return (try h.raw(msg)).get("result").?.object;
+    }
+
+    /// The response to a request.
+    fn send(h: *Harness, method: []const u8, params: []const u8) !std.json.ObjectMap {
+        const id = h.next_id;
+        h.next_id += 1;
+        const msg = try std.fmt.allocPrint(
+            h.arena,
+            "{{\"jsonrpc\":\"2.0\",\"id\":{d},\"method\":\"{s}\",\"params\":{s}}}",
+            .{ id, method, params },
+        );
+        return h.raw(msg);
     }
 
     /// The `result` of a request that must succeed.
@@ -129,28 +163,12 @@ fn str(o: std.json.ObjectMap, key: []const u8) []const u8 {
 }
 
 test "create, list, show, comment, edit and close" {
-    var arena_state: std.heap.ArenaAllocator = .init(testing.allocator);
-    defer arena_state.deinit();
-    const arena = arena_state.allocator();
-
-    var world: GitSim.World = .{
-        .identity = .{ .name = "Ada", .email = "ada@example.invalid" },
-        .clones = &.{.{ .name = "local" }},
-    };
-    var sim = try GitSim.init(arena, &world, 0);
-    var repos: SimRepos = .{ .sim = &sim };
-    var handler: tools.Handler(SimRepos) = .{
-        .repos = &repos,
-        // 2026-11-04 23:30 UTC: already the 5th an hour east.
-        .zone = .{ .initial = 3600 },
-        .now_s = 1_793_835_000,
-    };
-    var h: Harness = .{ .arena = arena, .server = .init(&handler) };
-    h.server.connection.markInitialized(.{
-        .protocolVersion = mcp.types.latest_protocol_version,
-        .capabilities = .{},
-        .clientInfo = .{ .name = "test", .version = "0" },
-    });
+    const h = try Harness.create();
+    defer h.destroy();
+    const arena = h.arena;
+    // 2026-11-04 23:30 UTC: already the 5th an hour east.
+    h.handler.zone = .{ .initial = 3600 };
+    h.handler.now_s = 1_793_835_000;
 
     const parent = try h.ok("create_issue",
         \\{"title":"Release 1.0","labels":["release"],"priority":"high","due":"2026-12-01"}
@@ -307,24 +325,10 @@ test "create, list, show, comment, edit and close" {
 }
 
 test "milestones by name, as text and cleared" {
-    var arena_state: std.heap.ArenaAllocator = .init(testing.allocator);
-    defer arena_state.deinit();
-    const arena = arena_state.allocator();
-
-    var world: GitSim.World = .{
-        .identity = .{ .name = "Ada", .email = "ada@example.invalid" },
-        .clones = &.{.{ .name = "local" }},
-    };
-    var sim = try GitSim.init(arena, &world, 0);
-    const v1 = try issuez.Catalog(GitSim).init(&sim).create(arena, .{ .name = "v1" }, .{});
-    var repos: SimRepos = .{ .sim = &sim };
-    var handler: tools.Handler(SimRepos) = .{ .repos = &repos };
-    var h: Harness = .{ .arena = arena, .server = .init(&handler) };
-    h.server.connection.markInitialized(.{
-        .protocolVersion = mcp.types.latest_protocol_version,
-        .capabilities = .{},
-        .clientInfo = .{ .name = "test", .version = "0" },
-    });
+    const h = try Harness.create();
+    defer h.destroy();
+    const arena = h.arena;
+    const v1 = try issuez.Catalog(GitSim).init(&h.sim).create(arena, .{ .name = "v1" }, .{});
 
     const created = try h.ok("create_issue", "{\"title\":\"Ship\",\"milestone\":\"v1\"}");
     const id = str(created, "id");
@@ -362,19 +366,9 @@ test "milestones by name, as text and cleared" {
 }
 
 test "resources: list, templates, read" {
-    var arena_state: std.heap.ArenaAllocator = .init(testing.allocator);
-    defer arena_state.deinit();
-    const arena = arena_state.allocator();
-    var world: GitSim.World = .{ .clones = &.{.{ .name = "local" }} };
-    var sim = try GitSim.init(arena, &world, 0);
-    var repos: SimRepos = .{ .sim = &sim };
-    var handler: tools.Handler(SimRepos) = .{ .repos = &repos };
-    var h: Harness = .{ .arena = arena, .server = .init(&handler) };
-    h.server.connection.markInitialized(.{
-        .protocolVersion = mcp.types.latest_protocol_version,
-        .capabilities = .{},
-        .clientInfo = .{ .name = "test", .version = "0" },
-    });
+    const h = try Harness.create();
+    defer h.destroy();
+    const arena = h.arena;
     try testing.expect(Server.capabilities.resources != null);
 
     const listed = (try h.request("resources/list", "{}")).object;
@@ -446,57 +440,27 @@ test "subscriptions: which a change touches" {
 }
 
 test "resources/subscribe and unsubscribe" {
-    var arena_state: std.heap.ArenaAllocator = .init(testing.allocator);
-    defer arena_state.deinit();
-    const arena = arena_state.allocator();
-    var world: GitSim.World = .{ .clones = &.{.{ .name = "local" }} };
-    var sim = try GitSim.init(arena, &world, 0);
-    var repos: SimRepos = .{ .sim = &sim };
-    var handler: tools.Handler(SimRepos) = .{ .repos = &repos };
-    var h: Harness = .{ .arena = arena, .server = .init(&handler) };
-    h.server.connection.markInitialized(.{
-        .protocolVersion = mcp.types.latest_protocol_version,
-        .capabilities = .{},
-        .clientInfo = .{ .name = "test", .version = "0" },
-    });
+    const h = try Harness.create();
+    defer h.destroy();
     try testing.expect(Server.capabilities.resources.?.subscribe.?);
 
     _ = try h.request("resources/subscribe", "{\"uri\":\"git-issue://issues\"}");
     _ = try h.request("resources/subscribe", "{\"uri\":\"git-issue://issues/abc\"}");
-    try testing.expectEqual(@as(u8, 2), handler.subscriptions.count);
+    try testing.expectEqual(@as(u8, 2), h.handler.subscriptions.count);
     const err = try h.requestError("resources/subscribe", "{\"uri\":\"git-issue://nope\"}");
     try testing.expectEqual(@as(i64, -32002), err.get("code").?.integer);
     _ = try h.request("resources/unsubscribe", "{\"uri\":\"git-issue://issues\"}");
-    try testing.expectEqual(@as(u8, 1), handler.subscriptions.count);
+    try testing.expectEqual(@as(u8, 1), h.handler.subscriptions.count);
 }
 
 test "tools/list" {
-    var arena_state: std.heap.ArenaAllocator = .init(testing.allocator);
-    defer arena_state.deinit();
-    const arena = arena_state.allocator();
+    const h = try Harness.create();
+    defer h.destroy();
 
-    var world: GitSim.World = .{
-        .identity = .{ .name = "Ada", .email = "ada@example.invalid" },
-        .clones = &.{.{ .name = "local" }},
-    };
-    var sim = try GitSim.init(arena, &world, 0);
-    var repos: SimRepos = .{ .sim = &sim };
-    var handler: tools.Handler(SimRepos) = .{ .repos = &repos };
-    var server: Server = .init(&handler);
-    server.connection.markInitialized(.{
-        .protocolVersion = mcp.types.latest_protocol_version,
-        .capabilities = .{},
-        .clientInfo = .{ .name = "test", .version = "0" },
-    });
-
-    var reader: std.Io.Reader = .fixed("");
-    var out: std.Io.Writer.Allocating = .init(arena);
-    var stream: mcp.Transport.Stream = .init(&reader, &out.writer);
-    try server.handleMessage(testing.io, testing.allocator, &stream.transport,
+    const response = try h.raw(
         \\{"jsonrpc":"2.0","id":1,"method":"tools/list"}
     );
-    const response = try std.json.parseFromSliceLeaky(std.json.Value, arena, out.written(), .{});
-    const list = response.object.get("result").?.object.get("tools").?.array.items;
+    const list = response.get("result").?.object.get("tools").?.array.items;
     const names = [_][]const u8{
         "list_issues",     "show_issue",    "search_issues", "list_milestones",
         "create_issue",    "comment_issue", "edit_issue",    "react_issue",
@@ -510,23 +474,9 @@ test "tools/list" {
 }
 
 test "reactions, host fields and provenance" {
-    var arena_state: std.heap.ArenaAllocator = .init(testing.allocator);
-    defer arena_state.deinit();
-    const arena = arena_state.allocator();
-
-    var world: GitSim.World = .{
-        .identity = .{ .name = "Ada", .email = "ada@example.invalid" },
-        .clones = &.{.{ .name = "local" }},
-    };
-    var sim = try GitSim.init(arena, &world, 0);
-    var repos: SimRepos = .{ .sim = &sim };
-    var handler: tools.Handler(SimRepos) = .{ .repos = &repos };
-    var h: Harness = .{ .arena = arena, .server = .init(&handler) };
-    h.server.connection.markInitialized(.{
-        .protocolVersion = mcp.types.latest_protocol_version,
-        .capabilities = .{},
-        .clientInfo = .{ .name = "test", .version = "0" },
-    });
+    const h = try Harness.create();
+    defer h.destroy();
+    const arena = h.arena;
 
     const created = try h.ok("create_issue",
         \\{"title":"Imported","fields":[{"key":"X-Forgejo-Project","value":"7"}],
@@ -597,25 +547,15 @@ test "server/discover before initialize: an error clients fall back on" {
     // The stdio binding of protocol 2026-07-28: a client probes with
     // server/discover and falls back to initialize on any error but the
     // modern ones (-32020 to -32022). This server speaks 2025-11-25.
-    var arena_state: std.heap.ArenaAllocator = .init(testing.allocator);
-    defer arena_state.deinit();
-    const arena = arena_state.allocator();
-    var world: GitSim.World = .{ .clones = &.{.{ .name = "a" }} };
-    var sim = try GitSim.init(arena, &world, 0);
-    var repos: SimRepos = .{ .sim = &sim };
-    var handler: tools.Handler(SimRepos) = .{ .repos = &repos };
-    var server: Server = .init(&handler);
+    const h = try Harness.createUninitialized();
+    defer h.destroy();
 
-    var reader: std.Io.Reader = .fixed("");
-    var out: std.Io.Writer.Allocating = .init(arena);
-    var stream: mcp.Transport.Stream = .init(&reader, &out.writer);
-    try server.handleMessage(testing.io, testing.allocator, &stream.transport,
+    const response = try h.raw(
         \\{"jsonrpc":"2.0","id":1,"method":"server/discover","params":{"_meta":{
         \\"io.modelcontextprotocol/protocolVersion":"2026-07-28",
         \\"io.modelcontextprotocol/clientCapabilities":{}}}}
     );
-    const response = try std.json.parseFromSliceLeaky(std.json.Value, arena, out.written(), .{});
-    try testing.expect(response.object.get("result") == null);
-    const code = response.object.get("error").?.object.get("code").?.integer;
+    try testing.expect(response.get("result") == null);
+    const code = response.get("error").?.object.get("code").?.integer;
     try testing.expect(code < -32022 or code > -32020);
 }

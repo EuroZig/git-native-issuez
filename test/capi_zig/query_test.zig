@@ -40,8 +40,9 @@ const World = struct {
     e: fixture.Created,
     m: fixture.Created,
 
-    fn init(w: *World) !void {
-        try w.r.init(.{});
+    fn init() !World {
+        var w: World = undefined;
+        w.r = try fixture.Repo.init(.{});
         errdefer w.r.deinit();
         const h = w.r.handle;
         w.m = try fixture.milestone(h, "v1");
@@ -116,6 +117,7 @@ const World = struct {
                 );
             }
         }
+        return w;
     }
 
     fn make(
@@ -158,22 +160,12 @@ const World = struct {
                 fixture.slice(c.issuez_issue_info_of(c.issuez_issue_list_at(list, i)).*.title),
             );
         }
-        var count: u64 = 0;
-        try expect.code(
-            c.ISSUEZ_OK,
-            c.issuez_query_count(w.r.handle, ops.ptr, ops.len, null, &count, null),
-            null,
-        );
-        try testing.expectEqual(@as(u64, c.issuez_issue_list_len(list)), count);
         return out.items;
     }
 };
 
-test "issuez_query_run, issuez_query_count: every filter" {
-    const leaks = fixture.Leaks.start();
-    defer leaks.check();
-    var w: World = undefined;
-    try w.init();
+test "issuez_query_run: every filter" {
+    var w = try World.init();
     defer w.deinit();
     const created_asc = blk: {
         var o = num(c.ISSUEZ_OPT_Q_ORDER, c.ISSUEZ_SORT_CREATED);
@@ -236,10 +228,7 @@ test "issuez_query_run, issuez_query_count: every filter" {
 }
 
 test "issuez_query_run: every sort" {
-    const leaks = fixture.Leaks.start();
-    defer leaks.check();
-    var w: World = undefined;
-    try w.init();
+    var w = try World.init();
     defer w.deinit();
     const Case = struct { c_uint, i64, []const c.issuez_op, []const u8 };
     const cases = [_]Case{
@@ -273,10 +262,7 @@ test "issuez_query_run: every sort" {
 
 // covers: issuez_issue_list_at, issuez_issue_list_next_cursor, issuez_issue_list_free
 test "issuez_issue_list_len: pages" {
-    const leaks = fixture.Leaks.start();
-    defer leaks.check();
-    var w: World = undefined;
-    try w.init();
+    var w = try World.init();
     defer w.deinit();
     var order = num(c.ISSUEZ_OPT_Q_ORDER, c.ISSUEZ_SORT_CREATED);
     order.num2 = 1;
@@ -313,18 +299,10 @@ test "issuez_issue_list_len: pages" {
         c.issuez_query_run(w.r.handle, null, 0, null, null, null),
         null,
     );
-    try expect.code(
-        c.ISSUEZ_E_INVALID_ARGUMENT,
-        c.issuez_query_count(w.r.handle, null, 0, null, null, null),
-        null,
-    );
 }
 
 test "issuez_issue_list_skipped_count, issuez_issue_list_skipped_at: damaged issues" {
-    const leaks = fixture.Leaks.start();
-    defer leaks.check();
-    var r: fixture.Repo = undefined;
-    try r.init(.{});
+    var r = try fixture.Repo.init(.{});
     defer r.deinit();
     _ = try fixture.titled(r.handle, "Fine");
     const blob = try r.git(&.{ "hash-object", "-w", "--stdin" });
@@ -351,17 +329,11 @@ fn countReads(_: ?*anyopaque, e: [*c]const c.issuez_log_event) callconv(.c) void
 }
 
 fn countAll(h: *c.issuez_repo) !u64 {
-    var n: u64 = 0;
-    var all = [_]c.issuez_op{c.issuez_q_done(-1)};
-    try expect.code(c.ISSUEZ_OK, c.issuez_query_count(h, &all, 1, null, &n, null), null);
-    return n;
+    return fixture.queryCount(h, &.{c.issuez_q_done(-1)});
 }
 
 test "issuez_query_run: the cache loads only what changed, and sees every change" {
-    const leaks = fixture.Leaks.start();
-    defer leaks.check();
-    var r: fixture.Repo = undefined;
-    try r.init(.{});
+    var r = try fixture.Repo.init(.{});
     defer r.deinit();
     const h = r.handle;
     const a = try fixture.titled(h, "A");
@@ -377,11 +349,10 @@ test "issuez_query_run: the cache loads only what changed, and sees every change
     // A write through the library, one by another tool, a purge.
     _ = try fixture.update(h, a.idStr(), &.{c.issuez_add_label(fixture.str("seen"))});
     var labelled = [_]c.issuez_op{c.issuez_q_label(fixture.str("seen"))};
-    var n: u64 = 0;
-    try expect.code(c.ISSUEZ_OK, c.issuez_query_count(h, &labelled, 1, null, &n, null), null);
+    var n = try fixture.queryCount(h, &labelled);
     try testing.expectEqual(@as(u64, 1), n);
     try fixture.foreignCommit(&r, b.idSlice(), "Label\n\nLabels: seen");
-    try expect.code(c.ISSUEZ_OK, c.issuez_query_count(h, &labelled, 1, null, &n, null), null);
+    n = try fixture.queryCount(h, &labelled);
     try testing.expectEqual(@as(u64, 2), n);
     var pr: ?*c.issuez_purge_result = null;
     try expect.code(
@@ -391,7 +362,7 @@ test "issuez_query_run: the cache loads only what changed, and sees every change
     );
     c.issuez_purge_result_free(pr);
     try testing.expectEqual(@as(u64, 2), try countAll(h));
-    try expect.code(c.ISSUEZ_OK, c.issuez_query_count(h, &labelled, 1, null, &n, null), null);
+    n = try fixture.queryCount(h, &labelled);
     try testing.expectEqual(@as(u64, 1), n);
 
     // With the cache off, every query reads again.
@@ -401,169 +372,4 @@ test "issuez_query_run: the cache loads only what changed, and sees every change
     reads.store(0, .monotonic);
     _ = try countAll(uncached);
     try testing.expect(reads.load(.monotonic) > 0);
-}
-
-// covers: issuez_label_counts_len, issuez_label_counts_at, issuez_label_counts_free
-// covers: issuez_people_take, issuez_people_len, issuez_people_at, issuez_people_free
-// covers: issuez_short_ids_take, issuez_short_ids_len, issuez_short_ids_at
-// covers: issuez_short_ids_find, issuez_short_ids_free
-test "issuez_label_counts_take: across issues" {
-    const leaks = fixture.Leaks.start();
-    defer leaks.check();
-    var r: fixture.Repo = undefined;
-    try r.init(.{});
-    defer r.deinit();
-    const h = r.handle;
-    const grace: c.issuez_person = .{
-        .name = .{},
-        .email = fixture.str("grace@example.invalid"),
-        .user_id = .{},
-    };
-    const x = try fixture.create(
-        h,
-        &.{
-            c.issuez_set_title(fixture.str("One")),
-            c.issuez_add_label(fixture.str("bug")),
-            c.issuez_add_assignee(grace),
-        },
-    );
-    _ = try fixture.create(
-        h,
-        &.{
-            c.issuez_set_title(fixture.str("Two")),
-            c.issuez_add_label(fixture.str("bug")),
-            c.issuez_add_label(fixture.str("ui")),
-            c.issuez_set_state(fixture.str("closed")),
-        },
-    );
-
-    var labels: ?*c.issuez_label_counts = null;
-    try expect.code(c.ISSUEZ_OK, c.issuez_label_counts_take(h, null, &labels, null), null);
-    try testing.expectEqual(@as(usize, 2), c.issuez_label_counts_len(labels));
-    const bug = c.issuez_label_counts_at(labels, 0).*;
-    try expect.str("bug", bug.name);
-    try testing.expectEqual(@as(u32, 1), bug.open);
-    try testing.expectEqual(@as(u32, 2), bug.total);
-    try testing.expect(c.issuez_label_counts_at(labels, 2) == null);
-    c.issuez_label_counts_free(labels);
-
-    var who: ?*c.issuez_people = null;
-    try expect.code(c.ISSUEZ_OK, c.issuez_people_take(h, null, &who, null), null);
-    try testing.expectEqual(@as(usize, 2), c.issuez_people_len(who));
-    const ada = c.issuez_people_at(who, 0).*;
-    try expect.str("ada@example.invalid", ada.person.email);
-    try testing.expectEqual(@as(u32, 2), ada.authored);
-    try testing.expectEqual(@as(u32, 1), c.issuez_people_at(who, 1).*.assigned);
-    try testing.expect(c.issuez_people_at(who, 2) == null);
-    c.issuez_people_free(who);
-
-    var short: ?*c.issuez_short_ids = null;
-    try expect.code(c.ISSUEZ_OK, c.issuez_short_ids_take(h, 4, null, &short, null), null);
-    try testing.expectEqual(@as(usize, 2), c.issuez_short_ids_len(short));
-    const mine = c.issuez_short_ids_find(short, x.idStr());
-    try testing.expect(mine.len >= 4 and std.mem.startsWith(u8, x.idSlice(), fixture.slice(mine)));
-    try testing.expect(c.issuez_short_ids_at(short, 0).*.id.len == 36);
-    try testing.expect(c.issuez_short_ids_at(short, 1).*.prefix.len >= 4);
-    for (0..2) |i| {
-        const item = c.issuez_short_ids_at(short, i).*;
-        if (std.mem.eql(u8, fixture.slice(item.id), x.idSlice()))
-            try expect.str(fixture.slice(mine), item.prefix);
-    }
-    try testing.expect(c.issuez_short_ids_find(short, fixture.str("x")).ptr == null);
-    try testing.expect(c.issuez_short_ids_at(short, 2) == null);
-    c.issuez_short_ids_free(short);
-    try expect.code(
-        c.ISSUEZ_E_INVALID_ARGUMENT,
-        c.issuez_people_take(null, null, &who, null),
-        null,
-    );
-}
-
-// covers: issuez_search_hits_len, issuez_search_hits_at, issuez_search_hits_free
-test "issuez_search: lines that contain a string" {
-    const leaks = fixture.Leaks.start();
-    defer leaks.check();
-    var r: fixture.Repo = undefined;
-    try r.init(.{});
-    defer r.deinit();
-    const h = r.handle;
-    const x = try fixture.create(
-        h,
-        &.{
-            c.issuez_set_title(fixture.str("Login crashes")),
-            c.issuez_set_description(fixture.str("On Safari.\nlogin twice")),
-        },
-    );
-    _ = try fixture.titled(h, "Unrelated");
-    var hits: ?*c.issuez_search_hits = null;
-    try expect.code(
-        c.ISSUEZ_OK,
-        c.issuez_search(h, fixture.str("Login"), 0, null, &hits, null),
-        null,
-    );
-    try testing.expectEqual(@as(usize, 1), c.issuez_search_hits_len(hits));
-    try expect.str(x.idSlice(), c.issuez_search_hits_at(hits, 0).*.issue_id);
-    try expect.str("Login crashes", c.issuez_search_hits_at(hits, 0).*.line);
-    c.issuez_search_hits_free(hits);
-    try expect.code(
-        c.ISSUEZ_OK,
-        c.issuez_search(
-            h,
-            fixture.str("LOGIN"),
-            c.ISSUEZ_SEARCH_FLAG_IGNORE_CASE,
-            null,
-            &hits,
-            null,
-        ),
-        null,
-    );
-    try testing.expectEqual(@as(usize, 2), c.issuez_search_hits_len(hits));
-    try testing.expect(c.issuez_search_hits_at(hits, 2) == null);
-    c.issuez_search_hits_free(hits);
-    try expect.code(
-        c.ISSUEZ_E_INVALID_ARGUMENT,
-        c.issuez_search(h, fixture.str("Login"), 1 << 31, null, &hits, null),
-        null,
-    );
-}
-
-// covers: issuez_store_refresh, issuez_store_generation, issuez_store_issue_count
-// covers: issuez_store_issue_at, issuez_store_find, issuez_store_changed_count
-// covers: issuez_store_changed_at, issuez_store_free
-test "issuez_store_new: a live view" {
-    const leaks = fixture.Leaks.start();
-    defer leaks.check();
-    var r: fixture.Repo = undefined;
-    try r.init(.{});
-    defer r.deinit();
-    const h = r.handle;
-    const x = try fixture.titled(h, "One");
-    _ = try fixture.titled(h, "Two");
-    var s: ?*c.issuez_store = null;
-    try expect.code(c.ISSUEZ_OK, c.issuez_store_new(h, &s, null), null);
-    defer c.issuez_store_free(s);
-    try testing.expectEqual(@as(usize, 0), c.issuez_store_issue_count(s));
-    var changed = false;
-    try expect.code(c.ISSUEZ_OK, c.issuez_store_refresh(s, null, &changed, null), null);
-    try testing.expect(changed);
-    try testing.expectEqual(@as(usize, 2), c.issuez_store_issue_count(s));
-    try testing.expectEqual(@as(u32, 1), c.issuez_store_generation(s));
-    const kept = c.issuez_store_find(s, x.idStr()).?;
-    try expect.code(c.ISSUEZ_OK, c.issuez_store_refresh(s, null, &changed, null), null);
-    try testing.expect(!changed);
-
-    _ = try fixture.update(h, x.idStr(), &.{c.issuez_set_title(fixture.str("One, renamed"))});
-    try expect.code(c.ISSUEZ_OK, c.issuez_store_refresh(s, null, &changed, null), null);
-    try testing.expect(changed);
-    try testing.expectEqual(@as(usize, 1), c.issuez_store_changed_count(s));
-    try expect.str(x.idSlice(), c.issuez_store_changed_at(s, 0));
-    try testing.expect(c.issuez_store_changed_at(s, 1).ptr == null);
-    const now = c.issuez_store_find(s, x.idStr()).?;
-    try testing.expect(now != kept);
-    try expect.str("One, renamed", c.issuez_issue_info_of(now).*.title);
-    try testing.expect(
-        c.issuez_store_issue_at(s, 0) != null and c.issuez_store_issue_at(s, 2) == null,
-    );
-    try testing.expect(c.issuez_store_find(s, fixture.str("x")) == null);
-    try testing.expectEqual(@as(u32, 2), c.issuez_store_generation(s));
 }

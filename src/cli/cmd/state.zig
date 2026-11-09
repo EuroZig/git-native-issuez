@@ -34,40 +34,23 @@ pub fn main(comptime B: type, ctx: *context.Context(B), argv: []const []const u8
     var reason: ?[]const u8 = null;
     var comment: std.ArrayList([]const u8) = .empty;
 
-    var args: common.Args = .{ .list = argv };
-    while (args.next()) |arg| {
-        if (!args.isOption(arg)) {
-            if (args.was_separator) continue;
-            if (issue_prefix == null) issue_prefix = arg;
-        } else if (common.isHelp(arg)) {
-            ctx.out.writeAll(help) catch {};
-            return common.exit_ok;
-        } else if (std.mem.eql(u8, arg, "--open")) {
-            new_state = "open";
-        } else if (std.mem.eql(u8, arg, "--close")) {
-            new_state = "closed";
-        } else if (std.mem.eql(u8, arg, "--state")) {
-            new_state = args.value(ctx.err, "--state") orelse return common.exit_error;
-        } else if (std.mem.eql(u8, arg, "-m") or std.mem.eql(u8, arg, "--message")) {
-            message = args.value(ctx.err, "-m") orelse return common.exit_error;
-        } else if (std.mem.eql(u8, arg, "--fixed-by")) {
-            fixed_by = args.value(ctx.err, "--fixed-by") orelse return common.exit_error;
-        } else if (std.mem.eql(u8, arg, "--release")) {
-            release = args.value(ctx.err, "--release") orelse return common.exit_error;
-        } else if (std.mem.eql(u8, arg, "--reason")) {
-            reason = args.value(ctx.err, "--reason") orelse return common.exit_error;
-        } else if (std.mem.eql(u8, arg, "-c") or std.mem.eql(u8, arg, "--comment")) {
-            const v = args.value(ctx.err, "-c") orelse return common.exit_error;
-            comment.append(arena, v) catch return common.oom(ctx.err);
-        } else {
-            return common.unknownOption(ctx.err, "state", arg);
-        }
-    }
-    const prefix = issue_prefix orelse return common.missing(
-        ctx.err,
-        "state",
-        "issue ID is required",
-    );
+    if (common.parseArgs(ctx, argv, .{
+        .command = "state",
+        .help = help,
+        .positionals = .{ .first = &issue_prefix },
+        .flags = &.{
+            .{ "--open", .{ .constant = .{ &new_state, "open" } } },
+            .{ "--close", .{ .constant = .{ &new_state, "closed" } } },
+            .{ "--state", .{ .text = &new_state } },
+            .{ "-m --message", .{ .text = &message } },
+            .{ "--fixed-by", .{ .text = &fixed_by } },
+            .{ "--release", .{ .text = &release } },
+            .{ "--reason", .{ .text = &reason } },
+            .{ "-c --comment", .{ .list = &comment } },
+        },
+    })) |exit| return exit;
+    const prefix = issue_prefix orelse
+        return common.missing(ctx.err, "state", "issue ID is required");
     // Like upstream, an empty `--state ""` counts as no state given.
     if (new_state) |s| if (s.len == 0) {
         new_state = null;
@@ -97,13 +80,7 @@ pub fn main(comptime B: type, ctx: *context.Context(B), argv: []const []const u8
     var repo = common.openRepo(B, ctx) orelse return common.exit_fatal;
     var skipped = false;
     repo.call.skipped = &skipped;
-    const ref = common.resolveOne(
-        B,
-        repo,
-        arena,
-        ctx.err,
-        prefix,
-    ) orelse return common.exit_error;
+    const ref = common.resolveOne(B, repo, arena, ctx.err, prefix) orelse return common.exit_error;
     const parsed = core.State.parse(state);
     if (comment.items.len > 0) {
         if (message != null) return common.fail(ctx.err, "error: --comment can't go with -m\n");

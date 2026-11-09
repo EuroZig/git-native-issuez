@@ -8,8 +8,7 @@
 //
 // Everything the library returns is copied into plain Go values and the C
 // handles are freed straight away, so values are safe to keep and share.
-// encoding/json writes their Go field names; LoadJSON and LoadManyJSON give
-// the documented schema (docs/json.md). Only *Repo holds C resources;
+// encoding/json writes their Go field names. Only *Repo holds C resources;
 // close it when done.
 //
 // Every call that touches git takes a context: cancelling it stops the
@@ -76,7 +75,7 @@ func goStr(s C.issuez_str) string {
 
 // cStr points at Go memory for the duration of a call. Passing it by value
 // is fine (the bytes hold no pointers); storing it in Go memory handed to
-// C needs a pin, see cStrs and the pinner in each call.
+// C needs a pin, see pinStr and the pinner in each call.
 func cStr(s string) C.issuez_str {
 	if s == "" {
 		return C.issuez_str{}
@@ -84,32 +83,11 @@ func cStr(s string) C.issuez_str {
 	return C.issuez_str{ptr: (*C.char)(unsafe.Pointer(unsafe.StringData(s))), len: C.size_t(len(s))}
 }
 
-// flagIf is flag when on, else 0: one bit of a call's flags.
-func flagIf(on bool, flag C.uint32_t) C.uint32_t {
-	if on {
-		return flag
-	}
-	return 0
-}
-
 func pinStr(p *runtime.Pinner, s string) C.issuez_str {
 	if s != "" {
 		p.Pin(unsafe.StringData(s))
 	}
 	return cStr(s)
-}
-
-// cStrs builds a pinned array of strings; nil for an empty list.
-func cStrs(p *runtime.Pinner, ss []string) (*C.issuez_str, C.size_t) {
-	if len(ss) == 0 {
-		return nil, 0
-	}
-	arr := make([]C.issuez_str, len(ss))
-	for i, s := range ss {
-		arr[i] = pinStr(p, s)
-	}
-	p.Pin(&arr[0])
-	return &arr[0], C.size_t(len(ss))
 }
 
 func goStrs(n C.size_t, at func(C.size_t) C.issuez_str) []string {

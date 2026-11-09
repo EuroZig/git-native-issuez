@@ -388,6 +388,7 @@ pub fn problem(s: *Stringify, arena: Allocator, p: issuez.projection.Problem) Er
 
 const testing = std.testing;
 const GitSim = issuez.backend.GitSim;
+const TestRepo = @import("test_repo.zig").TestRepo;
 
 /// Writes with `render` and parses the result back.
 fn roundTrip(arena: Allocator, render: anytype, args: anytype) !std.json.Value {
@@ -446,13 +447,10 @@ test "the documented keys, in order" {
     };
     const problem_keys = [_][]const u8{ "kind", "other", "key", "value", "description" };
 
-    var arena_state: std.heap.ArenaAllocator = .init(testing.allocator);
-    defer arena_state.deinit();
-    const arena = arena_state.allocator();
-    var world: GitSim.World = .{ .seed = 7, .clones = &.{.{ .name = "a" }} };
-    var sim = try GitSim.init(arena, &world, 0);
-    const repo = issuez.Repo(GitSim).init(&sim);
-    const catalog = issuez.milestone.Catalog(GitSim).init(&sim);
+    var fx: TestRepo = .{};
+    defer fx.deinit();
+    const arena, const sim, const repo = try fx.open(7);
+    const catalog = issuez.milestone.Catalog(GitSim).init(sim);
     _ = try catalog.create(
         arena,
         .{ .name = "v1", .due = .{ .year = 2026, .month = 12, .day = 1 } },
@@ -508,12 +506,9 @@ test "the documented keys, in order" {
 }
 
 test "values: nulls, dates, times with the author's offset" {
-    var arena_state: std.heap.ArenaAllocator = .init(testing.allocator);
-    defer arena_state.deinit();
-    const arena = arena_state.allocator();
-    var world: GitSim.World = .{ .seed = 8, .clones = &.{.{ .name = "a" }} };
-    var sim = try GitSim.init(arena, &world, 0);
-    const repo = issuez.Repo(GitSim).init(&sim);
+    var fx: TestRepo = .{};
+    defer fx.deinit();
+    const arena, _, const repo = try fx.open(8);
     for ([_]i16{ 330, -90, 0 }) |tz| {
         var author = ada;
         author.tz_offset_minutes = tz;

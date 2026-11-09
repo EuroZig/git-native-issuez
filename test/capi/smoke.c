@@ -78,7 +78,8 @@ int main(int argc, char **argv) {
         if (ok(issuez_write_load_issue(w, NULL, &issue, &err), err, "load")) {
             const issuez_issue_info *info = issuez_issue_info_of(issue);
             CHECK(str_is(info->title, "From C"));
-            CHECK(issuez_issue_has_label(issue, ISSUEZ_STR("c")));
+            CHECK(issuez_issue_label_count(issue) == 1);
+            CHECK(str_is(issuez_issue_label_at(issue, 0), "c"));
             CHECK(info->state == ISSUEZ_STATE_OPEN);
             issuez_issue_free(issue);
         }

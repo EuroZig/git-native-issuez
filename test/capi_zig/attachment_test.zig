@@ -58,10 +58,7 @@ fn refused(
 
 // covers: issuez_issue_attachment_at, issuez_comment_attachment_at
 test "issuez_issue_attachment_count: on the root, a comment and its edit, bytes kept by the host" {
-    const leaks = fixture.Leaks.start();
-    defer leaks.check();
-    var r: fixture.Repo = undefined;
-    try r.init(.{ .ops = &.{fixture.opNum(c.ISSUEZ_OPT_ATTACHMENT_STORE, 0)} });
+    var r = try fixture.Repo.init(.{ .ops = &.{fixture.opNum(c.ISSUEZ_OPT_ATTACHMENT_STORE, 0)} });
     defer r.deinit();
     const h = r.handle;
 
@@ -86,8 +83,8 @@ test "issuez_issue_attachment_count: on the root, a comment and its edit, bytes 
 
     // The photo's ID, from the comment that added it.
     var i = try fixture.load(h, id);
-    const cm = c.issuez_issue_comment_find(i, &commented.commit);
-    try testing.expectEqual(@as(usize, 1), cm.*.attachment_count);
+    const cm = fixture.findComment(i, commented.commit).?;
+    try testing.expectEqual(@as(usize, 1), cm.attachment_count);
     var photo: [36]u8 = undefined;
     @memcpy(&photo, fixture.slice(c.issuez_comment_attachment_at(cm, 0)));
     try testing.expect(c.issuez_comment_attachment_at(cm, 1).ptr == null);
@@ -123,11 +120,11 @@ test "issuez_issue_attachment_count: on the root, a comment and its edit, bytes 
     try expect.str("shot.png", shot.*.name);
     try testing.expectEqual(@as(u64, png.len), shot.*.size);
     try testing.expectEqual(@as(usize, 64), shot.*.sha256.len);
-    try testing.expect(c.issuez_oid_eq(&shot.*.added_in, &created.tip));
+    try testing.expect(fixture.oidEql(shot.*.added_in, created.tip));
     try expect.str("ada@example.invalid", shot.*.added_by.*.email);
     try testing.expect(!shot.*.removed);
     try expect.str("better.png", better.*.name);
-    try testing.expect(c.issuez_oid_eq(&better.*.added_in, &edited.commit));
+    try testing.expect(fixture.oidEql(better.*.added_in, edited.commit));
     const gone = c.issuez_issue_attachment_at(i, 2);
     try expect.str("photo.jpg", gone.*.name);
     try expect.str("image/jpeg", gone.*.media_type);
@@ -135,16 +132,16 @@ test "issuez_issue_attachment_count: on the root, a comment and its edit, bytes 
     // The description's (the root's) has no comment; an edit's and its
     // comment's belong to that comment.
     const none = std.mem.zeroes(c.issuez_oid);
-    try testing.expect(c.issuez_oid_eq(&shot.*.comment, &none));
-    try testing.expect(c.issuez_oid_eq(&better.*.comment, &commented.commit));
-    try testing.expect(c.issuez_oid_eq(&gone.*.comment, &commented.commit));
+    try testing.expect(fixture.oidEql(shot.*.comment, none));
+    try testing.expect(fixture.oidEql(better.*.comment, commented.commit));
+    try testing.expect(fixture.oidEql(gone.*.comment, commented.commit));
     try testing.expect(
         shot.*.at.unix_seconds > 0 and better.*.at.unix_seconds >= shot.*.at.unix_seconds,
     );
     try testing.expect(c.issuez_issue_attachment_at(i, 3) == null);
     try testing.expectEqual(@as(usize, 0), c.issuez_issue_attachment_count(null));
     try testing.expect(c.issuez_issue_attachment_at(null, 0) == null);
-    try expect.str("A better one.", c.issuez_issue_comment_find(i, &commented.commit).*.text);
+    try expect.str("A better one.", fixture.findComment(i, commented.commit).?.text);
 
     // The derived ref moved with them; no bytes were stored.
     const derived = try std.fmt.allocPrint(r.arena(), "refs/attachments/{s}", .{created.idSlice()});
@@ -173,41 +170,45 @@ test "issuez_issue_attachment_count: on the root, a comment and its edit, bytes 
     try testing.expectEqual(@as(c.issuez_code, c.ISSUEZ_E_INVALID_VALUE), with_title[0]);
 }
 
-test "issuez_attachment_validate: types, names, limits; the CLI's store" {
-    const leaks = fixture.Leaks.start();
-    defer leaks.check();
-    var r: fixture.Repo = undefined;
-    try r.init(.{});
+fn prepare(h: ?*c.issuez_repo, name: []const u8, data: []const u8, err: *?*c.issuez_error) c_uint {
+    var p: ?*c.issuez_prepared_attachment = null;
+    const rc = c.issuez_attachment_prepare(
+        h,
+        .{},
+        fixture.str(name),
+        fixture.str(data),
+        null,
+        &p,
+        err,
+    );
+    c.issuez_prepared_attachment_free(p);
+    return rc;
+}
+
+test "issuez_attachment_prepare: types, limits" {
+    var r = try fixture.Repo.init(.{});
     defer r.deinit();
     const h = r.handle;
-    var media: c.issuez_str = .{};
     var err: ?*c.issuez_error = null;
+    var p: ?*c.issuez_prepared_attachment = null;
     try expect.code(
         c.ISSUEZ_OK,
-        c.issuez_attachment_validate(h, fixture.str("a.png"), fixture.str(png), &media, &err),
+        c.issuez_attachment_prepare(h, .{}, fixture.str("a.png"), fixture.str(png), null, &p, &err),
         err,
     );
-    try expect.str("image/png", media);
-    try expect.code(
-        c.ISSUEZ_OK,
-        c.issuez_attachment_validate(h, fixture.str("a.jpg"), fixture.str(jpeg), null, &err),
-        err,
-    );
-    for ([_]struct { []const u8, []const u8, c.issuez_code }{
-        .{ "a.txt", "text", c.ISSUEZ_E_INVALID_VALUE },
-        .{ "", png, c.ISSUEZ_E_INVALID_VALUE },
-    }) |case| {
-        try testing.expectEqual(
-            case[2],
-            c.issuez_attachment_validate(h, fixture.str(case[0]), fixture.str(case[1]), null, &err),
-        );
-        try testing.expect(c.issuez_error_problems(err) != null);
-        c.issuez_error_free(err);
-        err = null;
-    }
+    try expect.str("image/png", c.issuez_prepared_attachment_info(p).*.media_type);
+    c.issuez_prepared_attachment_free(p);
+    try expect.code(c.ISSUEZ_OK, prepare(h, "a.jpg", jpeg, &err), err);
     try testing.expectEqual(
-        @as(c.issuez_code, c.ISSUEZ_E_INVALID_ARGUMENT),
-        c.issuez_attachment_validate(null, fixture.str("a.png"), fixture.str(png), null, &err),
+        @as(c_uint, c.ISSUEZ_E_INVALID_VALUE),
+        prepare(h, "a.txt", "text", &err),
+    );
+    try testing.expect(c.issuez_error_problems(err) != null);
+    c.issuez_error_free(err);
+    err = null;
+    try testing.expectEqual(
+        @as(c_uint, c.ISSUEZ_E_INVALID_ARGUMENT),
+        prepare(null, "a.png", png, &err),
     );
     c.issuez_error_free(err);
     err = null;
@@ -216,12 +217,15 @@ test "issuez_attachment_validate: types, names, limits; the CLI's store" {
     limit.name = fixture.str("max_attachment_bytes");
     const small = try r.open(&.{limit});
     defer c.issuez_repo_close(small);
-    try testing.expectEqual(
-        @as(c.issuez_code, c.ISSUEZ_E_LIMIT),
-        c.issuez_attachment_validate(small, fixture.str("a.png"), fixture.str(png), null, &err),
-    );
+    try testing.expectEqual(@as(c_uint, c.ISSUEZ_E_LIMIT), prepare(small, "a.png", png, &err));
     c.issuez_error_free(err);
-    err = null;
+}
+
+test "issuez_issue_create: an attachment's bytes go to the library's store" {
+    var r = try fixture.Repo.init(.{});
+    defer r.deinit();
+    const h = r.handle;
+    var err: ?*c.issuez_error = null;
 
     // By default the bytes go to this library's store, which needs git-lfs.
     var w: ?*c.issuez_write = null;
@@ -251,10 +255,7 @@ test "issuez_attachment_validate: types, names, limits; the CLI's store" {
 }
 
 test "issuez_issue_update: a stale expect is refused before the rest of the write" {
-    const leaks = fixture.Leaks.start();
-    defer leaks.check();
-    var r: fixture.Repo = undefined;
-    try r.init(.{});
+    var r = try fixture.Repo.init(.{});
     defer r.deinit();
     const made = try fixture.titled(r.handle, "Racy");
     _ = try fixture.comment(r.handle, made.idStr(), "Moved on");
@@ -295,66 +296,4 @@ test "issuez_issue_update: a stale expect is refused before the rest of the writ
         error.FileNotFound,
         std.Io.Dir.cwd().access(testing.io, path, .{}),
     );
-}
-
-test "issuez_attachment_read, issuez_bytes_data, issuez_bytes_free: stored bytes, missing ones" {
-    const leaks = fixture.Leaks.start();
-    defer leaks.check();
-    var r: fixture.Repo = undefined;
-    try r.init(.{});
-    defer r.deinit();
-    const h = r.handle;
-    const x = try fixture.create(
-        h,
-        &.{ c.issuez_set_title(fixture.str("Pictured")), attachAs(host_id, "shot.png", png) },
-    );
-    var b: ?*c.issuez_bytes = null;
-    var err: ?*c.issuez_error = null;
-    try expect.code(
-        c.ISSUEZ_OK,
-        c.issuez_attachment_read(h, x.idStr(), fixture.str(host_id), null, &b, &err),
-        err,
-    );
-    try testing.expectEqualSlices(u8, png, fixture.slice(c.issuez_bytes_data(b)));
-    c.issuez_bytes_free(b);
-    try expect.code(
-        c.ISSUEZ_E_NOT_FOUND,
-        c.issuez_attachment_read(
-            h,
-            x.idStr(),
-            fixture.str("6c1d5f1f-3c9b-4a6f-8e4a-7d2d2a1a3b88"),
-            null,
-            &b,
-            null,
-        ),
-        null,
-    );
-    try expect.code(
-        c.ISSUEZ_E_NOT_FOUND,
-        c.issuez_attachment_read(
-            h,
-            fixture.str("0b6c4f63-6f5a-4a3e-9c2b-1d2e3f4a5b6c"),
-            fixture.str(host_id),
-            null,
-            &b,
-            null,
-        ),
-        null,
-    );
-
-    // A host that keeps the bytes itself has none here.
-    const kept = try r.open(&.{fixture.opNum(c.ISSUEZ_OPT_ATTACHMENT_STORE, 0)});
-    defer c.issuez_repo_close(kept);
-    const other = "6c1d5f1f-3c9b-4a6f-8e4a-7d2d2a1a3b88";
-    const y = try fixture.create(
-        kept,
-        &.{ c.issuez_set_title(fixture.str("Hosted")), attachAs(other, "a.jpg", jpeg) },
-    );
-    try expect.code(
-        c.ISSUEZ_E_LFS,
-        c.issuez_attachment_read(kept, y.idStr(), fixture.str(other), null, &b, null),
-        null,
-    );
-    try testing.expectEqual(@as(usize, 0), c.issuez_bytes_data(null).len);
-    c.issuez_bytes_free(null);
 }

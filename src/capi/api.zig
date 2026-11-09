@@ -93,14 +93,6 @@ pub const Actor = extern struct {
     pub const type_kind: TypeKind = .input;
 };
 
-pub const Progress = extern struct {
-    done: u32 = 0,
-    total: u32 = 0,
-
-    pub const c_name = "issuez_progress";
-    pub const type_kind: TypeKind = .value;
-};
-
 // ─── Enums ─────────────────────────────────────────────────────────────
 
 pub const Code = enum(c_int) {
@@ -126,8 +118,6 @@ pub const Code = enum(c_int) {
     e_purged,
     /// history that can't be read as an issue
     e_corrupt,
-    /// sync: remote history was rewritten
-    e_quarantined,
     /// push check refused at least one ref
     e_rejected,
     e_not_a_repository,
@@ -137,8 +127,6 @@ pub const Code = enum(c_int) {
     e_git_version,
     e_timeout,
     e_cancelled,
-    /// fetch or push to a remote failed
-    e_network,
     /// git-lfs missing or a transfer failed
     e_lfs,
     /// not in this build, or not possible here
@@ -355,7 +343,8 @@ pub const Opt = enum(u32) {
     restore_comment,
     /// update: oid. The comment REACTIONS ADD or REMOVE is on; without it, the issue
     reaction_target,
-    /// ADD str: a prepared attachment trailer; external storage only
+    /// ADD str: "<id> <media_type> <size> sha256:<sha256> <name>", from
+    /// issuez_prepared_attachment_info; external storage only
     prepared_attachment,
 
     /// query: num 0 not done (default), 1 done, -1 any
@@ -401,8 +390,7 @@ pub const Opt = enum(u32) {
     env,
     /// open: person (name, email). Default: git's identity
     committer,
-    /// open: ADD str; overrides git config issue.doneStates. settings: ADD str writes the states
-    /// given; CLEAR unsets the key (the defaults)
+    /// open: ADD str; overrides git config issue.doneStates
     done_state,
     /// open: ADD str; overrides issue.workflowStates
     workflow_state,
@@ -415,8 +403,6 @@ pub const Opt = enum(u32) {
     pool_size,
     /// open: num
     timeout_local_ms,
-    /// open: num
-    timeout_network_ms,
     /// open: name ("max_labels", ...), num
     limit,
     /// open: num; issues kept loaded for queries (default 10000, 0 off)
@@ -424,11 +410,6 @@ pub const Opt = enum(u32) {
     /// open: num 0/1 (default 1). 0: the caller keeps attachment bytes (a host's LFS store); writes
     /// store none and need no git-lfs
     attachment_store,
-
-    /// sync: num 0/1 (default 1)
-    sync_push = 0x400,
-    /// sync: num 0/1 (default 1); 0 pushes refs/attachments but uploads no LFS bytes
-    sync_attachments,
 
     /// push check: person; its user_id counts as pusher_user_id
     pusher = 0x500,
@@ -461,9 +442,7 @@ pub const OpList = enum(u32) {
     milestone_update,
     query,
     open,
-    sync,
     push_check,
-    settings,
     _,
 
     pub const c_name = "issuez_op_list";
@@ -482,18 +461,6 @@ pub const LogLevel = enum(u32) {
 
     pub const c_name = "issuez_log_level";
     pub const c_prefix = "ISSUEZ_LOG_";
-};
-
-pub const ChangeKind = enum(u32) {
-    unknown = 0,
-    created,
-    updated,
-    /// the ref is gone (purge, or another tool)
-    removed,
-    _,
-
-    pub const c_name = "issuez_change_kind";
-    pub const c_prefix = "ISSUEZ_CHANGE_";
 };
 
 pub const State = enum(u32) {
@@ -567,54 +534,8 @@ pub const MilestoneStatus = enum(u32) {
     pub const c_prefix = "ISSUEZ_MILESTONE_";
 };
 
-pub const QuarantineReason = enum(u32) {
-    // It no longer applies; the next merge clears it.
-    /// no longer applies; the next merge clears it
-    unknown = 0,
-    /// the remote issue shares no history with the local one
-    unrelated_history,
-    /// the remote history was rewritten since the last merge
-    rewound,
-    /// the remote issue fails the integrity checks
-    invalid_issue,
-    _,
-
-    pub const c_name = "issuez_quarantine_reason";
-    pub const c_prefix = "ISSUEZ_QUARANTINE_";
-};
-
-pub const QuarantineChoice = enum(u32) {
-    unknown = 0,
-    /// keep ours and stop reporting theirs
-    keep_local,
-    /// take theirs; the replaced version is kept
-    take_remote,
-    _,
-
-    pub const c_name = "issuez_quarantine_choice";
-    pub const c_prefix = "ISSUEZ_CHOICE_";
-};
-
-pub const Quarantined = extern struct {
-    /// issuez_kind: ISSUE or MILESTONE
-    kind: u32,
-    id: Str,
-    /// the local title, or the remote one when it only exists there
-    title: Str,
-    /// the refused remote version
-    remote_tip: Oid,
-    /// issuez_quarantine_reason
-    reason: u32,
-    /// acknowledged (issuez_quarantine_resolve, ISSUEZ_CHOICE_KEEP_LOCAL)
-    kept_local: bool,
-
-    pub const c_name = "issuez_quarantined";
-    pub const type_kind: TypeKind = .record;
-};
-
 pub const FsckKind = enum(u32) {
     unknown = 0,
-    // Fails one of upstream fsck's checks: an error.
     /// error: fails one of upstream fsck's checks
     integrity,
     /// note: an X-Milestone-Status no reader takes; it reads as open
@@ -623,15 +544,11 @@ pub const FsckKind = enum(u32) {
     attachment_trailer,
     /// note: an attachment's bytes aren't in this repository
     attachment_missing,
-    // An error.
     /// error: an attachment's stored bytes don't match it
     attachment_corrupt,
-    /// note: refs/attachments/<id> is missing or stale (repair rewrites it)
+    /// note: refs/attachments/<id> is missing or stale
     derived_ref,
-    /// refs/attachments/<id> was rewritten
-    repaired,
-    // An error.
-    /// error: checking or repairing attachments failed
+    /// error: checking attachments failed
     attachments_failed,
     /// note: without git-lfs the bytes weren't checked
     bytes_unchecked,
@@ -661,111 +578,6 @@ pub const FsckFinding = extern struct {
 
     pub const c_name = "issuez_fsck_finding";
     pub const type_kind: TypeKind = .record;
-};
-
-pub const RemoteSetup = extern struct {
-    /// the refspecs were added now; false when they were there
-    configured: bool = false,
-    /// upstream's forced refspec was taken out (ISSUEZ_REMOTE_FLAG_FIX_UNSAFE)
-    removed_unsafe: bool = false,
-    /// the remote still has upstream's forced refspec: a plain git fetch can overwrite local issue
-    /// refs
-    unsafe: bool = false,
-    /// the library fills it; room to grow
-    reserved: [2]u64 = @splat(0),
-
-    pub const c_name = "issuez_remote_setup";
-    pub const type_kind: TypeKind = .value;
-};
-
-pub const SearchHit = extern struct {
-    issue_id: Str,
-    line: Str,
-
-    pub const c_name = "issuez_search_hit";
-    pub const type_kind: TypeKind = .record;
-};
-
-pub const SearchFlag = enum(u32) {
-    none = 0,
-    /// bit: ASCII case-insensitive
-    ignore_case = 1,
-    _,
-
-    pub const c_name = "issuez_search_flag";
-    pub const c_prefix = "ISSUEZ_SEARCH_FLAG_";
-};
-
-pub const ShortId = extern struct {
-    /// the full UUID
-    id: Str,
-    /// the shortest prefix no other issue's UUID starts with
-    prefix: Str,
-
-    pub const c_name = "issuez_short_id";
-    pub const type_kind: TypeKind = .record;
-};
-
-pub const JsonFlag = enum(u32) {
-    none = 0,
-    /// bit: add the description, comments and history
-    full = 1,
-    _,
-
-    pub const c_name = "issuez_json_flag";
-    pub const c_prefix = "ISSUEZ_JSON_FLAG_";
-};
-
-pub const LoadFlag = enum(u32) {
-    none = 0,
-    /// bit: a missing or damaged issue fails the call
-    strict = 1,
-    _,
-
-    pub const c_name = "issuez_load_flag";
-    pub const c_prefix = "ISSUEZ_LOAD_FLAG_";
-};
-
-pub const FsckFlag = enum(u32) {
-    none = 0,
-    /// bit: rewrite missing or stale derived attachment refs (needs the attachment store); nothing
-    /// else is written
-    repair = 1,
-    _,
-
-    pub const c_name = "issuez_fsck_flag";
-    pub const c_prefix = "ISSUEZ_FSCK_FLAG_";
-};
-
-pub const RemoteFlag = enum(u32) {
-    none = 0,
-    /// bit: take out upstream's forced refspec
-    fix_unsafe = 1,
-    _,
-
-    pub const c_name = "issuez_remote_flag";
-    pub const c_prefix = "ISSUEZ_REMOTE_FLAG_";
-};
-
-pub const SyncOutcome = enum(u32) {
-    unknown = 0,
-    up_to_date,
-    /// came from the remote
-    new,
-    fast_forward,
-    merged,
-    /// ours went to the remote (also new local issues)
-    pushed,
-    /// remote history rewritten; see issuez_quarantine_resolve
-    quarantined,
-    /// not reported in this version: a push that can't land fails the call
-    failed,
-    /// purged by a tombstone; the push deletes the remote's copy
-    purged,
-    _,
-
-    pub const c_name = "issuez_sync_outcome";
-    pub const c_prefix = "ISSUEZ_SYNC_";
 };
 
 pub const AuthorPolicy = enum(u32) {
@@ -810,26 +622,14 @@ pub const Error = Handle("issuez_error");
 pub const Problems = Handle("issuez_problems");
 pub const Cancel = Handle("issuez_cancel");
 pub const Repo = Handle("issuez_repo");
-pub const Matches = Handle("issuez_matches");
-pub const Bytes = Handle("issuez_bytes");
 pub const PreparedAttachment = Handle("issuez_prepared_attachment");
-pub const Watch = Handle("issuez_watch");
-pub const Store = Handle("issuez_store");
-pub const FsckReport = Handle("issuez_fsck_report");
-pub const SyncStatus = Handle("issuez_sync_status");
-pub const SearchHits = Handle("issuez_search_hits");
-pub const LabelCounts = Handle("issuez_label_counts");
-pub const People = Handle("issuez_people");
-pub const ShortIds = Handle("issuez_short_ids");
 pub const Snapshot = Handle("issuez_snapshot");
-pub const Diff = Handle("issuez_diff");
 pub const Issue = Handle("issuez_issue");
 pub const IssueList = Handle("issuez_issue_list");
 pub const Write = Handle("issuez_write");
 pub const Milestone = Handle("issuez_milestone");
 pub const MilestoneList = Handle("issuez_milestone_list");
-pub const Projection = Handle("issuez_projection");
-pub const SyncReport = Handle("issuez_sync_report");
+pub const FsckReport = Handle("issuez_fsck_report");
 pub const PushVerdicts = Handle("issuez_push_verdicts");
 pub const PurgeResult = Handle("issuez_purge_result");
 
@@ -867,7 +667,7 @@ pub const Problem = extern struct {
 pub const LogEvent = extern struct {
     /// issuez_log_level
     level: u32,
-    /// "issue.update", "git.cat-file", "sync"
+    /// "issue.update", "git.cat-file", "repo.open"
     operation: Str,
     message: Str,
     /// {NULL,0} when not about a repo
@@ -884,36 +684,6 @@ pub const LogEvent = extern struct {
 };
 
 pub const LogFn = ?*const fn (userdata: ?*anyopaque, event: *const LogEvent) callconv(.c) void;
-
-pub const WatchFn = ?*const fn (userdata: ?*anyopaque, changes: u32) callconv(.c) void;
-
-pub const WatchChange = enum(u32) {
-    none = 0,
-    /// bit: issue, milestone or attachment refs moved: read them again (issuez_snapshot_take and
-    /// issuez_diff_new say what)
-    refs = 1,
-    /// bit: the repository's config changed, which has the issue settings
-    config = 2,
-    _,
-
-    pub const c_name = "issuez_watch_change";
-    pub const c_prefix = "ISSUEZ_WATCH_";
-};
-
-pub const DiffEntry = extern struct {
-    /// issuez_kind
-    kind: u32,
-    /// issuez_change_kind
-    change: u32,
-    id: Str,
-    /// len 0 when created
-    old_tip: Oid,
-    /// len 0 when removed
-    new_tip: Oid,
-
-    pub const c_name = "issuez_diff_entry";
-    pub const type_kind: TypeKind = .record;
-};
 
 pub const IssueInfo = extern struct {
     id: Str,
@@ -949,7 +719,7 @@ pub const IssueInfo = extern struct {
     lock_reason: Str,
     /// issuez_priority
     priority: u32,
-    /// direct only; the effective one (through parents) is a projection answer
+    /// direct only, not one inherited from a parent
     milestone_id: Str,
     parent_id: Str,
     /// zero: none
@@ -1166,22 +936,6 @@ pub const Op = extern struct {
     pub const type_kind: TypeKind = .input;
 };
 
-pub const SyncItem = extern struct {
-    /// issuez_kind
-    kind: u32,
-    id: Str,
-    /// issuez_sync_outcome
-    outcome: u32,
-    /// after the sync
-    local_tip: Oid,
-    remote_tip: Oid,
-    /// for QUARANTINED and FAILED
-    reason: Str,
-
-    pub const c_name = "issuez_sync_item";
-    pub const type_kind: TypeKind = .record;
-};
-
 pub const RefUpdate = extern struct {
     ref: Str = .{},
     /// len 0 for a create
@@ -1193,29 +947,6 @@ pub const RefUpdate = extern struct {
 
     pub const c_name = "issuez_ref_update";
     pub const type_kind: TypeKind = .input;
-};
-
-pub const LabelCount = extern struct {
-    name: Str,
-    /// of them not done
-    open: u32,
-    /// issues carrying it
-    total: u32,
-
-    pub const c_name = "issuez_label_count";
-    pub const type_kind: TypeKind = .record;
-};
-
-pub const KnownPerson = extern struct {
-    /// the latest name they wrote under (empty for assignees only), email, user_id
-    person: Person,
-    /// issues they opened
-    authored: u32,
-    /// issues they are assigned
-    assigned: u32,
-
-    pub const c_name = "issuez_known_person";
-    pub const type_kind: TypeKind = .record;
 };
 
 pub const PushVerdict = extern struct {
@@ -1364,8 +1095,8 @@ pub const preamble =
     \\Ownership
     \\  - Every handle a function hands back through an out parameter
     \\    (`issuez_x **out`) is owned by the caller: free it with that type's
-    \\    issuez_x_free (NULL is a no-op). The exceptions say so: the repo is
-    \\    closed with issuez_repo_close, a watch ended with issuez_watch_stop.
+    \\    issuez_x_free (NULL is a no-op). The exception says so: the repo is
+    \\    closed with issuez_repo_close.
     \\  - Everything an accessor returns (strings, `const T *` records, list
     \\    items) is borrowed from the handle it came from and lives until that
     \\    handle is freed.
@@ -1375,7 +1106,7 @@ pub const preamble =
     \\
     \\Types
     \\  - Value types (issuez_str, issuez_oid, issuez_time, issuez_date,
-    \\    issuez_person, issuez_progress) are frozen and copied freely.
+    \\    issuez_person) are frozen and copied freely.
     \\  - Records the library returns (issue and milestone info, comments,
     \\    entries, problems, ...) only ever grow at the end: read them through
     \\    the pointer, never copy one by value, never allocate one. Nested lists
@@ -1418,28 +1149,23 @@ pub const preamble =
     \\  issuez_<handle>_<verb>, the verb saying what a call does:
     \\  - _open, _close        the repo (issuez_repo_open, issuez_repo_close)
     \\  - _new                 a handle built from what the call is given
-    \\                         (issuez_cancel_new, issuez_store_new, issuez_diff_new)
+    \\                         (issuez_cancel_new)
     \\  - _load*               an issue or milestone, read from git
     \\  - _info_of             a handle's single values, one record
     \\                         (issuez_issue_info_of, issuez_milestone_info_of)
     \\  - _take                a value read off the repo into a handle
-    \\                         (issuez_snapshot_take, issuez_label_counts_take)
-    \\  - plain verbs          operations (issuez_search, issuez_sync,
-    \\                         issuez_fsck, issuez_issue_update)
-    \\  - _start, _stop        a watch
+    \\                         (issuez_snapshot_take)
+    \\  - plain verbs          operations (issuez_query_run, issuez_issue_update)
     \\  - _free                every other handle
     \\  - _len, _at            the items of a list handle
     \\  - _<item>_count, _<item>_at
     \\                         a list inside another handle
-    \\                         (issuez_issue_label_count, issuez_store_issue_count);
+    \\                         (issuez_issue_label_count);
     \\                         a _count without an _at is a plain number
-    \\  - _find                one item by key, NULL or {NULL,0} for none
     \\
-    \\Flags and choices
-    \\  A call's switches are a `uint32_t flags` of its issuez_<call>_flag bits
-    \\  (0: the defaults), never a positional bool; a choice between named
-    \\  outcomes is an enum. Optional strings are an issuez_str, {NULL,0} when
-    \\  absent; optional objects (oids, actors) a pointer, NULL when absent.
+    \\Optional values
+    \\  Optional strings are an issuez_str, {NULL,0} when absent; optional
+    \\  objects (oids, actors) a pointer, NULL when absent.
     \\
     \\Threads
     \\  An issuez_repo is safe to use from any number of threads at once; it
@@ -1450,7 +1176,7 @@ pub const preamble =
     \\  Calls that touch git block. They take an `issuez_cancel *` (may be
     \\  NULL): triggering it from any thread makes the call return
     \\  ISSUEZ_E_CANCELLED within about 50 ms, killing a git request that is
-    \\  running (a fetch, a push). Writes are atomic: a write that returns
+    \\  running. Writes are atomic: a write that returns
     \\  CANCELLED didn't happen (a ref update, once started, isn't
     \\  interrupted), and one whose commit landed returns OK. The library
     \\  installs no signal handlers. It writes to
@@ -1459,7 +1185,7 @@ pub const preamble =
     \\
     \\IDs
     \\  Operations take full canonical UUIDs (lowercase, hyphenated). Turn
-    \\  user input ("a7f3", "#12") into one with issuez_resolve. Versions and
+    \\  user input ("a7f3", "#12") into one with issuez_resolve_one. Versions and
     \\  commits are issuez_oid values.
 ;
 
@@ -1484,7 +1210,6 @@ pub const items = [_]Item{
         "\"1.2.3\", or \"1.2.3-12-ga3e21cfa\" built from a git checkout past the tag. " ++
             "Static storage.",
     ),
-    f("issuez_abi_version", fn () callconv(.c) u32, &.{}, ""),
     f(
         "issuez_init",
         fn (u32, Err) callconv(.c) Code,
@@ -1513,24 +1238,6 @@ pub const items = [_]Item{
     },
     .{ .prose = "A git object ID: SHA-1 or SHA-256. A value type: copy it freely." },
     .{ .type = Oid },
-    .{ .raw =
-    \\/* The buffer issuez_oid_hex writes: 64 hex digits and a NUL. */
-    \\#define ISSUEZ_OID_HEX_BUFSIZE 65
-    },
-    f(
-        "issuez_oid_hex",
-        fn (?*const Oid, ?[*]u8) callconv(.c) usize,
-        &.{ "oid", "buf" },
-        "Writes the lowercase hex and a NUL into buf (ISSUEZ_OID_HEX_BUFSIZE bytes). " ++
-            "Returns the hex length (40 or 64), 0 for a none oid.",
-    ),
-    f(
-        "issuez_oid_parse",
-        fn (Str, ?*Oid, Err) callconv(.c) Code,
-        &.{ "hex", "out", "err" },
-        "Full hex only.",
-    ),
-    f("issuez_oid_eq", fn (?*const Oid, ?*const Oid) callconv(.c) bool, &.{ "a", "b" }, ""),
     .{ .prose = "A point in time as git records it." },
     .{ .type = Time },
     .{ .prose = "A calendar day (start and due dates)." },
@@ -1540,7 +1247,6 @@ pub const items = [_]Item{
     .{ .prose = "The acting user of a write: the commit's author. The committer is the " ++
         "identity the repo was opened with." },
     .{ .type = Actor },
-    .{ .type = Progress },
 
     .{ .section = .{ "Errors and problems", "" } },
     f(
@@ -1568,7 +1274,7 @@ pub const items = [_]Item{
         "issuez_error_git_stderr",
         fn (?*const Error) callconv(.c) Str,
         &.{"err"},
-        "git's stderr (trimmed, bounded), for GIT, NETWORK and LFS.",
+        "git's stderr (trimmed, bounded), for GIT and LFS.",
     ),
     f(
         "issuez_error_current_tip",
@@ -1665,7 +1371,6 @@ pub const items = [_]Item{
         &.{"c"},
         "Thread-safe and idempotent; affects every call using this token.",
     ),
-    f("issuez_cancel_triggered", fn (?*const Cancel) callconv(.c) bool, &.{"c"}, ""),
     f("issuez_cancel_free", fn (?*Cancel) callconv(.c) void, &.{"c"}, ""),
     .{ .type = LogLevel },
     .{ .type = LogEvent },
@@ -1703,15 +1408,6 @@ pub const items = [_]Item{
             "while they run; the same rules. NULL cb goes back to the process-wide one.",
     ),
     f(
-        "issuez_repo_drop_all",
-        fn (?*Repo, Can, ?*usize, Err) callconv(.c) Code,
-        &.{ "repo", "cancel", "dropped", "err" },
-        "Deletes every ref of the library's (issues, milestones, attachments, tombstones " ++
-            "and local state) in one transaction; *dropped is how many. It undoes an " ++
-            "import into a repository that had none, with no writes running. Not a purge: " ++
-            "clones keep their copies and sync them back.",
-    ),
-    f(
         "issuez_repo_begin_import",
         fn (?*Repo, Can, ?*?*Repo, Err) callconv(.c) Code,
         &.{ "repo", "cancel", "out", "err" },
@@ -1729,141 +1425,15 @@ pub const items = [_]Item{
             "success, stop writing and close staging. Does not publish local cache refs.",
     ),
     f(
-        "issuez_repo_adopt_refs",
-        fn (?*Repo, ?*Repo, Can, ?*usize, Err) callconv(.c) Code,
-        &.{ "repo", "from", "cancel", "adopted", "err" },
-        "Creates in repo every issue, milestone, attachment and tombstone ref from has, " ++
-            "in one transaction; *adopted is how many. An import written into a scratch " ++
-            "repository whose git uses repo's objects (GIT_OBJECT_DIRECTORY) lands at once " ++
-            "or not at all. CONTENDED when repo has one of them, CORRUPT when a tip's " ++
-            "object isn't in repo's store; nothing is taken then.",
-    ),
-    f(
-        "issuez_settings_write",
-        fn (?*Repo, OpsPtr, usize, Can, Err) callconv(.c) Code,
-        &.{ "repo", "ops", "n", "cancel", "err" },
-        "Writes git config issue.doneStates and issue.workflowStates, what a settings " ++
-            "page saves. ops: DONE_STATE and WORKFLOW_STATE, ADD each state (the key is " ++
-            "set to them) or CLEAR (the key is unset: the defaults). Every state is checked " ++
-            "first (INVALID_VALUE). Handles opened afterwards see the new settings.",
-    ),
-    f(
         "issuez_repo_limit",
         fn (?*const Repo, Str, ?*u64) callconv(.c) bool,
         &.{ "repo", "name", "out" },
         "The effective value of a limit (\"max_attachment_bytes\", \"cas_retries\", the " ++
             "names ISSUEZ_OPT_LIMIT takes); false for no such limit.",
     ),
-    f(
-        "issuez_repo_workflow_state_count",
-        fn (?*const Repo) callconv(.c) usize,
-        &.{"repo"},
-        "The effective settings, from opts or git config.",
-    ),
-    f(
-        "issuez_repo_workflow_state_at",
-        fn (?*const Repo, usize) callconv(.c) Str,
-        &.{ "repo", "i" },
-        "",
-    ),
-    f("issuez_repo_done_state_count", fn (?*const Repo) callconv(.c) usize, &.{"repo"}, ""),
-    f(
-        "issuez_repo_done_state_at",
-        fn (?*const Repo, usize) callconv(.c) Str,
-        &.{ "repo", "i" },
-        "",
-    ),
 
     .{ .section = .{ "Resolve and change detection", "" } },
     .{ .type = Kind },
-    .{ .handles = &.{Matches} },
-    f(
-        "issuez_resolve",
-        fn (?*Repo, Kind, Str, Can, ?*?*Matches, Err) callconv(.c) Code,
-        &.{ "repo", "kind", "input", "cancel", "out", "err" },
-        "User input to UUIDs: a full UUID, a unique prefix (\"a7f3\"), a number " ++
-            "(\"#12\"), or for milestones a name. OK with 0, 1 or more matches.",
-    ),
-    f("issuez_matches_len", fn (?*const Matches) callconv(.c) usize, &.{"m"}, ""),
-    f("issuez_matches_at", fn (?*const Matches, usize) callconv(.c) Str, &.{ "m", "i" }, ""),
-    f("issuez_matches_free", fn (?*Matches) callconv(.c) void, &.{"m"}, ""),
-    .{ .prose = "Line search: the lines of what each issue says now (title, fields as " ++
-        "`Key: value`, description, comments that aren't deleted) that contain a fixed " ++
-        "string, as git issue search shows them." },
-    .{ .type = SearchHit },
-    .{ .type = SearchFlag },
-    .{ .handles = &.{SearchHits} },
-    f(
-        "issuez_search",
-        fn (?*Repo, Str, u32, Can, ?*?*SearchHits, Err) callconv(.c) Code,
-        &.{ "repo", "needle", "flags", "cancel", "out", "err" },
-        "Every hit in every issue that isn't deleted, by issue UUID. flags: " ++
-            "issuez_search_flag bits.",
-    ),
-    f("issuez_search_hits_len", fn (?*const SearchHits) callconv(.c) usize, &.{"h"}, ""),
-    f(
-        "issuez_search_hits_at",
-        fn (?*const SearchHits, usize) callconv(.c) ?*const SearchHit,
-        &.{ "h", "i" },
-        "",
-    ),
-    f("issuez_search_hits_free", fn (?*SearchHits) callconv(.c) void, &.{"h"}, ""),
-    .{ .prose = "What pickers, filters and list views need across issues: the labels in use, " ++
-        "the people the history knows, and the shortest unique ID prefixes. Deleted issues " ++
-        "don't count in the labels and people." },
-    .{ .handles = &.{ LabelCounts, People, ShortIds } },
-    .{ .type = LabelCount },
-    .{ .type = KnownPerson },
-    .{ .type = ShortId },
-    f(
-        "issuez_label_counts_take",
-        fn (?*Repo, Can, ?*?*LabelCounts, Err) callconv(.c) Code,
-        &.{ "repo", "cancel", "out", "err" },
-        "Every label in use, by name.",
-    ),
-    f("issuez_label_counts_len", fn (?*const LabelCounts) callconv(.c) usize, &.{"l"}, ""),
-    f(
-        "issuez_label_counts_at",
-        fn (?*const LabelCounts, usize) callconv(.c) ?*const LabelCount,
-        &.{ "l", "i" },
-        "",
-    ),
-    f("issuez_label_counts_free", fn (?*LabelCounts) callconv(.c) void, &.{"l"}, ""),
-    f(
-        "issuez_people_take",
-        fn (?*Repo, Can, ?*?*People, Err) callconv(.c) Code,
-        &.{ "repo", "cancel", "out", "err" },
-        "Everyone who opened or is assigned an issue, by email (compared ignoring case).",
-    ),
-    f("issuez_people_len", fn (?*const People) callconv(.c) usize, &.{"p"}, ""),
-    f(
-        "issuez_people_at",
-        fn (?*const People, usize) callconv(.c) ?*const KnownPerson,
-        &.{ "p", "i" },
-        "",
-    ),
-    f("issuez_people_free", fn (?*People) callconv(.c) void, &.{"p"}, ""),
-    f(
-        "issuez_short_ids_take",
-        fn (?*Repo, usize, Can, ?*?*ShortIds, Err) callconv(.c) Code,
-        &.{ "repo", "min", "cancel", "out", "err" },
-        "For every issue, the shortest prefix of its UUID that no other issue's starts " ++
-            "with, at least min long: what a list shows so that issuez_resolve takes it.",
-    ),
-    f("issuez_short_ids_len", fn (?*const ShortIds) callconv(.c) usize, &.{"s"}, ""),
-    f(
-        "issuez_short_ids_at",
-        fn (?*const ShortIds, usize) callconv(.c) ?*const ShortId,
-        &.{ "s", "i" },
-        "In UUID order.",
-    ),
-    f(
-        "issuez_short_ids_find",
-        fn (?*const ShortIds, Str) callconv(.c) Str,
-        &.{ "s", "id" },
-        "The prefix of a full UUID; {NULL,0} for one it doesn't know.",
-    ),
-    f("issuez_short_ids_free", fn (?*ShortIds) callconv(.c) void, &.{"s"}, ""),
     .{ .raw =
     \\/* The buffer issuez_resolve_one writes: a hyphenated UUID and a NUL. */
     \\#define ISSUEZ_UUID_BUFSIZE 37
@@ -1872,12 +1442,13 @@ pub const items = [_]Item{
         "issuez_resolve_one",
         fn (?*Repo, Kind, Str, Can, ?[*]u8, Err) callconv(.c) Code,
         &.{ "repo", "kind", "input", "cancel", "buf", "err" },
-        "Exactly one, or NOT_FOUND / AMBIGUOUS. Writes the UUID and a NUL into buf " ++
-            "(ISSUEZ_UUID_BUFSIZE bytes).",
+        "User input to a UUID: a full UUID, a unique prefix (\"a7f3\"), a number " ++
+            "(\"#12\"), or for milestones a name. Exactly one, or NOT_FOUND / AMBIGUOUS. " ++
+            "Writes the UUID and a NUL into buf (ISSUEZ_UUID_BUFSIZE bytes).",
     ),
     .{ .prose = "Snapshot: every issue and milestone ref with its tip. Cheap (no issue is " ++
-        "read), and serialisable so a host can store what it indexed." },
-    .{ .handles = &.{ Snapshot, Diff } },
+        "read). A host stores what it indexed in the encoding issuez_snapshot_decode reads." },
+    .{ .handles = &.{Snapshot} },
     f(
         "issuez_snapshot_take",
         fn (?*Repo, Can, ?*?*Snapshot, Err) callconv(.c) Code,
@@ -1893,62 +1464,16 @@ pub const items = [_]Item{
         "The i-th entry, sorted by kind, then UUID.",
     ),
     f(
-        "issuez_snapshot_tip",
-        fn (?*const Snapshot, Kind, Str, ?*Oid) callconv(.c) bool,
-        &.{ "s", "kind", "id", "out" },
-        "",
-    ),
-    f(
-        "issuez_snapshot_encode",
-        fn (?*const Snapshot) callconv(.c) Str,
-        &.{"s"},
-        "A stable, versioned binary encoding. The bytes live until s is freed.",
-    ),
-    f(
         "issuez_snapshot_decode",
         fn (Str, ?*?*Snapshot, Err) callconv(.c) Code,
         &.{ "bytes", "out", "err" },
-        "Empty bytes decode to an empty snapshot.",
+        "The stable, versioned encoding: \"issuez-snapshot 1\\n\", then a line " ++
+            "\"i <uuid> <tip>\\n\" or \"m <uuid> <tip>\\n\" per issue or milestone, the tip in " ++
+            "full lowercase hex. Empty bytes decode to an empty snapshot.",
     ),
-    .{ .type = ChangeKind },
-    .{ .type = DiffEntry },
-    f(
-        "issuez_diff_new",
-        fn (?*const Snapshot, ?*const Snapshot, ?*?*Diff, Err) callconv(.c) Code,
-        &.{ "old_snap", "new_snap", "out", "err" },
-        "old_snap may be NULL (everything is created). Pure: no git.",
-    ),
-    f("issuez_diff_len", fn (?*const Diff) callconv(.c) usize, &.{"d"}, ""),
-    f(
-        "issuez_diff_at",
-        fn (?*const Diff, usize) callconv(.c) ?*const DiffEntry,
-        &.{ "d", "i" },
-        "",
-    ),
-    f("issuez_diff_free", fn (?*Diff) callconv(.c) void, &.{"d"}, ""),
 
-    .{ .section = .{ "Watching", "Live updates: a callback when other processes (git issue, " ++
-        "another front end, a sync) change a repository's issues on disk." } },
-    .{ .type = WatchChange },
-    .{ .raw = "typedef void (*issuez_watch_fn)(void *userdata, uint32_t changes);" },
-    .{ .handles = &.{Watch} },
-    f(
-        "issuez_watch_start",
-        fn (?*Repo, WatchFn, ?*anyopaque, ?*?*Watch, Err) callconv(.c) Code,
-        &.{ "repo", "cb", "userdata", "out", "err" },
-        "Calls cb with issuez_watch_change bits once a burst of changes is quiet (and at " ++
-            "least every 400 ms while it isn't), on a thread of its own; our own writes " ++
-            "count too. cb must not call issuez_watch_stop. A changed path says something " ++
-            "may have changed, not what: read again.",
-    ),
-    f(
-        "issuez_watch_stop",
-        fn (?*Watch) callconv(.c) void,
-        &.{"w"},
-        "No call to cb after it returns.",
-    ),
     .{ .section = .{ "Issues: read", "" } },
-    .{ .handles = &.{ Issue, IssueList, Bytes } },
+    .{ .handles = &.{ Issue, IssueList } },
     f(
         "issuez_issue_load",
         fn (?*Repo, Str, Can, ?*?*Issue, Err) callconv(.c) Code,
@@ -1973,30 +1498,6 @@ pub const items = [_]Item{
             "since outside the issue's history (a purge rewrote it, or it isn't this " ++
             "issue's) makes none new and issuez_issue_info.rewritten true.",
     ),
-    .{ .type = JsonFlag },
-    f(
-        "issuez_issue_json",
-        fn (?*Repo, Str, u32, Can, ?*?*Bytes, Err) callconv(.c) Code,
-        &.{ "repo", "id", "flags", "cancel", "out", "err" },
-        "The issue as git issue show --json writes it (docs/json.md; " ++
-            "ISSUEZ_JSON_FLAG_FULL adds the description, comments and history), UTF-8: one " ++
-            "call for a binding that would rather parse JSON than call every accessor.",
-    ),
-    f(
-        "issuez_issue_json_many",
-        fn (?*Repo, ?[*]const Str, usize, u32, Can, ?*?*Bytes, Err) callconv(.c) Code,
-        &.{ "repo", "ids", "n", "flags", "cancel", "out", "err" },
-        "A JSON array of the issues with these full UUIDs, in their order; NULL ids and " ++
-            "n 0: every issue that isn't deleted. Missing and damaged ones are left out.",
-    ),
-    .{ .type = LoadFlag },
-    f(
-        "issuez_issue_load_many",
-        fn (?*Repo, ?[*]const Str, usize, u32, Can, ?*?*IssueList, Err) callconv(.c) Code,
-        &.{ "repo", "ids", "n", "flags", "cancel", "out", "err" },
-        "In the order of ids. Missing and damaged ones are skipped (see " ++
-            "issuez_issue_list_skipped_at) unless ISSUEZ_LOAD_FLAG_STRICT.",
-    ),
     f("issuez_issue_free", fn (?*Issue) callconv(.c) void, &.{"issue"}, ""),
     .{ .type = State },
     .{ .type = Priority },
@@ -2014,7 +1515,6 @@ pub const items = [_]Item{
     ),
     f("issuez_issue_label_count", fn (?*const Issue) callconv(.c) usize, &.{"i"}, ""),
     f("issuez_issue_label_at", fn (?*const Issue, usize) callconv(.c) Str, &.{ "i", "k" }, ""),
-    f("issuez_issue_has_label", fn (?*const Issue, Str) callconv(.c) bool, &.{ "i", "label" }, ""),
     f("issuez_issue_assignee_count", fn (?*const Issue) callconv(.c) usize, &.{"i"}, ""),
     f(
         "issuez_issue_assignee_at",
@@ -2024,12 +1524,6 @@ pub const items = [_]Item{
     ),
     f("issuez_issue_blocker_count", fn (?*const Issue) callconv(.c) usize, &.{"i"}, ""),
     f("issuez_issue_blocker_at", fn (?*const Issue, usize) callconv(.c) Str, &.{ "i", "k" }, ""),
-    f(
-        "issuez_issue_field",
-        fn (?*const Issue, Str) callconv(.c) Str,
-        &.{ "i", "key" },
-        "Any trailer by key, case-insensitive, as resolved (unknown ones too).",
-    ),
     f(
         "issuez_issue_extra_count",
         fn (?*const Issue) callconv(.c) usize,
@@ -2076,12 +1570,6 @@ pub const items = [_]Item{
         "issuez_issue_comment_at",
         fn (?*const Issue, usize) callconv(.c) ?*const Comment,
         &.{ "i", "k" },
-        "",
-    ),
-    f(
-        "issuez_issue_comment_find",
-        fn (?*const Issue, ?*const Oid) callconv(.c) ?*const Comment,
-        &.{ "i", "id" },
         "",
     ),
     f(
@@ -2146,12 +1634,6 @@ pub const items = [_]Item{
         "ops: ISSUEZ_OPT_Q_*. Defaults: not done, not deleted, newest first, 100 per " ++
             "page. Q_TEXT is a fixed-string match, not a search engine.",
     ),
-    f(
-        "issuez_query_count",
-        fn (?*Repo, OpsPtr, usize, Can, ?*u64, Err) callconv(.c) Code,
-        &.{ "repo", "ops", "n", "cancel", "out", "err" },
-        "Ignores Q_LIMIT and Q_AFTER.",
-    ),
     f("issuez_issue_list_len", fn (?*const IssueList) callconv(.c) usize, &.{"l"}, ""),
     f(
         "issuez_issue_list_at",
@@ -2169,7 +1651,7 @@ pub const items = [_]Item{
         "issuez_issue_list_skipped_count",
         fn (?*const IssueList) callconv(.c) usize,
         &.{"l"},
-        "Ids asked for or matched that couldn't be read (damaged).",
+        "Issues matched that couldn't be read (damaged).",
     ),
     f(
         "issuez_issue_list_skipped_at",
@@ -2178,65 +1660,12 @@ pub const items = [_]Item{
         "",
     ),
     f("issuez_issue_list_free", fn (?*IssueList) callconv(.c) void, &.{"l"}, ""),
-    .{ .section = .{ "Store", "A live view of a repository's issues for a front end: " ++
-        "every issue, kept up to date by issuez_store_refresh, which loads only the issues " ++
-        "whose tip moved. Issue handles from it are borrowed: valid until the next refresh " ++
-        "or free. Not for concurrent use; the repo is." } },
-    .{ .handles = &.{Store} },
-    f(
-        "issuez_store_new",
-        fn (?*Repo, ?*?*Store, Err) callconv(.c) Code,
-        &.{ "repo", "out", "err" },
-        "Empty until the first refresh.",
-    ),
-    f(
-        "issuez_store_refresh",
-        fn (?*Store, Can, ?*bool, Err) callconv(.c) Code,
-        &.{ "store", "cancel", "changed", "err" },
-        "Reads the refs and loads what moved; *changed is false when nothing did and the " ++
-            "handles stay valid.",
-    ),
-    f(
-        "issuez_store_generation",
-        fn (?*const Store) callconv(.c) u32,
-        &.{"store"},
-        "Bumped by every refresh that changed something.",
-    ),
-    f("issuez_store_issue_count", fn (?*const Store) callconv(.c) usize, &.{"store"}, ""),
-    f(
-        "issuez_store_issue_at",
-        fn (?*const Store, usize) callconv(.c) ?*const Issue,
-        &.{ "store", "i" },
-        "In UUID order; deleted ones too.",
-    ),
-    f(
-        "issuez_store_find",
-        fn (?*const Store, Str) callconv(.c) ?*const Issue,
-        &.{ "store", "id" },
-        "By full UUID; NULL for none.",
-    ),
-    f("issuez_store_changed_count", fn (?*const Store) callconv(.c) usize, &.{"store"}, ""),
-    f(
-        "issuez_store_changed_at",
-        fn (?*const Store, usize) callconv(.c) Str,
-        &.{ "store", "i" },
-        "UUIDs of the issues the last refresh found created, changed or deleted.",
-    ),
-    f("issuez_store_free", fn (?*Store) callconv(.c) void, &.{"store"}, ""),
-
     .{ .section = .{
         "Issues: write",
         "One op list, one commit: a user action (\"comment and close\", \"edit labels and " ++
             "assignees\", \"delete\") is one call. ISSUEZ_OPT_EXPECT and the other write " ++
             "options go in the same list.",
     } },
-    f(
-        "issuez_issue_check",
-        fn (?*Repo, Str, OpsPtr, usize, Can, ?*?*Problems, Err) callconv(.c) Code,
-        &.{ "repo", "id", "ops", "n", "cancel", "out", "err" },
-        "Dry run: every problem the write would hit, without writing. OK with an " ++
-            "empty list: it would succeed now. id {NULL,0}: as a create.",
-    ),
     f(
         "issuez_issue_create",
         fn (?*Repo, OpsPtr, usize, ?*const Actor, Can, ?*?*Write, Err) callconv(.c) Code,
@@ -2253,29 +1682,6 @@ pub const items = [_]Item{
             "issuez_reaction_target). A list that changes nothing (empty, or every " ++
             "value as it is) is OK and writes nothing (issuez_write_wrote).",
     ),
-    f(
-        "issuez_attachment_read",
-        fn (?*Repo, Str, Str, Can, ?*?*Bytes, Err) callconv(.c) Code,
-        &.{ "repo", "issue_id", "attachment_id", "cancel", "out", "err" },
-        "An attachment's bytes from the repository's store, checked against its trailer: " ++
-            "what a front end shows. NOT_FOUND for no such issue or attachment, LFS when " ++
-            "the bytes aren't in this clone (git lfs fetch), CORRUPT when they don't match.",
-    ),
-    f(
-        "issuez_bytes_data",
-        fn (?*const Bytes) callconv(.c) Str,
-        &.{"b"},
-        "The bytes; not NUL-terminated text, binary.",
-    ),
-    f("issuez_bytes_free", fn (?*Bytes) callconv(.c) void, &.{"b"}, ""),
-    f(
-        "issuez_attachment_validate",
-        fn (?*Repo, Str, Str, ?*Str, Err) callconv(.c) Code,
-        &.{ "repo", "name", "data", "media_type", "err" },
-        "Whether a write would take these bytes as an attachment (a PNG, JPEG or WebP, " ++
-            "not animated, within the repo's limits), without writing. media_type (may be " ++
-            "NULL) gets the type, a static string.",
-    ),
     .{ .handles = &.{PreparedAttachment} },
     .{ .type = AttachmentSpec },
     f(
@@ -2283,7 +1689,8 @@ pub const items = [_]Item{
         fn (?*Repo, Str, Str, Str, Can, ?*?*PreparedAttachment, Err) callconv(.c) Code,
         &.{ "repo", "id", "name", "data", "cancel", "out", "err" },
         "Validates and hashes bytes once, sanitizes the name and chooses an ID when empty. " ++
-            "Store the bytes in the host's LFS store before using the prepared op. " ++
+            "Store the bytes in the host's LFS store before writing " ++
+            "ISSUEZ_OPT_PREPARED_ATTACHMENT. " ++
             "The write requires ATTACHMENT_STORE 0 and checks metadata and limits again.",
     ),
     f(
@@ -2291,12 +1698,6 @@ pub const items = [_]Item{
         fn (?*const PreparedAttachment) callconv(.c) ?*const AttachmentSpec,
         &.{"p"},
         "Borrowed metadata for the host's storage, valid until p is freed.",
-    ),
-    f(
-        "issuez_prepared_attachment_op",
-        fn (?*const PreparedAttachment) callconv(.c) Op,
-        &.{"p"},
-        "An ADD op borrowing p's metadata. Keep p until the write returns.",
     ),
     f("issuez_prepared_attachment_free", fn (?*PreparedAttachment) callconv(.c) void, &.{"p"}, ""),
     .{ .prose = "The receipt of a write." },
@@ -2384,18 +1785,11 @@ pub const items = [_]Item{
         "",
     ),
     f(
-        "issuez_milestone_check",
-        fn (?*Repo, Str, OpsPtr, usize, Can, ?*?*Problems, Err) callconv(.c) Code,
-        &.{ "repo", "id", "ops", "n", "cancel", "out", "err" },
-        "Fields: NAME (required on create), DESCRIPTION, DUE_DATE, MILESTONE_STATUS " ++
-            "(COMPLETED is a GUARD problem while issues are open), plus ISSUEZ_OPT_EXPECT. " ++
-            "id {NULL,0}: as a create.",
-    ),
-    f(
         "issuez_milestone_create",
         fn (?*Repo, OpsPtr, usize, ?*const Actor, Can, ?*?*Write, Err) callconv(.c) Code,
         &.{ "repo", "ops", "n", "actor", "cancel", "out", "err" },
-        "",
+        "Fields: NAME (required on create), DESCRIPTION, DUE_DATE, MILESTONE_STATUS " ++
+            "(COMPLETED is a GUARD problem while issues are open), plus ISSUEZ_OPT_EXPECT.",
     ),
     f(
         "issuez_milestone_update",
@@ -2405,142 +1799,20 @@ pub const items = [_]Item{
     ),
 
     .{ .section = .{
-        "Projection",
-        "Answers that need several issues: tree, blockers, progress, effective " ++
-            "milestone, problems. Built from every issue, or from what one issue's " ++
-            "answers need (cheaper; the same answers for that issue).",
+        "Fsck",
+        "Checking the issue data, as git issue fsck does: upstream fsck's checks on every " ++
+            "issue and milestone, attachment trailers and bytes, derived attachment refs, " ++
+            "quarantined remote versions, and hierarchy and blocker problems. Nothing is " ++
+            "written. With ISSUEZ_OPT_ATTACHMENT_STORE 0 the bytes are the caller's to check.",
     } },
-    .{ .handles = &.{Projection} },
-    f(
-        "issuez_projection_build",
-        fn (?*Repo, Can, ?*?*Projection, Err) callconv(.c) Code,
-        &.{ "repo", "cancel", "out", "err" },
-        "",
-    ),
-    f(
-        "issuez_projection_around",
-        fn (?*Repo, Str, Can, ?*?*Projection, Err) callconv(.c) Code,
-        &.{ "repo", "id", "cancel", "out", "err" },
-        "What one issue's answers need: the issue, its ancestors, descendants " ++
-            "and blockers. Its answers are those of issuez_projection_build, but " ++
-            "for whom it blocks: that needs every issue.",
-    ),
-    f("issuez_projection_free", fn (?*Projection) callconv(.c) void, &.{"p"}, ""),
-    f(
-        "issuez_projection_issues",
-        fn (?*const Projection) callconv(.c) ?*const IssueList,
-        &.{"p"},
-        "The issues it covers, borrowed.",
-    ),
-    f(
-        "issuez_projection_root_count",
-        fn (?*const Projection) callconv(.c) usize,
-        &.{"p"},
-        "Roots in tree order (a broken parent makes an issue a root).",
-    ),
-    f(
-        "issuez_projection_root_at",
-        fn (?*const Projection, usize) callconv(.c) Str,
-        &.{ "p", "i" },
-        "",
-    ),
-    f(
-        "issuez_projection_child_count",
-        fn (?*const Projection, Str) callconv(.c) usize,
-        &.{ "p", "id" },
-        "",
-    ),
-    f(
-        "issuez_projection_child_at",
-        fn (?*const Projection, Str, usize) callconv(.c) Str,
-        &.{ "p", "id", "i" },
-        "",
-    ),
-    f(
-        "issuez_projection_active_blocker_count",
-        fn (?*const Projection, Str) callconv(.c) usize,
-        &.{ "p", "id" },
-        "Blockers that aren't done.",
-    ),
-    f(
-        "issuez_projection_active_blocker_at",
-        fn (?*const Projection, Str, usize) callconv(.c) Str,
-        &.{ "p", "id", "i" },
-        "",
-    ),
-    f(
-        "issuez_projection_blocking_count",
-        fn (?*const Projection, Str) callconv(.c) usize,
-        &.{ "p", "id" },
-        "Issues this one blocks.",
-    ),
-    f(
-        "issuez_projection_blocking_at",
-        fn (?*const Projection, Str, usize) callconv(.c) Str,
-        &.{ "p", "id", "i" },
-        "",
-    ),
-    f(
-        "issuez_projection_progress",
-        fn (?*const Projection, Str, ?*Progress) callconv(.c) bool,
-        &.{ "p", "id", "out" },
-        "Done and total leaves below the issue; false without sub-issues.",
-    ),
-    f(
-        "issuez_projection_milestone_of",
-        fn (?*const Projection, Str) callconv(.c) Str,
-        &.{ "p", "id" },
-        "Direct or through parents; {NULL,0} for none.",
-    ),
-    f(
-        "issuez_projection_milestone_progress",
-        fn (?*const Projection, Str) callconv(.c) Progress,
-        &.{ "p", "milestone_id" },
-        "",
-    ),
-    f(
-        "issuez_projection_problems",
-        fn (?*const Projection, Str) callconv(.c) ?*const Problems,
-        &.{ "p", "id" },
-        "Problems across issues (missing parent, cycle, ...); id {NULL,0} for all.",
-    ),
-
-    .{ .section = .{
-        "Sync",
-        "Fetch, merge and push issues and milestones with a remote. Never force-pushes " ++
-            "or drops a version.",
-    } },
-    .{ .handles = &.{SyncReport} },
-    .{ .type = SyncOutcome },
-    .{ .type = SyncItem },
-    f(
-        "issuez_sync",
-        fn (?*Repo, Str, OpsPtr, usize, Can, ?*?*SyncReport, Err) callconv(.c) Code,
-        &.{ "repo", "remote", "opts", "n_opts", "cancel", "out", "err" },
-        "opts: ISSUEZ_OPT_SYNC_*. OK even when some items failed or were " ++
-            "quarantined: check the report.",
-    ),
-    f("issuez_sync_report_len", fn (?*const SyncReport) callconv(.c) usize, &.{"r"}, ""),
-    f(
-        "issuez_sync_report_at",
-        fn (?*const SyncReport, usize) callconv(.c) ?*const SyncItem,
-        &.{ "r", "i" },
-        "",
-    ),
-    f("issuez_sync_report_ok", fn (?*const SyncReport) callconv(.c) bool, &.{"r"}, ""),
-    f("issuez_sync_report_free", fn (?*SyncReport) callconv(.c) void, &.{"r"}, ""),
-    .{ .prose = "Checking the issue data (git issue fsck): upstream fsck's checks on every " ++
-        "issue and milestone, attachment trailers and bytes, derived attachment refs, " ++
-        "quarantined remote versions, and hierarchy and blocker problems." },
     .{ .type = FsckKind },
     .{ .type = FsckFinding },
-    .{ .type = FsckFlag },
     .{ .handles = &.{FsckReport} },
     f(
         "issuez_fsck",
-        fn (?*Repo, u32, Can, ?*?*FsckReport, Err) callconv(.c) Code,
-        &.{ "repo", "flags", "cancel", "out", "err" },
-        "flags: issuez_fsck_flag bits. Without ISSUEZ_FSCK_FLAG_REPAIR nothing is written.",
+        fn (?*Repo, Can, ?*?*FsckReport, Err) callconv(.c) Code,
+        &.{ "repo", "cancel", "out", "err" },
+        "",
     ),
     f("issuez_fsck_report_issue_count", fn (?*const FsckReport) callconv(.c) usize, &.{"r"}, ""),
     f(
@@ -2558,64 +1830,6 @@ pub const items = [_]Item{
         "In the order the checks ran.",
     ),
     f("issuez_fsck_report_free", fn (?*FsckReport) callconv(.c) void, &.{"r"}, ""),
-    .{ .prose = "Setting a remote up (git issue init): fetch refspecs that bring its " ++
-        "issues, milestones and attachment refs into refs/remotes/<remote>/, where a merge " ++
-        "takes them from. Optional: issuez_sync works without it." },
-    .{ .type = RemoteSetup },
-    .{ .type = RemoteFlag },
-    f(
-        "issuez_remote_default",
-        fn (?*Repo, Can, ?*?*Matches, Err) callconv(.c) Code,
-        &.{ "repo", "cancel", "out", "err" },
-        "The remote to set up when none is named: one entry (the only remote, else " ++
-            "origin), none, or every remote when there are several and none is origin.",
-    ),
-    f(
-        "issuez_remote_configure",
-        fn (?*Repo, Str, u32, Can, ?*RemoteSetup, Err) callconv(.c) Code,
-        &.{ "repo", "remote", "flags", "cancel", "out", "err" },
-        "Adds the refspecs remote lacks; idempotent. flags: issuez_remote_flag bits. " ++
-            "NOT_FOUND for no such remote.",
-    ),
-    .{ .prose = "Sync status without the network: what is quarantined from a remote and what " ++
-        "isn't pushed to it yet." },
-    .{ .type = QuarantineReason },
-    .{ .type = QuarantineChoice },
-    .{ .type = Quarantined },
-    .{ .handles = &.{SyncStatus} },
-    f(
-        "issuez_sync_status_take",
-        fn (?*Repo, Str, Can, ?*?*SyncStatus, Err) callconv(.c) Code,
-        &.{ "repo", "remote", "cancel", "out", "err" },
-        "",
-    ),
-    f(
-        "issuez_sync_status_quarantined_count",
-        fn (?*const SyncStatus) callconv(.c) usize,
-        &.{"s"},
-        "",
-    ),
-    f(
-        "issuez_sync_status_quarantined_at",
-        fn (?*const SyncStatus, usize) callconv(.c) ?*const Quarantined,
-        &.{ "s", "i" },
-        "",
-    ),
-    f("issuez_sync_status_pending_count", fn (?*const SyncStatus) callconv(.c) usize, &.{"s"}, ""),
-    f(
-        "issuez_sync_status_pending_at",
-        fn (?*const SyncStatus, usize) callconv(.c) Str,
-        &.{ "s", "i" },
-        "The UUID of an issue not pushed yet; quarantined ones aren't counted.",
-    ),
-    f("issuez_sync_status_free", fn (?*SyncStatus) callconv(.c) void, &.{"s"}, ""),
-    f(
-        "issuez_quarantine_resolve",
-        fn (?*Repo, Str, Kind, Str, QuarantineChoice, Can, Err) callconv(.c) Code,
-        &.{ "repo", "remote", "kind", "id", "choice", "cancel", "err" },
-        "Keep ours, or take theirs (the replaced version is kept). INVALID_ARGUMENT for " ++
-            "ISSUEZ_CHOICE_UNKNOWN.",
-    ),
 
     .{ .section = .{
         "Push check",
@@ -2709,8 +1923,8 @@ pub const items = [_]Item{
         fn (?*const PurgeResult) callconv(.c) usize,
         &.{"r"},
         "Remotes whose tracking refs show they had the purged commits, one synced by URL " ++
-            "or path as the url-<hash> its refs are kept under. The next issuez_sync with " ++
-            "each replaces their copy (leased on what it fetched).",
+            "or path as the url-<hash> its refs are kept under. The next git issue sync " ++
+            "with each replaces their copy (leased on what it fetched).",
     ),
     f(
         "issuez_purge_result_exposed_remote_at",
@@ -2836,10 +2050,7 @@ pub const helpers = [_]Helper{
     h(.add, "exclusive_scope", .str, .{}),
     h(.add, "extra_prefix", .str, .{}),
     h(.set, "timeout_local_ms", .num, .{}),
-    h(.set, "timeout_network_ms", .num, .{}),
     h(.set, "limit", .name_num, .{ .param = "value" }),
     h(.set, "cache_issues", .num, .{}),
     h(.set, "attachment_store", .num, .{ .num_type = "bool", .param = "store" }),
-    h(.set, "sync_push", .num, .{ .num_type = "bool", .param = "push" }),
-    h(.set, "sync_attachments", .num, .{ .num_type = "bool", .param = "attachments" }),
 };

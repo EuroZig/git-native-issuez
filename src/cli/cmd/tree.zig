@@ -29,23 +29,15 @@ pub fn main(comptime B: type, ctx: *context.Context(B), argv: []const []const u8
     var prefix: ?[]const u8 = null;
     var all = false;
     var as_json = false;
-    var args: common.Args = .{ .list = argv };
-    while (args.next()) |arg| {
-        if (!args.isOption(arg)) {
-            if (args.was_separator) continue;
-            if (prefix != null) return common.missing(ctx.err, "tree", "only one issue");
-            prefix = arg;
-        } else if (common.isHelp(arg)) {
-            ctx.out.writeAll(help) catch {};
-            return common.exit_ok;
-        } else if (std.mem.eql(u8, arg, "-a") or std.mem.eql(u8, arg, "--all")) {
-            all = true;
-        } else if (std.mem.eql(u8, arg, "--json")) {
-            as_json = true;
-        } else {
-            return common.unknownOption(ctx.err, "tree", arg);
-        }
-    }
+    if (common.parseArgs(ctx, argv, .{
+        .command = "tree",
+        .help = help,
+        .positionals = .{ .only = .{ &prefix, "only one issue" } },
+        .flags = &.{
+            .{ "-a --all", .{ .on = &all } },
+            .{ "--json", .{ .on = &as_json } },
+        },
+    })) |exit| return exit;
 
     const repo = common.openRepo(B, ctx) orelse return common.exit_fatal;
     const proj = ext_flags.project(B, ctx, repo) orelse return common.exit_error;

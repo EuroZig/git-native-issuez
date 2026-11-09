@@ -68,18 +68,28 @@ pub fn arena(sb: *Sandbox) std.mem.Allocator {
 
 pub const Output = struct { stdout: []const u8, stderr: []const u8, code: u8 };
 
-/// Runs `argv` with the sandbox environment, in `cwd` (default: the repo).
-pub fn runIn(sb: *Sandbox, cwd: ?[]const u8, argv: []const []const u8) !Output {
-    const result = try std.process.run(sb.arena(), io, .{
+/// Runs `argv` in `cwd` with `env`. A signal or the like is code 255.
+pub fn exec(
+    arena_: std.mem.Allocator,
+    cwd: []const u8,
+    argv: []const []const u8,
+    env: *const std.process.Environ.Map,
+) !Output {
+    const result = try std.process.run(arena_, io, .{
         .argv = argv,
-        .cwd = .{ .path = cwd orelse sb.repo },
-        .environ_map = &sb.env,
+        .cwd = .{ .path = cwd },
+        .environ_map = env,
     });
     const code: u8 = switch (result.term) {
         .exited => |c| c,
         else => 255,
     };
     return .{ .stdout = result.stdout, .stderr = result.stderr, .code = code };
+}
+
+/// Runs `argv` with the sandbox environment, in `cwd` (default: the repo).
+pub fn runIn(sb: *Sandbox, cwd: ?[]const u8, argv: []const []const u8) !Output {
+    return exec(sb.arena(), cwd orelse sb.repo, argv, &sb.env);
 }
 
 pub fn run(sb: *Sandbox, argv: []const []const u8) !Output {
@@ -106,12 +116,44 @@ pub fn exe(sb: *Sandbox, path: []const u8) ![]const u8 {
     return std.fs.path.join(sb.arena(), &.{ sb.cwd, path });
 }
 
-/// Runs `program args...` in the repo.
-pub fn tool(sb: *Sandbox, program: []const u8, args: []const []const u8) !Output {
+/// Runs `program args...` in `dir` (default: the repo).
+pub fn toolIn(
+    sb: *Sandbox,
+    dir: ?[]const u8,
+    program: []const u8,
+    args: []const []const u8,
+) !Output {
     var argv: std.ArrayList([]const u8) = .empty;
     try argv.append(sb.arena(), try sb.exe(program));
     try argv.appendSlice(sb.arena(), args);
-    return sb.run(argv.items);
+    return sb.runIn(dir, argv.items);
+}
+
+/// Runs `program args...` in the repo.
+pub fn tool(sb: *Sandbox, program: []const u8, args: []const []const u8) !Output {
+    return sb.toolIn(null, program, args);
+}
+
+/// A bare repository beside the repo, for clones to sync through.
+pub fn hub(sb: *Sandbox) ![]const u8 {
+    const path = try std.fmt.allocPrint(sb.arena(), "{s}-hub.git", .{sb.repo});
+    try sb.git(&.{ "init", "-q", "--bare", path });
+    return path;
+}
+
+/// A hub that is the repo's `origin`.
+pub fn originHub(sb: *Sandbox) ![]const u8 {
+    const path = try sb.hub();
+    try sb.git(&.{ "remote", "add", "origin", path });
+    return path;
+}
+
+/// Another repository beside the repo, with `url` as its `origin`.
+pub fn clone(sb: *Sandbox, name: []const u8, url: []const u8) ![]const u8 {
+    const path = try std.fmt.allocPrint(sb.arena(), "{s}-{s}", .{ sb.repo, name });
+    try sb.git(&.{ "init", "-q", path });
+    try expectSuccess(try sb.runIn(path, &.{ "git", "remote", "add", "origin", url }));
+    return path;
 }
 
 pub fn expectSuccess(out: Output) !void {

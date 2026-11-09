@@ -9,11 +9,10 @@ import (
 	"context"
 	"runtime"
 	"time"
-	"unsafe"
 )
 
 // Issue is a loaded issue, copied out of the library. Safe to keep and
-// share; LoadJSON is its documented JSON form.
+// share.
 type Issue struct {
 	ID            string
 	Tip           OID    // pass to ExpectTip
@@ -38,7 +37,7 @@ type Issue struct {
 	Priority    Priority
 	Labels      []string
 	Assignees   []Person
-	MilestoneID string // direct only; see Projection for the effective one
+	MilestoneID string // direct only, not one inherited from a parent
 	ParentID    string
 	BlockedBy   []string
 	StartDate   *Date
@@ -332,11 +331,11 @@ func goIssue(i *C.issuez_issue, history bool) *Issue {
 	return out
 }
 
-func goIssues(l *C.issuez_issue_list, history bool) (issues []*Issue, skipped []string) {
+func goIssues(l *C.issuez_issue_list) (issues []*Issue, skipped []string) {
 	n := C.issuez_issue_list_len(l)
 	issues = make([]*Issue, 0, int(n))
 	for k := C.size_t(0); k < n; k++ {
-		issues = append(issues, goIssue(C.issuez_issue_list_at(l, k), history))
+		issues = append(issues, goIssue(C.issuez_issue_list_at(l, k), false))
 	}
 	skipped = goStrs(C.issuez_issue_list_skipped_count(l), func(k C.size_t) C.issuez_str {
 		return C.issuez_issue_list_skipped_at(l, k)
@@ -345,9 +344,9 @@ func goIssues(l *C.issuez_issue_list, history bool) (issues []*Issue, skipped []
 }
 
 // takePage copies and frees an owned list.
-func takePage(l *C.issuez_issue_list, history bool) (p Page) {
+func takePage(l *C.issuez_issue_list) (p Page) {
 	defer C.issuez_issue_list_free(l)
-	p.Issues, p.Skipped = goIssues(l, history)
+	p.Issues, p.Skipped = goIssues(l)
 	p.Next = goStr(C.issuez_issue_list_next_cursor(l))
 	return p
 }
@@ -358,7 +357,6 @@ func takePage(l *C.issuez_issue_list, history bool) (p Page) {
 type LoadOption func(*loadOpts)
 type loadOpts struct {
 	history bool
-	strict  bool
 	since   OID
 	at      OID
 }
@@ -371,10 +369,6 @@ func LoadHistory() LoadOption { return func(o *loadOpts) { o.history = true } }
 // included. A tip outside the history sets Issue.Rewritten instead. Load
 // only; the zero OID marks every entry new.
 func Since(tip OID) LoadOption { return func(o *loadOpts) { o.since = tip } }
-
-// Strict makes LoadMany fail on a missing or damaged issue instead of
-// skipping it.
-func Strict() LoadOption { return func(o *loadOpts) { o.strict = true } }
 
 // CommentOf is the comment a timeline entry adds or targets; nil for
 // entries without one.
@@ -438,19 +432,6 @@ func (r *Repo) Load(ctx context.Context, id string, opts ...LoadOption) (*Issue,
 		defer C.issuez_issue_free(i)
 		return goIssue(i, o.history)
 	})
-}
-
-// LoadMany reads several issues in the order of ids. Missing and damaged
-// ones are skipped and listed, unless Strict.
-func (r *Repo) LoadMany(ctx context.Context, ids []string, opts ...LoadOption) (issues []*Issue, skipped []string, err error) {
-	o := loadOptions(opts)
-	var pin runtime.Pinner
-	defer pin.Unpin()
-	cids, n := cStrs(&pin, ids)
-	page, err := fetch(ctx, r, func(a cArgs, l **C.issuez_issue_list) C.issuez_code {
-		return C.issuez_issue_load_many(a.repo, cids, n, flagIf(o.strict, C.ISSUEZ_LOAD_FLAG_STRICT), a.tok, l, a.cerr)
-	}, func(l *C.issuez_issue_list) Page { return takePage(l, o.history) })
-	return page.Issues, page.Skipped, err
 }
 
 // ─── Query ─────────────────────────────────────────────────────────────
@@ -577,94 +558,5 @@ func (r *Repo) Query(ctx context.Context, q Query) (Page, error) {
 	ops, n := cOps(&pin, q.ops())
 	return fetch(ctx, r, func(a cArgs, l **C.issuez_issue_list) C.issuez_code {
 		return C.issuez_query_run(a.repo, ops, n, a.tok, l, a.cerr)
-	}, func(l *C.issuez_issue_list) Page { return takePage(l, false) })
-}
-
-// Count is the number of matches, ignoring Limit and After.
-func (r *Repo) Count(ctx context.Context, q Query) (int, error) {
-	var pin runtime.Pinner
-	defer pin.Unpin()
-	ops, n := cOps(&pin, q.ops())
-	return fetch(ctx, r, func(a cArgs, out *C.uint64_t) C.issuez_code {
-		return C.issuez_query_count(a.repo, ops, n, a.tok, out, a.cerr)
-	}, func(out C.uint64_t) int { return int(out) })
-}
-
-// ─── Across issues ─────────────────────────────────────────────────────
-
-// LabelCounts is every label in use, by name; deleted issues don't count.
-func (r *Repo) LabelCounts(ctx context.Context) ([]LabelCount, error) {
-	return fetch(ctx, r, func(a cArgs, l **C.issuez_label_counts) C.issuez_code {
-		return C.issuez_label_counts_take(a.repo, a.tok, l, a.cerr)
-	}, func(l *C.issuez_label_counts) []LabelCount {
-		defer C.issuez_label_counts_free(l)
-		return goList(C.issuez_label_counts_len(l), func(i C.size_t) LabelCount {
-			return goLabelCount(C.issuez_label_counts_at(l, i))
-		})
-	})
-}
-
-// People is everyone who opened or is assigned an issue, by email.
-func (r *Repo) People(ctx context.Context) ([]KnownPerson, error) {
-	return fetch(ctx, r, func(a cArgs, p **C.issuez_people) C.issuez_code {
-		return C.issuez_people_take(a.repo, a.tok, p, a.cerr)
-	}, func(p *C.issuez_people) []KnownPerson {
-		defer C.issuez_people_free(p)
-		return goList(C.issuez_people_len(p), func(i C.size_t) KnownPerson {
-			return goKnownPerson(C.issuez_people_at(p, i))
-		})
-	})
-}
-
-// ShortIDs maps every issue's UUID to its shortest unique prefix, at
-// least minLen long: what a list shows so that Resolve takes it.
-func (r *Repo) ShortIDs(ctx context.Context, minLen int) (map[string]string, error) {
-	return fetch(ctx, r, func(a cArgs, s **C.issuez_short_ids) C.issuez_code {
-		return C.issuez_short_ids_take(a.repo, C.size_t(minLen), a.tok, s, a.cerr)
-	}, func(s *C.issuez_short_ids) map[string]string {
-		defer C.issuez_short_ids_free(s)
-		n := C.issuez_short_ids_len(s)
-		out := make(map[string]string, int(n))
-		for i := C.size_t(0); i < n; i++ {
-			x := C.issuez_short_ids_at(s, i)
-			out[goStr(x.id)] = goStr(x.prefix)
-		}
-		return out
-	})
-}
-
-// ─── JSON ──────────────────────────────────────────────────────────────
-
-// JSONOptions shape LoadJSON and LoadManyJSON.
-type JSONOptions struct {
-	// Full adds the description, comments and history, as show does.
-	Full bool
-}
-
-// LoadJSON is the issue as git issue show --json writes it (docs/json.md):
-// for a host that passes it on, to a web client say, without its own
-// encoding.
-func (r *Repo) LoadJSON(ctx context.Context, id string, opts JSONOptions) ([]byte, error) {
-	return fetch(ctx, r, func(a cArgs, b **C.issuez_bytes) C.issuez_code {
-		return C.issuez_issue_json(a.repo, cStr(id), flagIf(opts.Full, C.ISSUEZ_JSON_FLAG_FULL), a.tok, b, a.cerr)
-	}, takeBytes)
-}
-
-// LoadManyJSON is a JSON array of the issues with ids, in their order
-// (none: every issue that isn't deleted), each in LoadJSON's form;
-// missing and damaged ones are left out.
-func (r *Repo) LoadManyJSON(ctx context.Context, ids []string, opts JSONOptions) ([]byte, error) {
-	var pin runtime.Pinner
-	defer pin.Unpin()
-	cids, n := cStrs(&pin, ids)
-	return fetch(ctx, r, func(a cArgs, b **C.issuez_bytes) C.issuez_code {
-		return C.issuez_issue_json_many(a.repo, cids, n, flagIf(opts.Full, C.ISSUEZ_JSON_FLAG_FULL), a.tok, b, a.cerr)
-	}, takeBytes)
-}
-
-// takeBytes copies and frees owned bytes.
-func takeBytes(b *C.issuez_bytes) []byte {
-	defer C.issuez_bytes_free(b)
-	d := C.issuez_bytes_data(b)
-	return C.GoBytes(unsafe.Pointer(d.ptr), C.int(d.len))
+	}, takePage)
 }

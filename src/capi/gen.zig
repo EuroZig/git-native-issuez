@@ -35,7 +35,6 @@ fn cType(comptime T: type) []const u8 {
 fn cTypeOf(comptime T: type) []const u8 {
     if (T == api.Code) return "issuez_code";
     if (T == api.LogFn) return "issuez_log_fn";
-    if (T == api.WatchFn) return "issuez_watch_fn";
     if (T == c_int) return "int";
     if (T == anyopaque) return "void";
     if (T == usize) return "size_t";
@@ -74,10 +73,6 @@ fn upper(comptime s: []const u8) []const u8 {
         const out = buf;
         return &out;
     }
-}
-
-fn targetConstOf(comptime target: []const u8) []const u8 {
-    comptime return targetConst(target);
 }
 
 fn enumConst(comptime T: type, comptime field: []const u8) []const u8 {

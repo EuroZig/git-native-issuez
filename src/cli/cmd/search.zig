@@ -30,31 +30,23 @@ pub fn main(comptime B: type, ctx: *context.Context(B), argv: []const []const u8
     var ignore_case = false;
     var as_json = false;
 
-    var args: common.Args = .{ .list = argv };
-    while (args.next()) |arg| {
-        if (!args.isOption(arg)) {
-            if (args.was_separator) continue;
-            if (pattern == null) pattern = arg;
-        } else if (common.isHelp(arg)) {
-            ctx.out.writeAll(help) catch {};
-            return common.exit_ok;
-        } else if (std.mem.eql(u8, arg, "-s") or std.mem.eql(u8, arg, "--state")) {
-            state_filter = common.stateFilter(
-                args.value(ctx.err, "-s") orelse return common.exit_error,
-            );
-        } else if (std.mem.eql(u8, arg, "-i") or std.mem.eql(u8, arg, "--ignore-case")) {
-            ignore_case = true;
-        } else if (std.mem.eql(u8, arg, "--json")) {
-            as_json = true;
-        } else {
-            return common.unknownOption(ctx.err, "search", arg);
-        }
+    const flags = [_]common.Flag{
+        .{ "-i --ignore-case", .{ .on = &ignore_case } },
+        .{ "--json", .{ .on = &as_json } },
+    };
+    var parser = common.argParser(ctx, argv, .{
+        .command = "search",
+        .help = help,
+        .positionals = .{ .first = &pattern },
+        .flags = &flags,
+    });
+    while (parser.next()) |arg| {
+        if (!common.isFlag(arg, "-s --state")) return parser.unknown(arg);
+        state_filter = common.stateFilter(parser.value("-s") orelse return common.exit_error);
     }
-    const needle = pattern orelse return common.missing(
-        ctx.err,
-        "search",
-        "search pattern is required",
-    );
+    if (parser.exit) |exit| return exit;
+    const needle = pattern orelse
+        return common.missing(ctx.err, "search", "search pattern is required");
     if (needle.len == 0) return common.missing(ctx.err, "search", "search pattern is required");
 
     const repo = common.openRepo(B, ctx) orelse return common.exit_fatal;

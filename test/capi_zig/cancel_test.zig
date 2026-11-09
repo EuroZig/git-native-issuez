@@ -6,21 +6,61 @@ const fixture = @import("fixture.zig");
 const expect = @import("expect.zig");
 const c = fixture.c;
 
-// covers: issuez_cancel_trigger, issuez_cancel_triggered, issuez_cancel_free
+// covers: issuez_cancel_trigger, issuez_cancel_free
 test "issuez_cancel_new: a token and NULL" {
-    fixture.ensureInit();
-    const leaks = fixture.Leaks.start();
-    defer leaks.check();
+    var r = try fixture.Repo.init(.{});
+    defer r.deinit();
     const t = c.issuez_cancel_new().?;
-    try testing.expect(!c.issuez_cancel_triggered(t));
+    defer c.issuez_cancel_free(t);
+    var snap: ?*c.issuez_snapshot = null;
+    try expect.code(c.ISSUEZ_OK, c.issuez_snapshot_take(r.handle, t, &snap, null), null);
+    c.issuez_snapshot_free(snap);
+    // Triggering twice is the same; every call with the token stops.
     c.issuez_cancel_trigger(t);
-    try testing.expect(c.issuez_cancel_triggered(t));
     c.issuez_cancel_trigger(t);
-    try testing.expect(c.issuez_cancel_triggered(t));
-    c.issuez_cancel_free(t);
+    try expect.code(c.ISSUEZ_E_CANCELLED, c.issuez_snapshot_take(r.handle, t, &snap, null), null);
+    try expect.code(c.ISSUEZ_E_CANCELLED, c.issuez_snapshot_take(r.handle, t, &snap, null), null);
     c.issuez_cancel_free(null);
     c.issuez_cancel_trigger(null);
-    try testing.expect(!c.issuez_cancel_triggered(null));
+}
+
+fn triggerLater(t: *c.issuez_cancel) void {
+    std.Io.sleep(testing.io, .fromMilliseconds(200), .awake) catch {};
+    c.issuez_cancel_trigger(t);
+}
+
+test "issuez_fsck: a cancelled call fails, with no report" {
+    var r = try fixture.Repo.init(.{});
+    defer r.deinit();
+    _ = try fixture.titled(r.handle, "Fine");
+    const slow = try fixture.slowGit(r.arena(), r.root);
+    const h = try r.open(&.{c.issuez_opt_git_path(fixture.str(slow))});
+    defer c.issuez_repo_close(h);
+    const token = c.issuez_cancel_new().?;
+    defer c.issuez_cancel_free(token);
+    const thread = try std.Thread.spawn(.{}, triggerLater, .{token});
+    defer thread.join();
+    var rep: ?*c.issuez_fsck_report = null;
+    try expect.code(c.ISSUEZ_E_CANCELLED, c.issuez_fsck(h, token, &rep, null), null);
+    try testing.expect(rep == null);
+}
+
+test "issuez_cancel_trigger: kills a git that is running" {
+    var r = try fixture.Repo.init(.{});
+    defer r.deinit();
+    const slow = try fixture.slowGit(r.arena(), r.root);
+    const h = try r.open(&.{c.issuez_opt_git_path(fixture.str(slow))});
+    defer c.issuez_repo_close(h);
+    const token = c.issuez_cancel_new().?;
+    defer c.issuez_cancel_free(token);
+    const thread = try std.Thread.spawn(.{}, triggerLater, .{token});
+    const start = std.Io.Timestamp.now(testing.io, .awake);
+    var snap: ?*c.issuez_snapshot = null;
+    var err: ?*c.issuez_error = null;
+    try expect.code(c.ISSUEZ_E_CANCELLED, c.issuez_snapshot_take(h, token, &snap, &err), err);
+    c.issuez_error_free(err);
+    thread.join();
+    try testing.expect(start.untilNow(testing.io, .awake).toMilliseconds() < 3000);
 }
 
 /// Records what the logger gets.
@@ -64,10 +104,7 @@ const Recorder = struct {
 };
 
 test "issuez_set_logger: git requests at debug, nothing when off" {
-    const leaks = fixture.Leaks.start();
-    defer leaks.check();
-    var r: fixture.Repo = undefined;
-    try r.init(.{});
+    var r = try fixture.Repo.init(.{});
     defer r.deinit();
     var rec: Recorder = .{};
     defer rec.deinit();
@@ -96,10 +133,7 @@ test "issuez_set_logger: git requests at debug, nothing when off" {
 }
 
 test "issuez_repo_set_logger: one repo's calls log to its own logger" {
-    const leaks = fixture.Leaks.start();
-    defer leaks.check();
-    var r: fixture.Repo = undefined;
-    try r.init(.{});
+    var r = try fixture.Repo.init(.{});
     defer r.deinit();
     const other = try r.open(&.{});
     defer c.issuez_repo_close(other);

@@ -235,6 +235,18 @@ pub fn fail(s: *State, comptime format: []const u8, args: anytype) void {
     s.setStatus(.err, format, args);
 }
 
+/// `fail`, for a key or an answer that goes no further.
+pub fn failed(s: *State, comptime format: []const u8, args: anytype) Action {
+    s.fail(format, args);
+    return .none;
+}
+
+/// `info`, likewise.
+pub fn noted(s: *State, comptime format: []const u8, args: anytype) Action {
+    s.info(format, args);
+    return .none;
+}
+
 /// A message too long for the buffer is cut, ending in `…`.
 fn setStatus(
     s: *State,
@@ -382,11 +394,10 @@ pub fn quitUnlessSyncing(s: *State) Action {
     const kind = s.sync.running orelse return .quit;
     if (s.quit_armed) return .quit;
     s.quit_armed = true;
-    s.fail(
+    return s.failed(
         "a {s} with {s} is running: q again quits and stops it",
         .{ kind.label(), s.sync.runningRemote() },
     );
-    return .none;
 }
 
 /// What the timeline's draft would change, now: a frame may not have
@@ -558,15 +569,9 @@ fn drawTopBar(s: *State, f: ui.Frame, bar: ui.Window) Allocator.Error!void {
     if (s.view == .timeline and s.timeline.editing) return s.drawEditBanner(f, bar);
     const bg: ui.Style = .{ .bg = ui.palette.bar_bg };
     bar.fill(.{ .style = bg });
-    var col: u16 = 0;
-    col += ui.text(
-        bar,
-        1,
-        0,
-        "◆ issues",
-        .{ .fg = ui.palette.accent, .bg = ui.palette.bar_bg, .bold = true },
-    );
-    col += 3;
+    var l: ui.Line = .{ .f = f, .win = bar, .x = 1 };
+    l.text("◆ issues", .{ .fg = ui.palette.accent, .bg = ui.palette.bar_bg, .bold = true });
+    l.x += 2;
     const tabs = [_]struct {
         ui.View,
         []const u8,
@@ -578,41 +583,17 @@ fn drawTopBar(s: *State, f: ui.Frame, bar: ui.Window) Allocator.Error!void {
     };
     for (tabs, 1..) |t, n| {
         const active = s.view == t[0] or (t[0] == .milestones and s.view == .milestone);
-        col += try ui.button(
-            f,
-            bar,
-            col,
-            0,
-            f.fmt("{d} {s}", .{ n, t[1] }),
-            .{ .tab = t[0] },
-            ui.buttonStyle(active),
-        );
-        col += 1;
+        try l.button(f.fmt("{d} {s}", .{ n, t[1] }), .{ .tab = t[0] }, ui.buttonStyle(active));
+        l.x += 1;
     }
     if (s.view == .milestone) {
         const name = milestone_view.scopeName(s.snap, s.milestone.scope);
-        col += try ui.button(
-            f,
-            bar,
-            col,
-            0,
-            f.fmt("◆ {s}", .{name}),
-            .{ .command = .back },
-            ui.buttonStyle(true),
-        );
+        try l.button(f.fmt("◆ {s}", .{name}), .{ .command = .back }, ui.buttonStyle(true));
     }
     if (s.view == .detail) {
         if (s.detail.issue(s.snap)) |i| {
             const label = f.fmt("#{s}", .{issuez.format.uuid.shortId(s.snap.issues[i].id)});
-            col += try ui.button(
-                f,
-                bar,
-                col,
-                0,
-                label,
-                .{ .command = .back },
-                ui.buttonStyle(true),
-            );
+            try l.button(label, .{ .command = .back }, ui.buttonStyle(true));
         }
     }
     // Counts.
@@ -637,10 +618,10 @@ fn drawTopBar(s: *State, f: ui.Frame, bar: ui.Window) Allocator.Error!void {
     var right: u16 = 0;
     for (buttons) |b| right += bar.gwidth(b[0]) + 3;
     right += bar.gwidth(badge.text) + 3;
-    if (bar.width > right + col + 2) {
+    if (bar.width > right + l.x + 2) {
         var x = bar.width - right;
         const cw = bar.gwidth(counts);
-        if (x > col + cw + 2) _ = ui.text(
+        if (x > l.x + cw + 2) _ = ui.text(
             bar,
             x - cw - 2,
             0,
@@ -664,7 +645,7 @@ fn drawTopBar(s: *State, f: ui.Frame, bar: ui.Window) Allocator.Error!void {
 /// remote couldn't be read.
 fn syncBadge(s: *State, f: ui.Frame) struct { text: []const u8, style: ui.Style } {
     const r = &s.snap.remote;
-    const failed: ui.Style = .{ .fg = .{ .index = 231 }, .bg = ui.palette.err, .bold = true };
+    const trouble: ui.Style = .{ .fg = .{ .index = 231 }, .bg = ui.palette.err, .bold = true };
     if (s.sync.running) |_| {
         const what = if (s.sync.phase) |p| switch (p) {
             .fetching => "fetching",
@@ -677,7 +658,7 @@ fn syncBadge(s: *State, f: ui.Frame) struct { text: []const u8, style: ui.Style 
         };
     }
     const name = r.name orelse {
-        if (r.problem.len > 0) return .{ .text = "⇅ remote ⚠", .style = failed };
+        if (r.problem.len > 0) return .{ .text = "⇅ remote ⚠", .style = trouble };
         return .{
             .text = "⇅ no remote",
             .style = .{ .fg = ui.palette.faint, .bg = ui.palette.bar_bg },
@@ -691,7 +672,7 @@ fn syncBadge(s: *State, f: ui.Frame) struct { text: []const u8, style: ui.Style 
     const q = r.quarantined.count();
     if (s.sync.failed or r.problem.len > 0) return .{
         .text = f.fmt("⇅ {s} ⚠", .{name}),
-        .style = failed,
+        .style = trouble,
     };
     if (up == 0 and q == 0 and conflicts == 0) return .{
         .text = f.fmt("⇅ {s} ✓", .{name}),
@@ -702,13 +683,13 @@ fn syncBadge(s: *State, f: ui.Frame) struct { text: []const u8, style: ui.Style 
     if (up > 0) buf.print(f.arena, " ↑{d}", .{up}) catch {};
     if (q > 0) buf.print(f.arena, " !{d}", .{q}) catch {};
     if (conflicts > 0) buf.print(f.arena, " ✕{d}", .{conflicts}) catch {};
-    const trouble = q > 0 or conflicts > 0;
+    const attention = q > 0 or conflicts > 0;
     return .{
         .text = buf.items,
         .style = .{
-            .fg = if (trouble) ui.palette.medium else .{ .index = 252 },
+            .fg = if (attention) ui.palette.medium else .{ .index = 252 },
             .bg = ui.palette.button_bg,
-            .bold = trouble,
+            .bold = attention,
         },
     };
 }
@@ -719,31 +700,25 @@ fn drawEditBanner(s: *State, f: ui.Frame, bar: ui.Window) Allocator.Error!void {
     const t = &s.timeline;
     const st: ui.Style = .{ .fg = .{ .index = 16 }, .bg = ui.palette.medium, .bold = true };
     bar.fill(.{ .style = st });
-    var col: u16 = 1;
-    col += ui.text(bar, col, 0, "✎ EDIT MODE", st);
-    col += 2;
+    var l: ui.Line = .{ .f = f, .win = bar, .x = 1 };
+    l.text("✎ EDIT MODE", st);
+    l.x += 2;
     const n = t.changes();
     const what = if (n == 0) "no changes yet" else f.fmt(
         "{d} {s} not applied",
         .{ n, if (n == 1) "change" else "changes" },
     );
-    col += ui.text(bar, col, 0, what, .{ .fg = .{ .index = 16 }, .bg = ui.palette.medium });
+    l.text(what, .{ .fg = .{ .index = 16 }, .bg = ui.palette.medium });
     if (t.plan) |p| if (p.stale.len > 0) {
-        col += 2;
-        col += ui.text(
-            bar,
-            col,
-            0,
+        l.x += 2;
+        l.text(
             f.fmt("! {d} changed elsewhere", .{p.stale.len}),
             .{ .fg = .{ .index = 160 }, .bg = ui.palette.medium, .bold = true },
         );
     };
     if (t.linking) |id| {
-        col += 2;
-        col += ui.text(
-            bar,
-            col,
-            0,
+        l.x += 2;
+        l.text(
             f.fmt("linking #{s}: pick its blocker", .{issuez.format.uuid.shortId(id.slice())}),
             .{ .fg = .{ .index = 16 }, .bg = ui.palette.medium, .italic = true },
         );
@@ -756,7 +731,7 @@ fn drawEditBanner(s: *State, f: ui.Frame, bar: ui.Window) Allocator.Error!void {
     };
     var w: u16 = 0;
     for (buttons) |b| w += bar.gwidth(b[0]) + 3;
-    if (bar.width > col + w + 2) {
+    if (bar.width > l.x + w + 2) {
         var x = bar.width - w;
         for (buttons) |b| {
             const style: ui.Style = if (b[2]) .{
@@ -863,8 +838,7 @@ fn handleKey(s: *State, k: vaxis.Key) Allocator.Error!Action {
         if (!k.matches('q', .{})) return .none;
         // No room to ask: what would be lost holds it back.
         if (s.timelineChanges() > 0 or (if (s.modal) |*m| m.unsaved() else false)) {
-            s.fail("unsaved changes: make the terminal larger to keep or drop them", .{});
-            return .none;
+            return s.failed("unsaved changes: make the terminal larger to keep or drop them", .{});
         }
         return s.quitUnlessSyncing();
     }

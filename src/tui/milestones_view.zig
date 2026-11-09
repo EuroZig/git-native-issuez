@@ -96,53 +96,20 @@ const Layout = struct {
 };
 
 fn drawFilterBar(s: *AppState, f: ui.Frame, bar: ui.Window) Allocator.Error!void {
-    const bg: ui.Style = .{ .bg = palette.panel_bg };
-    bar.fill(.{ .style = bg });
-    var col: u16 = 1;
-    col += ui.text(
-        bar,
-        col,
-        0,
-        "/ ",
-        .{ .fg = if (s.search_focused) palette.accent else palette.muted, .bg = palette.panel_bg },
-    );
     const box_w: u16 = @min(@max(bar.width / 3, 20), 48);
-    const box = bar.child(.{ .x_off = col, .width = box_w, .height = 1 });
-    try s.ms_search.draw(
-        f.arena,
-        box,
-        .{ .bg = palette.input_bg },
-        s.search_focused,
-        "filter: words, is:overdue, is:at-risk, due:<2026-12-31",
-    );
-    try f.hit(box, .search);
-    col += box_w + 2;
+    const hint = "filter: words, is:overdue, is:at-risk, due:<2026-12-31";
+    const x = try ui.filterBox(f, bar, &s.ms_search, s.search_focused, box_w, hint);
+    var l: ui.Line = .{ .f = f, .win = bar, .x = x };
     for (std.enums.values(mf.Scope)) |sc| {
-        col += try ui.button(
-            f,
-            bar,
-            col,
-            0,
-            sc.label(),
-            .{ .ms_scope = sc },
-            ui.buttonStyle(s.ms_query.scope == sc),
-        );
+        try l.button(sc.label(), .{ .ms_scope = sc }, ui.buttonStyle(s.ms_query.scope == sc));
     }
-    col += 2;
-    col += ui.text(bar, col, 0, "Sort ", .{ .fg = palette.muted, .bg = palette.panel_bg });
+    l.x += 2;
+    l.text("Sort ", .{ .fg = palette.muted, .bg = palette.panel_bg });
     const sort_label = switch (s.ms_query.key) {
         inline else => |k| @tagName(k) ++ " ▾",
     };
-    col += try ui.button(f, bar, col, 0, sort_label, .{ .command = .sort }, ui.buttonStyle(false));
-    col += try ui.button(
-        f,
-        bar,
-        col,
-        0,
-        if (s.ms_query.reverse) "↑" else "↓",
-        .sort_reverse,
-        ui.buttonStyle(false),
-    );
+    try l.button(sort_label, .{ .command = .sort }, ui.buttonStyle(false));
+    try l.button(if (s.ms_query.reverse) "↑" else "↓", .sort_reverse, ui.buttonStyle(false));
 }
 
 pub fn draw(s: *AppState, f: ui.Frame, win: ui.Window) Allocator.Error!void {
@@ -174,12 +141,7 @@ pub fn draw(s: *AppState, f: ui.Frame, win: ui.Window) Allocator.Error!void {
     try drawHeader(s, f, win.child(.{ .y_off = 1, .height = 1 }), lay);
     const body = win.child(.{ .y_off = 2, .height = win.height -| 2 });
     v.visible = @max(body.height, 1);
-    if (v.follow) {
-        if (v.selected < v.scroll) v.scroll = v.selected;
-        if (v.selected >= v.scroll + v.visible) v.scroll = v.selected - v.visible + 1;
-        v.follow = false;
-    }
-    v.scroll = @min(v.scroll, @as(u32, @intCast(v.rows.len -| v.visible)));
+    ui.settleScroll(&v.scroll, &v.follow, v.selected, v.rows.len, v.visible);
 
     const only_none = v.rows.len <= 1 and snap.milestones.len == 0;
     if (v.rows.len == 0 or only_none) {
@@ -300,6 +262,9 @@ fn drawRow(
     const h: ?issuez.schedule.Health = if (none) null else data.health[n];
     const retired = if (m) |x| x.status == .retired else false;
     const dim = none or retired;
+    const leaves = sum.leaves;
+    const muted: ui.Style = .{ .fg = palette.muted, .bg = bg };
+    const faint: ui.Style = .{ .fg = palette.faint, .bg = bg };
 
     var x: u16 = 0;
     for (std.enums.values(Column)) |c| {
@@ -340,28 +305,13 @@ fn drawRow(
                     .{ .fg = palette.muted, .bg = bg, .italic = true },
                 );
             },
-            .progress => if (sum.leaves.total == 0) {
-                _ = ui.text(cell, 0, 0, "\u{2014}", .{ .fg = palette.faint, .bg = bg });
+            .progress => if (leaves.total == 0) {
+                _ = ui.text(cell, 0, 0, "\u{2014}", faint);
             } else if (!none) {
                 const active = if (s.milestones.in_progress) sum.leaves_active else 0;
-                ui.progressBar(
-                    cell,
-                    0,
-                    0,
-                    lay.bar,
-                    sum.leaves.closed,
-                    active,
-                    sum.leaves.total,
-                    bg,
-                );
-                const pct = sum.leaves.closed * 100 / sum.leaves.total;
-                _ = ui.text(
-                    cell,
-                    lay.bar + 1,
-                    0,
-                    f.fmt("{d: >3}%", .{pct}),
-                    .{ .fg = palette.muted, .bg = bg },
-                );
+                ui.progressBar(cell, 0, 0, lay.bar, leaves.closed, active, leaves.total, bg);
+                const pct = leaves.closed * 100 / leaves.total;
+                _ = ui.text(cell, lay.bar + 1, 0, f.fmt("{d: >3}%", .{pct}), muted);
             },
             // Leaves, as the progress counts them.
             .open => _ = ui.text(
@@ -375,7 +325,7 @@ fn drawRow(
                 cell,
                 0,
                 0,
-                f.fmt("{d: >4}", .{sum.leaves.closed}),
+                f.fmt("{d: >4}", .{leaves.closed}),
                 .{ .fg = palette.done, .bg = bg },
             ),
             .blocked => if (sum.blocked > 0) {
@@ -392,21 +342,15 @@ fn drawRow(
                 const rel = dates.relative(&buf, d, data.today);
                 const late = d.order(data.today) == .lt and ms.status == .open;
                 const soon = !late and data.today.daysBetween(d) <= 1 and ms.status == .open;
-                var cx = ui.text(
-                    cell,
-                    0,
-                    0,
-                    f.fmt("{f}", .{d}),
-                    .{ .fg = palette.muted, .bg = bg },
-                );
-                cx += 1;
-                if (ms.status == .open) _ = ui.text(cell, cx, 0, f.fmt("{s}", .{rel}), .{
+                var l: ui.Line = .{ .f = f, .win = cell };
+                l.word(f.fmt("{f}", .{d}), muted);
+                if (ms.status == .open) l.text(f.fmt("{s}", .{rel}), .{
                     .fg = if (late) palette.err else if (soon) palette.medium else palette.faint,
                     .bg = bg,
                     .bold = late,
                 });
             } else {
-                _ = ui.text(cell, 0, 0, "\u{2014}", .{ .fg = palette.faint, .bg = bg });
+                _ = ui.text(cell, 0, 0, "\u{2014}", faint);
             },
             .health => if (h) |hh| {
                 _ = ui.text(
@@ -427,20 +371,8 @@ fn drawRow(
 pub fn key(s: *AppState, k: vaxis.Key) Allocator.Error!AppState.Action {
     const v = &s.milestones;
     const snap = s.snap;
-    const sel: i64 = v.selected;
-    const page: i64 = @max(v.visible, 2) - 1;
-    if (k.matches(K.down, .{}) or k.matches('j', .{})) {
-        v.moveTo(snap, sel + 1);
-    } else if (k.matches(K.up, .{}) or k.matches('k', .{})) {
-        v.moveTo(snap, sel - 1);
-    } else if (k.matches(K.page_down, .{}) or k.matches('d', .{ .ctrl = true })) {
-        v.moveTo(snap, sel + page);
-    } else if (k.matches(K.page_up, .{}) or k.matches('u', .{ .ctrl = true })) {
-        v.moveTo(snap, sel - page);
-    } else if (k.matches(K.home, .{}) or k.matches('g', .{})) {
-        v.moveTo(snap, 0);
-    } else if (k.matches(K.end, .{}) or k.matches('G', .{})) {
-        v.moveTo(snap, @as(i64, @intCast(v.rows.len)) - 1);
+    if (ui.rowKey(k, v.selected, v.rows.len, v.visible)) |row| {
+        v.moveTo(snap, row);
     } else if (k.matches('n', .{})) {
         modal_mod.newMilestone(s);
     } else if (k.matches('s', .{})) {
@@ -486,10 +418,7 @@ pub fn milestoneKey(s: *AppState, k: vaxis.Key, n: u32) AppState.Action {
         confirmRetire(s, n);
     } else if (k.matches('o', .{})) {
         const m = s.snap.milestones[n];
-        if (m.status == .open) {
-            s.info("{s} is open already", .{m.name});
-            return .none;
-        }
+        if (m.status == .open) return s.noted("{s} is open already", .{m.name});
         return .{
             .edit_milestone = .{ .id = .of(m.id), .edit = .{ .status = .open, .expect = m.tip } },
         };

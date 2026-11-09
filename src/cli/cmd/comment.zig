@@ -40,43 +40,35 @@ pub fn main(comptime B: type, ctx: *context.Context(B), argv: []const []const u8
     var files: std.ArrayList([]const u8) = .empty;
 
     var extras: common.Extras = .{};
-    var args: common.Args = .{ .list = argv };
-    while (args.next()) |arg| {
-        if (!args.isOption(arg)) {
-            if (args.was_separator) continue;
-            if (issue_prefix == null) issue_prefix = arg;
-        } else if (common.isHelp(arg)) {
-            ctx.out.writeAll(help) catch {};
-            return common.exit_ok;
-        } else if (std.mem.eql(u8, arg, "-m") or std.mem.eql(u8, arg, "--message")) {
-            const v = args.value(ctx.err, "-m") orelse return common.exit_error;
-            paragraphs.append(arena, v) catch return common.oom(ctx.err);
-        } else if (std.mem.startsWith(u8, arg, "--original-")) {
-            const was = extras.parse(arena, ctx.err, &args, arg) orelse return common.exit_error;
-            if (!was) return common.unknownOption(ctx.err, "comment", arg);
-        } else if (std.mem.eql(u8, arg, "--attach")) {
-            const v = args.value(ctx.err, arg) orelse return common.exit_error;
-            files.append(arena, v) catch return common.oom(ctx.err);
+    const flags = [_]common.Flag{
+        .{ "-m --message", .{ .list = &paragraphs } },
+        .{ "--attach", .{ .list = &files } },
+    };
+    var parser = common.argParser(ctx, argv, .{
+        .command = "comment",
+        .help = help,
+        .positionals = .{ .first = &issue_prefix },
+        .flags = &flags,
+    });
+    while (parser.next()) |arg| {
+        if (std.mem.startsWith(u8, arg, "--original-")) {
+            const was = extras.parse(arena, ctx.err, &parser.args, arg) orelse
+                return common.exit_error;
+            if (!was) return parser.unknown(arg);
         } else if (std.meta.stringToEnum(Action, if (arg.len > 2) arg[2..] else "")) |a| {
-            if (a == .add or !std.mem.startsWith(u8, arg, "--")) {
-                return common.unknownOption(ctx.err, "comment", arg);
-            }
+            if (a == .add or !std.mem.startsWith(u8, arg, "--")) return parser.unknown(arg);
             if (action != .add) return common.missing(
                 ctx.err,
                 "comment",
                 "only one of --edit, --delete, --restore",
             );
             action = a;
-            target = args.value(ctx.err, arg) orelse return common.exit_error;
-        } else {
-            return common.unknownOption(ctx.err, "comment", arg);
-        }
+            target = parser.value(arg) orelse return common.exit_error;
+        } else return parser.unknown(arg);
     }
-    const prefix = issue_prefix orelse return common.missing(
-        ctx.err,
-        "comment",
-        "issue ID is required",
-    );
+    if (parser.exit) |exit| return exit;
+    const prefix = issue_prefix orelse
+        return common.missing(ctx.err, "comment", "issue ID is required");
     if (files.items.len > 0 and action != .add) return common.missing(
         ctx.err,
         "comment",
@@ -101,13 +93,7 @@ pub fn main(comptime B: type, ctx: *context.Context(B), argv: []const []const u8
     );
 
     const repo = common.openRepo(B, ctx) orelse return common.exit_fatal;
-    const ref = common.resolveOne(
-        B,
-        repo,
-        arena,
-        ctx.err,
-        prefix,
-    ) orelse return common.exit_error;
+    const ref = common.resolveOne(B, repo, arena, ctx.err, prefix) orelse return common.exit_error;
     const short = uuid.shortId(ref.id());
     if (action == .add and files.items.len > 0) {
         const att = issuez.Attachments(B).fromRepo(repo);

@@ -578,10 +578,10 @@ pub fn Purge(comptime B: type) type {
                             .op = .{ .update = .{ .new = r.tip, .old = tip } },
                         });
                         const guard = try self.repo.readGuardRef(arena, id);
-                        try ops.append(arena, .{ .name = guard.name, .op = if (guard.old) |old|
-                            .{ .update = .{ .new = r.tip, .old = old } }
-                        else
-                            .{ .create = r.tip } });
+                        try ops.append(
+                            arena,
+                            .{ .name = guard.name, .op = repo_mod.moveOp(guard.old, r.tip) },
+                        );
                     }
                 } else {
                     try ops.append(arena, .{ .name = ref_name, .op = .{ .delete = tip } });
@@ -613,10 +613,10 @@ pub fn Purge(comptime B: type) type {
                 ));
                 const parents: []const Oid = if (old_tomb) |o| &.{o} else &.{};
                 const tomb = try self.repo.writeCommit(arena, parents, who, message);
-                try ops.append(arena, .{ .name = tomb_name, .op = if (old_tomb) |o|
-                    .{ .update = .{ .new = tomb, .old = o } }
-                else
-                    .{ .create = tomb } });
+                try ops.append(
+                    arena,
+                    .{ .name = tomb_name, .op = repo_mod.moveOp(old_tomb, tomb) },
+                );
                 if (self.repo.call.dry_run) return .{
                     .tombstone = tomb,
                     .tip = new_tip,
@@ -651,11 +651,7 @@ pub fn Purge(comptime B: type) type {
         ) Error![]const contract.RefEntry {
             const backend = self.repo.backend;
             var out: std.ArrayList(contract.RefEntry) = .empty;
-            const derived = try std.fmt.allocPrint(
-                arena,
-                "{s}{s}",
-                .{ repo_mod.attachment_ref_prefix, id },
-            );
+            const derived = try @import("attachments.zig").refName(arena, id);
             if (try backend.resolveRef(derived)) |oid| try out.append(
                 arena,
                 .{ .name = derived, .oid = oid },
@@ -675,11 +671,7 @@ pub fn Purge(comptime B: type) type {
         /// whether anything changed.
         pub fn apply(self: Self, arena: Allocator, id: []const u8, t: Tombstone) Error!bool {
             const backend = self.repo.backend;
-            const ref_name = try std.fmt.allocPrint(
-                arena,
-                "{s}{s}",
-                .{ repo_mod.issue_ref_prefix, id },
-            );
+            const ref_name = try repo_mod.refNameOf(arena, id);
             var attempt: u8 = 0;
             while (attempt < self.repo.limits.cas_retries) : (attempt += 1) {
                 var ops: std.ArrayList(contract.RefUpdate) = .empty;
@@ -715,10 +707,10 @@ pub fn Purge(comptime B: type) type {
                                 .name = ref_name,
                                 .op = .{ .update = .{ .new = r.tip, .old = old } },
                             });
-                            try ops.append(arena, .{ .name = guard.name, .op = if (guard.old) |g|
-                                .{ .update = .{ .new = r.tip, .old = g } }
-                            else
-                                .{ .create = r.tip } });
+                            try ops.append(
+                                arena,
+                                .{ .name = guard.name, .op = repo_mod.moveOp(guard.old, r.tip) },
+                            );
                         }
                     }
                 }

@@ -74,65 +74,25 @@ const Layout = struct {
 /// columns used.
 pub fn drawFilterBar(s: *AppState, f: ui.Frame, bar: ui.Window, tree: bool) Allocator.Error!u16 {
     const q = s.issueQuery();
-    const bg: ui.Style = .{ .bg = palette.panel_bg };
-    bar.fill(.{ .style = bg });
-    var col: u16 = 1;
-    const search_icon: ui.Style = .{
-        .fg = if (s.search_focused) palette.accent else palette.muted,
-        .bg = palette.panel_bg,
-    };
-    col += ui.text(bar, col, 0, "/ ", search_icon);
     const box_w: u16 = @min(@max(bar.width / 3, 20), 48);
-    const box = bar.child(.{ .x_off = col, .width = box_w, .height = 1 });
-    try s.searchBox().draw(
-        f.arena,
-        box,
-        .{ .bg = palette.input_bg },
-        s.search_focused,
-        "filter: words, label:x, @who, p:high, is:blocked",
-    );
-    try f.hit(box, .search);
-    col += box_w + 2;
-
+    const hint = "filter: words, label:x, @who, p:high, is:blocked";
+    const x = try ui.filterBox(f, bar, s.searchBox(), s.search_focused, box_w, hint);
+    var l: ui.Line = .{ .f = f, .win = bar, .x = x };
     for ([_]filter.Scope{ .open, .done, .all }) |sc| {
-        col += try ui.button(
-            f,
-            bar,
-            col,
-            0,
-            sc.label(),
-            .{ .scope = sc },
-            ui.buttonStyle(q.scope == sc),
-        );
+        try l.button(sc.label(), .{ .scope = sc }, ui.buttonStyle(q.scope == sc));
     }
-    col += 2;
+    l.x += 2;
     if (tree) {
-        col += try ui.button(
-            f,
-            bar,
-            col,
-            0,
-            if (q.tree) "▾ Tree" else "▸ Tree",
-            .tree,
-            ui.buttonStyle(q.tree),
-        );
-        col += 2;
+        try l.button(if (q.tree) "▾ Tree" else "▸ Tree", .tree, ui.buttonStyle(q.tree));
+        l.x += 2;
     }
-    col += ui.text(bar, col, 0, "Sort ", .{ .fg = palette.muted, .bg = palette.panel_bg });
+    l.text("Sort ", .{ .fg = palette.muted, .bg = palette.panel_bg });
     const sort_label = switch (q.key) {
         inline else => |k| @tagName(k) ++ " ▾",
     };
-    col += try ui.button(f, bar, col, 0, sort_label, .{ .command = .sort }, ui.buttonStyle(false));
-    col += try ui.button(
-        f,
-        bar,
-        col,
-        0,
-        if (q.reverse) "↑" else "↓",
-        .sort_reverse,
-        ui.buttonStyle(false),
-    );
-    return col;
+    try l.button(sort_label, .{ .command = .sort }, ui.buttonStyle(false));
+    try l.button(if (q.reverse) "↑" else "↓", .sort_reverse, ui.buttonStyle(false));
+    return l.x;
 }
 
 pub fn draw(s: *AppState, f: ui.Frame, win: ui.Window) Allocator.Error!void {
@@ -187,12 +147,7 @@ pub fn drawTable(s: *AppState, f: ui.Frame, win: ui.Window, t: Table) Allocator.
     const body = win.child(.{ .y_off = 1, .height = win.height -| 1 });
     if (t.drop) body.fill(.{ .style = .{ .bg = palette.hover_bg } });
     l.visible = @max(body.height, 1);
-    if (l.follow) {
-        if (l.selected < l.scroll) l.scroll = l.selected;
-        if (l.selected >= l.scroll + l.visible) l.scroll = l.selected - l.visible + 1;
-        l.follow = false;
-    }
-    l.scroll = @min(l.scroll, @as(u32, @intCast(l.rows.len -| l.visible)));
+    ui.settleScroll(&l.scroll, &l.follow, l.selected, l.rows.len, l.visible);
 
     if (t.pane) |p| try f.hit(body, .{ .mpane = p });
     if (l.rows.len == 0) {
@@ -331,6 +286,7 @@ fn drawRow(
         look.focused) palette.select_bg else if (look.marked) palette.mark_bg else .default;
     if (bg != .default) win.fill(.{ .style = .{ .bg = bg } });
     const dim = row.context;
+    const muted: ui.Style = .{ .fg = palette.muted, .bg = bg, .dim = dim };
 
     var x: u16 = 0;
     for (std.enums.values(Column)) |c| {
@@ -381,43 +337,31 @@ fn drawRow(
                 .{ .fg = palette.id, .bg = bg, .dim = dim },
             ),
             .title => {
-                var tx: u16 = 0;
+                var l: ui.Line = .{ .f = f, .win = cell };
                 if (row.depth > 0) {
-                    const indent: u16 = @intCast(@min(@as(u32, row.depth - 1) * 2, cell.width / 2));
-                    tx += indent;
-                    tx += ui.text(cell, tx, 0, "└ ", .{ .fg = palette.faint, .bg = bg });
+                    l.x = @intCast(@min(@as(u32, row.depth - 1) * 2, cell.width / 2));
+                    l.text("└ ", .{ .fg = palette.faint, .bg = bg });
                 }
-                const ts: ui.Style = .{
+                l.word(issue.title, .{
                     .fg = if (done or dim) palette.muted else .default,
                     .bg = bg,
                     .bold = selected and look.focused and !dim,
                     .strikethrough = (done and issue.state == .closed) or issue.deleted,
-                };
-                tx += ui.text(cell, tx, 0, issue.title, ts);
-                if (snap.proj.progress(i)) |p| {
-                    tx += 1;
-                    tx += ui.text(
-                        cell,
-                        tx,
-                        0,
-                        f.fmt("{d}/{d}", .{ p.closed, p.total }),
-                        .{ .fg = palette.muted, .bg = bg },
-                    );
-                }
-                if (row.inherited) _ = ui.text(
-                    cell,
-                    tx + 1,
-                    0,
+                });
+                if (snap.proj.progress(i)) |p| l.word(
+                    f.fmt("{d}/{d}", .{ p.closed, p.total }),
+                    .{ .fg = palette.muted, .bg = bg },
+                );
+                if (row.inherited) l.text(
                     "↳ inherited",
                     .{ .fg = palette.faint, .bg = bg, .italic = true },
                 );
             },
             .labels => {
-                var lx: u16 = 0;
+                var l: ui.Line = .{ .f = f, .win = cell };
                 for (issue.labels) |lab| {
-                    if (lx >= cell.width) break;
-                    lx += ui.text(cell, lx, 0, lab, .{ .fg = palette.label, .bg = bg, .dim = dim });
-                    lx += 1;
+                    if (l.x >= cell.width) break;
+                    l.word(lab, .{ .fg = palette.label, .bg = bg, .dim = dim });
                 }
             },
             .priority => {
@@ -444,24 +388,12 @@ fn drawRow(
             .assignee => {
                 const a = issue.field("Assignee") orelse "";
                 const shown = if (issue.assignee) |p| p.email else a;
-                _ = ui.text(cell, 0, 0, shown, .{ .fg = palette.muted, .bg = bg, .dim = dim });
+                _ = ui.text(cell, 0, 0, shown, muted);
             },
             .due => if (issue.due_date) |d| {
-                _ = ui.text(
-                    cell,
-                    0,
-                    0,
-                    f.fmt("{f}", .{d}),
-                    .{ .fg = palette.muted, .bg = bg, .dim = dim },
-                );
+                _ = ui.text(cell, 0, 0, f.fmt("{f}", .{d}), muted);
             },
-            .updated => _ = ui.text(
-                cell,
-                0,
-                0,
-                ui.ago(f, issue.updated),
-                .{ .fg = palette.muted, .bg = bg, .dim = dim },
-            ),
+            .updated => _ = ui.text(cell, 0, 0, ui.ago(f, issue.updated), muted),
         }
     }
 }
@@ -473,20 +405,8 @@ pub fn key(s: *AppState, k: vaxis.Key) Allocator.Error!AppState.Action {
 /// Keys on an issue table; null when the key isn't one of them.
 pub fn tableKey(s: *AppState, l: *State, k: vaxis.Key) ?AppState.Action {
     const snap = s.snap;
-    const sel: i64 = l.selected;
-    const page: i64 = @max(l.visible, 2) - 1;
-    if (k.matches(K.down, .{}) or k.matches('j', .{})) {
-        l.moveTo(snap, sel + 1);
-    } else if (k.matches(K.up, .{}) or k.matches('k', .{})) {
-        l.moveTo(snap, sel - 1);
-    } else if (k.matches(K.page_down, .{}) or k.matches('d', .{ .ctrl = true })) {
-        l.moveTo(snap, sel + page);
-    } else if (k.matches(K.page_up, .{}) or k.matches('u', .{ .ctrl = true })) {
-        l.moveTo(snap, sel - page);
-    } else if (k.matches(K.home, .{}) or k.matches('g', .{})) {
-        l.moveTo(snap, 0);
-    } else if (k.matches(K.end, .{}) or k.matches('G', .{})) {
-        l.moveTo(snap, @as(i64, @intCast(l.rows.len)) - 1);
+    if (ui.rowKey(k, l.selected, l.rows.len, l.visible)) |row| {
+        l.moveTo(snap, row);
     } else if (k.matches(K.enter, .{}) or k.matches(K.right, .{}) or k.matches('l', .{})) {
         if (l.selectedIssue()) |i| s.openIssue(snap.issues[i].id);
     } else if (k.matches('t', .{})) {

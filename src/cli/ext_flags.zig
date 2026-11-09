@@ -62,43 +62,25 @@ pub const Flags = struct {
         labels,
     };
 
-    pub const Parsed = enum { no, yes, failed };
+    /// The table entries for the flags `create` and `edit` share.
+    pub fn table(f: *Flags) [8]common.Flag {
+        return .{
+            .{ "--parent", .{ .text = &f.parent } },
+            .{ "--blocked-by", .{ .list = &f.blocked_by } },
+            .{ "--start", .{ .text = &f.start } },
+            .{ "--due", .{ .text = &f.due } },
+            .{ "--estimate", .{ .text = &f.estimate } },
+            .{ "--workflow", .{ .text = &f.workflow } },
+            .{ "--milestone-id", .{ .text = &f.milestone_id } },
+            .{ "--milestone-mode", .{ .text = &f.milestone_mode } },
+        };
+    }
 
-    /// Consumes `arg` and its value when it is an extension flag.
-    pub fn parse(
-        f: *Flags,
-        arena: Allocator,
-        err: *std.Io.Writer,
-        args: *common.Args,
-        arg: []const u8,
-        edit: bool,
-    ) Parsed {
-        const eql = std.mem.eql;
-        const single = [_]struct { []const u8, *?[]const u8 }{
-            .{ "--parent", &f.parent },
-            .{ "--start", &f.start },
-            .{ "--due", &f.due },
-            .{ "--estimate", &f.estimate },
-            .{ "--workflow", &f.workflow },
-            .{ "--milestone-id", &f.milestone_id },
-            .{ "--milestone-mode", &f.milestone_mode },
-        };
-        for (single) |s| if (eql(u8, arg, s[0])) {
-            s[1].* = args.value(err, s[0]) orelse return .failed;
-            return .yes;
-        };
-        if (eql(u8, arg, "--blocked-by") or (edit and eql(u8, arg, "--unblock"))) {
-            const v = args.value(err, arg) orelse return .failed;
-            const list = if (eql(u8, arg, "--unblock")) &f.unblock else &f.blocked_by;
-            list.append(arena, v) catch return .failed;
-            return .yes;
-        }
-        if (edit and std.mem.startsWith(u8, arg, "--no-")) {
-            const which = std.meta.stringToEnum(Clear, arg["--no-".len..]) orelse return .no;
-            f.no.insert(which);
-            return .yes;
-        }
-        return .no;
+    /// Edit's `--no-...`: false when `arg` isn't one.
+    pub fn clear(f: *Flags, arg: []const u8) bool {
+        if (!std.mem.startsWith(u8, arg, "--no-")) return false;
+        f.no.insert(std.meta.stringToEnum(Clear, arg["--no-".len..]) orelse return false);
+        return true;
     }
 
     pub fn any(f: Flags) bool {

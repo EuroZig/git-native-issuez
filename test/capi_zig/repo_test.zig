@@ -8,10 +8,7 @@ const c = fixture.c;
 
 // covers: issuez_repo_close, issuez_repo_git_dir
 test "issuez_repo_open: work tree, subdirectory, bare, sha256" {
-    const leaks = fixture.Leaks.start();
-    defer leaks.check();
-    var r: fixture.Repo = undefined;
-    try r.init(.{});
+    var r = try fixture.Repo.init(.{});
     defer r.deinit();
     const a = r.arena();
     const git_dir = try std.fs.path.join(a, &.{ r.path, ".git" });
@@ -26,14 +23,12 @@ test "issuez_repo_open: work tree, subdirectory, bare, sha256" {
     c.issuez_repo_close(null);
     try expect.str("", c.issuez_repo_git_dir(null));
 
-    var bare: fixture.Repo = undefined;
-    try bare.init(.{ .bare = true });
+    var bare = try fixture.Repo.init(.{ .bare = true });
     defer bare.deinit();
     try expect.str(bare.path, c.issuez_repo_git_dir(bare.handle));
     _ = try fixture.titled(bare.handle, "In a bare repo");
 
-    var long: fixture.Repo = undefined;
-    try long.init(.{ .init_flags = &.{"--object-format=sha256"} });
+    var long = try fixture.Repo.init(.{ .init_flags = &.{"--object-format=sha256"} });
     defer long.deinit();
     const made = try fixture.titled(long.handle, "SHA-256");
     try testing.expectEqual(@as(u8, 32), made.tip.len);
@@ -55,8 +50,7 @@ test "issuez_repo_open: not a repository, an unknown option, bad values" {
     try testing.expect(res[1] == null);
     c.issuez_error_free(err);
 
-    var r: fixture.Repo = undefined;
-    try r.init(.{});
+    var r = try fixture.Repo.init(.{});
     defer r.deinit();
     var limit = fixture.opNum(c.ISSUEZ_OPT_LIMIT, 3);
     limit.name = fixture.str("no_such_limit");
@@ -89,10 +83,7 @@ test "issuez_repo_open: not a repository, an unknown option, bad values" {
 }
 
 test "issuez_repo_open: a git too old, a git that isn't there" {
-    const leaks = fixture.Leaks.start();
-    defer leaks.check();
-    var r: fixture.Repo = undefined;
-    try r.init(.{});
+    var r = try fixture.Repo.init(.{});
     defer r.deinit();
     const old = try fixture.script(r.arena(), r.root, "old-git",
         \\#!/bin/sh
@@ -112,10 +103,7 @@ test "issuez_repo_open: a git too old, a git that isn't there" {
 }
 
 test "issuez_repo_limit: the effective limits, set and default" {
-    const leaks = fixture.Leaks.start();
-    defer leaks.check();
-    var r: fixture.Repo = undefined;
-    try r.init(.{});
+    var r = try fixture.Repo.init(.{});
     defer r.deinit();
     var limit = fixture.opNum(c.ISSUEZ_OPT_LIMIT, 2);
     limit.name = fixture.str("max_labels");
@@ -137,10 +125,7 @@ extern "c" fn setenv(name: [*:0]const u8, value: [*:0]const u8, overwrite: c_int
 extern "c" fn unsetenv(name: [*:0]const u8) c_int;
 
 test "issuez_repo_open: the process environment as it is at the open" {
-    const leaks = fixture.Leaks.start();
-    defer leaks.check();
-    var r: fixture.Repo = undefined;
-    try r.init(.{});
+    var r = try fixture.Repo.init(.{});
     defer r.deinit();
     // A git that says what it finds. The variable is new, so the C library
     // moves the environment to fit it, and other tests never see it.
@@ -169,10 +154,7 @@ test "issuez_repo_open: the process environment as it is at the open" {
 }
 
 test "issuez_repo_open: committer, environment, scopes and host prefixes" {
-    const leaks = fixture.Leaks.start();
-    defer leaks.check();
-    var r: fixture.Repo = undefined;
-    try r.init(.{});
+    var r = try fixture.Repo.init(.{});
     defer r.deinit();
     var committer = std.mem.zeroes(c.issuez_op);
     committer.verb = c.ISSUEZ_OP_SET;
@@ -249,31 +231,27 @@ test "issuez_repo_open: committer, environment, scopes and host prefixes" {
     var issue: ?*c.issuez_issue = null;
     try expect.code(c.ISSUEZ_OK, c.issuez_issue_load(h, scoped.idStr(), null, &issue, null), null);
     defer c.issuez_issue_free(issue);
-    try testing.expect(c.issuez_issue_has_label(issue, fixture.str("kind/idea")));
-    try testing.expect(!c.issuez_issue_has_label(issue, fixture.str("kind/bug")));
-    try testing.expect(c.issuez_issue_has_label(issue, fixture.str("ui")));
+    try testing.expect(fixture.hasLabel(issue.?, "kind/idea"));
+    try testing.expect(!fixture.hasLabel(issue.?, "kind/bug"));
+    try testing.expect(fixture.hasLabel(issue.?, "ui"));
 }
 
 test "issuez_repo_open: timeouts end a hanging git" {
-    const leaks = fixture.Leaks.start();
-    defer leaks.check();
-    var r: fixture.Repo = undefined;
-    try r.init(.{});
+    var r = try fixture.Repo.init(.{});
     defer r.deinit();
-    _ = try r.git(&.{ "remote", "add", "origin", "/nonexistent" });
     const slow = try fixture.slowGit(r.arena(), r.root);
     const res = fixture.tryOpen(r.path, &.{
         c.issuez_opt_git_path(fixture.str(slow)),
-        fixture.opNum(c.ISSUEZ_OPT_TIMEOUT_NETWORK_MS, 200),
+        c.issuez_opt_timeout_local_ms(2000),
     }, null);
     try expect.code(c.ISSUEZ_OK, res[0], null);
     defer c.issuez_repo_close(res[1]);
-    var report: ?*c.issuez_sync_report = null;
+    var snap: ?*c.issuez_snapshot = null;
     var err: ?*c.issuez_error = null;
     const start = std.Io.Timestamp.now(testing.io, .awake);
     try expect.code(
         c.ISSUEZ_E_TIMEOUT,
-        c.issuez_sync(res[1], fixture.str("origin"), null, 0, null, &report, &err),
+        c.issuez_snapshot_take(res[1], null, &snap, &err),
         err,
     );
     c.issuez_error_free(err);
@@ -281,203 +259,86 @@ test "issuez_repo_open: timeouts end a hanging git" {
     try testing.expect(took < 5000);
 }
 
-// covers: issuez_repo_workflow_state_at, issuez_repo_done_state_count, issuez_repo_done_state_at
-test "issuez_repo_workflow_state_count: defaults, config, options" {
-    const leaks = fixture.Leaks.start();
-    defer leaks.check();
-    var r: fixture.Repo = undefined;
-    try r.init(.{});
+/// A new issue in `h` starts in `first`; `other` is a workflow state and `unknown` isn't; `done`
+/// counts as done and `not_done` doesn't.
+fn expectStates(
+    h: *c.issuez_repo,
+    first: []const u8,
+    other: []const u8,
+    unknown: []const u8,
+    done: []const u8,
+    not_done: []const u8,
+) !void {
+    const x = try fixture.titled(h, "States");
+    var i = try fixture.load(h, x.idStr());
+    try expect.str(first, c.issuez_issue_info_of(i).*.workflow_state);
+    c.issuez_issue_free(i);
+    _ = try fixture.update(h, x.idStr(), &.{c.issuez_set_workflow_state(fixture.str(other))});
+    var w: ?*c.issuez_write = null;
+    const refused = [_]c.issuez_op{c.issuez_set_workflow_state(fixture.str(unknown))};
+    try expect.code(
+        c.ISSUEZ_E_INVALID_VALUE,
+        fixture.updateRc(h, x.idStr(), &refused, &fixture.ada, null, &w, null),
+        null,
+    );
+    _ = try fixture.update(h, x.idStr(), &.{c.issuez_set_state(fixture.str(not_done))});
+    i = try fixture.load(h, x.idStr());
+    try testing.expect(!c.issuez_issue_info_of(i).*.is_done);
+    c.issuez_issue_free(i);
+    _ = try fixture.update(h, x.idStr(), &.{c.issuez_set_state(fixture.str(done))});
+    i = try fixture.load(h, x.idStr());
+    defer c.issuez_issue_free(i);
+    try testing.expect(c.issuez_issue_info_of(i).*.is_done);
+}
+
+test "issuez_repo_open: done and workflow states from defaults, config, options" {
+    var r = try fixture.Repo.init(.{});
     defer r.deinit();
-    try testing.expectEqual(@as(usize, 4), c.issuez_repo_workflow_state_count(r.handle));
-    try expect.str("backlog", c.issuez_repo_workflow_state_at(r.handle, 0));
-    try expect.str("review", c.issuez_repo_workflow_state_at(r.handle, 3));
-    try expect.str("", c.issuez_repo_workflow_state_at(r.handle, 4));
-    // `closed` is always done; these are the others.
-    try testing.expectEqual(@as(usize, 2), c.issuez_repo_done_state_count(r.handle));
-    try expect.str("wontfix", c.issuez_repo_done_state_at(r.handle, 0));
-    try expect.str("duplicate", c.issuez_repo_done_state_at(r.handle, 1));
-    try expect.str("", c.issuez_repo_done_state_at(r.handle, 2));
-    try testing.expectEqual(@as(usize, 0), c.issuez_repo_done_state_count(null));
-    try testing.expectEqual(@as(usize, 0), c.issuez_repo_workflow_state_count(null));
+    // `closed` is always done; wontfix and duplicate are the others.
+    try expectStates(r.handle, "backlog", "review", "doing", "duplicate", "shipped");
 
     // From git config.
     _ = try r.git(&.{ "config", "issue.workflowStates", "todo, doing" });
     _ = try r.git(&.{ "config", "issue.doneStates", "shipped" });
     const configured = fixture.tryOpen(r.path, &.{}, null);
     defer c.issuez_repo_close(configured[1]);
-    try testing.expectEqual(@as(usize, 2), c.issuez_repo_workflow_state_count(configured[1]));
-    try expect.str("doing", c.issuez_repo_workflow_state_at(configured[1], 1));
-    try expect.str("shipped", c.issuez_repo_done_state_at(configured[1], 0));
+    try expectStates(configured[1].?, "todo", "doing", "review", "shipped", "wontfix");
 
     // Options win over config.
     const overridden = fixture.tryOpen(r.path, &.{
         fixture.opStr(c.ISSUEZ_OPT_WORKFLOW_STATE, c.ISSUEZ_OP_ADD, "new"),
+        fixture.opStr(c.ISSUEZ_OPT_WORKFLOW_STATE, c.ISSUEZ_OP_ADD, "later"),
         fixture.opStr(c.ISSUEZ_OPT_DONE_STATE, c.ISSUEZ_OP_ADD, "merged"),
         fixture.opStr(c.ISSUEZ_OPT_DONE_STATE, c.ISSUEZ_OP_ADD, "rejected"),
     }, null);
     defer c.issuez_repo_close(overridden[1]);
-    try testing.expectEqual(@as(usize, 1), c.issuez_repo_workflow_state_count(overridden[1]));
-    try expect.str("new", c.issuez_repo_workflow_state_at(overridden[1], 0));
-    try testing.expectEqual(@as(usize, 2), c.issuez_repo_done_state_count(overridden[1]));
-    try expect.str("rejected", c.issuez_repo_done_state_at(overridden[1], 1));
-}
-
-test "issuez_repo_drop_all: every ref of the library's, in one go" {
-    const leaks = fixture.Leaks.start();
-    defer leaks.check();
-    var r: fixture.Repo = undefined;
-    try r.init(.{});
-    defer r.deinit();
-    const h = r.handle;
-    _ = try fixture.titled(h, "One");
-    _ = try fixture.milestone(h, "v1");
-    var n: usize = 0;
-    try expect.code(c.ISSUEZ_OK, c.issuez_repo_drop_all(h, null, &n, null), null);
-    try testing.expect(n >= 2);
-    const left = try r.git(&.{ "for-each-ref", "refs/issues/", "refs/milestones/" });
-    try testing.expectEqualStrings("", left);
-    try expect.code(c.ISSUEZ_OK, c.issuez_repo_drop_all(h, null, &n, null), null);
-    try testing.expectEqual(@as(usize, 0), n);
-    try expect.code(c.ISSUEZ_OK, c.issuez_repo_drop_all(h, null, null, null), null);
-    try expect.code(
-        c.ISSUEZ_E_INVALID_ARGUMENT,
-        c.issuez_repo_drop_all(null, null, &n, null),
-        null,
-    );
-}
-
-test "issuez_repo_adopt_refs: an import from a scratch repository on our objects, at once" {
-    const leaks = fixture.Leaks.start();
-    defer leaks.check();
-    var r: fixture.Repo = undefined;
-    try r.init(.{});
-    defer r.deinit();
-    const a = r.arena();
-    const objects = try std.fs.path.join(a, &.{ r.path, ".git", "objects" });
-    const scratch_path = try std.fs.path.join(a, &.{ r.root, "scratch.git" });
-    _ = try fixture.runGit(a, r.root, &.{ "init", "-q", "--bare", scratch_path });
-    var shared = fixture.opStr(c.ISSUEZ_OPT_ENV, c.ISSUEZ_OP_SET, objects);
-    shared.name = fixture.str("GIT_OBJECT_DIRECTORY");
-    const opened = fixture.tryOpen(scratch_path, &.{shared}, null);
-    try expect.code(c.ISSUEZ_OK, opened[0], null);
-    const scratch = opened[1].?;
-    defer c.issuez_repo_close(scratch);
-    const x = try fixture.titled(scratch, "Imported");
-    _ = try fixture.milestone(scratch, "v1");
-
-    var n: usize = 0;
-    try expect.code(c.ISSUEZ_OK, c.issuez_repo_adopt_refs(r.handle, scratch, null, &n, null), null);
-    try testing.expectEqual(@as(usize, 2), n);
-    const i = try fixture.load(r.handle, x.idStr());
-    try expect.str("Imported", c.issuez_issue_info_of(i).*.title);
-    c.issuez_issue_free(i);
-    // The refs are there now: nothing is taken.
-    try expect.code(
-        c.ISSUEZ_E_CONTENDED,
-        c.issuez_repo_adopt_refs(r.handle, scratch, null, &n, null),
-        null,
-    );
-
-    // A scratch repository with objects of its own.
-    const own_path = try std.fs.path.join(a, &.{ r.root, "own.git" });
-    _ = try fixture.runGit(a, r.root, &.{ "init", "-q", "--bare", own_path });
-    const own = fixture.tryOpen(own_path, &.{}, null);
-    try expect.code(c.ISSUEZ_OK, own[0], null);
-    defer c.issuez_repo_close(own[1].?);
-    _ = try fixture.titled(own[1].?, "Elsewhere");
-    try expect.code(
-        c.ISSUEZ_E_CORRUPT,
-        c.issuez_repo_adopt_refs(r.handle, own[1].?, null, &n, null),
-        null,
-    );
-    try expect.code(
-        c.ISSUEZ_E_INVALID_ARGUMENT,
-        c.issuez_repo_adopt_refs(r.handle, null, null, &n, null),
-        null,
-    );
-    try expect.code(
-        c.ISSUEZ_E_INVALID_ARGUMENT,
-        c.issuez_repo_adopt_refs(r.handle, r.handle, null, &n, null),
-        null,
-    );
-}
-
-test "issuez_settings_write: done and workflow states in git config, checked" {
-    const leaks = fixture.Leaks.start();
-    defer leaks.check();
-    var r: fixture.Repo = undefined;
-    try r.init(.{});
-    defer r.deinit();
-    const h = r.handle;
-    const ops = [_]c.issuez_op{
-        fixture.opStr(c.ISSUEZ_OPT_DONE_STATE, c.ISSUEZ_OP_ADD, "wontfix"),
-        fixture.opStr(c.ISSUEZ_OPT_DONE_STATE, c.ISSUEZ_OP_ADD, "cancelled"),
-        fixture.opStr(c.ISSUEZ_OPT_WORKFLOW_STATE, c.ISSUEZ_OP_ADD, "todo"),
-        fixture.opStr(c.ISSUEZ_OPT_WORKFLOW_STATE, c.ISSUEZ_OP_ADD, "doing"),
-    };
-    try expect.code(c.ISSUEZ_OK, c.issuez_settings_write(h, &ops, ops.len, null, null), null);
-    try testing.expectEqualStrings(
-        "wontfix, cancelled",
-        try r.git(&.{ "config", "issue.doneStates" }),
-    );
-    // A handle opened now sees them.
-    const again = try r.open(&.{});
-    defer c.issuez_repo_close(again);
-    try testing.expectEqual(@as(usize, 2), c.issuez_repo_workflow_state_count(again));
-    // CLEAR unsets the key.
-    var unset = std.mem.zeroes(c.issuez_op);
-    unset.verb = c.ISSUEZ_OP_CLEAR;
-    unset.target = c.ISSUEZ_OPT_WORKFLOW_STATE;
-    const unsets = [_]c.issuez_op{unset};
-    try expect.code(c.ISSUEZ_OK, c.issuez_settings_write(h, &unsets, 1, null, null), null);
-    const left = try r.git(&.{ "config", "--get", "--default", "unset", "issue.workflowStates" });
-    try testing.expectEqualStrings("unset", left);
-    const bad = [_]c.issuez_op{fixture.opStr(c.ISSUEZ_OPT_DONE_STATE, c.ISSUEZ_OP_ADD, "open")};
-    var err: ?*c.issuez_error = null;
-    try expect.code(c.ISSUEZ_E_INVALID_VALUE, c.issuez_settings_write(h, &bad, 1, null, &err), err);
-    c.issuez_error_free(err);
-    const wrong = [_]c.issuez_op{c.issuez_set_title(fixture.str("x"))};
-    try expect.code(
-        c.ISSUEZ_E_INVALID_VALUE,
-        c.issuez_settings_write(h, &wrong, 1, null, null),
-        null,
-    );
-    var ps: ?*c.issuez_problems = null;
-    try expect.code(
-        c.ISSUEZ_OK,
-        c.issuez_ops_validate(c.ISSUEZ_LIST_SETTINGS, &ops, ops.len, &ps, null),
-        null,
-    );
-    try testing.expectEqual(@as(usize, 0), c.issuez_problems_len(ps));
-    c.issuez_problems_free(ps);
+    try expectStates(overridden[1].?, "new", "later", "todo", "rejected", "shipped");
 }
 
 // covers: issuez_fsck_report_issue_count, issuez_fsck_report_milestone_count
 // covers: issuez_fsck_report_error_count, issuez_fsck_report_len, issuez_fsck_report_at
 // covers: issuez_fsck_report_free
-test "issuez_fsck: a clean repository, a damaged issue" {
-    const leaks = fixture.Leaks.start();
-    defer leaks.check();
-    var r: fixture.Repo = undefined;
-    try r.init(.{});
+test "issuez_fsck: a clean repository, a damaged issue, nothing written" {
+    var r = try fixture.Repo.init(.{});
     defer r.deinit();
     const h = r.handle;
     _ = try fixture.titled(h, "Fine");
     _ = try fixture.milestone(h, "v1");
     var rep: ?*c.issuez_fsck_report = null;
-    try expect.code(c.ISSUEZ_OK, c.issuez_fsck(h, 0, null, &rep, null), null);
+    try expect.code(c.ISSUEZ_OK, c.issuez_fsck(h, null, &rep, null), null);
     try testing.expectEqual(@as(usize, 1), c.issuez_fsck_report_issue_count(rep));
     try testing.expectEqual(@as(usize, 1), c.issuez_fsck_report_milestone_count(rep));
     try testing.expectEqual(@as(usize, 0), c.issuez_fsck_report_error_count(rep));
     c.issuez_fsck_report_free(rep);
-    // A flag this library doesn't know.
-    try expect.code(c.ISSUEZ_E_INVALID_ARGUMENT, c.issuez_fsck(h, 1 << 31, null, &rep, null), null);
+    try expect.code(c.ISSUEZ_E_INVALID_ARGUMENT, c.issuez_fsck(h, null, null, null), null);
 
-    // A ref that isn't a UUID, on a commit with a file in its tree.
+    // A ref that isn't a UUID.
     const tree = try r.git(&.{ "hash-object", "-t", "tree", "-w", "/dev/null" });
     const commit = try r.git(&.{ "commit-tree", tree, "-m", "Odd" });
     _ = try r.git(&.{ "update-ref", "refs/issues/not-a-uuid", commit });
-    try expect.code(c.ISSUEZ_OK, c.issuez_fsck(h, 0, null, &rep, null), null);
+    const refs = try r.git(&.{"for-each-ref"});
+    const objects = try r.git(&.{ "count-objects", "-v" });
+    try expect.code(c.ISSUEZ_OK, c.issuez_fsck(h, null, &rep, null), null);
     defer c.issuez_fsck_report_free(rep);
     try testing.expect(c.issuez_fsck_report_error_count(rep) >= 1);
     var saw = false;
@@ -491,40 +352,6 @@ test "issuez_fsck: a clean repository, a damaged issue" {
     }
     try testing.expect(saw);
     try testing.expect(c.issuez_fsck_report_at(rep, 99) == null);
-}
-
-var watch_calls: std.atomic.Value(u32) = .init(0);
-var watch_bits: std.atomic.Value(u32) = .init(0);
-
-fn onWatch(_: ?*anyopaque, changes: u32) callconv(.c) void {
-    _ = watch_calls.fetchAdd(1, .acq_rel);
-    _ = watch_bits.fetchOr(changes, .acq_rel);
-}
-
-test "issuez_watch_start, issuez_watch_stop: another process's write is reported" {
-    const leaks = fixture.Leaks.start();
-    defer leaks.check();
-    var r: fixture.Repo = undefined;
-    try r.init(.{});
-    defer r.deinit();
-    var w: ?*c.issuez_watch = null;
-    var err: ?*c.issuez_error = null;
-    try expect.code(c.ISSUEZ_OK, c.issuez_watch_start(r.handle, onWatch, null, &w, &err), err);
-    // Another handle, as another process would write.
-    const other = try r.open(&.{});
-    defer c.issuez_repo_close(other);
-    _ = try fixture.titled(other, "Watched");
-    var waited: usize = 0;
-    while (watch_calls.load(.acquire) == 0 and waited < 300) : (waited += 1) {
-        try std.Io.sleep(testing.io, .fromMilliseconds(10), .awake);
-    }
-    c.issuez_watch_stop(w);
-    try testing.expect(watch_calls.load(.acquire) > 0);
-    try testing.expect(watch_bits.load(.acquire) & c.ISSUEZ_WATCH_REFS != 0);
-    c.issuez_watch_stop(null);
-    try expect.code(
-        c.ISSUEZ_E_INVALID_ARGUMENT,
-        c.issuez_watch_start(r.handle, null, null, &w, null),
-        null,
-    );
+    try testing.expectEqualStrings(refs, try r.git(&.{"for-each-ref"}));
+    try testing.expectEqualStrings(objects, try r.git(&.{ "count-objects", "-v" }));
 }

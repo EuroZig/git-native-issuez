@@ -7,8 +7,6 @@ import "C"
 
 import (
 	"context"
-	"crypto/sha256"
-	"encoding/hex"
 	"fmt"
 	"runtime"
 )
@@ -145,32 +143,6 @@ func (r *Repo) Update(ctx context.Context, id string, e *Edit, actor Actor, opts
 	})
 }
 
-// CheckCreate is a dry run of Create: every problem it would hit now,
-// nil if none. Unlike Edit.ValidateCreate it reads the repository (the
-// targets of milestones, parents and blockers, the done states).
-func (r *Repo) CheckCreate(ctx context.Context, e *Edit) ([]Problem, error) {
-	return r.check(ctx, "", e.opsOrNil())
-}
-
-// CheckUpdate is a dry run of Update: every problem it would hit now, nil
-// if none. ExpectTip applies; Reload has nothing to reload.
-func (r *Repo) CheckUpdate(ctx context.Context, id string, e *Edit, opts ...WriteOption) ([]Problem, error) {
-	if id == "" {
-		return nil, &Error{Code: CodeInvalidArgument, Message: "id is empty"}
-	}
-	return r.check(ctx, id, writeOptions(opts).withExpect(e))
-}
-
-// check runs issuez_issue_check; id "" checks a create.
-func (r *Repo) check(ctx context.Context, id string, o []op) ([]Problem, error) {
-	var pin runtime.Pinner
-	defer pin.Unpin()
-	ops, n := cOps(&pin, o)
-	return fetch(ctx, r, func(a cArgs, out **C.issuez_problems) C.issuez_code {
-		return C.issuez_issue_check(a.repo, cStr(id), ops, n, a.tok, out, a.cerr)
-	}, takeProblems)
-}
-
 func optOID(pin *runtime.Pinner, o OID) *C.issuez_oid {
 	if o.IsZero() {
 		return nil
@@ -178,45 +150,6 @@ func optOID(pin *runtime.Pinner, o OID) *C.issuez_oid {
 	c := cOID(o)
 	pin.Pin(&c)
 	return &c
-}
-
-// ReadAttachment is an attachment's bytes from the repository's store,
-// checked against its trailer. CodeNotFound for no such issue or
-// attachment, CodeLFS when the bytes aren't in this clone (git lfs
-// fetch), CodeCorrupt when they don't match.
-func (r *Repo) ReadAttachment(ctx context.Context, issueID, attachmentID string) ([]byte, error) {
-	return fetch(ctx, r, func(a cArgs, b **C.issuez_bytes) C.issuez_code {
-		return C.issuez_attachment_read(a.repo, cStr(issueID), cStr(attachmentID), a.tok, b, a.cerr)
-	}, takeBytes)
-}
-
-// AttachmentInfo is what a write would store of an attachment: its media
-// type and its LFS pointer (SHA256, Size), the object a host that keeps
-// the bytes (WithAttachmentStore(false)) stores before the write.
-type AttachmentInfo struct {
-	MediaType string
-	SHA256    string // lowercase hex
-	Size      uint64
-}
-
-// ValidateAttachment says whether a write would take data as an
-// attachment, without writing: what it would store, or an *Error
-// (CodeInvalidValue for the type or animation, CodeLimit for the size).
-func (r *Repo) ValidateAttachment(name string, data []byte) (AttachmentInfo, error) {
-	var info AttachmentInfo
-	err := r.use(func(c *C.issuez_repo) error {
-		var pin runtime.Pinner
-		defer pin.Unpin()
-		var media C.issuez_str
-		var cerr *C.issuez_error
-		if C.issuez_attachment_validate(c, pinStr(&pin, name), pinStr(&pin, string(data)), &media, &cerr) != C.ISSUEZ_OK {
-			return takeError(context.Background(), cerr)
-		}
-		sum := sha256.Sum256(data)
-		info = AttachmentInfo{MediaType: goStr(media), SHA256: hex.EncodeToString(sum[:]), Size: uint64(len(data))}
-		return nil
-	})
-	return info, err
 }
 
 // ─── Milestones ────────────────────────────────────────────────────────

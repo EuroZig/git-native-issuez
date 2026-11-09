@@ -25,14 +25,12 @@ const (
 	CodeContended       Code = C.ISSUEZ_E_CONTENDED // past the retry budget (WithRetries): final
 	CodePurged          Code = C.ISSUEZ_E_PURGED
 	CodeCorrupt         Code = C.ISSUEZ_E_CORRUPT
-	CodeQuarantined     Code = C.ISSUEZ_E_QUARANTINED
 	CodeRejected        Code = C.ISSUEZ_E_REJECTED
 	CodeNotARepository  Code = C.ISSUEZ_E_NOT_A_REPOSITORY
 	CodeGit             Code = C.ISSUEZ_E_GIT
 	CodeGitVersion      Code = C.ISSUEZ_E_GIT_VERSION
 	CodeTimeout         Code = C.ISSUEZ_E_TIMEOUT
 	CodeCancelled       Code = C.ISSUEZ_E_CANCELLED
-	CodeNetwork         Code = C.ISSUEZ_E_NETWORK
 	CodeLFS             Code = C.ISSUEZ_E_LFS
 	CodeUnsupported     Code = C.ISSUEZ_E_UNSUPPORTED
 	CodeNoMem           Code = C.ISSUEZ_E_NOMEM

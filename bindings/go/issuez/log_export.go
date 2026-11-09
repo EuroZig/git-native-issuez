@@ -6,7 +6,6 @@ package issuez
 import "C"
 
 import (
-	"runtime/cgo"
 	"unsafe"
 )
 
@@ -20,11 +19,4 @@ func issuezGoLog(userdata unsafe.Pointer, event unsafe.Pointer) {
 		return
 	}
 	deliverLog(event)
-}
-
-//export issuezGoWatch
-func issuezGoWatch(h C.uintptr_t, changes C.uint32_t) {
-	if fn, ok := cgo.Handle(h).Value().(func(WatchChange)); ok {
-		fn(WatchChange(changes))
-	}
 }

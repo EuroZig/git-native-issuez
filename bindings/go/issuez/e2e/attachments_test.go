@@ -12,13 +12,11 @@ import (
 	"os/exec"
 	"path/filepath"
 	"testing"
-
-	"github.com/EuroZig/git-native-issuez/bindings/go/issuez"
 )
 
 // TestAttachments: a CLI client attaches an image and syncs to a file://
 // hub with git-lfs. The host sees the derived ref and the attachment ID,
-// and its own Sync to mirrors uploads the bytes unless NoAttachments.
+// and a sync from the hub to a mirror uploads the bytes.
 func TestAttachments(t *testing.T) {
 	if err := exec.Command("git", "lfs", "version").Run(); err != nil {
 		t.Skip("no git-lfs")
@@ -62,21 +60,13 @@ func TestAttachments(t *testing.T) {
 		t.Errorf("attachment IDs: %v in %+v", ids, i.Comments)
 	}
 
-	for _, upload := range []bool{false, true} {
-		mirror := newHub(t)
-		name := "refs-only"
-		if upload {
-			name = "with-bytes"
-		}
-		git(t, hub, "remote", "add", name, "file://"+mirror)
-		if _, err := r.Sync(bg, name, issuez.SyncOptions{NoAttachments: !upload}); err != nil {
-			t.Fatalf("sync to %s: %v", name, err)
-		}
-		if len(refsUnder(t, mirror, "refs/attachments/"+id)) != 1 {
-			t.Errorf("%s: no derived ref", name)
-		}
-		if lfsObject(mirror) != upload {
-			t.Errorf("%s: bytes there %v", name, lfsObject(mirror))
-		}
+	mirror := newHub(t)
+	git(t, hub, "remote", "add", "mirror", "file://"+mirror)
+	cli(t, hub, "sync", "mirror")
+	if len(refsUnder(t, mirror, "refs/attachments/"+id)) != 1 {
+		t.Errorf("no derived ref on the mirror")
+	}
+	if !lfsObject(mirror) {
+		t.Errorf("no bytes on the mirror")
 	}
 }

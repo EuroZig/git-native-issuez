@@ -2,7 +2,7 @@
 // binding's enum types, the integer types with a const block of their
 // own values that have no String method yet. A value's string is its Go
 // name without the prefix its block shares, in snake case:
-// SyncFastForward is "fast_forward".
+// PushFastForward is "fast_forward".
 package enumgen
 
 import (

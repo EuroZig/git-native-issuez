@@ -1,13 +1,11 @@
 package issuez_test
 
 import (
-	"bytes"
 	"context"
-	"crypto/sha256"
-	"encoding/hex"
 	"errors"
 	"os"
 	"path/filepath"
+	"slices"
 	"testing"
 
 	"github.com/EuroZig/git-native-issuez/bindings/go/issuez"
@@ -88,32 +86,6 @@ func TestEdit_AddAttachment(t *testing.T) {
 	}
 }
 
-func TestRepo_ValidateAttachment(t *testing.T) {
-	r := newRepo(t)
-	sum := sha256.Sum256(jpeg)
-	if m, err := r.ValidateAttachment("a.jpg", jpeg); err != nil || m != (issuez.AttachmentInfo{MediaType: "image/jpeg", SHA256: hex.EncodeToString(sum[:]), Size: uint64(len(jpeg))}) {
-		t.Errorf("jpeg: %+v %v", m, err)
-	}
-	// The pointer is the one a write stores.
-	info, _ := r.ValidateAttachment("a.png", png)
-	w, err := r.Create(t.Context(), new(issuez.Edit).SetTitle("Pointer").AddAttachment("", "a.png", png), ada, issuez.Reload())
-	if err != nil || w.Issue.Attachments[0].SHA256 != info.SHA256 || w.Issue.Attachments[0].Size != info.Size {
-		t.Errorf("stored %+v, validated %+v: %v", w.Issue.Attachments, info, err)
-	}
-	var e *issuez.Error
-	if _, err := r.ValidateAttachment("a.gif", []byte("GIF89a")); !errors.As(err, &e) || e.Code != issuez.CodeInvalidValue {
-		t.Errorf("gif: %v", err)
-	}
-	small := open(t, r.GitDir(), issuez.WithLimit("max_attachment_bytes", 8))
-	if _, err := small.ValidateAttachment("a.png", png); !errors.As(err, &e) || e.Code != issuez.CodeLimit {
-		t.Errorf("too large: %v", err)
-	}
-	r.Close()
-	if _, err := r.ValidateAttachment("a.png", png); err == nil {
-		t.Error("closed repo")
-	}
-}
-
 func TestEdit_EditComment(t *testing.T) {
 	ctx := context.Background()
 	r := newRepo(t)
@@ -173,6 +145,59 @@ func TestWithAttachmentStore(t *testing.T) {
 	}
 }
 
+// TestRepo_Fsck_attachmentStore: a repo that stores the bytes checks them;
+// one whose caller keeps them doesn't look, and says nothing of them.
+func TestRepo_Fsck_attachmentStore(t *testing.T) {
+	ctx := context.Background()
+	kinds := func(rep *issuez.FsckReport) (l []issuez.FsckKind) {
+		for _, f := range rep.Findings {
+			l = append(l, f.Kind)
+		}
+		return l
+	}
+	t.Run("the caller's", func(t *testing.T) {
+		dir := initRepo(t)
+		r := open(t, dir, issuez.WithAttachmentStore(false))
+		if _, err := r.Create(ctx, new(issuez.Edit).SetTitle("Shot").AddAttachment("", "a.png", png), ada); err != nil {
+			t.Fatal(err)
+		}
+		rep, err := r.Fsck(ctx)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if rep.Errors != 0 || len(rep.Findings) != 0 {
+			t.Errorf("%v: %+v", kinds(rep), rep.Findings)
+		}
+	})
+	t.Run("the repository's", func(t *testing.T) {
+		dir := initRepo(t)
+		r := open(t, dir)
+		w, err := r.Create(ctx, new(issuez.Edit).SetTitle("Shot").AddAttachment("", "a.png", png), ada)
+		var e *issuez.Error
+		if errors.As(err, &e) && e.Code == issuez.CodeLFS {
+			t.Skip("the repository's store needs git-lfs")
+		}
+		if err != nil {
+			t.Fatal(err)
+		}
+		i, err := r.Load(ctx, w.ID)
+		if err != nil {
+			t.Fatal(err)
+		}
+		sha := i.Attachments[0].SHA256
+		if err := os.Remove(filepath.Join(dir, ".git", "issuez", "lfs", "objects", sha[:2], sha[2:4], sha)); err != nil {
+			t.Fatal(err)
+		}
+		rep, err := r.Fsck(ctx)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if !slices.Contains(kinds(rep), issuez.FsckAttachmentMissing) {
+			t.Errorf("missing bytes not noted: %+v", rep.Findings)
+		}
+	})
+}
+
 // TestEdit_RemoveAttachment: a commit of its own that keeps the text, with
 // the attachment still under its comment; not on a create.
 func TestEdit_RemoveAttachment(t *testing.T) {
@@ -221,21 +246,5 @@ func TestPurgeResult_RemovedAttachments(t *testing.T) {
 	res, err = r.PurgeIssue(ctx, w.ID, ada, "gone")
 	if err != nil || len(res.RemovedAttachments) != 1 || res.RemovedAttachments[0] != shot {
 		t.Errorf("issue purge: %+v %v", res, err)
-	}
-}
-
-func TestRepo_ReadAttachment(t *testing.T) {
-	ctx := t.Context()
-	r := newRepo(t)
-	w, err := r.Create(ctx, new(issuez.Edit).SetTitle("Pictured").AddAttachment("", "a.png", png), ada, issuez.Reload())
-	if err != nil {
-		t.Skipf("no attachment store here: %v", err)
-	}
-	id := w.Issue.Attachments[0].ID
-	if data, err := r.ReadAttachment(ctx, w.ID, id); err != nil || !bytes.Equal(data, png) {
-		t.Errorf("read: %d bytes, %v", len(data), err)
-	}
-	if _, err := r.ReadAttachment(ctx, w.ID, "6c1d5f1f-3c9b-4a6f-8e4a-7d2d2a1a3b88"); !errors.Is(err, issuez.ErrNotFound) {
-		t.Errorf("unknown: %v", err)
 	}
 }

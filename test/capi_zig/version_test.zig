@@ -17,10 +17,6 @@ test "issuez_version: starts with the header's version, as text" {
     try testing.expect(std.mem.startsWith(u8, v, want));
 }
 
-test "issuez_abi_version: the header's" {
-    try testing.expectEqual(@as(u32, c.ISSUEZ_ABI_VERSION), c.issuez_abi_version());
-}
-
 test "issuez_init: idempotent; another major refused with a message" {
     const leaks = fixture.Leaks.start();
     defer leaks.check();

@@ -75,8 +75,13 @@ func Example_syncCache() {
 			changed = append(changed, d.ID)
 		}
 	}
-	issues, skipped, _ := repo.LoadMany(ctx, changed)
-	fmt.Println(len(issues), "to upsert,", len(skipped), "damaged")
+	for _, id := range changed {
+		issue, err := repo.Load(ctx, id)
+		if err != nil {
+			continue // gone or damaged since the snapshot
+		}
+		fmt.Println("upsert", issue.Title)
+	}
 	stored, _ = now.MarshalBinary()
 }
 

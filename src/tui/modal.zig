@@ -23,6 +23,7 @@ const Action = AppState.Action;
 const K = vaxis.Key;
 const palette = ui.palette;
 const fields_fmt = issuez.format.fields;
+const Date = fields_fmt.Date;
 const core = issuez.format.core;
 const shortId = issuez.format.uuid.shortId;
 
@@ -506,8 +507,7 @@ pub fn openPrompt(
 /// For an answer that is what the issue already has: no write.
 fn unchanged(s: *AppState) Action {
     s.closeModal();
-    s.info("unchanged", .{});
-    return .none;
+    return s.noted("unchanged", .{});
 }
 
 pub fn editTitle(s: *AppState, i: u32) void {
@@ -540,153 +540,111 @@ pub fn addComment(s: *AppState, i: u32) void {
 pub fn editField(s: *AppState, i: u32, field: Field) void {
     const snap = s.snap;
     const issue = snap.issues[i];
-    const id: Id = .of(issue.id);
-    const purpose: Purpose = .{ .field = .{ .id = id, .field = field } };
+    const purpose: Purpose = .{ .field = .{ .id = .of(issue.id), .field = field } };
     const a = s.modalArena();
     s.closeModal();
-    switch (field) {
-        .state, .workflow, .priority, .milestone => {
-            var options: std.ArrayList(Menu.Option) = .empty;
-            const cur: []const u8 = switch (field) {
-                .state => issue.state.text(),
-                .workflow => issue.workflow orelse "",
-                .priority => issue.field("Priority") orelse "",
-                // Catalog milestones by ID; a plain-text one is none of
-                // the options.
-                .milestone => milestoneCurrent(snap, i),
-                else => unreachable,
-            };
-            // Copied: the menu outlives a reload of the snapshot they're in.
-            const add = struct {
-                fn f(
-                    list: *std.ArrayList(Menu.Option),
-                    arena: Allocator,
-                    o: Menu.Option,
-                    current: []const u8,
-                ) void {
-                    var opt = o;
-                    opt.current = !o.other and std.mem.eql(u8, o.value, current);
-                    opt.label = arena.dupe(u8, o.label) catch return;
-                    opt.value = arena.dupe(u8, o.value) catch return;
-                    list.append(arena, opt) catch {};
-                }
-            }.f;
-            switch (field) {
-                .state => {
-                    add(&options, a, .{ .label = "open", .value = "open" }, cur);
-                    add(&options, a, .{ .label = "closed", .value = "closed" }, cur);
-                    for (snap.settings.done_states) |d| add(
-                        &options,
-                        a,
-                        .{ .label = d, .value = d },
-                        cur,
-                    );
-                    if (issue.state == .other and !issue.state.isDone(snap.settings.done_states)) {
-                        add(
-                            &options,
-                            a,
-                            .{ .label = issue.state.text(), .value = issue.state.text() },
-                            cur,
-                        );
-                    }
-                },
-                .workflow => {
-                    for (snap.settings.workflow_states) |w| add(
-                        &options,
-                        a,
-                        .{ .label = w, .value = w },
-                        cur,
-                    );
-                    add(&options, a, .{ .label = "(default)", .value = "" }, cur);
-                },
-                .priority => {
-                    add(&options, a, .{ .label = "(none)", .value = "" }, cur);
-                    for ([_][]const u8{ "low", "medium", "high", "critical" }) |p| add(
-                        &options,
-                        a,
-                        .{ .label = p, .value = p },
-                        cur,
-                    );
-                },
-                .milestone => {
-                    for (snap.milestones) |m| {
-                        if (m.status != .open) continue;
-                        add(&options, a, .{ .label = m.name, .value = m.id }, cur);
-                    }
-                    add(&options, a, .{ .label = "(none)", .value = link_none }, cur);
-                    if (snap.proj.parent[i] != std.math.maxInt(u32)) {
-                        add(
-                            &options,
-                            a,
-                            .{ .label = "(inherit from parent)", .value = link_inherit },
-                            cur,
-                        );
-                    }
-                    add(&options, a, .{ .label = "Other…", .value = "", .other = true }, cur);
-                },
-                else => unreachable,
-            }
-            var selected: u16 = 0;
-            for (options.items, 0..) |o, n| if (o.current) {
-                selected = @intCast(n);
-            };
-            s.openModal(.{ .menu = .{
-                .title = print(s, "{s} of #{s}", .{ field.label(), shortId(issue.id) }),
-                .options = options.items,
-                .selected = selected,
-                .purpose = purpose,
-            } });
+    const hint: []const u8, const value: []const u8 = switch (field) {
+        .state, .workflow, .priority, .milestone => return openFieldMenu(s, i, field, purpose),
+        .assignee => .{ "an email; empty unassigns", issue.field("Assignee") orelse "" },
+        .labels => .{
+            "comma-separated; empty removes all",
+            std.mem.join(a, ", ", issue.labels) catch "",
         },
-        .assignee => openPrompt(
-            s,
-            "Assignee",
-            "an email; empty unassigns",
-            issue.field("Assignee") orelse "",
-            purpose,
-            false,
-        ),
-        .labels => {
-            const joined = std.mem.join(a, ", ", issue.labels) catch "";
-            openPrompt(s, "Labels", "comma-separated; empty removes all", joined, purpose, false);
-        },
-        .parent => {
+        .parent => blk: {
             const p = snap.proj.parent[i];
-            const value = if (p == std.math.maxInt(u32)) "" else shortId(snap.issues[p].id);
-            openPrompt(
-                s,
-                "Parent",
+            break :blk .{
                 "an issue ID (prefix); empty makes it top-level",
-                value,
-                purpose,
-                false,
-            );
+                if (p == std.math.maxInt(u32)) "" else shortId(snap.issues[p].id),
+            };
         },
-        .blocked_by => {
+        .blocked_by => blk: {
             var ids: std.ArrayList(u8) = .empty;
             for (issue.blocked_by, 0..) |b, n| {
                 if (n > 0) ids.append(a, ' ') catch {};
                 ids.appendSlice(a, shortId(b)) catch {};
             }
-            openPrompt(
-                s,
-                "Blocked by",
-                "issue IDs (prefixes), space-separated; empty clears",
-                ids.items,
-                purpose,
-                false,
-            );
+            break :blk .{ "issue IDs (prefixes), space-separated; empty clears", ids.items };
         },
-        .start, .due => {
+        .start, .due => blk: {
             const d = if (field == .start) issue.start_date else issue.due_date;
-            const value = if (d) |date| print(s, "{f}", .{date}) else "";
-            openPrompt(s, field.label(), dates.hint, value, purpose, false);
-            s.modal.?.prompt.date = true;
+            break :blk .{ dates.hint, if (d) |date| print(s, "{f}", .{date}) else "" };
         },
-        .estimate => {
-            const value = if (issue.estimate_minutes) |m| durationText(s, m) else "";
-            openPrompt(s, "Estimate", "like 90m, 2h or 1h30m; empty clears", value, purpose, false);
+        .estimate => .{
+            "like 90m, 2h or 1h30m; empty clears",
+            if (issue.estimate_minutes) |m| durationText(s, m) else "",
         },
+    };
+    openPrompt(s, field.label(), hint, value, purpose, false);
+    if (field == .start or field == .due) s.modal.?.prompt.date = true;
+}
+
+/// A field with a few values, the issue's marked. Copied: the menu outlives
+/// a reload of the snapshot they're in.
+const FieldOptions = struct {
+    a: Allocator,
+    current: []const u8,
+    list: std.ArrayList(Menu.Option) = .empty,
+
+    fn add(o: *FieldOptions, label: []const u8, value: []const u8) void {
+        o.list.append(o.a, .{
+            .label = o.a.dupe(u8, label) catch return,
+            .value = o.a.dupe(u8, value) catch return,
+            .current = std.mem.eql(u8, value, o.current),
+        }) catch {};
     }
+};
+
+fn openFieldMenu(s: *AppState, i: u32, field: Field, purpose: Purpose) void {
+    const snap = s.snap;
+    const issue = snap.issues[i];
+    var o: FieldOptions = .{
+        .a = s.modalArena(),
+        .current = switch (field) {
+            .state => issue.state.text(),
+            .workflow => issue.workflow orelse "",
+            .priority => issue.field("Priority") orelse "",
+            // Catalog milestones by ID; a plain-text one is none of the options.
+            .milestone => milestoneCurrent(snap, i),
+            else => unreachable,
+        },
+    };
+    switch (field) {
+        .state => {
+            o.add("open", "open");
+            o.add("closed", "closed");
+            for (snap.settings.done_states) |d| o.add(d, d);
+            if (issue.state == .other and !issue.state.isDone(snap.settings.done_states)) {
+                o.add(issue.state.text(), issue.state.text());
+            }
+        },
+        .workflow => {
+            for (snap.settings.workflow_states) |w| o.add(w, w);
+            o.add("(default)", "");
+        },
+        .priority => {
+            o.add("(none)", "");
+            for ([_][]const u8{ "low", "medium", "high", "critical" }) |p| o.add(p, p);
+        },
+        .milestone => {
+            for (snap.milestones) |m| if (m.status == .open) o.add(m.name, m.id);
+            o.add("(none)", link_none);
+            if (snap.proj.parent[i] != std.math.maxInt(u32)) {
+                o.add("(inherit from parent)", link_inherit);
+            }
+            o.list.append(o.a, .{ .label = "Other…", .value = "", .other = true }) catch {};
+        },
+        else => unreachable,
+    }
+    var selected: u16 = 0;
+    for (o.list.items, 0..) |option, n| if (option.current) {
+        selected = @intCast(n);
+    };
+    s.openModal(.{ .menu = .{
+        .title = print(s, "{s} of #{s}", .{ field.label(), shortId(issue.id) }),
+        .options = o.list.items,
+        .selected = selected,
+        .purpose = purpose,
+    } });
 }
 
 /// Menu values for milestone links that aren't a catalog ID.
@@ -754,16 +712,12 @@ fn openSortMenu(
             .current = k == current,
         };
     }
-    s.openModal(
-        .{
-            .menu = .{
-                .title = title,
-                .options = options,
-                .selected = selected,
-                .purpose = purpose,
-            },
-        },
-    );
+    s.openModal(.{ .menu = .{
+        .title = title,
+        .options = options,
+        .selected = selected,
+        .purpose = purpose,
+    } });
 }
 
 /// Choosing the key in use flips the order; another sorts by it.
@@ -816,9 +770,7 @@ pub fn key(s: *AppState, k: vaxis.Key) Allocator.Error!Action {
         .prompt => |*p| {
             if (k.matches(K.escape, .{})) {
                 s.closeModal();
-            } else if (k.matches(K.enter, .{})) {
-                return submit(s);
-            } else if (save) {
+            } else if (k.matches(K.enter, .{}) or save) {
                 return submit(s);
             } else {
                 s.discard_armed = false;
@@ -828,10 +780,8 @@ pub fn key(s: *AppState, k: vaxis.Key) Allocator.Error!Action {
         .editor => |*e| {
             if (k.matches(K.escape, .{})) {
                 const changed = !std.mem.eql(u8, e.input.text(), e.original);
-                if (changed and !s.discard_armed) {
-                    s.discard_armed = true;
-                    s.fail("unsaved text: press esc again to discard, ctrl+s to save", .{});
-                } else s.closeModal();
+                const ask = "unsaved text: press esc again to discard, ctrl+s to save";
+                closeOrAsk(s, changed, ask, .{});
             } else if (save) {
                 return submit(s);
             } else {
@@ -860,54 +810,7 @@ pub fn key(s: *AppState, k: vaxis.Key) Allocator.Error!Action {
         .form => |*fm| return fm.key(s, k, save),
         .milestone_form => |*fm| return fm.key(s, k, save),
         .sync_panel => |*p| return syncPanelKey(s, p, k),
-        .picker => |*p| {
-            const shown = try p.shown(a);
-            const n: i64 = @intCast(shown.len);
-            const page: i64 = 10;
-            if (!k.matches(K.escape, .{})) s.discard_armed = false;
-            if (k.matches(K.escape, .{})) {
-                if (p.filter.text().len > 0) {
-                    p.filter.clear();
-                    p.selected = 0;
-                } else closePicker(s, p);
-            } else if (k.matches(
-                K.down,
-                .{},
-            ) or k.matches('n', .{ .ctrl = true }) or k.matches('j', .{ .ctrl = true })) {
-                p.selected = @intCast(std.math.clamp(@as(i64, p.selected) + 1, 0, @max(n - 1, 0)));
-            } else if (k.matches(
-                K.up,
-                .{},
-            ) or k.matches('p', .{ .ctrl = true }) or k.matches('k', .{ .ctrl = true })) {
-                p.selected = @intCast(std.math.clamp(@as(i64, p.selected) - 1, 0, @max(n - 1, 0)));
-            } else if (k.matches(K.page_down, .{})) {
-                p.selected = @intCast(
-                    std.math.clamp(@as(i64, p.selected) + page, 0, @max(n - 1, 0)),
-                );
-            } else if (k.matches(K.page_up, .{})) {
-                p.selected = @intCast(
-                    std.math.clamp(@as(i64, p.selected) - page, 0, @max(n - 1, 0)),
-                );
-            } else if (p.multi and (k.matches(
-                K.tab,
-                .{},
-            ) or k.matches(K.tab, .{ .shift = true }))) {
-                if (p.selected < shown.len) {
-                    const it = &p.items[shown[p.selected]];
-                    if (!it.disabled) it.marked = !it.marked;
-                    if (k.matches(K.tab, .{})) p.selected = @intCast(
-                        @min(@as(i64, p.selected) + 1, @max(n - 1, 0)),
-                    );
-                }
-            } else if (k.matches(K.enter, .{}) or save) {
-                return submit(s);
-            } else {
-                // Moving the cursor keeps the row; new text starts over.
-                const before = try a.dupe(u8, p.filter.text());
-                _ = try p.filter.key(gpa, a, k);
-                if (!std.mem.eql(u8, before, p.filter.text())) p.selected = 0;
-            }
-        },
+        .picker => |*p| return pickerKey(s, p, k, save),
         .confirm => |*c| {
             const n: i32 = @intCast(c.choices.len);
             if (k.matches(K.escape, .{}) or k.matches('q', .{})) {
@@ -959,13 +862,60 @@ fn helpKey(s: *AppState, h: *Help, k: vaxis.Key) void {
     h.scroll = @intCast(std.math.clamp(@as(i32, h.scroll) + by, 0, all));
 }
 
+fn pickerKey(s: *AppState, p: *Picker, k: vaxis.Key, save: bool) Allocator.Error!Action {
+    if (k.matches(K.escape, .{})) {
+        if (p.filter.text().len > 0) {
+            p.filter.clear();
+            p.selected = 0;
+        } else closePicker(s, p);
+        return .none;
+    }
+    s.discard_armed = false;
+    const a = s.input_arena.allocator();
+    const shown = try p.shown(a);
+    const last: i64 = @max(@as(i64, @intCast(shown.len)) - 1, 0);
+    const ctrl: K.Modifiers = .{ .ctrl = true };
+    const by: ?i64 = if (k.matches(K.down, .{}) or k.matches('n', ctrl) or k.matches('j', ctrl))
+        1
+    else if (k.matches(K.up, .{}) or k.matches('p', ctrl) or k.matches('k', ctrl))
+        -1
+    else if (k.matches(K.page_down, .{}))
+        10
+    else if (k.matches(K.page_up, .{}))
+        -10
+    else
+        null;
+    if (by) |b| {
+        p.selected = @intCast(std.math.clamp(@as(i64, p.selected) + b, 0, last));
+    } else if (p.multi and (k.matches(K.tab, .{}) or k.matches(K.tab, .{ .shift = true }))) {
+        if (p.selected < shown.len) {
+            const it = &p.items[shown[p.selected]];
+            if (!it.disabled) it.marked = !it.marked;
+            if (k.matches(K.tab, .{})) p.selected = @intCast(@min(@as(i64, p.selected) + 1, last));
+        }
+    } else if (k.matches(K.enter, .{}) or save) {
+        return submit(s);
+    } else {
+        // Moving the cursor keeps the row; new text starts over.
+        const before = try a.dupe(u8, p.filter.text());
+        _ = try p.filter.key(s.gpa, a, k);
+        if (!std.mem.eql(u8, before, p.filter.text())) p.selected = 0;
+    }
+    return .none;
+}
+
+/// Closing with something to lose asks once.
+fn closeOrAsk(s: *AppState, losing: bool, comptime format: []const u8, args: anytype) void {
+    if (losing and !s.discard_armed) {
+        s.discard_armed = true;
+        s.fail(format, args);
+    } else s.closeModal();
+}
+
 /// Marks are a choice made: closing asks once before dropping them.
 fn closePicker(s: *AppState, p: *const Picker) void {
     const marked = p.marked();
-    if (marked > 0 and !s.discard_armed) {
-        s.discard_armed = true;
-        s.fail("{d} marked: press esc again to drop them", .{marked});
-    } else s.closeModal();
+    closeOrAsk(s, marked > 0, "{d} marked: press esc again to drop them", .{marked});
 }
 
 /// The first character a key types, if it types one.
@@ -1055,20 +1005,20 @@ pub fn rebase(s: *AppState) void {
 
 fn submit(s: *AppState) Action {
     const m = &s.modal.?;
-    const a = s.modalArena();
     if (s.modalStale()) {
         const id = m.issue().?;
         s.rebaseModal();
-        s.fail(
+        return s.failed(
             "#{s} changed meanwhile: save again to replace it with yours",
             .{shortId(id.slice())},
         );
-        return .none;
     }
     if (milestoneStale(s)) |name| {
         rebase(s);
-        s.fail("milestone {s} changed meanwhile: save again to replace it with yours", .{name});
-        return .none;
+        return s.failed(
+            "milestone {s} changed meanwhile: save again to replace it with yours",
+            .{name},
+        );
     }
     switch (m.*) {
         .help => return .none,
@@ -1090,67 +1040,54 @@ fn submit(s: *AppState) Action {
                 },
                 .comment => |id| {
                     if (std.mem.trim(u8, t, " \t\n").len == 0) {
-                        s.fail("a comment needs some text", .{});
-                        return .none;
+                        return s.failed("a comment needs some text", .{});
                     }
                     return .{ .comment = .{ .id = id, .text = t } };
                 },
                 else => unreachable,
             }
         },
-        .menu => |*mn| {
-            const o = mn.options[mn.selected];
-            if (o.disabled) {
-                s.fail("{s}: reopen it first to add open work", .{o.label});
-                return .none;
-            }
-            switch (mn.purpose) {
-                .stage_milestone => |id| {
-                    const link: draft_mod.Link = switch (linkOf(o.value)) {
-                        .none => .none,
-                        .inherit => .inherit,
-                        .id => |v| .{ .id = .of(v) },
-                    };
-                    return .{ .stage = .{ .milestone = .{ .id = id, .link = link } } };
-                },
-                .stage_unblock => |id| return .{
-                    .stage = .{ .remove_blocker = .{ .id = id, .blocker = .of(o.value) } },
-                },
-                .pane_pick => {
-                    const v = &s.milestone;
-                    v.other = if (std.mem.eql(u8, o.value, link_none)) .none else .{
-                        .id = .of(o.value),
-                    };
-                    v.split = true;
-                    v.pane = 1;
-                    v.panes[1] = .{};
-                    s.closeModal();
-                    return .none;
-                },
-                .milestones => {
-                    var buf: [256]u8 = undefined;
-                    const term = std.fmt.bufPrint(&buf, "m:{s}", .{o.value}) catch "m:";
-                    s.search.set(s.gpa, term) catch {
-                        s.fail("out of memory", .{});
-                        return .none;
-                    };
-                    s.closeModal();
-                    s.filterChanged();
-                    return .none;
-                },
-                .sort, .milestone_sort => {
-                    if (mn.purpose == .sort) {
-                        toggleSort(s.issueQuery(), filter.SortKey, o.value);
-                    } else {
-                        toggleSort(&s.ms_query, milestone_filter.SortKey, o.value);
-                        s.milestones.follow = true;
-                    }
-                    s.closeModal();
-                    return .none;
-                },
-                else => {},
-            }
-            const fp = mn.purpose.field;
+        .menu => |*mn| return menuSubmit(s, mn),
+        .prompt => |*p| return promptSubmit(s, p),
+    }
+}
+
+fn menuSubmit(s: *AppState, mn: *Menu) Action {
+    const o = mn.options[mn.selected];
+    if (o.disabled) return s.failed("{s}: reopen it first to add open work", .{o.label});
+    switch (mn.purpose) {
+        .stage_milestone => |id| {
+            const link: draft_mod.Link = switch (linkOf(o.value)) {
+                .none => .none,
+                .inherit => .inherit,
+                .id => |v| .{ .id = .of(v) },
+            };
+            return .{ .stage = .{ .milestone = .{ .id = id, .link = link } } };
+        },
+        .stage_unblock => |id| return .{
+            .stage = .{ .remove_blocker = .{ .id = id, .blocker = .of(o.value) } },
+        },
+        .pane_pick => {
+            const v = &s.milestone;
+            v.other = if (std.mem.eql(u8, o.value, link_none)) .none else .{ .id = .of(o.value) };
+            v.split = true;
+            v.pane = 1;
+            v.panes[1] = .{};
+        },
+        .milestones => {
+            var buf: [256]u8 = undefined;
+            const term = std.fmt.bufPrint(&buf, "m:{s}", .{o.value}) catch "m:";
+            s.search.set(s.gpa, term) catch return s.failed("out of memory", .{});
+            s.closeModal();
+            s.filterChanged();
+            return .none;
+        },
+        .sort => toggleSort(s.issueQuery(), filter.SortKey, o.value),
+        .milestone_sort => {
+            toggleSort(&s.ms_query, milestone_filter.SortKey, o.value);
+            s.milestones.follow = true;
+        },
+        .field => |fp| {
             if (o.current) return unchanged(s);
             if (o.other) {
                 openPrompt(
@@ -1175,90 +1112,67 @@ fn submit(s: *AppState) Action {
                 else => unreachable,
             };
         },
-        .prompt => |*p| {
-            const t = std.mem.trim(u8, p.input.text(), " \t");
-            if (p.original) |o| {
-                if (std.mem.eql(u8, t, std.mem.trim(u8, o, " \t"))) return unchanged(s);
-            }
-            switch (p.purpose) {
-                .title => |id| {
-                    if (t.len == 0) {
-                        s.fail("the title can't be empty", .{});
-                        return .none;
-                    }
-                    return .{ .edit = .{ .id = id, .spec = .{ .title = t } } };
-                },
-                .field => |fp| return fieldAction(s, a, fp.id, fp.field, t),
-                .stage_date => |sd| {
-                    const d: ?fields_fmt.Date = if (t.len == 0) null else dateOrFail(
-                        s,
-                        t,
-                    ) orelse return .none;
-                    const i = s.snap.find(sd.id.slice()) orelse return .none;
-                    const cur = @import("timeline_view.zig").datesOf(s, i);
-                    const start = if (sd.start) d else cur.start;
-                    const due = if (sd.start) cur.due else d;
-                    if (start != null and due != null and start.?.order(due.?) == .gt) {
-                        s.fail("the start can't be after the due date", .{});
-                        return .none;
-                    }
-                    // Only the date typed: the other stays what it is when applied.
-                    return .{
-                        .stage = .{
-                            .dates = if (sd.start) .{
-                                .id = sd.id,
-                                .start = d,
-                            } else .{ .id = sd.id, .due = d },
-                        },
-                    };
-                },
-                .stage_ms_due => |id| {
-                    const d: ?fields_fmt.Date = if (t.len == 0) null else dateOrFail(
-                        s,
-                        t,
-                    ) orelse return .none;
-                    return .{ .stage = .{ .milestone_due = .{ .id = id, .due = d } } };
-                },
-                .stage_estimate => |id| {
-                    const minutes: ?u32 = if (t.len == 0) null else durationOrFail(
-                        s,
-                        t,
-                    ) orelse return .none;
-                    return .{ .stage = .{ .estimate = .{ .id = id, .minutes = minutes } } };
-                },
-                .quick_add => |scope| {
-                    if (t.len == 0) {
-                        s.closeModal();
-                        return .none;
-                    }
-                    return .{ .quick_create = .{
-                        .title = t,
-                        .milestone_id = if (scope == .id) dupe(s, scope.id.slice()) else null,
-                    } };
-                },
-                .milestone => |mp| switch (mp.what) {
-                    .name => {
-                        if (!validName(s, t)) return .none;
-                        return .{
-                            .edit_milestone = .{
-                                .id = mp.id,
-                                .edit = .{ .name = t, .expect = mp.tip },
-                            },
-                        };
-                    },
-                    .due => {
-                        const value = dateValue(s, t) orelse return .none;
-                        return .{
-                            .edit_milestone = .{
-                                .id = mp.id,
-                                .edit = .{ .due = value, .expect = mp.tip },
-                            },
-                        };
-                    },
-                },
-                else => unreachable,
-            }
+        else => unreachable,
+    }
+    s.closeModal();
+    return .none;
+}
+
+fn promptSubmit(s: *AppState, p: *Prompt) Action {
+    const t = std.mem.trim(u8, p.input.text(), " \t");
+    if (p.original) |o| {
+        if (std.mem.eql(u8, t, std.mem.trim(u8, o, " \t"))) return unchanged(s);
+    }
+    switch (p.purpose) {
+        .title => |id| {
+            if (t.len == 0) return s.failed("the title can't be empty", .{});
+            return .{ .edit = .{ .id = id, .spec = .{ .title = t } } };
         },
+        .field => |fp| return fieldAction(s, s.modalArena(), fp.id, fp.field, t),
+        .stage_date => |sd| {
+            const d: ?Date = if (t.len == 0) null else dateOrFail(s, t) orelse return .none;
+            const i = s.snap.find(sd.id.slice()) orelse return .none;
+            const cur = @import("timeline_view.zig").datesOf(s, i);
+            const start = if (sd.start) d else cur.start;
+            const due = if (sd.start) cur.due else d;
+            if (start != null and due != null and start.?.order(due.?) == .gt) {
+                return s.failed("the start can't be after the due date", .{});
+            }
+            // Only the date typed: the other stays what it is when applied.
+            return .{ .stage = .{
+                .dates = if (sd.start) .{ .id = sd.id, .start = d } else .{ .id = sd.id, .due = d },
+            } };
+        },
+        .stage_ms_due => |id| {
+            const d: ?Date = if (t.len == 0) null else dateOrFail(s, t) orelse return .none;
+            return .{ .stage = .{ .milestone_due = .{ .id = id, .due = d } } };
+        },
+        .stage_estimate => |id| {
+            const m: ?u32 = if (t.len == 0) null else durationOrFail(s, t) orelse return .none;
+            return .{ .stage = .{ .estimate = .{ .id = id, .minutes = m } } };
+        },
+        .quick_add => |scope| {
+            if (t.len == 0) {
+                s.closeModal();
+                return .none;
+            }
+            return .{ .quick_create = .{
+                .title = t,
+                .milestone_id = if (scope == .id) dupe(s, scope.id.slice()) else null,
+            } };
+        },
+        .milestone => |mp| {
+            var edit: store.MilestoneEdit = .{ .expect = mp.tip };
+            switch (mp.what) {
+                .name => {
+                    if (!validName(s, t)) return .none;
+                    edit.name = t;
+                },
+                .due => edit.due = dateValue(s, t) orelse return .none,
+            }
+            return .{ .edit_milestone = .{ .id = mp.id, .edit = edit } };
+        },
+        else => unreachable,
     }
 }
 
@@ -1303,8 +1217,7 @@ fn fieldAction(s: *AppState, a: Allocator, id: Id, field: Field, t: []const u8) 
         .assignee => {
             if (t.len == 0) return edit(id, .{ .set_assignees = &.{} });
             const one = fields_fmt.Assignee.parse(t) orelse {
-                s.fail("'{s}' isn't an email", .{t});
-                return .none;
+                return s.failed("'{s}' isn't an email", .{t});
             };
             const list = a.dupe(fields_fmt.Assignee, &.{one}) catch return .none;
             return edit(id, .{ .set_assignees = list });
@@ -1349,7 +1262,7 @@ fn dateValue(s: *AppState, t: []const u8) ?issuez.engine.EditSpec.DateEdit {
 }
 
 /// A typed date; null, with a failure shown, when it isn't one.
-fn dateOrFail(s: *AppState, t: []const u8) ?fields_fmt.Date {
+fn dateOrFail(s: *AppState, t: []const u8) ?Date {
     return dates.parse(t, s.today, s.snap.settings.work_days) orelse {
         s.fail("'{s}' isn't a date like 2026-12-31, +3d or fri", .{t});
         return null;
@@ -1409,29 +1322,14 @@ fn drawPrompt(s: *AppState, f: ui.Frame, win: ui.Window, p: *Prompt) Allocator.E
     try p.input.draw(f.arena, input, .{ .bg = palette.input_bg }, true, "");
     try f.hit(input, .{ .modal = .{ .field = 0 } });
     const typed = std.mem.trim(u8, p.input.text(), " \t");
-    if (p.date and typed.len > 0) {
-        if (dates.parse(typed, s.today, s.snap.settings.work_days)) |d| {
-            _ = ui.text(
-                inner,
-                1,
-                2,
-                f.fmt("→ {f}, {s}", .{ d, d.weekday().short() }),
-                .{ .fg = palette.ok, .bg = palette.panel_bg },
-            );
-        } else _ = ui.text(
-            inner,
-            1,
-            2,
-            "not a date yet",
-            .{ .fg = palette.err, .bg = palette.panel_bg, .italic = true },
-        );
-    } else _ = ui.text(
-        inner,
-        1,
-        2,
-        p.hint,
-        .{ .fg = palette.muted, .bg = palette.panel_bg, .italic = true },
-    );
+    const bg = palette.panel_bg;
+    const note: []const u8, const style: ui.Style = if (!p.date or typed.len == 0)
+        .{ p.hint, .{ .fg = palette.muted, .bg = bg, .italic = true } }
+    else if (dates.parse(typed, s.today, s.snap.settings.work_days)) |d|
+        .{ f.fmt("→ {f}, {s}", .{ d, d.weekday().short() }), .{ .fg = palette.ok, .bg = bg } }
+    else
+        .{ "not a date yet", .{ .fg = palette.err, .bg = bg, .italic = true } };
+    _ = ui.text(inner, 1, 2, note, style);
     try buttons(f, inner, inner.height -| 1, "Save  ⏎");
 }
 
@@ -1511,10 +1409,7 @@ fn syncPanelKey(s: *AppState, p: *SyncPanel, k: vaxis.Key) Action {
     } else if (k.matches('a', .{}) or k.matches('l', .{})) {
         if (p.selected >= p.rows.len) return .none;
         const row = p.rows[p.selected];
-        if (row != .quarantined) {
-            s.info("select a quarantined issue first", .{});
-            return .none;
-        }
+        if (row != .quarantined) return s.noted("select a quarantined issue first", .{});
         const q = row.quarantined;
         const accept = k.matches('a', .{});
         const lines: []const []const u8 = if (accept) &.{
@@ -1560,8 +1455,7 @@ fn syncPanelOpen(s: *AppState, p: *SyncPanel) Action {
     const id: Id, const field: ?Field = switch (p.rows[p.selected]) {
         .unpushed => |u| if (u.milestone) return .none else .{ u.id, null },
         .quarantined => |q| if (!q.local) {
-            s.info("only on the remote: accept it (a) to see it here", .{});
-            return .none;
+            return s.noted("only on the remote: accept it (a) to see it here", .{});
         } else if (q.milestone) {
             if (s.snap.findMilestone(q.id.slice()) == null) return .none;
             s.closeModal();
@@ -1586,42 +1480,26 @@ fn drawSyncPanel(s: *AppState, f: ui.Frame, win: ui.Window, p: *SyncPanel) Alloc
     const bg = palette.panel_bg;
     const mt: ui.Style = .{ .fg = palette.muted, .bg = bg };
     // The remote, and the last sync.
-    var x: u16 = 1;
-    x += ui.text(inner, x, 0, "Remote ", mt);
-    if (s.snap.remote.remotes.len > 1) {
-        x += try ui.button(
-            f,
-            inner,
-            x,
-            0,
-            "◂",
-            .{ .modal = .{ .option = .{ .field = 0, .option = 0 } } },
-            ui.buttonStyle(false),
-        );
-    }
-    x += ui.text(inner, x + 1, 0, p.remote, .{ .fg = palette.accent, .bg = bg, .bold = true }) + 2;
-    if (s.snap.remote.remotes.len > 1) {
-        x += try ui.button(
-            f,
-            inner,
-            x,
-            0,
-            "▸",
-            .{ .modal = .{ .option = .{ .field = 0, .option = 1 } } },
-            ui.buttonStyle(false),
-        );
-    }
-    _ = ui.text(inner, x + 2, 0, p.url, mt);
+    var l: ui.Line = .{ .f = f, .win = inner, .x = 1 };
+    const off = ui.buttonStyle(false);
+    const choose = s.snap.remote.remotes.len > 1;
+    l.text("Remote ", mt);
+    if (choose) try l.button("◂", .option(0, 0), off);
+    l.x += 1;
+    l.word(p.remote, .{ .fg = palette.accent, .bg = bg, .bold = true });
+    if (choose) try l.button("▸", .option(0, 1), off);
+    l.x += 2;
+    l.text(p.url, mt);
     const last = if (s.sync.running) |kind|
         f.fmt(
             "{s} running: {s}…",
             .{ kind.label(), if (s.sync.phase) |ph| @tagName(ph) else "starting" },
         )
-    else if (s.sync.last) |*l| blk: {
+    else if (s.sync.last) |*synced| blk: {
         var buf: [512]u8 = undefined;
         break :blk f.fmt(
             "{s}, {s}",
-            .{ @import("sync_job.zig").report(&buf, l), ui.ago(f, s.sync.last_at) },
+            .{ @import("sync_job.zig").report(&buf, synced), ui.ago(f, s.sync.last_at) },
         );
     } else "not synced in this session";
     _ = ui.text(inner, 1, 1, "Last   ", mt);
@@ -1638,8 +1516,7 @@ fn drawSyncPanel(s: *AppState, f: ui.Frame, win: ui.Window, p: *SyncPanel) Alloc
     if (p.problem.len > 0) _ = ui.text(inner, 8, 2, p.problem, .{ .fg = palette.err, .bg = bg });
 
     const rows_h: u16 = inner.height -| 5;
-    if (p.selected < p.scroll) p.scroll = p.selected;
-    if (rows_h > 0 and p.selected >= p.scroll + rows_h) p.scroll = p.selected - rows_h + 1;
+    ui.keepInView(&p.scroll, p.selected, rows_h);
     var y: u16 = 0;
     while (y < rows_h and p.scroll + y < p.rows.len) : (y += 1) {
         const n = p.scroll + y;
@@ -1668,46 +1545,30 @@ fn drawSyncPanel(s: *AppState, f: ui.Frame, win: ui.Window, p: *SyncPanel) Alloc
                 _ = ui.text(row, row.width -| 8, 0, tag, .{ .fg = palette.muted, .bg = rbg });
             },
             .quarantined => |q| {
-                const lw = ui.text(
-                    row,
-                    3,
-                    0,
-                    q.label,
-                    .{ .bg = rbg, .bold = sel, .fg = if (q.kept) palette.muted else .default },
-                );
-                _ = ui.text(
-                    row,
-                    3 + lw + 2,
-                    0,
+                var cells: ui.Line = .{ .f = f, .win = row, .x = 3 };
+                const fg = if (q.kept) palette.muted else vaxis.Color.default;
+                cells.text(q.label, .{ .bg = rbg, .bold = sel, .fg = fg });
+                cells.x += 2;
+                cells.text(
                     if (q.kept) f.fmt("{s} · kept local", .{q.reason}) else q.reason,
                     .{ .fg = if (q.kept) palette.faint else palette.err, .bg = rbg },
                 );
             },
             .conflict => |c| {
-                const lw = ui.text(row, 3, 0, c.label, .{ .bg = rbg, .bold = sel });
-                _ = ui.text(row, 3 + lw + 2, 0, c.what, .{ .fg = palette.medium, .bg = rbg });
+                var cells: ui.Line = .{ .f = f, .win = row, .x = 3 };
+                cells.text(c.label, .{ .bg = rbg, .bold = sel });
+                cells.x += 2;
+                cells.text(c.what, .{ .fg = palette.medium, .bg = rbg });
             },
         }
         try f.hit(row, .{ .modal = .{ .choice = @intCast(n) } });
     }
     // Actions.
     const bar = inner.height -| 1;
-    var bx: u16 = 1;
-    const acts = [_]struct {
-        []const u8,
-        @import("sync_job.zig").Kind,
-    }{ .{ "Sync  y", .sync }, .{ "Fetch & merge  f", .merge }, .{ "Push  p", .push } };
-    for (acts, 0..) |a, i| {
-        bx += try ui.button(
-            f,
-            inner,
-            bx,
-            bar,
-            a[0],
-            .{ .modal = .{ .option = .{ .field = 1, .option = @intCast(i) } } },
-            ui.buttonStyle(i == 0),
-        );
-        bx += 1;
+    var acts: ui.Line = .{ .f = f, .win = inner, .x = 1, .y = bar };
+    for ([_][]const u8{ "Sync  y", "Fetch & merge  f", "Push  p" }, 0..) |label, i| {
+        try acts.button(label, .option(1, @intCast(i)), ui.buttonStyle(i == 0));
+        acts.x += 1;
     }
     const close = "Close  esc";
     _ = try ui.button(
@@ -1717,7 +1578,7 @@ fn drawSyncPanel(s: *AppState, f: ui.Frame, win: ui.Window, p: *SyncPanel) Alloc
         bar,
         close,
         .{ .modal = .cancel },
-        ui.buttonStyle(false),
+        off,
     );
 }
 
@@ -1728,15 +1589,9 @@ fn pickerSubmit(s: *AppState, p: *Picker) Action {
     var values: std.ArrayList([]const u8) = .empty;
     for (p.items) |it| if (it.marked) values.append(a, it.value) catch {};
     if (values.items.len == 0) {
-        if (p.selected >= shown.len) {
-            s.info("nothing matches", .{});
-            return .none;
-        }
+        if (p.selected >= shown.len) return s.noted("nothing matches", .{});
         const it = p.items[shown[p.selected]];
-        if (it.disabled) {
-            s.fail("{s}: reopen it first to add open work", .{it.label});
-            return .none;
-        }
+        if (it.disabled) return s.failed("{s}: reopen it first to add open work", .{it.label});
         if (it.current and !p.multi) return unchanged(s);
         values.append(a, it.value) catch {};
     }
@@ -1784,8 +1639,7 @@ fn drawPicker(f: ui.Frame, win: ui.Window, p: *Picker) Allocator.Error!void {
     );
     try f.hit(input, .{ .modal = .{ .field = 0 } });
     const rows: u16 = inner.height -| 3;
-    if (p.selected < p.scroll) p.scroll = p.selected;
-    if (rows > 0 and p.selected >= p.scroll + rows) p.scroll = p.selected - rows + 1;
+    ui.keepInView(&p.scroll, p.selected, rows);
     var y: u16 = 0;
     while (y < rows and p.scroll + y < shown.len) : (y += 1) {
         const n = p.scroll + y;
@@ -1855,18 +1709,11 @@ fn drawConfirm(f: ui.Frame, win: ui.Window, c: *Confirm) Allocator.Error!void {
         l,
         .{ .bg = palette.panel_bg },
     );
-    var x: u16 = inner.width -| bw;
+    var l: ui.Line = .{ .f = f, .win = inner, .x = inner.width -| bw, .y = inner.height -| 1 };
     for (c.choices, 0..) |ch, n| {
-        x += try ui.button(
-            f,
-            inner,
-            x,
-            inner.height -| 1,
-            ch.label,
-            .{ .modal = .{ .choice = @intCast(n) } },
-            ui.buttonStyle(n == c.selected),
-        );
-        x += 1;
+        const target: ui.Target = .{ .modal = .{ .choice = @intCast(n) } };
+        try l.button(ch.label, target, ui.buttonStyle(n == c.selected));
+        l.x += 1;
     }
 }
 
@@ -1997,10 +1844,7 @@ pub const MilestoneForm = struct {
     fn key(f: *MilestoneForm, s: *AppState, k: vaxis.Key, save: bool) Allocator.Error!Action {
         if (save) return f.submit(s);
         if (k.matches(K.escape, .{})) {
-            if (f.changed() and !s.discard_armed) {
-                s.discard_armed = true;
-                s.fail("press esc again to discard this milestone", .{});
-            } else s.closeModal();
+            closeOrAsk(s, f.changed(), "press esc again to discard this milestone", .{});
             return .none;
         }
         s.discard_armed = false;
@@ -2038,7 +1882,7 @@ pub const MilestoneForm = struct {
         } };
         var edit: store.MilestoneEdit = .{ .expect = e.tip };
         if (!std.mem.eql(u8, name, e.name)) edit.name = name;
-        const was = fields_fmt.Date.parse(e.due);
+        const was = Date.parse(e.due);
         const same_due = switch (due) {
             .clear => was == null,
             .set => |d| was != null and was.?.eql(d),
@@ -2111,28 +1955,13 @@ pub const MilestoneForm = struct {
                 // The date it will be, as typed.
                 const typed = std.mem.trim(u8, ta.text(), " \t");
                 if (typed.len > 0) {
-                    const note = if (dates.parse(
-                        typed,
-                        s.today,
-                        s.snap.settings.work_days,
-                    )) |d| fr.fmt(
-                        "→ {f}, {s}",
-                        .{ d, d.weekday().short() },
-                    ) else "not a date yet";
-                    _ = ui.text(
-                        inner,
-                        label_w,
-                        y + 1,
-                        note,
-                        .{
-                            .fg = if (std.mem.eql(
-                                u8,
-                                note,
-                                "not a date yet",
-                            )) palette.err else palette.ok,
-                            .bg = bg,
-                        },
-                    );
+                    const parsed = dates.parse(typed, s.today, s.snap.settings.work_days);
+                    const note = if (parsed) |d|
+                        fr.fmt("→ {f}, {s}", .{ d, d.weekday().short() })
+                    else
+                        "not a date yet";
+                    const fg = if (parsed != null) palette.ok else palette.err;
+                    _ = ui.text(inner, label_w, y + 1, note, .{ .fg = fg, .bg = bg });
                 }
                 y += 1;
             }
@@ -2378,10 +2207,7 @@ pub const Form = struct {
         const a = s.input_arena.allocator();
         if (save) return f.submit(s);
         if (k.matches(K.escape, .{})) {
-            if (f.hasText() and !s.discard_armed) {
-                s.discard_armed = true;
-                s.fail("press esc again to discard this issue", .{});
-            } else s.closeModal();
+            closeOrAsk(s, f.hasText(), "press esc again to discard this issue", .{});
             return .none;
         }
         s.discard_armed = false;
@@ -2431,8 +2257,7 @@ pub const Form = struct {
         const title = std.mem.trim(u8, f.title.text(), " \t");
         if (title.len == 0) {
             f.focus = 0;
-            s.fail("an issue needs a title", .{});
-            return .none;
+            return s.failed("an issue needs a title", .{});
         }
         const parent_text = std.mem.trim(u8, f.parent.text(), " \t");
         const parent: ?[]const u8 = if (parent_text.len == 0)
@@ -2476,6 +2301,11 @@ pub const Form = struct {
             const n: u8 = @intCast(idx);
             const focused = f.focus == n;
             const rows: u16 = if (n == 1) desc_rows else 1;
+            const chosen: ui.Style = .{
+                .fg = .{ .index = 231 },
+                .bg = if (focused) palette.accent_bg else palette.button_bg,
+                .bold = true,
+            };
             _ = ui.text(
                 inner,
                 1,
@@ -2522,54 +2352,20 @@ pub const Form = struct {
                     (if (f.parent.text().len > 0) "the parent's" else "none")
                 else
                     f.milestone_names[f.milestone - 1];
-                const st: ui.Style = .{
-                    .fg = .{ .index = 231 },
-                    .bg = if (focused) palette.accent_bg else palette.button_bg,
-                    .bold = true,
-                };
-                var x: u16 = 0;
+                var l: ui.Line = .{ .f = fr, .win = field_win };
                 const count = f.optionCount(n);
-                x += try ui.button(
-                    fr,
-                    field_win,
-                    x,
-                    0,
-                    "◂",
-                    .{
-                        .modal = .{
-                            .option = .{
-                                .field = n,
-                                .option = if (f.milestone == 0) count - 1 else f.milestone - 1,
-                            },
-                        },
-                    },
-                    ui.buttonStyle(false),
-                );
-                x += 1;
-                x += try ui.button(fr, field_win, x, 0, lab, .{ .modal = .{ .field = n } }, st);
-                x += 1;
-                x += try ui.button(
-                    fr,
-                    field_win,
-                    x,
-                    0,
-                    "▸",
-                    .{
-                        .modal = .{
-                            .option = .{ .field = n, .option = (f.milestone + 1) % count },
-                        },
-                    },
-                    ui.buttonStyle(false),
-                );
-                if (count == 1) _ = ui.text(
-                    field_win,
-                    x + 2,
-                    0,
-                    "no open milestones",
-                    .{ .fg = palette.faint, .bg = bg },
-                );
+                const before = if (f.milestone == 0) count - 1 else f.milestone - 1;
+                try l.button("◂", .option(n, before), ui.buttonStyle(false));
+                l.x += 1;
+                try l.button(lab, .{ .modal = .{ .field = n } }, chosen);
+                l.x += 1;
+                try l.button("▸", .option(n, (f.milestone + 1) % count), ui.buttonStyle(false));
+                if (count == 1) {
+                    l.x += 2;
+                    l.text("no open milestones", .{ .fg = palette.faint, .bg = bg });
+                }
             } else {
-                var x: u16 = 0;
+                var l: ui.Line = .{ .f = fr, .win = field_win };
                 const count = f.optionCount(n);
                 const cur = f.optionOf(n);
                 var o: u8 = 0;
@@ -2580,25 +2376,11 @@ pub const Form = struct {
                         "default"
                     else
                         f.workflow_states[o - 1];
-                    const st: ui.Style = if (o == cur)
-                        .{
-                            .fg = .{ .index = 231 },
-                            .bg = if (focused) palette.accent_bg else palette.button_bg,
-                            .bold = true,
-                        }
-                    else
-                        .{ .fg = palette.muted, .bg = palette.select_bg };
-                    if (x >= field_win.width) break;
-                    x += try ui.button(
-                        fr,
-                        field_win,
-                        x,
-                        0,
-                        lab,
-                        .{ .modal = .{ .option = .{ .field = n, .option = o } } },
-                        st,
-                    );
-                    x += 1;
+                    const st: ui.Style =
+                        if (o == cur) chosen else .{ .fg = palette.muted, .bg = palette.select_bg };
+                    if (l.x >= field_win.width) break;
+                    try l.button(lab, .option(n, o), st);
+                    l.x += 1;
                 }
             }
             y += rows + gap;

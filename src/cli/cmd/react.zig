@@ -22,34 +22,22 @@ pub const help =
 
 pub fn main(comptime B: type, ctx: *context.Context(B), argv: []const []const u8) u8 {
     const arena = ctx.arena;
-    var issue_prefix: ?[]const u8 = null;
-    var emoji: ?[]const u8 = null;
+    var words: std.ArrayList([]const u8) = .empty;
     var on: ?[]const u8 = null;
     var undo = false;
-    var args: common.Args = .{ .list = argv };
-    while (args.next()) |arg| {
-        if (!args.isOption(arg)) {
-            if (args.was_separator) continue;
-            if (issue_prefix == null) {
-                issue_prefix = arg;
-            } else if (emoji == null) emoji = arg;
-        } else if (common.isHelp(arg)) {
-            ctx.out.writeAll(help) catch {};
-            return common.exit_ok;
-        } else if (std.mem.eql(u8, arg, "--on")) {
-            on = args.value(ctx.err, arg) orelse return common.exit_error;
-        } else if (std.mem.eql(u8, arg, "--undo")) {
-            undo = true;
-        } else {
-            return common.unknownOption(ctx.err, "react", arg);
-        }
-    }
-    const prefix = issue_prefix orelse return common.missing(
-        ctx.err,
-        "react",
-        "issue ID is required",
-    );
-    const e = emoji orelse return common.missing(ctx.err, "react", "an emoji is required");
+    if (common.parseArgs(ctx, argv, .{
+        .command = "react",
+        .help = help,
+        .positionals = .{ .words = &words },
+        .flags = &.{
+            .{ "--on", .{ .text = &on } },
+            .{ "--undo", .{ .on = &undo } },
+        },
+    })) |exit| return exit;
+    if (words.items.len < 1) return common.missing(ctx.err, "react", "issue ID is required");
+    if (words.items.len < 2) return common.missing(ctx.err, "react", "an emoji is required");
+    const prefix = words.items[0];
+    const e = words.items[1];
     if (!issuez.format.fields.isEmoji(e)) return common.fail(
         ctx.err,
         "error: an emoji is 1 to 64 bytes without whitespace or commas\n",
@@ -60,15 +48,7 @@ pub fn main(comptime B: type, ctx: *context.Context(B), argv: []const []const u8
     var target: ?issuez.engine.Oid = null;
     if (on) |c| {
         const issue = repo.load(arena, ref) catch |err| return common.repoFailed(B, ctx, err);
-        var found: ?issuez.engine.Oid = null;
-        for (issue.comments) |cm| {
-            if (cm.is_merge) continue;
-            const hex = cm.oid.hex();
-            if (!std.mem.startsWith(u8, hex.slice(), c)) continue;
-            if (found != null) return common.fail(ctx.err, "error: ambiguous comment ID\n");
-            found = cm.oid;
-        }
-        target = found orelse return common.fail(ctx.err, "error: no such comment on this issue\n");
+        target = common.findCommentOid(ctx.err, issue, c) orelse return common.exit_error;
     }
     const tip = repo.react(
         arena,

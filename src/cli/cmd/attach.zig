@@ -54,25 +54,17 @@ pub fn main(comptime B: type, ctx: *context.Context(B), argv: []const []const u8
     var name: ?[]const u8 = null;
     var remote: ?[]const u8 = null;
     var as_json = false;
-    var args: common.Args = .{ .list = argv[1..] };
-    while (args.next()) |arg| {
-        if (!args.isOption(arg)) {
-            if (args.was_separator) continue;
-            words.append(arena, arg) catch return common.oom(ctx.err);
-        } else if (common.isHelp(arg)) {
-            ctx.out.writeAll(help) catch {};
-            return common.exit_ok;
-        } else if (std.mem.eql(u8, arg, "-m") or std.mem.eql(u8, arg, "--message")) {
-            const v = args.value(ctx.err, "-m") orelse return common.exit_error;
-            paragraphs.append(arena, v) catch return common.oom(ctx.err);
-        } else if (std.mem.eql(u8, arg, "--name")) {
-            name = args.value(ctx.err, arg) orelse return common.exit_error;
-        } else if (std.mem.eql(u8, arg, "--remote")) {
-            remote = args.value(ctx.err, arg) orelse return common.exit_error;
-        } else if (std.mem.eql(u8, arg, "--json")) {
-            as_json = true;
-        } else return common.unknownOption(ctx.err, "attach", arg);
-    }
+    if (common.parseArgs(ctx, argv[1..], .{
+        .command = "attach",
+        .help = help,
+        .positionals = .{ .words = &words },
+        .flags = &.{
+            .{ "-m --message", .{ .list = &paragraphs } },
+            .{ "--name", .{ .text = &name } },
+            .{ "--remote", .{ .text = &remote } },
+            .{ "--json", .{ .on = &as_json } },
+        },
+    })) |exit| return exit;
     const w = words.items;
     if (as_json and sub != .ls) return common.missing(ctx.err, "attach", "--json goes with ls");
     if (remote != null and sub != .fetch and sub != .cat)

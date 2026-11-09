@@ -36,19 +36,15 @@ pub fn main(comptime B: type, ctx: *context.Context(B), argv: []const []const u8
     const arena = ctx.arena;
     var quiet = false;
     var repair = false;
-    var args: common.Args = .{ .list = argv };
-    while (args.next()) |arg| {
-        if (common.isHelp(arg)) {
-            ctx.out.writeAll(help) catch {};
-            return common.exit_ok;
-        } else if (std.mem.eql(u8, arg, "--quiet") or std.mem.eql(u8, arg, "-q")) {
-            quiet = true;
-        } else if (std.mem.eql(u8, arg, "--repair")) {
-            repair = true;
-        } else {
-            return common.unknownOption(ctx.err, "fsck", arg);
-        }
-    }
+    if (common.parseArgs(ctx, argv, .{
+        .command = "fsck",
+        .help = help,
+        .positionals = .none,
+        .flags = &.{
+            .{ "-q --quiet", .{ .on = &quiet } },
+            .{ "--repair", .{ .on = &repair } },
+        },
+    })) |exit| return exit;
 
     const repo = common.openRepo(B, ctx) orelse return common.exit_fatal;
     const F = issuez.fsck.Fsck(B);

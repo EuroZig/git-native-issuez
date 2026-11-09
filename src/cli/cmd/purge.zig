@@ -27,26 +27,18 @@ pub fn main(comptime B: type, ctx: *context.Context(B), argv: []const []const u8
     const arena = ctx.arena;
     var prefix: ?[]const u8 = null;
     var comment: ?[]const u8 = null;
-    var reason: []const u8 = "";
+    var reason: ?[]const u8 = null;
     var yes = false;
-    var args: common.Args = .{ .list = argv };
-    while (args.next()) |arg| {
-        if (!args.isOption(arg)) {
-            if (args.was_separator) continue;
-            if (prefix == null) prefix = arg;
-        } else if (common.isHelp(arg)) {
-            ctx.out.writeAll(help) catch {};
-            return common.exit_ok;
-        } else if (std.mem.eql(u8, arg, "--comment")) {
-            comment = args.value(ctx.err, arg) orelse return common.exit_error;
-        } else if (std.mem.eql(u8, arg, "--reason")) {
-            reason = args.value(ctx.err, arg) orelse return common.exit_error;
-        } else if (std.mem.eql(u8, arg, "-y") or std.mem.eql(u8, arg, "--yes")) {
-            yes = true;
-        } else {
-            return common.unknownOption(ctx.err, "purge", arg);
-        }
-    }
+    if (common.parseArgs(ctx, argv, .{
+        .command = "purge",
+        .help = help,
+        .positionals = .{ .first = &prefix },
+        .flags = &.{
+            .{ "--comment", .{ .text = &comment } },
+            .{ "--reason", .{ .text = &reason } },
+            .{ "-y --yes", .{ .on = &yes } },
+        },
+    })) |exit| return exit;
     const p = prefix orelse return common.missing(ctx.err, "purge", "issue ID is required");
     if (!yes) return common.fail(
         ctx.err,
@@ -57,21 +49,10 @@ pub fn main(comptime B: type, ctx: *context.Context(B), argv: []const []const u8
     const ref = common.resolveOne(B, repo, arena, ctx.err, p) orelse return common.exit_error;
     const purge = issuez.purge.Purge(B).fromRepo(repo);
     const short = uuid.shortId(ref.id());
-    const spec: issuez.purge.Spec = .{ .reason = reason };
+    const spec: issuez.purge.Spec = .{ .reason = reason orelse "" };
     if (comment) |c| {
         const issue = repo.load(arena, ref) catch |err| return common.repoFailed(B, ctx, err);
-        var found: ?issuez.engine.Oid = null;
-        for (issue.comments) |cm| {
-            if (cm.is_merge) continue;
-            const hex = cm.oid.hex();
-            if (!std.mem.startsWith(u8, hex.slice(), c)) continue;
-            if (found != null) return common.fail(ctx.err, "error: ambiguous comment ID\n");
-            found = cm.oid;
-        }
-        const oid = found orelse return common.fail(
-            ctx.err,
-            "error: no such comment on this issue\n",
-        );
+        const oid = common.findCommentOid(ctx.err, issue, c) orelse return common.exit_error;
         const r = purge.comment(arena, ref.name, oid, spec, .{}) catch |err|
             return common.repoFailed(B, ctx, err);
         ctx.out.print("Purged a comment of {s}, {d} commits rewritten\n", .{

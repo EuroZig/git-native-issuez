@@ -186,11 +186,7 @@ test "changes between two reads" {
     try testing.expect(created.hasIssue(a.id) and created.hasIssue(b.id));
     try testing.expect(!created.milestones);
 
-    const a_ref = try std.fmt.allocPrint(
-        arena,
-        "{s}{s}",
-        .{ repo_mod.issue_ref_prefix, a.id },
-    );
+    const a_ref = try repo_mod.refNameOf(arena, a.id);
     _ = try r.comment(arena, a_ref, .{ .text = "Hello" }, .{});
     var kept = try two.clone(testing.allocator);
     defer kept.deinit(testing.allocator);

@@ -12,7 +12,7 @@ import (
 )
 
 // TestPurge: the host purges a comment and an issue on the hub. A mirror
-// the hub synced to is reported exposed, and the next Sync replaces its
+// the hub synced to is reported exposed, and the next sync replaces its
 // copy; clients drop the text on their next sync.
 func TestPurge(t *testing.T) {
 	hub := newHub(t)
@@ -27,10 +27,8 @@ func TestPurge(t *testing.T) {
 
 	mirror := newHub(t)
 	git(t, hub, "remote", "add", "mirror", "file://"+mirror)
+	cli(t, hub, "sync", "mirror")
 	r := openHost(t, hub)
-	if _, err := r.Sync(bg, "mirror", issuez.SyncOptions{}); err != nil {
-		t.Fatal(err)
-	}
 
 	i, err := r.Load(bg, talk)
 	if err != nil {
@@ -51,9 +49,7 @@ func TestPurge(t *testing.T) {
 		t.Fatalf("issue purge: %v %+v", err, res)
 	}
 
-	if _, err := r.Sync(bg, "mirror", issuez.SyncOptions{}); err != nil {
-		t.Fatal(err)
-	}
+	cli(t, hub, "sync", "mirror")
 	if got := refsUnder(t, mirror, "refs/issues/"+doxx); len(got) != 0 {
 		t.Errorf("mirror still has the purged issue")
 	}

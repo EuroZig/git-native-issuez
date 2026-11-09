@@ -7,10 +7,7 @@ const expect = @import("expect.zig");
 const c = fixture.c;
 
 test "issuez_purge_issue: the actor's user_id is on the tombstone, and must be a UUID" {
-    const leaks = fixture.Leaks.start();
-    defer leaks.check();
-    var r: fixture.Repo = undefined;
-    try r.init(.{});
+    var r = try fixture.Repo.init(.{});
     defer r.deinit();
     const h = r.handle;
     const x = try fixture.titled(h, "Doxxing");
@@ -44,24 +41,22 @@ test "issuez_purge_issue: the actor's user_id is on the tombstone, and must be a
 }
 
 test "issuez_purge_result_exposed_remote_at: a remote synced by URL" {
-    const leaks = fixture.Leaks.start();
-    defer leaks.check();
-    var r: fixture.Repo = undefined;
-    try r.init(.{});
+    var r = try fixture.Repo.init(.{});
     defer r.deinit();
     const h = r.handle;
-    const path = try fixture.hub(&r, "hub.git");
-    _ = try r.git(&.{ "remote", "remove", "origin" });
     const x = try fixture.titled(h, "Doxxing");
-    var out: ?*c.issuez_sync_report = null;
-    var err: ?*c.issuez_error = null;
-    try expect.code(
-        c.ISSUEZ_OK,
-        c.issuez_sync(h, fixture.str(path), null, 0, null, &out, &err),
-        err,
-    );
-    c.issuez_sync_report_free(out);
+    // What syncing by URL leaves: its refs under url-<hash>.
+    _ = try r.git(&.{
+        "update-ref",
+        try std.fmt.allocPrint(
+            r.arena(),
+            "refs/issuez-sync/url-0123456789abcdef/seen/issues/{s}",
+            .{x.idSlice()},
+        ),
+        fixture.oidHex(x.tip)[0 .. x.tip.len * 2],
+    });
 
+    var err: ?*c.issuez_error = null;
     var pr: ?*c.issuez_purge_result = null;
     try expect.code(
         c.ISSUEZ_OK,
@@ -77,16 +72,18 @@ test "issuez_purge_result_exposed_remote_at: a remote synced by URL" {
 // covers: issuez_purge_result_free, issuez_purge_result_new_tip
 // covers: issuez_purge_result_exposed_remote_count, issuez_purge_result_exposed_remote_at
 test "issuez_purge_issue: an issue a remote saw" {
-    const leaks = fixture.Leaks.start();
-    defer leaks.check();
-    var r: fixture.Repo = undefined;
-    try r.init(.{});
+    var r = try fixture.Repo.init(.{});
     defer r.deinit();
     const h = r.handle;
     _ = try fixture.hub(&r, "hub.git");
     const x = try fixture.titled(h, "Doxxing");
     const local_only = try fixture.titled(h, "Never pushed");
-    (try fixture.sync(h, &.{})).deinit();
+    // What syncing with origin leaves: a tracking ref for the issue it has.
+    _ = try r.git(&.{
+        "update-ref",
+        try std.fmt.allocPrint(r.arena(), "refs/remotes/origin/issues/{s}", .{x.idSlice()}),
+        fixture.oidHex(x.tip)[0 .. x.tip.len * 2],
+    });
     _ = local_only;
 
     var pr: ?*c.issuez_purge_result = null;
@@ -142,10 +139,7 @@ test "issuez_purge_issue: an issue a remote saw" {
 }
 
 test "issuez_purge_comment: the text goes, the fields stay, later commits move" {
-    const leaks = fixture.Leaks.start();
-    defer leaks.check();
-    var r: fixture.Repo = undefined;
-    try r.init(.{});
+    var r = try fixture.Repo.init(.{});
     defer r.deinit();
     const h = r.handle;
     const x = try fixture.titled(h, "Moderated");
@@ -177,15 +171,15 @@ test "issuez_purge_comment: the text goes, the fields stay, later commits move" 
         null,
     );
     const new_tip = c.issuez_purge_result_new_tip(pr);
-    try testing.expect(new_tip.len > 0 and !c.issuez_oid_eq(&new_tip, &later.tip));
+    try testing.expect(new_tip.len > 0 and !fixture.oidEql(new_tip, later.tip));
     try testing.expectEqual(@as(usize, 0), c.issuez_purge_result_exposed_remote_count(pr));
     c.issuez_purge_result_free(pr);
     const i = try fixture.load(h, x.idStr());
     defer c.issuez_issue_free(i);
     const tip = c.issuez_issue_info_of(i).*.tip;
-    try testing.expect(c.issuez_oid_eq(&tip, &new_tip));
+    try testing.expect(fixture.oidEql(tip, new_tip));
     try testing.expect(c.issuez_issue_comment_at(i, 0).*.purged);
-    try testing.expect(c.issuez_issue_has_label(i, fixture.str("kept")));
+    try testing.expect(fixture.hasLabel(i, "kept"));
     try expect.str("Fine", c.issuez_issue_comment_at(i, 1).*.text);
 
     // The root holds the title: purge the issue instead. Not a full oid.
@@ -217,23 +211,18 @@ test "issuez_purge_comment: the text goes, the fields stay, later commits move" 
 }
 
 test "lifetime: results outlive the repo and each other, freed in any order" {
-    const leaks = fixture.Leaks.start();
-    defer leaks.check();
-    var r: fixture.Repo = undefined;
-    try r.init(.{});
+    var r = try fixture.Repo.init(.{});
     defer r.deinit();
     const made = try fixture.titled(r.handle, "Kept");
     const h = try r.open(&.{});
     var issue: ?*c.issuez_issue = null;
     var list: ?*c.issuez_issue_list = null;
-    var proj: ?*c.issuez_projection = null;
     var snap: ?*c.issuez_snapshot = null;
     var ms: ?*c.issuez_milestone_list = null;
     var w: ?*c.issuez_write = null;
     try expect.code(c.ISSUEZ_OK, c.issuez_issue_load(h, made.idStr(), null, &issue, null), null);
     var q = [_]c.issuez_op{c.issuez_q_done(-1)};
     try expect.code(c.ISSUEZ_OK, c.issuez_query_run(h, &q, 1, null, &list, null), null);
-    try expect.code(c.ISSUEZ_OK, c.issuez_projection_build(h, null, &proj, null), null);
     try expect.code(c.ISSUEZ_OK, c.issuez_snapshot_take(h, null, &snap, null), null);
     try expect.code(c.ISSUEZ_OK, c.issuez_milestone_list_all(h, null, &ms, null), null);
     const ops = [_]c.issuez_op{c.issuez_add_label(fixture.str("late"))};
@@ -245,16 +234,11 @@ test "lifetime: results outlive the repo and each other, freed in any order" {
     c.issuez_repo_close(h);
     // All still readable, and a receipt can still load its issue.
     try expect.str("Kept", c.issuez_issue_info_of(issue).*.title);
-    try expect.str(
-        "Kept",
-        c.issuez_issue_info_of(c.issuez_issue_list_at(c.issuez_projection_issues(proj), 0)).*.title,
-    );
     try testing.expectEqual(@as(usize, 1), c.issuez_snapshot_len(snap));
     var after: ?*c.issuez_issue = null;
     try expect.code(c.ISSUEZ_OK, c.issuez_write_load_issue(w, null, &after, null), null);
-    try testing.expect(c.issuez_issue_has_label(after, fixture.str("late")));
+    try testing.expect(fixture.hasLabel(after.?, "late"));
     c.issuez_write_free(w);
-    c.issuez_projection_free(proj);
     c.issuez_issue_free(issue);
     c.issuez_milestone_list_free(ms);
     c.issuez_issue_free(after);
@@ -265,10 +249,7 @@ test "lifetime: results outlive the repo and each other, freed in any order" {
 
 // covers: issuez_purge_result_attachment_at
 test "issuez_purge_result_attachment_count: the attachments a purge takes" {
-    const leaks = fixture.Leaks.start();
-    defer leaks.check();
-    var r: fixture.Repo = undefined;
-    try r.init(.{ .ops = &.{fixture.opNum(c.ISSUEZ_OPT_ATTACHMENT_STORE, 0)} });
+    var r = try fixture.Repo.init(.{ .ops = &.{fixture.opNum(c.ISSUEZ_OPT_ATTACHMENT_STORE, 0)} });
     defer r.deinit();
     const h = r.handle;
     const png = "\x89PNG\r\n\x1a\n\x00\x00\x00\x0dIHDR\x00\x00\x00\x01\x00\x00\x00\x01" ++

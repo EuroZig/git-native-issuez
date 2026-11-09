@@ -109,12 +109,6 @@ func WithLocalTimeout(d time.Duration) Option {
 	return opt(op{verb: VerbSet, target: C.ISSUEZ_OPT_TIMEOUT_LOCAL_MS, num: d.Milliseconds()})
 }
 
-// WithNetworkTimeout bounds every fetch, push and LFS transfer (default
-// 600 s for a fetch or push, 1800 s for a transfer); 0 keeps the default.
-func WithNetworkTimeout(d time.Duration) Option {
-	return opt(op{verb: VerbSet, target: C.ISSUEZ_OPT_TIMEOUT_NETWORK_MS, num: d.Milliseconds()})
-}
-
 // WithAttachmentStore with false leaves attachment bytes to the caller, a
 // host that keeps them in its own LFS store: writes store none and need
 // no git-lfs. The default stores them in the repository, as the CLI does.
@@ -250,7 +244,7 @@ func IsRef(ref string) bool {
 
 // RefSpecs are forced refspecs of every namespace in RefPrefixes, for a
 // mirror that copies them as they are ("+refs/issues/*:refs/issues/*",
-// ...). Clones that merge use Sync instead.
+// ...). Clones that merge use `git issue sync` instead.
 func RefSpecs() []string {
 	out := make([]string, 0, len(refPrefixes))
 	for _, p := range refPrefixes {
@@ -259,59 +253,14 @@ func RefSpecs() []string {
 	return out
 }
 
-// Resolve turns user input ("a7f3", "#12", a UUID, a milestone name)
-// into UUIDs: none, one or several.
-func (r *Repo) Resolve(ctx context.Context, kind Kind, input string) ([]string, error) {
-	return fetch(ctx, r, func(a cArgs, m **C.issuez_matches) C.issuez_code {
-		return C.issuez_resolve(a.repo, C.issuez_kind(kind), cStr(input), a.tok, m, a.cerr)
-	}, takeMatches)
-}
-
-// takeMatches copies and frees an owned list.
-func takeMatches(m *C.issuez_matches) []string {
-	defer C.issuez_matches_free(m)
-	return goStrs(C.issuez_matches_len(m), func(i C.size_t) C.issuez_str { return C.issuez_matches_at(m, i) })
-}
-
-// ResolveOne is Resolve that wants exactly one: ErrNotFound or
-// ErrAmbiguous otherwise.
+// ResolveOne turns user input ("a7f3", "#12", a UUID, a milestone name) into
+// its UUID: ErrNotFound or ErrAmbiguous when that isn't exactly one.
 func (r *Repo) ResolveOne(ctx context.Context, kind Kind, input string) (string, error) {
 	buf := (*C.char)(C.malloc(C.ISSUEZ_UUID_BUFSIZE))
 	defer C.free(unsafe.Pointer(buf))
 	return fetch(ctx, r, func(a cArgs, _ *struct{}) C.issuez_code {
 		return C.issuez_resolve_one(a.repo, C.issuez_kind(kind), cStr(input), a.tok, buf, a.cerr)
 	}, func(struct{}) string { return C.GoString(buf) })
-}
-
-// DropAll deletes every ref of the library's (issues, milestones,
-// attachments, tombstones, local state) in one transaction and returns how
-// many: it undoes an import into a repository that had none, with no
-// writes running. Not a purge: clones keep their copies and sync them
-// back.
-func (r *Repo) DropAll(ctx context.Context) (int, error) {
-	return fetch(ctx, r, func(a cArgs, out *C.size_t) C.issuez_code {
-		return C.issuez_repo_drop_all(a.repo, a.tok, out, a.cerr)
-	}, func(out C.size_t) int { return int(out) })
-}
-
-// AdoptRefs creates in r every issue, milestone, attachment and tombstone
-// ref that from has, in one transaction, and returns how many. An import
-// written into a scratch repository whose git uses r's objects
-// (WithEnvOverrides("GIT_OBJECT_DIRECTORY=<r's objects>")) lands at once
-// or not at all: CodeContended when r has one of the refs, CodeCorrupt
-// when a tip's object isn't in r's store, and nothing is taken.
-func (r *Repo) AdoptRefs(ctx context.Context, from *Repo) (int, error) {
-	var n int
-	err := r.use(func(c *C.issuez_repo) error {
-		return from.use(func(f *C.issuez_repo) error {
-			out, err := invoke(ctx, c, func(a cArgs, out *C.size_t) C.issuez_code {
-				return C.issuez_repo_adopt_refs(a.repo, f, a.tok, out, a.cerr)
-			})
-			n = int(out)
-			return err
-		})
-	})
-	return n, err
 }
 
 // ResolveNumber is the UUID of the issue numbered n: ErrNotFound when
@@ -356,8 +305,8 @@ func goSnapshot(s *C.issuez_snapshot) *Snapshot {
 	return out
 }
 
-// MarshalBinary is the library's stable encoding, readable by every
-// binding.
+// MarshalBinary is the stable encoding issuez_snapshot_decode reads, from
+// any binding.
 func (s *Snapshot) MarshalBinary() ([]byte, error) {
 	keys := make([]RefKey, 0, len(s.Tips))
 	for k := range s.Tips {
@@ -418,9 +367,9 @@ func (s *Snapshot) UnmarshalBinary(b []byte) error {
 type ChangeKind uint32
 
 const (
-	ChangeCreated ChangeKind = C.ISSUEZ_CHANGE_CREATED
-	ChangeUpdated ChangeKind = C.ISSUEZ_CHANGE_UPDATED
-	ChangeRemoved ChangeKind = C.ISSUEZ_CHANGE_REMOVED
+	ChangeCreated ChangeKind = iota + 1
+	ChangeUpdated
+	ChangeRemoved
 )
 
 // DiffEntry is one ref that changed between two snapshots.
@@ -430,8 +379,7 @@ type DiffEntry struct {
 	OldTip, NewTip OID
 }
 
-// Diff says what changed from prev (nil: nothing) to next. Pure Go: same
-// rules as issuez_diff_new.
+// Diff says what changed from prev (nil: nothing) to next. Pure Go.
 func Diff(prev, next *Snapshot) []DiffEntry {
 	var out []DiffEntry
 	var oldTips map[RefKey]OID
@@ -459,40 +407,6 @@ func Diff(prev, next *Snapshot) []DiffEntry {
 		return out[i].ID < out[j].ID
 	})
 	return out
-}
-
-// Settings is what WriteSettings writes to git config: a nil list leaves
-// its key alone, an empty one unsets it (the defaults then).
-type Settings struct {
-	DoneStates, WorkflowStates []string
-}
-
-// WriteSettings writes issue.doneStates and issue.workflowStates, what a
-// settings page saves; every state is checked first (CodeInvalidValue).
-// Handles opened afterwards see them.
-func (r *Repo) WriteSettings(ctx context.Context, s Settings) error {
-	var ops []op
-	for _, k := range []struct {
-		target uint32
-		states []string
-	}{{C.ISSUEZ_OPT_DONE_STATE, s.DoneStates}, {C.ISSUEZ_OPT_WORKFLOW_STATE, s.WorkflowStates}} {
-		switch {
-		case k.states == nil:
-		case len(k.states) == 0:
-			ops = append(ops, op{verb: VerbClear, target: k.target})
-		default:
-			for _, st := range k.states {
-				ops = append(ops, op{verb: VerbAdd, target: k.target, str: st})
-			}
-		}
-	}
-	var pin runtime.Pinner
-	defer pin.Unpin()
-	cops, n := cOps(&pin, ops)
-	_, err := fetch(ctx, r, func(a cArgs, _ *struct{}) C.issuez_code {
-		return C.issuez_settings_write(a.repo, cops, n, a.tok, a.cerr)
-	}, func(struct{}) struct{} { return struct{}{} })
-	return err
 }
 
 // Import stages ordinary writes on Repo, with the target's policy and objects.

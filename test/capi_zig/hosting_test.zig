@@ -7,10 +7,7 @@ const c = f.c;
 
 // covers: issuez_issue_load_at, issuez_write_load_milestone, issuez_milestone_load_at
 test "receipt reads stay at their tip after a later write and ref deletion" {
-    const leaks = f.Leaks.start();
-    defer leaks.check();
-    var r: f.Repo = undefined;
-    try r.init(.{});
+    var r = try f.Repo.init(.{});
     defer r.deinit();
     const ops = [_]c.issuez_op{c.issuez_set_title(f.str("Before"))};
     var w: ?*c.issuez_write = null;
@@ -32,7 +29,7 @@ test "receipt reads stay at their tip after a later write and ref deletion" {
     defer c.issuez_issue_free(loaded);
     try testing.expectEqualStrings("Before", f.slice(c.issuez_issue_info_of(loaded).*.title));
     const got_tip = c.issuez_issue_info_of(loaded).*.tip;
-    try testing.expect(c.issuez_oid_eq(&tip, &got_tip));
+    try testing.expect(f.oidEql(tip, got_tip));
     _ = try r.git(&.{
         "update-ref",                                                         "-d",
         try std.fmt.allocPrint(r.arena(), "refs/issues/{s}", .{f.slice(id)}),
@@ -90,10 +87,7 @@ test "receipt reads stay at their tip after a later write and ref deletion" {
 
 // covers: issuez_repo_begin_import, issuez_repo_commit_import
 test "staged import: invisible until committed, no partial conflict" {
-    const leaks = f.Leaks.start();
-    defer leaks.check();
-    var r: f.Repo = undefined;
-    try r.init(.{});
+    var r = try f.Repo.init(.{});
     defer r.deinit();
     var stage: ?*c.issuez_repo = null;
     var err: ?*c.issuez_error = null;
@@ -127,12 +121,9 @@ test "staged import: invisible until committed, no partial conflict" {
 }
 
 // covers: issuez_attachment_prepare, issuez_prepared_attachment_info
-// covers: issuez_prepared_attachment_op, issuez_prepared_attachment_free
+// covers: issuez_prepared_attachment_free
 test "prepared attachments: metadata survives handle lifetime through a write" {
-    const leaks = f.Leaks.start();
-    defer leaks.check();
-    var r: f.Repo = undefined;
-    try r.init(.{ .ops = &.{c.issuez_opt_attachment_store(false)} });
+    var r = try f.Repo.init(.{ .ops = &.{c.issuez_opt_attachment_store(false)} });
     defer r.deinit();
     const png = "\x89PNG\r\n\x1a\n\x00\x00\x00\x0dIHDR\x00\x00\x00\x01\x00\x00\x00\x01" ++
         "\x08\x06\x00\x00\x00\x1f\x15\xc4\x89\x00\x00\x00\x00IEND\xaeB`\x82";
@@ -152,7 +143,7 @@ test "prepared attachments: metadata survives handle lifetime through a write" {
     const id = try r.arena().dupe(u8, f.slice(info.id));
     const x = try f.create(r.handle, &.{
         c.issuez_set_title(f.str("Image")),
-        c.issuez_prepared_attachment_op(prepared),
+        try f.preparedOp(r.arena(), prepared),
     });
     c.issuez_prepared_attachment_free(prepared);
     var loaded: ?*c.issuez_issue = null;
@@ -177,10 +168,7 @@ const CancelOnCommit = struct {
 };
 
 test "committed writes with the repository's identity succeed despite cancellation" {
-    const leaks = f.Leaks.start();
-    defer leaks.check();
-    var r: f.Repo = undefined;
-    try r.init(.{});
+    var r = try f.Repo.init(.{});
     defer r.deinit();
     const cancel = c.issuez_cancel_new();
     defer c.issuez_cancel_free(cancel);

@@ -7,77 +7,6 @@ import "C"
 
 import "time"
 
-// SearchHit is one matching line of an issue.
-type SearchHit struct {
-	IssueID string
-	Line    string
-}
-
-func goSearchHit(x *C.issuez_search_hit) SearchHit {
-	return SearchHit{
-		IssueID: goStr(x.issue_id),
-		Line:    goStr(x.line),
-	}
-}
-
-// LabelCount is a label in use: for pickers and filters.
-type LabelCount struct {
-	Name string
-	// Of them not done.
-	Open int
-	// Issues carrying it.
-	Total int
-}
-
-func goLabelCount(x *C.issuez_label_count) LabelCount {
-	return LabelCount{
-		Name:  goStr(x.name),
-		Open:  int(x.open),
-		Total: int(x.total),
-	}
-}
-
-// KnownPerson is someone the history knows: candidates for assignee and
-// author pickers.
-type KnownPerson struct {
-	Person
-	// Issues they opened.
-	Authored int
-	// Issues they are assigned.
-	Assigned int
-}
-
-func goKnownPerson(x *C.issuez_known_person) KnownPerson {
-	return KnownPerson{
-		Person:   goPerson(&x.person),
-		Authored: int(x.authored),
-		Assigned: int(x.assigned),
-	}
-}
-
-// SyncItem is what a sync did to one issue or milestone.
-type SyncItem struct {
-	Kind    Kind
-	ID      string
-	Outcome SyncOutcome
-	// After the sync.
-	LocalTip  OID
-	RemoteTip OID
-	// For QUARANTINED and FAILED.
-	Reason string
-}
-
-func goSyncItem(x *C.issuez_sync_item) SyncItem {
-	return SyncItem{
-		Kind:      Kind(x.kind),
-		ID:        goStr(x.id),
-		Outcome:   SyncOutcome(x.outcome),
-		LocalTip:  goOID(x.local_tip),
-		RemoteTip: goOID(x.remote_tip),
-		Reason:    goStr(x.reason),
-	}
-}
-
 // FsckFinding is one thing fsck found; notes aren't errors.
 type FsckFinding struct {
 	Kind FsckKind
@@ -98,31 +27,6 @@ func goFsckFinding(x *C.issuez_fsck_finding) FsckFinding {
 		SubjectKind: Kind(x.subject_kind),
 		Subject:     goStr(x.subject),
 		Message:     goStr(x.message),
-	}
-}
-
-// Quarantined is a remote version a merge refused.
-type Quarantined struct {
-	// ISSUE or MILESTONE.
-	Kind Kind
-	ID   string
-	// The local title, or the remote one when it only exists there.
-	Title string
-	// The refused remote version.
-	RemoteTip OID
-	Reason    QuarantineReason
-	// Acknowledged (issuez_quarantine_resolve, ISSUEZ_CHOICE_KEEP_LOCAL).
-	KeptLocal bool
-}
-
-func goQuarantined(x *C.issuez_quarantined) Quarantined {
-	return Quarantined{
-		Kind:      Kind(x.kind),
-		ID:        goStr(x.id),
-		Title:     goStr(x.title),
-		RemoteTip: goOID(x.remote_tip),
-		Reason:    QuarantineReason(x.reason),
-		KeptLocal: bool(x.kept_local),
 	}
 }
 

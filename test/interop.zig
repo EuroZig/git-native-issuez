@@ -23,7 +23,8 @@ const Repo = issuez.Repo(GitProcess);
 
 const io = testing.io;
 
-const Output = struct { stdout: []const u8, stderr: []const u8, code: u8 };
+const shared = @import("sandbox.zig");
+const Output = shared.Output;
 
 /// A scratch directory for repositories. Git sees a fixed identity and no
 /// user or system config, so results don't depend on the machine.
@@ -106,29 +107,12 @@ const Sandbox = struct {
         return path;
     }
 
-    fn exec(
-        sb: *Sandbox,
-        cwd: []const u8,
-        argv: []const []const u8,
-        env: *const std.process.Environ.Map,
-    ) !Output {
-        const result = try std.process.run(sb.allocator(), io, .{
-            .argv = argv,
-            .cwd = .{ .path = cwd },
-            .environ_map = env,
-        });
-        const code: u8 = switch (result.term) {
-            .exited => |c| c,
-            else => 255,
-        };
-        return .{ .stdout = result.stdout, .stderr = result.stderr, .code = code };
-    }
-
     /// `git <args>`, which has to succeed. Returns stdout without the final
     /// newline.
     fn git(sb: *Sandbox, cwd: []const u8, args: []const []const u8) ![]const u8 {
         const argv = try std.mem.concat(sb.allocator(), []const u8, &.{ &.{"git"}, args });
-        const out = try succeed(sb.allocator(), argv, try sb.exec(cwd, argv, &sb.env));
+        const a = sb.allocator();
+        const out = try succeed(a, argv, try shared.exec(a, cwd, argv, &sb.env));
         return std.mem.trimEnd(u8, out, "\n");
     }
 };
@@ -196,7 +180,7 @@ const Clone = struct {
             try env.put("LC_ALL", "C"); // upstream sorts labels with sort(1)
         }
         const argv = try std.mem.concat(arena, []const u8, &.{ &.{ "git", "issue" }, args });
-        return c.sb.exec(c.path, argv, &env);
+        return shared.exec(arena, c.path, argv, &env);
     }
 
     /// The same clone, writing with a fixed date ("1700000000 +0000").
@@ -222,7 +206,7 @@ const Clone = struct {
 
     /// Any program, run in this repository.
     fn exec(c: Clone, argv: []const []const u8) !Output {
-        return c.sb.exec(c.path, argv, &c.sb.env);
+        return shared.exec(c.sb.allocator(), c.path, argv, &c.sb.env);
     }
 
     /// The repository as the library sees it. Close it when done.
@@ -699,7 +683,7 @@ test "upstream's pushes pass our push check" {
             "--pusher-email interop@example.invalid\n",
         .{sb.ours_bin},
     );
-    _ = try sb.exec(sb.root, &.{
+    _ = try shared.exec(sb.allocator(), sb.root, &.{
         "sh", "-c", "printf '%s' \"$2\" > \"$1\" && chmod +x \"$1\"", "sh", hook, script,
     }, &sb.env);
     const a = try sb.repo("a", .{ .origin = hub });

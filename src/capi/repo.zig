@@ -32,6 +32,18 @@ pub const Backend = struct {
         return .{ .operation = operation, .repo = self.repo, .start = now() };
     }
 
+    /// A git request: the cancel token checked first, the time logged after.
+    fn traced(
+        self: *Self,
+        comptime operation: []const u8,
+        comptime request: anytype,
+        args: anytype,
+    ) @typeInfo(@TypeOf(request)).@"fn".return_type.? {
+        const t = try self.check(operation);
+        defer t.done();
+        return @call(.auto, request, .{self.git} ++ args);
+    }
+
     const Timer = struct {
         operation: []const u8,
         repo: *RepoObj,
@@ -57,41 +69,29 @@ pub const Backend = struct {
         return self.git.objectFormat();
     }
     pub fn readObject(self: *Self, arena: Allocator, oid: contract.Oid) Error!?contract.Object {
-        const t = try self.check("git.read-object");
-        defer t.done();
-        return self.git.readObject(arena, oid);
+        return self.traced("git.read-object", GitProcess.readObject, .{ arena, oid });
     }
     pub fn writeObject(
         self: *Self,
         kind: contract.ObjectKind,
         data: []const u8,
     ) Error!contract.Oid {
-        const t = try self.check("git.write-object");
-        defer t.done();
-        return self.git.writeObject(kind, data);
+        return self.traced("git.write-object", GitProcess.writeObject, .{ kind, data });
     }
     pub fn resolveRef(self: *Self, name: []const u8) Error!?contract.Oid {
-        const t = try self.check("git.resolve-ref");
-        defer t.done();
-        return self.git.resolveRef(name);
+        return self.traced("git.resolve-ref", GitProcess.resolveRef, .{name});
     }
     pub fn listRefs(self: *Self, arena: Allocator, prefix: []const u8) Error![]contract.RefEntry {
-        const t = try self.check("git.for-each-ref");
-        defer t.done();
-        return self.git.listRefs(arena, prefix);
+        return self.traced("git.for-each-ref", GitProcess.listRefs, .{ arena, prefix });
     }
     pub fn updateRefs(
         self: *Self,
         updates: []const contract.RefUpdate,
     ) (Error || error{RefConflict})!void {
-        const t = try self.check("git.update-ref");
-        defer t.done();
-        return self.git.updateRefs(updates);
+        return self.traced("git.update-ref", GitProcess.updateRefs, .{updates});
     }
     pub fn isAncestor(self: *Self, a: contract.Oid, b: contract.Oid) Error!bool {
-        const t = try self.check("git.merge-base");
-        defer t.done();
-        return self.git.isAncestor(a, b);
+        return self.traced("git.merge-base", GitProcess.isAncestor, .{ a, b });
     }
     pub fn mergeBases(
         self: *Self,
@@ -99,39 +99,25 @@ pub const Backend = struct {
         a: contract.Oid,
         b: contract.Oid,
     ) Error![]contract.Oid {
-        const t = try self.check("git.merge-base");
-        defer t.done();
-        return self.git.mergeBases(arena, a, b);
+        return self.traced("git.merge-base", GitProcess.mergeBases, .{ arena, a, b });
     }
     pub fn configGet(self: *Self, arena: Allocator, key: []const u8) Error!?[]const u8 {
-        const t = try self.check("git.config");
-        defer t.done();
-        return self.git.configGet(arena, key);
+        return self.traced("git.config", GitProcess.configGet, .{ arena, key });
     }
     pub fn configGetAll(self: *Self, arena: Allocator, key: []const u8) Error![]const []const u8 {
-        const t = try self.check("git.config");
-        defer t.done();
-        return self.git.configGetAll(arena, key);
+        return self.traced("git.config", GitProcess.configGetAll, .{ arena, key });
     }
     pub fn configAdd(self: *Self, key: []const u8, value: []const u8) Error!void {
-        const t = try self.check("git.config");
-        defer t.done();
-        return self.git.configAdd(key, value);
+        return self.traced("git.config", GitProcess.configAdd, .{ key, value });
     }
     pub fn configUnsetValue(self: *Self, key: []const u8, value: []const u8) Error!void {
-        const t = try self.check("git.config");
-        defer t.done();
-        return self.git.configUnsetValue(key, value);
+        return self.traced("git.config", GitProcess.configUnsetValue, .{ key, value });
     }
     pub fn configList(self: *Self, arena: Allocator) Error![]const GitProcess.ConfigEntry {
-        const t = try self.check("git.config");
-        defer t.done();
-        return self.git.configList(arena);
+        return self.traced("git.config", GitProcess.configList, .{arena});
     }
     pub fn remoteNames(self: *Self, arena: Allocator) Error![]const []const u8 {
-        const t = try self.check("git.remote");
-        defer t.done();
-        return self.git.remoteNames(arena);
+        return self.traced("git.remote", GitProcess.remoteNames, .{arena});
     }
     /// The repo's committer when it has one; the author is the call's
     /// actor (the engine passes it) or that committer.
@@ -162,9 +148,7 @@ pub const Backend = struct {
         refspecs: []const []const u8,
         options: contract.FetchOptions,
     ) (Error || error{FetchFailed})!void {
-        const t = try self.check("git.fetch");
-        defer t.done();
-        return self.git.fetch(arena, remote, refspecs, options);
+        return self.traced("git.fetch", GitProcess.fetch, .{ arena, remote, refspecs, options });
     }
     pub fn push(
         self: *Self,
@@ -173,9 +157,7 @@ pub const Backend = struct {
         refspecs: []const []const u8,
         options: contract.PushOptions,
     ) (Error || error{PushFailed})!contract.PushResult {
-        const t = try self.check("git.push");
-        defer t.done();
-        return self.git.push(arena, remote, refspecs, options);
+        return self.traced("git.push", GitProcess.push, .{ arena, remote, refspecs, options });
     }
     pub fn pushLeased(
         self: *Self,
@@ -183,36 +165,24 @@ pub const Backend = struct {
         remote: []const u8,
         updates: []const contract.LeasedRef,
     ) (Error || error{PushFailed})!contract.PushResult {
-        const t = try self.check("git.push");
-        defer t.done();
-        return self.git.pushLeased(arena, remote, updates);
+        return self.traced("git.push", GitProcess.pushLeased, .{ arena, remote, updates });
     }
 
     // Attachments: the issuez store, and git-lfs for transfers.
     pub fn lfsRead(self: *Self, arena: Allocator, sha256: []const u8) Error!?[]const u8 {
-        const t = try self.check("lfs.read");
-        defer t.done();
-        return self.git.lfsRead(arena, sha256);
+        return self.traced("lfs.read", GitProcess.lfsRead, .{ arena, sha256 });
     }
     pub fn lfsSize(self: *Self, sha256: []const u8) Error!?u64 {
-        const t = try self.check("lfs.size");
-        defer t.done();
-        return self.git.lfsSize(sha256);
+        return self.traced("lfs.size", GitProcess.lfsSize, .{sha256});
     }
     pub fn lfsWrite(self: *Self, sha256: []const u8, data: []const u8) Error!void {
-        const t = try self.check("lfs.write");
-        defer t.done();
-        return self.git.lfsWrite(sha256, data);
+        return self.traced("lfs.write", GitProcess.lfsWrite, .{ sha256, data });
     }
     pub fn lfsList(self: *Self, arena: Allocator) Error![]const []const u8 {
-        const t = try self.check("lfs.list");
-        defer t.done();
-        return self.git.lfsList(arena);
+        return self.traced("lfs.list", GitProcess.lfsList, .{arena});
     }
     pub fn lfsAvailable(self: *Self, arena: Allocator) Error!bool {
-        const t = try self.check("lfs.available");
-        defer t.done();
-        return self.git.lfsAvailable(arena);
+        return self.traced("lfs.available", GitProcess.lfsAvailable, .{arena});
     }
     pub fn lfsPush(
         self: *Self,
@@ -220,9 +190,7 @@ pub const Backend = struct {
         remote: []const u8,
         shas: []const []const u8,
     ) (Error || contract.LfsTransportError)!void {
-        const t = try self.check("lfs.push");
-        defer t.done();
-        return self.git.lfsPush(arena, remote, shas);
+        return self.traced("lfs.push", GitProcess.lfsPush, .{ arena, remote, shas });
     }
     pub fn lfsFetch(
         self: *Self,
@@ -230,9 +198,7 @@ pub const Backend = struct {
         remote: []const u8,
         local_refs: []const []const u8,
     ) (Error || contract.LfsTransportError)!void {
-        const t = try self.check("lfs.fetch");
-        defer t.done();
-        return self.git.lfsFetch(arena, remote, local_refs);
+        return self.traced("lfs.fetch", GitProcess.lfsFetch, .{ arena, remote, local_refs });
     }
 
     comptime {
@@ -243,7 +209,6 @@ pub const Backend = struct {
 
 pub const IssueRepo = issuez.Repo(Backend);
 pub const Catalog = issuez.Catalog(Backend);
-pub const Sync = issuez.Sync(Backend);
 
 // ─── The repo ──────────────────────────────────────────────────────────
 
@@ -274,9 +239,7 @@ pub const RepoObj = struct {
     store_attachments: bool = true,
     import_state: ?*GitProcess.Import = null,
     import_target: ?*RepoObj = null,
-    /// The effective settings, NUL-terminated for the accessors.
-    done_states: []const Str = &.{},
-    workflow_states: []const Str = &.{},
+    /// The effective settings.
     settings: issuez.Settings = .{},
     /// Issues kept loaded for queries.
     cache: cache_mod.Cache = .{},
@@ -360,11 +323,7 @@ pub const RepoObj = struct {
 
     /// A session outside the pool, with `vars` set in its environment:
     /// the push check reads a push's quarantine this way.
-    pub fn openPrivate(
-        r: *RepoObj,
-        cancel: ?*api.Cancel,
-        vars: []const [2][]const u8,
-    ) !*Session {
+    pub fn openPrivate(r: *RepoObj, cancel: ?*api.Cancel, vars: []const [2][]const u8) !*Session {
         var env = try r.env.clone(rt.gpa);
         defer env.deinit();
         for (vars) |v| try env.put(v[0], v[1]);
@@ -417,8 +376,6 @@ pub const Call = struct {
     retries: u32 = 0,
     /// The engine skipped the call's write: it changed nothing.
     skipped: bool = false,
-    /// Checks a write without writing (`issuez_issue_check`).
-    dry_run: bool = false,
     /// The actor's `user_id`, for `X-Author-Id` on the call's commits.
     author_id: ?[]const u8 = null,
     /// Cache entries the call reads, released at its end.
@@ -442,11 +399,7 @@ pub const Call = struct {
 
     /// Like `begin`, on a session of its own with `vars` in its
     /// environment.
-    pub fn beginPrivate(
-        repo: ?*api.Repo,
-        cancel: ?*api.Cancel,
-        vars: []const [2][]const u8,
-    ) !Call {
+    pub fn beginPrivate(repo: ?*api.Repo, cancel: ?*api.Cancel, vars: []const [2][]const u8) !Call {
         rt.ensure();
         const r = rt.obj(RepoObj, repo) orelse return error.NullHandle;
         if (rt.cancelled(cancel)) return error.Canceled;
@@ -476,11 +429,15 @@ pub const Call = struct {
         return c.arena_state.allocator();
     }
 
+    /// An issue's ref, whatever `id` is.
+    pub fn issueRef(c: *Call, id: []const u8) Allocator.Error![]const u8 {
+        return std.fmt.allocPrint(c.arena(), "{s}{s}", .{ issuez.engine.issue_ref_prefix, id });
+    }
+
     pub fn engine(c: *Call) IssueRepo {
         if (c.diagnostics == null) c.diagnostics = .{ .arena = c.arena_state.allocator() };
         var e = c.repo.engine(c.session).withOptions(.{
             .diagnostics = &c.diagnostics.?,
-            .dry_run = c.dry_run,
             .author_id = c.author_id,
         });
         e.call.retries = &c.retries;
@@ -510,9 +467,9 @@ pub fn issuez_repo_open(
     err: ?*?*api.Error,
 ) callconv(.c) Code {
     rt.ensure();
-    const o = out orelse return rt.fail(err, .e_invalid_argument, "out is NULL", .{});
-    if (path.len == 0) return rt.fail(err, .e_invalid_argument, "path is empty", .{});
-    return open(path.slice(), if (opts) |p| p[0..n_opts] else &.{}, null, o, err) catch |e|
+    const o = out orelse return rt.badArgument(err, "out is NULL");
+    if (path.len == 0) return rt.badArgument(err, "path is empty");
+    return open(path.slice(), rt.sliceOf(api.Op, opts, n_opts), null, o, err) catch |e|
         rt.failError(err, e, .{});
 }
 
@@ -552,15 +509,10 @@ fn applyOptions(r: *RepoObj, arena: Allocator, ops: []const api.Op, problems: *r
             } else {
                 r.pool_size = @intCast(op.num);
             },
-            .timeout_local_ms, .timeout_network_ms => if (op.num > 0) {
+            .timeout_local_ms => if (op.num > 0) {
                 const d: std.Io.Duration = .fromMilliseconds(op.num);
-                if (target == .timeout_local_ms) {
-                    r.timeouts.command = d;
-                    r.timeouts.request = d;
-                } else {
-                    r.timeouts.network = d;
-                    r.timeouts.transfer = d;
-                }
+                r.timeouts.command = d;
+                r.timeouts.request = d;
             },
             .cache_issues => if (op.num < 0) {
                 try check.add(.bad_format, "the cache size can't be negative");
@@ -619,13 +571,7 @@ fn open(
     try applyOptions(r, arena, ops, &problems);
     if (problems.items.len > 0) {
         // The problems point into the arena: copy them out first.
-        const code = rt.failWith(
-            err,
-            .e_invalid_value,
-            .{ .problems = problems.items },
-            "invalid options",
-            .{},
-        );
+        const code = rt.badOps(err, problems.items, "invalid options");
         r.env.deinit();
         rt.freeArena(arena_state);
         return code;
@@ -659,8 +605,6 @@ fn open(
         else
             configured.invalid_workflow_state,
     };
-    r.done_states = try strList(arena, r.settings.done_states);
-    r.workflow_states = try strList(arena, r.settings.workflow_states);
     r.git_dir = try rt.dupeZ(arena, s.git.common_dir orelse r.open_path);
     r.putBack(s);
     rt.log(.info, .{ .operation = "repo.open", .repo_path = r.git_dir.slice() });
@@ -671,12 +615,6 @@ fn open(
 fn dupeList(arena: Allocator, list: []const []const u8) ![]const []const u8 {
     const out = try arena.alloc([]const u8, list.len);
     for (list, out) |s, *o| o.* = try arena.dupe(u8, s);
-    return out;
-}
-
-fn strList(arena: Allocator, list: []const []const u8) ![]const Str {
-    const out = try arena.alloc(Str, list.len);
-    for (list, out) |s, *o| o.* = try rt.dupeZ(arena, s);
     return out;
 }
 
@@ -719,11 +657,6 @@ pub fn issuez_repo_limit(repo: ?*const api.Repo, name: Str, out: ?*u64) callconv
     return false;
 }
 
-pub const issuez_repo_workflow_state_count = RepoReads.count("workflow_states");
-pub const issuez_repo_workflow_state_at = RepoReads.at("workflow_states");
-pub const issuez_repo_done_state_count = RepoReads.count("done_states");
-pub const issuez_repo_done_state_at = RepoReads.at("done_states");
-
 /// Rebuild the immutable open options so staging uses the same policy.
 fn importOptions(a: Allocator, r: *RepoObj, env: *const std.process.Environ.Map) ![]api.Op {
     var ops: OpBuilder = .{ .a = a };
@@ -749,7 +682,6 @@ fn importOptions(a: Allocator, r: *RepoObj, env: *const std.process.Environ.Map)
     try ops.add(.set, .pool_size, .{ .num = r.pool_size });
     try ops.add(.set, .cache_issues, .{ .num = @intCast(r.cache.max) });
     try ops.add(.set, .timeout_local_ms, .{ .num = r.timeouts.command.toMilliseconds() });
-    try ops.add(.set, .timeout_network_ms, .{ .num = r.timeouts.network.toMilliseconds() });
     return ops.list.items;
 }
 
@@ -772,7 +704,7 @@ pub fn issuez_repo_begin_import(
     out: ?*?*api.Repo,
     err: ?*?*api.Error,
 ) callconv(.c) Code {
-    const o = out orelse return rt.fail(err, .e_invalid_argument, "out is NULL", .{});
+    const o = out orelse return rt.badArgument(err, "out is NULL");
     var c = Call.begin(repo, cancel) catch |e| return rt.failError(err, e, .{});
     defer c.end();
     const stage = rt.gpa.create(GitProcess.Import) catch |e| return rt.failError(err, e, .{});

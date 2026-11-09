@@ -15,8 +15,9 @@ const Push = struct {
     server_objects: []const u8,
     client_objects: []const u8,
 
-    fn init(p: *Push) !void {
-        try p.r.init(.{ .bare = true });
+    fn init() !Push {
+        var p: Push = undefined;
+        p.r = try fixture.Repo.init(.{ .bare = true });
         errdefer p.r.deinit();
         p.client = try fixture.second(&p.r, "client", p.r.path);
         p.client_path = try std.fs.path.join(p.r.arena(), &.{ p.r.root, "client" });
@@ -25,6 +26,7 @@ const Push = struct {
             p.r.arena(),
             &.{ p.client_path, ".git", "objects" },
         );
+        return p;
     }
 
     fn deinit(p: *Push) void {
@@ -47,17 +49,13 @@ const Push = struct {
     fn clientTip(p: *Push, ref: []const u8) !c.issuez_oid {
         const found = try fixture.revParse(p.r.arena(), p.client_path, ref);
         const hex = found orelse return std.mem.zeroes(c.issuez_oid);
-        var oid: c.issuez_oid = undefined;
-        try expect.code(c.ISSUEZ_OK, c.issuez_oid_parse(fixture.str(hex), &oid, null), null);
-        return oid;
+        return fixture.oidParse(hex);
     }
 
     fn serverTip(p: *Push, ref: []const u8) !c.issuez_oid {
         const found = try fixture.revParse(p.r.arena(), p.r.path, ref);
         const hex = found orelse return std.mem.zeroes(c.issuez_oid);
-        var oid: c.issuez_oid = undefined;
-        try expect.code(c.ISSUEZ_OK, c.issuez_oid_parse(fixture.str(hex), &oid, null), null);
-        return oid;
+        return fixture.oidParse(hex);
     }
 
     /// The update that would bring the server's `ref` to the client's.
@@ -161,10 +159,7 @@ const enforce_ada = [_]c.issuez_op{
 // covers: issuez_push_verdicts_len, issuez_push_verdicts_at, issuez_push_verdicts_free
 // covers: issuez_push_verdict_entry_at
 test "issuez_push_check: create, fast-forward, ignored" {
-    const leaks = fixture.Leaks.start();
-    defer leaks.check();
-    var p: Push = undefined;
-    try p.init();
+    var p = try Push.init();
     defer p.deinit();
     const x = try fixture.titled(p.client, "New");
     const ref = try std.fmt.allocPrint(p.r.arena(), "refs/issues/{s}", .{x.idSlice()});
@@ -216,10 +211,7 @@ test "issuez_push_check: create, fast-forward, ignored" {
 }
 
 test "issuez_push_check: refused refs, rewinds, deletes, authors, numbers, formats" {
-    const leaks = fixture.Leaks.start();
-    defer leaks.check();
-    var p: Push = undefined;
-    try p.init();
+    var p = try Push.init();
     defer p.deinit();
     const a = p.r.arena();
     const x = try fixture.titled(p.client, "Base");
@@ -378,8 +370,7 @@ test "issuez_push_check: refused refs, rewinds, deletes, authors, numbers, forma
         p.client_path,
         &.{ "commit-tree", tree, "-m", "Future\n\nState: open\nFormat-Version: 2" },
     );
-    var foid: c.issuez_oid = undefined;
-    _ = c.issuez_oid_parse(fixture.str(future), &foid, null);
+    const foid = try fixture.oidParse(future);
     const fut = c.issuez_ref_update{
         .ref = fixture.str("refs/issues/0b6c4f63-6f5a-4a3e-9c2b-1d2e3f4a5b6c"),
         .old_oid = .{},
@@ -392,10 +383,7 @@ test "issuez_push_check: refused refs, rewinds, deletes, authors, numbers, forma
 }
 
 test "issuez_push_check: an X-Author-Id passes as the pusher's own UUID" {
-    const leaks = fixture.Leaks.start();
-    defer leaks.check();
-    var p: Push = undefined;
-    try p.init();
+    var p = try Push.init();
     defer p.deinit();
     const a = p.r.arena();
     // Ada's email, Mallory's UUID.
@@ -447,10 +435,7 @@ test "issuez_push_check: an X-Author-Id passes as the pusher's own UUID" {
 }
 
 test "issuez_push_check: purges need leave, and allow the rewrite" {
-    const leaks = fixture.Leaks.start();
-    defer leaks.check();
-    var p: Push = undefined;
-    try p.init();
+    var p = try Push.init();
     defer p.deinit();
     const a = p.r.arena();
     const x = try fixture.titled(p.client, "Talk");
@@ -511,8 +496,7 @@ test "issuez_push_check: purges need leave, and allow the rewrite" {
         p.client_path,
         &.{ "commit-tree", tree, "-p", xt, "-m", "Hello\n\nX-Purge: maybe" },
     );
-    var foid: c.issuez_oid = undefined;
-    _ = c.issuez_oid_parse(fixture.str(forged), &foid, null);
+    const foid = try fixture.oidParse(forged);
     const fake = c.issuez_ref_update{
         .ref = fixture.str(xt),
         .old_oid = try p.serverTip(xt),
@@ -525,10 +509,7 @@ test "issuez_push_check: purges need leave, and allow the rewrite" {
 }
 
 test "issuez_push_check: derived attachment refs, the quarantine, bad input" {
-    const leaks = fixture.Leaks.start();
-    defer leaks.check();
-    var p: Push = undefined;
-    try p.init();
+    var p = try Push.init();
     defer p.deinit();
     const a = p.r.arena();
     const x = try fixture.titled(p.client, "Screenshot");
@@ -544,8 +525,7 @@ test "issuez_push_check: derived attachment refs, the quarantine, bad input" {
         p.client_path,
         &.{ "commit-tree", tree, "-m", "Regenerate attachments" },
     );
-    var foid: c.issuez_oid = undefined;
-    _ = c.issuez_oid_parse(fixture.str(fake), &foid, null);
+    const foid = try fixture.oidParse(fake);
     const att = c.issuez_ref_update{
         .ref = fixture.str(try std.fmt.allocPrint(a, "refs/attachments/{s}", .{x.idSlice()})),
         .old_oid = .{},
@@ -600,10 +580,7 @@ test "issuez_push_check: derived attachment refs, the quarantine, bad input" {
 }
 
 test "issuez_push_verdict_attachment_at: the images new commits add, the issue's author" {
-    const leaks = fixture.Leaks.start();
-    defer leaks.check();
-    var p: Push = undefined;
-    try p.init();
+    var p = try Push.init();
     defer p.deinit();
     const a = p.r.arena();
     // The client keeps no bytes, as a host's clients upload them first.

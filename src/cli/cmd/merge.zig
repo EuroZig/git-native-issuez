@@ -57,27 +57,20 @@ pub fn main(
     var remote: ?[]const u8 = null;
     var check = false;
     var fetch = true;
-    var args: common.Args = .{ .list = argv };
-    while (args.next()) |arg| {
-        if (!args.isOption(arg)) {
-            if (args.was_separator) continue;
-            if (remote != null) return common.missing(ctx.err, name, "unexpected argument");
-            remote = arg;
-        } else if (common.isHelp(arg)) {
-            ctx.out.writeAll(switch (mode) {
-                .merge => merge_help,
-                .push => push_help,
-                .sync => sync_help,
-            }) catch {};
-            return common.exit_ok;
-        } else if (mode == .merge and std.mem.eql(u8, arg, "--check")) {
-            check = true;
-        } else if (mode == .merge and std.mem.eql(u8, arg, "--no-fetch")) {
-            fetch = false;
-        } else {
-            return common.unknownOption(ctx.err, name, arg);
-        }
-    }
+    const merge_flags = [_]common.Flag{
+        .{ "--check", .{ .on = &check } },
+        .{ "--no-fetch", .{ .off = &fetch } },
+    };
+    if (common.parseArgs(ctx, argv, .{
+        .command = name,
+        .help = switch (mode) {
+            .merge => merge_help,
+            .push => push_help,
+            .sync => sync_help,
+        },
+        .positionals = .{ .only = .{ &remote, "unexpected argument" } },
+        .flags = if (mode == .merge) &merge_flags else &.{},
+    })) |exit| return exit;
     const r = remote orelse return common.missing(ctx.err, name, "remote name is required");
     // A name, or a URL or path: its refs go under `url-<hash>`.
     if (!issuez.backend.contract.isValidRemoteTarget(r)) {

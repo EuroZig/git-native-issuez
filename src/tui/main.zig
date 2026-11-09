@@ -432,4 +432,5 @@ test {
     _ = @import("timeline_draft.zig");
     _ = @import("sync_job.zig");
     _ = app_mod;
+    _ = @import("app_test.zig");
 }

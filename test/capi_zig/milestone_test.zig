@@ -38,10 +38,7 @@ fn load(h: *c.issuez_repo, id: c.issuez_str) !*c.issuez_milestone {
 
 // C fills the record by hand: no two fields here hold the same value, so a swapped field fails.
 test "issuez_milestone_info_of: every value" {
-    const leaks = fixture.Leaks.start();
-    defer leaks.check();
-    var r: fixture.Repo = undefined;
-    try r.init(.{});
+    var r = try fixture.Repo.init(.{});
     defer r.deinit();
     const h = r.handle;
     var t1: c.issuez_time = .{ .unix_seconds = 1_700_000_000, .tz_offset_minutes = 0 };
@@ -92,7 +89,7 @@ test "issuez_milestone_info_of: every value" {
     const info = c.issuez_milestone_info_of(m);
     try testing.expect(c.issuez_milestone_info_of(m) == info);
     try expect.str(&id_buf, info.*.id);
-    try testing.expect(c.issuez_oid_eq(&info.*.tip, &tip));
+    try testing.expect(fixture.oidEql(info.*.tip, tip));
     try expect.str("v1.0", info.*.name);
     try expect.str("The first release.", info.*.description);
     try testing.expectEqual(@as(u32, c.ISSUEZ_MILESTONE_COMPLETED), info.*.status);
@@ -106,10 +103,7 @@ test "issuez_milestone_info_of: every value" {
 
 // covers: issuez_milestone_load, issuez_milestone_free, issuez_milestone_create
 test "issuez_milestone_info_of: a minimal one, NULL, and what can't be created or found" {
-    const leaks = fixture.Leaks.start();
-    defer leaks.check();
-    var r: fixture.Repo = undefined;
-    try r.init(.{});
+    var r = try fixture.Repo.init(.{});
     defer r.deinit();
     const h = r.handle;
     const made = try fixture.milestone(h, "Minimal");
@@ -158,10 +152,7 @@ test "issuez_milestone_info_of: a minimal one, NULL, and what can't be created o
 
 // covers: issuez_milestone_list_len, issuez_milestone_list_at, issuez_milestone_list_free
 test "issuez_milestone_list_all: none, several" {
-    const leaks = fixture.Leaks.start();
-    defer leaks.check();
-    var r: fixture.Repo = undefined;
-    try r.init(.{});
+    var r = try fixture.Repo.init(.{});
     defer r.deinit();
     const h = r.handle;
     var list: ?*c.issuez_milestone_list = null;
@@ -191,10 +182,7 @@ test "issuez_milestone_list_all: none, several" {
 }
 
 test "issuez_milestone_update: rename, due, status, stale" {
-    const leaks = fixture.Leaks.start();
-    defer leaks.check();
-    var r: fixture.Repo = undefined;
-    try r.init(.{});
+    var r = try fixture.Repo.init(.{});
     defer r.deinit();
     const h = r.handle;
     const made = try fixture.milestone(h, "Spring");
@@ -252,11 +240,8 @@ test "issuez_milestone_update: rename, due, status, stale" {
     );
 }
 
-test "issuez_milestone_check: valid, completing with open work, nothing written" {
-    const leaks = fixture.Leaks.start();
-    defer leaks.check();
-    var r: fixture.Repo = undefined;
-    try r.init(.{});
+test "issuez_milestone_create: completing with open work and no name are refused, unwritten" {
+    var r = try fixture.Repo.init(.{});
     defer r.deinit();
     const h = r.handle;
     const m = try fixture.milestone(h, "Busy");
@@ -265,52 +250,44 @@ test "issuez_milestone_check: valid, completing with open work, nothing written"
         &.{ c.issuez_set_title(fixture.str("Work")), c.issuez_set_milestone(m.idStr()) },
     );
     const id = m.idStr();
-    var ps: ?*c.issuez_problems = null;
+    var w: ?*c.issuez_write = null;
     var err: ?*c.issuez_error = null;
-    const rename = [_]c.issuez_op{c.issuez_set_name(fixture.str("Renamed"))};
-    try expect.code(
-        c.ISSUEZ_OK,
-        c.issuez_milestone_check(h, id, &rename, 1, null, &ps, &err),
-        err,
-    );
-    try testing.expectEqual(@as(usize, 0), c.issuez_problems_len(ps));
-    c.issuez_problems_free(ps);
     const complete = [_]c.issuez_op{c.issuez_set_milestone_status(c.ISSUEZ_MILESTONE_COMPLETED)};
     try expect.code(
-        c.ISSUEZ_OK,
-        c.issuez_milestone_check(h, id, &complete, 1, null, &ps, &err),
+        c.ISSUEZ_E_GUARD,
+        c.issuez_milestone_update(h, id, &complete, 1, &fixture.ada, null, &w, &err),
         err,
     );
-    try testing.expectEqual(@as(usize, 1), c.issuez_problems_len(ps));
     try testing.expectEqual(
         @as(u32, c.ISSUEZ_PROBLEM_MILESTONE_OPEN_WORK),
-        c.issuez_problems_at(ps, 0).*.kind,
+        c.issuez_problems_at(c.issuez_error_problems(err), 0).*.kind,
     );
-    c.issuez_problems_free(ps);
-    // As a create: no name.
+    c.issuez_error_free(err);
+    err = null;
     const nameless = [_]c.issuez_op{c.issuez_set_description(fixture.str("x"))};
     try expect.code(
-        c.ISSUEZ_OK,
-        c.issuez_milestone_check(h, .{}, &nameless, 1, null, &ps, &err),
+        c.ISSUEZ_E_INVALID_VALUE,
+        c.issuez_milestone_create(h, &nameless, 1, &fixture.ada, null, &w, &err),
         err,
     );
     try testing.expectEqual(
         @as(u32, c.ISSUEZ_PROBLEM_MISSING_VALUE),
-        c.issuez_problems_at(ps, 0).*.kind,
+        c.issuez_problems_at(c.issuez_error_problems(err), 0).*.kind,
     );
-    c.issuez_problems_free(ps);
+    c.issuez_error_free(err);
     const ml = try load(h, id);
     defer c.issuez_milestone_free(ml);
-    try expect.str("Busy", c.issuez_milestone_info_of(ml).*.name);
     const info = c.issuez_milestone_info_of(ml);
+    try expect.str("Busy", info.*.name);
     try testing.expectEqual(@as(u32, c.ISSUEZ_MILESTONE_OPEN), info.*.status);
+    var list: ?*c.issuez_milestone_list = null;
+    try expect.code(c.ISSUEZ_OK, c.issuez_milestone_list_all(h, null, &list, null), null);
+    defer c.issuez_milestone_list_free(list);
+    try testing.expectEqual(@as(usize, 1), c.issuez_milestone_list_len(list));
 }
 
 test "issuez_milestone_problems: two clones renamed it differently" {
-    const leaks = fixture.Leaks.start();
-    defer leaks.check();
-    var r: fixture.Repo = undefined;
-    try r.init(.{});
+    var r = try fixture.Repo.init(.{});
     defer r.deinit();
     const h = r.handle;
     const m = try fixture.milestone(h, "Base");

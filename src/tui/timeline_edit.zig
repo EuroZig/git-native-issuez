@@ -381,18 +381,15 @@ pub fn key(s: *AppState, k: vaxis.Key) Allocator.Error!?AppState.Action {
     const week: i32 = if (bits == 0) 7 else @popCount(bits);
     // Writes that can't wait for apply.
     if (k.matches('x', .{})) {
-        s.info("closing writes at once: apply or leave edit mode first (esc)", .{});
-        return .none;
+        return s.noted("closing writes at once: apply or leave edit mode first (esc)", .{});
     }
     if (k.matches('n', .{}) or k.matches('a', .{})) {
-        s.info("creating writes at once: apply or leave edit mode first (esc)", .{});
-        return .none;
+        return s.noted("creating writes at once: apply or leave edit mode first (esc)", .{});
     }
     if (t.linking != null) {
         if (k.matches(K.escape, .{})) {
             t.linking = null;
-            s.info("not linked", .{});
-            return .none;
+            return s.noted("not linked", .{});
         }
         if (k.matches(K.enter, .{}) or k.matches('b', .{})) return pickBlocker(s);
         return null;
@@ -478,11 +475,10 @@ pub fn key(s: *AppState, k: vaxis.Key) Allocator.Error!?AppState.Action {
     if (k.matches('b', .{})) {
         const x = i orelse return .none;
         t.linking = .of(snap.issues[x].id);
-        s.info(
+        return s.noted(
             "#{s} waits for…: select its blocker, ⏎ links, esc cancels",
             .{shortId(snap.issues[x].id)},
         );
-        return .none;
     }
     if (k.matches('B', .{})) {
         if (i) |x| unblockMenu(s, x);
@@ -512,39 +508,30 @@ pub fn pickBlocker(s: *AppState) AppState.Action {
     const t = &s.timeline;
     const snap = s.snap;
     const id = t.linking orelse return .none;
-    const b = t.selectedIssue() orelse {
-        s.info("select an issue to wait for", .{});
-        return .none;
-    };
+    const b = t.selectedIssue() orelse return s.noted("select an issue to wait for", .{});
     const i = snap.find(id.slice()) orelse {
         t.linking = null;
         return .none;
     };
-    if (b == i) {
-        s.fail("an issue can't wait for itself", .{});
-        return .none;
-    }
+    if (b == i) return s.failed("an issue can't wait for itself", .{});
     const proj = t.projection(snap);
     for (proj.blockers[i]) |x| if (x == b) {
         t.linking = null;
-        s.info("already blocked by it", .{});
-        return .none;
+        return s.noted("already blocked by it", .{});
     };
     // Waiting for something that waits for it would be a loop.
     if (reaches(s, proj, b, i)) {
-        s.fail(
+        return s.failed(
             "#{s} already waits for #{s}: that would be a loop",
             .{ shortId(snap.issues[b].id), shortId(id.slice()) },
         );
-        return .none;
     }
     t.linking = null;
     if (!stage(
         s,
         .{ .add_blocker = .{ .id = id, .blocker = .of(snap.issues[b].id) } },
     )) return .none;
-    s.info("#{s} now waits for #{s}", .{ shortId(id.slice()), shortId(snap.issues[b].id) });
-    return .none;
+    return s.noted("#{s} now waits for #{s}", .{ shortId(id.slice()), shortId(snap.issues[b].id) });
 }
 
 /// Whether `from` waits for `to`, directly or not.

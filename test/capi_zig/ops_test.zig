@@ -86,7 +86,7 @@ test "issuez_ops_validate: each kind of mistake, at its op" {
         },
         .{
             c.ISSUEZ_LIST_ISSUE_UPDATE,
-            op(c.ISSUEZ_OP_SET, c.ISSUEZ_OPT_SYNC_PUSH),
+            op(c.ISSUEZ_OP_SET, c.ISSUEZ_OPT_POOL_SIZE),
             c.ISSUEZ_PROBLEM_UNKNOWN_TARGET,
         },
         .{
@@ -124,11 +124,6 @@ test "issuez_ops_validate: each kind of mistake, at its op" {
         .{ c.ISSUEZ_LIST_OPEN, c.issuez_q_limit(1), c.ISSUEZ_PROBLEM_UNKNOWN_TARGET },
         .{ c.ISSUEZ_LIST_OPEN, c.issuez_opt_pool_size(0), c.ISSUEZ_PROBLEM_BAD_FORMAT },
         .{
-            c.ISSUEZ_LIST_SYNC,
-            c.issuez_set_title(fixture.str("T")),
-            c.ISSUEZ_PROBLEM_UNKNOWN_TARGET,
-        },
-        .{
             c.ISSUEZ_LIST_PUSH_CHECK,
             c.issuez_opt_author_policy(77),
             c.ISSUEZ_PROBLEM_UNKNOWN_TARGET,
@@ -139,19 +134,11 @@ test "issuez_ops_validate: each kind of mistake, at its op" {
         const good = switch (case[0]) {
             c.ISSUEZ_LIST_QUERY => c.issuez_q_done(1),
             c.ISSUEZ_LIST_OPEN => c.issuez_opt_pool_size(2),
-            c.ISSUEZ_LIST_SYNC, c.ISSUEZ_LIST_PUSH_CHECK => c.issuez_opt_allow_numbers(true),
+            c.ISSUEZ_LIST_PUSH_CHECK => c.issuez_opt_allow_numbers(true),
             c.ISSUEZ_LIST_MILESTONE_CREATE => c.issuez_set_name(fixture.str("v1")),
             else => c.issuez_add_label(fixture.str("ok")),
         };
-        const sync_good = blk: {
-            var o = op(c.ISSUEZ_OP_SET, c.ISSUEZ_OPT_SYNC_PUSH);
-            o.num = 1;
-            break :blk o;
-        };
-        const ops = [_]c.issuez_op{
-            if (case[0] == c.ISSUEZ_LIST_SYNC) sync_good else good,
-            case[1],
-        };
+        const ops = [_]c.issuez_op{ good, case[1] };
         var ps = try problemsOf(case[0], &ops);
         defer ps.deinit(testing.allocator);
         testing.expect(ps.items.len >= 1) catch |e| {

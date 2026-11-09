@@ -36,13 +36,8 @@ func TestConcurrentQueries(t *testing.T) {
 					return
 				default:
 				}
-				n, err := r.Count(ctx, issuez.Query{Labels: []string{"seed"}})
-				if err != nil || n < 5 || n > 25 {
-					errs <- fmt.Errorf("count %d: %v", n, err)
-					return
-				}
 				page, err := r.Query(ctx, issuez.Query{Labels: []string{"seed"}})
-				if err != nil || len(page.Issues) < 5 {
+				if err != nil || len(page.Issues) < 5 || len(page.Issues) > 25 {
 					errs <- fmt.Errorf("query %d: %v", len(page.Issues), err)
 					return
 				}
@@ -64,8 +59,8 @@ func TestConcurrentQueries(t *testing.T) {
 			t.Fatal(err)
 		}
 	}
-	if n, err := r.Count(ctx, issuez.Query{Labels: []string{"seed"}}); err != nil || n != 25 {
-		t.Fatalf("final count %d: %v", n, err)
+	if page, err := r.Query(ctx, issuez.Query{Labels: []string{"seed"}}); err != nil || len(page.Issues) != 25 {
+		t.Fatalf("final count %d: %v", len(page.Issues), err)
 	}
 }
 
@@ -171,10 +166,6 @@ func TestLoadHistory(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	many, _, err := r.LoadMany(ctx, []string{w.ID}, issuez.LoadHistory())
-	if err != nil || len(many) != 1 || len(many[0].Comments[0].History) != 2 {
-		t.Errorf("LoadMany with history: %+v, %v", many, err)
-	}
 	if len(without.History) != 0 || len(without.Comments[0].History) != 0 {
 		t.Errorf("history without LoadHistory: %+v", without.Comments[0].History)
 	}
@@ -195,30 +186,6 @@ func TestLoadHistory(t *testing.T) {
 	}
 	if again, err := r.Load(ctx, w.ID); err != nil || again.Edits != 1 {
 		t.Errorf("description edits: %v %v", again, err)
-	}
-}
-
-func TestRepo_LoadMany(t *testing.T) {
-	ctx := t.Context()
-	r := newRepo(t)
-	a, b := create(t, r, "A"), create(t, r, "B")
-	missing := "0b6c4f63-6f5a-4a3e-9c2b-1d2e3f4a5b6c"
-	issues, skipped, err := r.LoadMany(ctx, []string{a.ID, missing, b.ID})
-	if err != nil || len(issues) != 2 || issues[1].Title != "B" || len(skipped) != 1 || skipped[0] != missing {
-		t.Errorf("not strict: %v %d %v", err, len(issues), skipped)
-	}
-	if issues, _, err := r.LoadMany(ctx, nil, issuez.Strict()); err != nil || len(issues) != 0 {
-		t.Errorf("none: %v %d", err, len(issues))
-	}
-}
-
-func TestStrict(t *testing.T) {
-	ctx := t.Context()
-	r := newRepo(t)
-	a := create(t, r, "A")
-	missing := "0b6c4f63-6f5a-4a3e-9c2b-1d2e3f4a5b6c"
-	if _, _, err := r.LoadMany(ctx, []string{a.ID, missing}, issuez.Strict()); !errors.Is(err, issuez.ErrNotFound) {
-		t.Errorf("strict: %v", err)
 	}
 }
 
@@ -312,21 +279,6 @@ func TestRepo_Query(t *testing.T) {
 	}
 }
 
-func TestRepo_Count(t *testing.T) {
-	ctx := t.Context()
-	r := newRepo(t)
-	for _, title := range []string{"A", "B", "C"} {
-		create(t, r, title, "x")
-	}
-	create(t, r, "D")
-	q := issuez.Query{Labels: []string{"x"}}
-	n, err := r.Count(ctx, q)
-	page, _ := r.Query(ctx, q)
-	if err != nil || n != 3 || int(n) != len(page.Issues) {
-		t.Errorf("Count = %d, %v; Query found %d", n, err, len(page.Issues))
-	}
-}
-
 // covers: Issue_NewEntries
 func TestSince(t *testing.T) {
 	ctx := t.Context()
@@ -355,54 +307,6 @@ func TestSince(t *testing.T) {
 	gone, err := r.Load(ctx, w.ID, issuez.Since(other.NewTip))
 	if err != nil || !gone.Rewritten || len(gone.NewEntries()) != 0 {
 		t.Errorf("another issue's tip: rewritten %v, %v", gone.Rewritten, err)
-	}
-}
-
-// TestSince_merge: a commit merged in from a clone is new even when it is
-// older than the tip the host saw, so it comes before it in the timeline.
-func TestSince_merge(t *testing.T) {
-	ctx := t.Context()
-	a := newRepo(t)
-	w := create(t, a, "Merged")
-	hub := withHub(t, a)
-	mustSync(t, a, issuez.SyncOptions{})
-	b := clone(t, hub)
-	mustSync(t, b, issuez.SyncOptions{})
-	early := ada
-	early.At = time.Now().Add(-time.Hour)
-	fromB, err := b.Update(ctx, w.ID, new(issuez.Edit).AddComment("From B, written earlier"), early)
-	if err != nil {
-		t.Fatal(err)
-	}
-	mustSync(t, b, issuez.SyncOptions{})
-	// The timeline orders by commit time, in seconds.
-	time.Sleep(1100 * time.Millisecond)
-	seen, err := a.Update(ctx, w.ID, new(issuez.Edit).AddComment("From A"), ada)
-	if err != nil {
-		t.Fatal(err)
-	}
-	// a merges B's comment into its own history.
-	mustSync(t, a, issuez.SyncOptions{})
-	i, err := a.Load(ctx, w.ID, issuez.Since(seen.NewTip))
-	if err != nil {
-		t.Fatal(err)
-	}
-	at := map[issuez.OID]int{}
-	for k, e := range i.Timeline {
-		at[e.Commit] = k
-	}
-	if at[fromB.Commit] > at[seen.Commit] {
-		t.Fatal("B's comment doesn't come first: the case isn't tested")
-	}
-	var sawB bool
-	for _, e := range i.NewEntries() {
-		if e.Commit == seen.Commit {
-			t.Error("the tip seen is new")
-		}
-		sawB = sawB || e.Commit == fromB.Commit
-	}
-	if !sawB || i.Rewritten {
-		t.Errorf("B's comment isn't new: %+v", i.NewEntries())
 	}
 }
 
@@ -452,65 +356,6 @@ func TestChange(t *testing.T) {
 	}
 	if c := of(5, issuez.FieldState); len(c) != 1 || c[0].Old != "open" || c[0].OldDone || !c[0].NewDone {
 		t.Errorf("state: %+v", c)
-	}
-}
-
-func TestRepo_LabelCounts(t *testing.T) {
-	r := newRepo(t)
-	create(t, r, "One", "bug")
-	create(t, r, "Two", "bug", "ui")
-	got, err := r.LabelCounts(t.Context())
-	if err != nil || len(got) != 2 || got[0] != (issuez.LabelCount{Name: "bug", Open: 2, Total: 2}) {
-		t.Errorf("LabelCounts() = %+v, %v", got, err)
-	}
-}
-
-func TestRepo_People(t *testing.T) {
-	ctx := t.Context()
-	r := newRepo(t)
-	if _, err := r.Create(ctx, new(issuez.Edit).SetTitle("One").AddAssignee(issuez.Person{Email: "grace@example.com"}), ada); err != nil {
-		t.Fatal(err)
-	}
-	got, err := r.People(ctx)
-	if err != nil || len(got) != 2 || got[0].Email != ada.Email || got[0].Authored != 1 || got[1].Assigned != 1 {
-		t.Errorf("People() = %+v, %v", got, err)
-	}
-}
-
-func TestRepo_ShortIDs(t *testing.T) {
-	r := newRepo(t)
-	a, b := create(t, r, "One"), create(t, r, "Two")
-	got, err := r.ShortIDs(t.Context(), 4)
-	if err != nil || len(got) != 2 || !strings.HasPrefix(a.ID, got[a.ID]) || len(got[b.ID]) < 4 {
-		t.Errorf("ShortIDs() = %v, %v", got, err)
-	}
-	if id, err := r.ResolveOne(t.Context(), issuez.KindIssue, got[a.ID]); err != nil || id != a.ID {
-		t.Errorf("resolving %q: %q %v", got[a.ID], id, err)
-	}
-}
-
-func TestRepo_LoadJSON(t *testing.T) {
-	r := newRepo(t)
-	w := create(t, r, "As JSON")
-	data, err := r.LoadJSON(t.Context(), w.ID, issuez.JSONOptions{Full: true})
-	var got struct {
-		ID, Title string
-	}
-	if err != nil || json.Unmarshal(data, &got) != nil || got.ID != w.ID || got.Title != "As JSON" {
-		t.Errorf("LoadJSON() = %s, %v", data, err)
-	}
-}
-
-func TestRepo_LoadManyJSON(t *testing.T) {
-	r := newRepo(t)
-	a, b := create(t, r, "One"), create(t, r, "Two")
-	data, err := r.LoadManyJSON(t.Context(), []string{b.ID, a.ID}, issuez.JSONOptions{})
-	var got []struct{ Title string }
-	if err != nil || json.Unmarshal(data, &got) != nil || len(got) != 2 || got[0].Title != "Two" {
-		t.Errorf("LoadManyJSON() = %s, %v", data, err)
-	}
-	if data, err := r.LoadManyJSON(t.Context(), nil, issuez.JSONOptions{}); err != nil || json.Unmarshal(data, &got) != nil || len(got) != 2 {
-		t.Errorf("every issue: %s, %v", data, err)
 	}
 }
 

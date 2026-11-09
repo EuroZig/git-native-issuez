@@ -14,7 +14,8 @@ pub fn live() i64 {
     return issuez__debug_live_allocations();
 }
 
-/// `defer leaks.check()` after `const leaks = Leaks.start();`.
+/// `defer leaks.check()` after `const leaks = Leaks.start();`. A `Repo` does
+/// this for itself, over its whole life.
 pub const Leaks = struct {
     before: i64,
 
@@ -94,8 +95,10 @@ pub const Options = struct {
     ops: []const c.issuez_op = &.{},
 };
 
-/// A new repository in a temp dir, opened.
+/// A new repository in a temp dir, opened. `deinit` checks that the library's
+/// live allocations are back to what they were before `init`.
 pub const Repo = struct {
+    leaks: Leaks,
     arena_state: std.heap.ArenaAllocator,
     tmp: testing.TmpDir,
     /// Absolute.
@@ -104,7 +107,9 @@ pub const Repo = struct {
     path: []const u8,
     handle: *c.issuez_repo,
 
-    pub fn init(r: *Repo, options: Options) !void {
+    pub fn init(options: Options) !Repo {
+        var r: Repo = undefined;
+        r.leaks = .start();
         r.arena_state = .init(testing.allocator);
         errdefer r.arena_state.deinit();
         const a = r.arena_state.allocator();
@@ -120,6 +125,7 @@ pub const Repo = struct {
         });
         _ = try runGit(a, r.root, flags);
         r.handle = try r.open(options.ops);
+        return r;
     }
 
     /// Another handle on the same repository.
@@ -143,6 +149,7 @@ pub const Repo = struct {
         c.issuez_repo_close(r.handle);
         r.tmp.cleanup();
         r.arena_state.deinit();
+        r.leaks.check();
     }
 
     pub fn arena(r: *Repo) Allocator {
@@ -236,11 +243,11 @@ pub fn script(arena: Allocator, dir: []const u8, name: []const u8, body: []const
     return path;
 }
 
-/// A git that hangs on `fetch` and is git otherwise.
+/// A git that hangs on `for-each-ref`, which listing refs runs, and is git otherwise.
 pub fn slowGit(arena: Allocator, dir: []const u8) ![]const u8 {
     return script(arena, dir, "slow-git",
         \\#!/bin/sh
-        \\for a; do [ "$a" = fetch ] && exec sleep 30; done
+        \\for a; do [ "$a" = for-each-ref ] && exec sleep 30; done
         \\exec git "$@"
         \\
     );
@@ -296,23 +303,17 @@ pub fn milestone(repo: *c.issuez_repo, name: []const u8) !Created {
     return out;
 }
 
-/// The matches of `input`, owned by the caller (testing.allocator).
-pub fn resolve(repo: *c.issuez_repo, kind: c.issuez_kind, input: []const u8) ![]const []const u8 {
-    var m: ?*c.issuez_matches = null;
-    var err: ?*c.issuez_error = null;
-    if (c.issuez_resolve(repo, kind, str(input), null, &m, &err) != c.ISSUEZ_OK) {
-        c.issuez_error_free(err);
-        return error.ResolveFailed;
-    }
-    defer c.issuez_matches_free(m);
-    const out = try testing.allocator.alloc([]const u8, c.issuez_matches_len(m));
-    for (out, 0..) |*o, i| o.* = try testing.allocator.dupe(u8, slice(c.issuez_matches_at(m, i)));
-    return out;
-}
-
-pub fn freeAll(list: []const []const u8) void {
-    for (list) |x| testing.allocator.free(x);
-    testing.allocator.free(list);
+/// What ISSUEZ_OPT_PREPARED_ATTACHMENT takes for a prepared attachment.
+pub fn preparedOp(arena: Allocator, p: ?*const c.issuez_prepared_attachment) !c.issuez_op {
+    const info = c.issuez_prepared_attachment_info(p).*;
+    const encoded = try std.fmt.allocPrint(arena, "{s} {s} {d} sha256:{s} {s}", .{
+        slice(info.id),
+        slice(info.media_type),
+        info.size,
+        slice(info.sha256),
+        slice(info.name),
+    });
+    return opStr(c.ISSUEZ_OPT_PREPARED_ATTACHMENT, c.ISSUEZ_OP_ADD, encoded);
 }
 
 pub const Wrote = struct { tip: c.issuez_oid, commit: c.issuez_oid };
@@ -352,6 +353,36 @@ pub fn load(repo: *c.issuez_repo, id: c.issuez_str) !*c.issuez_issue {
     return issue.?;
 }
 
+/// How many issues a query's first page has.
+pub fn queryCount(repo: *c.issuez_repo, ops: []const c.issuez_op) !u64 {
+    var list: ?*c.issuez_issue_list = null;
+    var err: ?*c.issuez_error = null;
+    if (c.issuez_query_run(repo, ops.ptr, ops.len, null, &list, &err) != c.ISSUEZ_OK) {
+        std.debug.print("query: {s}\n", .{slice(c.issuez_error_message(err))});
+        c.issuez_error_free(err);
+        return error.QueryFailed;
+    }
+    defer c.issuez_issue_list_free(list);
+    return c.issuez_issue_list_len(list);
+}
+
+/// Whether the issue carries exactly this label.
+pub fn hasLabel(i: *const c.issuez_issue, label: []const u8) bool {
+    for (0..c.issuez_issue_label_count(i)) |k| {
+        if (std.mem.eql(u8, slice(c.issuez_issue_label_at(i, k)), label)) return true;
+    }
+    return false;
+}
+
+/// The comment with this ID, if the issue has it.
+pub fn findComment(i: *const c.issuez_issue, id: c.issuez_oid) ?*const c.issuez_comment {
+    for (0..c.issuez_issue_comment_count(i)) |k| {
+        const cm = c.issuez_issue_comment_at(i, k);
+        if (std.meta.eql(cm.*.id, id)) return cm;
+    }
+    return null;
+}
+
 /// A commit on an issue written with git, as another tool would.
 pub fn foreignCommit(r: *Repo, id: []const u8, message: []const u8) !void {
     const ref = try std.fmt.allocPrint(r.arena(), "refs/issues/{s}", .{id});
@@ -360,10 +391,26 @@ pub fn foreignCommit(r: *Repo, id: []const u8, message: []const u8) !void {
     _ = try r.git(&.{ "update-ref", ref, tip });
 }
 
+/// The lowercase hex and a NUL; the NUL alone for no object.
 pub fn oidHex(o: c.issuez_oid) [65]u8 {
     var buf: [65]u8 = undefined;
-    _ = c.issuez_oid_hex(&o, &buf);
+    const hex = std.fmt.bytesToHex(o.bytes, .lower);
+    const n = @as(usize, o.len) * 2;
+    @memcpy(buf[0..n], hex[0..n]);
+    buf[n] = 0;
     return buf;
+}
+
+/// The oid of a full hex object ID, as git prints them.
+pub fn oidParse(hex: []const u8) !c.issuez_oid {
+    var o = std.mem.zeroes(c.issuez_oid);
+    o.len = @intCast(hex.len / 2);
+    _ = try std.fmt.hexToBytes(o.bytes[0..o.len], hex);
+    return o;
+}
+
+pub fn oidEql(a: c.issuez_oid, b: c.issuez_oid) bool {
+    return a.len == b.len and std.mem.eql(u8, a.bytes[0..a.len], b.bytes[0..b.len]);
 }
 
 /// A bare hub next to `r`, and `r`'s origin pointing at it.
@@ -382,36 +429,6 @@ pub fn second(r: *Repo, name: []const u8, hub_path: []const u8) !*c.issuez_repo 
     const res = tryOpen(path, &.{}, null);
     if (res[0] != c.ISSUEZ_OK) return error.OpenFailed;
     return res[1].?;
-}
-
-pub const Synced = struct {
-    report: *c.issuez_sync_report,
-
-    pub fn deinit(s: Synced) void {
-        c.issuez_sync_report_free(s.report);
-    }
-
-    pub fn item(s: Synced, id: []const u8) ?c.issuez_sync_item {
-        for (0..c.issuez_sync_report_len(s.report)) |i| {
-            const it = c.issuez_sync_report_at(s.report, i).*;
-            if (std.mem.eql(u8, slice(it.id), id)) return it;
-        }
-        return null;
-    }
-};
-
-pub fn sync(repo: *c.issuez_repo, ops: []const c.issuez_op) !Synced {
-    var out: ?*c.issuez_sync_report = null;
-    var err: ?*c.issuez_error = null;
-    if (c.issuez_sync(repo, str("origin"), ops.ptr, ops.len, null, &out, &err) != c.ISSUEZ_OK) {
-        std.debug.print(
-            "sync: {s}: {s}\n",
-            .{ slice(c.issuez_error_message(err)), slice(c.issuez_error_git_stderr(err)) },
-        );
-        c.issuez_error_free(err);
-        return error.SyncFailed;
-    }
-    return .{ .report = out.? };
 }
 
 /// `git rev-parse --verify -q <ref>` in `dir`: null when there's no such ref.
