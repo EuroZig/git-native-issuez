@@ -50,10 +50,10 @@ fn Audited(comptime Inner: type) type {
             arena: Allocator,
             remote: []const u8,
             refspecs: []const []const u8,
-            atomic: bool,
+            options: contract.PushOptions,
         ) (Error || error{PushFailed})!contract.PushResult {
             self.log.print("  push {d} ref(s) to {s}\n", .{ refspecs.len, remote }) catch {};
-            return self.inner.push(arena, remote, refspecs, atomic);
+            return self.inner.push(arena, remote, refspecs, options);
         }
 
         // Plain delegation for the rest of the contract. The optional LFS
@@ -131,9 +131,9 @@ fn Audited(comptime Inner: type) type {
             arena: Allocator,
             remote: []const u8,
             refspecs: []const []const u8,
-            prune: bool,
+            options: contract.FetchOptions,
         ) (Error || error{FetchFailed})!void {
-            return self.inner.fetch(arena, remote, refspecs, prune);
+            return self.inner.fetch(arena, remote, refspecs, options);
         }
 
         comptime {
@@ -159,17 +159,17 @@ pub fn main(init: std.process.Init) !void {
     const repo = issuez.Repo(Backend).init(&backend);
 
     try out.writeAll("create:\n");
-    const created = try repo.create(arena, .{ .title = "Audit me" });
-    const ref_name = try std.fmt.allocPrint(arena, "refs/issues/{s}", .{created.id.slice()});
+    const created = try repo.create(arena, .{ .title = "Audit me" }, .{});
+    const ref_name = try std.fmt.allocPrint(arena, "refs/issues/{s}", .{created.id});
 
     // Two clients read the issue at the same version (the ETag)...
     const etag = created.tip;
     try out.writeAll("client A comments (based on the ETag):\n");
-    const after_a = try repo.comment(arena, ref_name, .{ .text = "Seen it", .expect = etag });
+    const after_a = try repo.comment(arena, ref_name, .{ .text = "Seen it", .expect = etag }, .{});
 
     // ...client B's change is based on a version that no longer exists.
     try out.writeAll("client B closes (same, now stale ETag):\n");
-    if (repo.setState(arena, ref_name, .{ .state = .closed, .expect = etag })) |_| {
+    if (repo.setState(arena, ref_name, .{ .state = .closed, .expect = etag }, .{})) |_| {
         try out.writeAll("  unexpectedly applied\n");
     } else |err| switch (err) {
         error.VersionMismatch => try out.writeAll("  refused: VersionMismatch (reload, retry)\n"),
@@ -177,9 +177,12 @@ pub fn main(init: std.process.Init) !void {
     }
 
     try out.writeAll("client B retries with the fresh ETag:\n");
-    _ = try repo.setState(arena, ref_name, .{ .state = .closed, .expect = after_a });
+    _ = try repo.setState(arena, ref_name, .{ .state = .closed, .expect = after_a.tip }, .{});
 
     const tip = (try sim.resolveRef(ref_name)).?;
     const issue = try repo.load(arena, .{ .name = ref_name, .tip = tip });
-    try out.print("\n{s}: {s}, {d} update(s)\n", .{ issue.title, issue.state.text(), issue.comments.len });
+    try out.print(
+        "\n{s}: {s}, {d} update(s)\n",
+        .{ issue.title, issue.state.text(), issue.comments.len },
+    );
 }

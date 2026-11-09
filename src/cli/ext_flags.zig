@@ -62,43 +62,25 @@ pub const Flags = struct {
         labels,
     };
 
-    pub const Parsed = enum { no, yes, failed };
+    /// The table entries for the flags `create` and `edit` share.
+    pub fn table(f: *Flags) [8]common.Flag {
+        return .{
+            .{ "--parent", .{ .text = &f.parent } },
+            .{ "--blocked-by", .{ .list = &f.blocked_by } },
+            .{ "--start", .{ .text = &f.start } },
+            .{ "--due", .{ .text = &f.due } },
+            .{ "--estimate", .{ .text = &f.estimate } },
+            .{ "--workflow", .{ .text = &f.workflow } },
+            .{ "--milestone-id", .{ .text = &f.milestone_id } },
+            .{ "--milestone-mode", .{ .text = &f.milestone_mode } },
+        };
+    }
 
-    /// Consumes `arg` and its value when it is an extension flag.
-    pub fn parse(
-        f: *Flags,
-        arena: Allocator,
-        err: *std.Io.Writer,
-        args: *common.Args,
-        arg: []const u8,
-        edit: bool,
-    ) Parsed {
-        const eql = std.mem.eql;
-        const single = [_]struct { []const u8, *?[]const u8 }{
-            .{ "--parent", &f.parent },
-            .{ "--start", &f.start },
-            .{ "--due", &f.due },
-            .{ "--estimate", &f.estimate },
-            .{ "--workflow", &f.workflow },
-            .{ "--milestone-id", &f.milestone_id },
-            .{ "--milestone-mode", &f.milestone_mode },
-        };
-        for (single) |s| if (eql(u8, arg, s[0])) {
-            s[1].* = args.value(err, s[0]) orelse return .failed;
-            return .yes;
-        };
-        if (eql(u8, arg, "--blocked-by") or (edit and eql(u8, arg, "--unblock"))) {
-            const v = args.value(err, arg) orelse return .failed;
-            const list = if (eql(u8, arg, "--unblock")) &f.unblock else &f.blocked_by;
-            list.append(arena, v) catch return .failed;
-            return .yes;
-        }
-        if (edit and std.mem.startsWith(u8, arg, "--no-")) {
-            const which = std.meta.stringToEnum(Clear, arg["--no-".len..]) orelse return .no;
-            f.no.insert(which);
-            return .yes;
-        }
-        return .no;
+    /// Edit's `--no-...`: false when `arg` isn't one.
+    pub fn clear(f: *Flags, arg: []const u8) bool {
+        if (!std.mem.startsWith(u8, arg, "--no-")) return false;
+        f.no.insert(std.meta.stringToEnum(Clear, arg["--no-".len..]) orelse return false);
+        return true;
     }
 
     pub fn any(f: Flags) bool {
@@ -111,8 +93,8 @@ pub const Flags = struct {
         parent: ?[]const u8 = null,
         blocked_by: []const []const u8 = &.{},
         unblock: []const []const u8 = &.{},
-        start: ?[]const u8 = null,
-        due: ?[]const u8 = null,
+        start: ?fields.Date = null,
+        due: ?fields.Date = null,
         estimate: ?u32 = null,
         workflow: ?[]const u8 = null,
     };
@@ -139,13 +121,14 @@ pub const Flags = struct {
             resolveRef(B, ctx, repo, b) orelse return null,
         ) catch return null;
         out.unblock = unblock.items;
-        for ([_]struct { []const u8, ?[]const u8, *?[]const u8 }{
+        for ([_]struct { []const u8, ?[]const u8, *?fields.Date }{
             .{ "--start", f.start, &out.start },
             .{ "--due", f.due, &out.due },
         }) |d| if (d[1]) |v| {
-            d[2].* = (ctx.date(v) catch return null) orelse {
+            d[2].* = ctx.date(v) orelse {
                 ctx.err.print(
-                    "error: {s} must be a date as YYYY-MM-DD, or like today, +3d, fri, eom, not '{s}'\n",
+                    "error: {s} must be a date as YYYY-MM-DD, or like today, +3d, fri, eom, not " ++
+                        "'{s}'\n",
                     .{ d[0], v },
                 ) catch {};
                 return null;
@@ -177,6 +160,10 @@ pub const MilestoneChoice = struct {
     text: ?[]const u8 = null,
     id: ?[]const u8 = null,
     mode: ?fields.MilestoneMode = null,
+
+    pub fn edit(c: MilestoneChoice) ?issuez.engine.MilestoneEdit {
+        return .fromParts(.{ .text = c.text, .id = c.id, .mode = c.mode });
+    }
 };
 
 /// `--milestone <name>` links a catalog milestone when exactly one open
@@ -198,7 +185,7 @@ pub fn resolveMilestone(
         ) catch {};
         return null;
     } else null;
-    const cat = issuez.Catalog(B).of(repo);
+    const cat = issuez.Catalog(B).fromRepo(repo);
     const chosen = cat.choose(ctx.arena, .{
         .name = if (f.no.contains(.milestone)) "" else text,
         .id = f.milestone_id,
@@ -233,7 +220,12 @@ pub fn resolveMilestone(
             .explicit_needs_id => w.writeAll(
                 "error: --milestone-mode explicit needs a milestone (--milestone-id)\n",
             ) catch {},
-            .no_such_milestone, .retired_name, .ambiguous_id => reportLookup(B, w, f.milestone_id.?, r),
+            .no_such_milestone, .retired_name, .ambiguous_id => reportLookup(
+                B,
+                w,
+                f.milestone_id.?,
+                r,
+            ),
             .not_open => |m| w.print("error: milestone '{s}' is {t}{s}\n", .{
                 m.name,
                 m.status,
@@ -244,7 +236,10 @@ pub fn resolveMilestone(
                 .{n},
             ) catch {},
             .ambiguous_name => |ms| {
-                w.print("error: several open milestones are named '{s}':\n", .{ms[0].name}) catch {};
+                w.print(
+                    "error: several open milestones are named '{s}':\n",
+                    .{ms[0].name},
+                ) catch {};
                 for (ms) |m| w.print("  {s} {s}\n", .{ uuid.shortId(m.id), m.name }) catch {};
                 w.writeAll("Name one with --milestone-id <id>.\n") catch {};
             },
@@ -260,7 +255,7 @@ pub fn findMilestone(
     cat: issuez.Catalog(B),
     key: []const u8,
 ) ?issuez.milestone.Milestone {
-    const found = cat.lookup(ctx.arena, key) catch |e| {
+    const found = cat.resolve(ctx.arena, key) catch |e| {
         common.reportRepoError(B, ctx, e);
         return null;
     };
@@ -311,7 +306,7 @@ pub fn workflowStates(
 
 /// For reads: a bad setting is a warning, and the default states stand in
 /// (`Catalog.project`), so listing never fails on it.
-fn warnBadWorkflowStates(
+pub fn warnBadWorkflowStates(
     comptime B: type,
     ctx: *context.Context(B),
     repo: issuez.engine.Repo(B),
@@ -326,13 +321,16 @@ fn readWorkflowStates(
     comptime prefix: []const u8,
     comptime suffix: []const u8,
 ) ?[]const []const u8 {
-    const settings = ctx.settings orelse issuez.settings.read(ctx.arena, repo.backend) catch {
-        ctx.err.writeAll(prefix ++ "could not read git config issue.workflowStates" ++ suffix) catch {};
+    const settings = ctx.settings orelse issuez.settings.read(B, ctx.arena, repo.backend) catch {
+        ctx.err.writeAll(
+            prefix ++ "could not read git config issue.workflowStates" ++ suffix,
+        ) catch {};
         return null;
     };
     if (settings.invalid_workflow_state) |s| {
         ctx.err.print(
-            prefix ++ "issue.workflowStates has '{s}'; " ++ issuez.settings.workflow_states_rule ++ suffix,
+            prefix ++ "issue.workflowStates has '{s}'; " ++
+                issuez.settings.workflow_states_rule ++ suffix,
             .{s},
         ) catch {};
         return null;
@@ -386,9 +384,9 @@ pub fn projectIssues(
     repo: issuez.engine.Repo(B),
     issues: []const issuez.engine.Issue,
 ) ?issuez.projection.Projection {
-    // The repo has the states (`Settings.apply`).
+    // The repo has the states (`Repo.settings`).
     warnBadWorkflowStates(B, ctx, repo);
-    const cat = issuez.Catalog(B).of(repo);
+    const cat = issuez.Catalog(B).fromRepo(repo);
     return cat.project(ctx.arena, issues, .{}) catch |e| {
         common.reportRepoError(B, ctx, e);
         return null;
@@ -396,6 +394,6 @@ pub fn projectIssues(
 }
 
 pub fn describeProblem(arena: Allocator, p: issuez.projection.Problem) []const u8 {
-    return p.describe(arena) catch
+    return std.fmt.allocPrint(arena, "{f}", .{p}) catch
         if (p.kind == .invalid_value) "invalid value" else p.kind.describe();
 }

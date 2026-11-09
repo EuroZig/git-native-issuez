@@ -11,6 +11,7 @@
 //! then remote.
 
 const std = @import("std");
+const stableSort = @import("issuez").sort.stable;
 const Allocator = std.mem.Allocator;
 const issuez = @import("issuez");
 const object = issuez.backend.object;
@@ -98,7 +99,7 @@ fn mergeLabels(
     try all.appendSlice(arena, base);
     try all.appendSlice(arena, local);
     try all.appendSlice(arena, remote);
-    std.mem.sort([]const u8, all.items, {}, lessThan);
+    stableSort([]const u8, all.items, {}, lessThan);
     var prev: ?[]const u8 = null;
     for (all.items) |l| {
         if (prev != null and std.mem.eql(u8, prev.?, l)) continue;

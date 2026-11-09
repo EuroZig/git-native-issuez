@@ -82,16 +82,24 @@ fn loadFile(io: std.Io, gpa: Allocator, path: []const u8) ?Zone {
     // A FIFO or a terminal would block the read.
     const st = std.Io.Dir.cwd().statFile(io, path, .{}) catch return null;
     if (st.kind != .file) return null;
-    const bytes = std.Io.Dir.cwd().readFileAlloc(io, path, gpa, .limited(1 << 20)) catch return null;
+    const bytes = std.Io.Dir.cwd().readFileAlloc(
+        io,
+        path,
+        gpa,
+        .limited(1 << 20),
+    ) catch return null;
     defer gpa.free(bytes);
     return parseTzif(gpa, bytes) catch null;
 }
 
 /// A TZif file's transitions and its rule.
-pub fn parseTzif(gpa: Allocator, bytes: []const u8) !Zone {
+pub fn parseTzif(gpa: Allocator, bytes: []const u8) (Allocator.Error || error{Malformed})!Zone {
     try checkTzif(bytes);
     var reader: std.Io.Reader = .fixed(bytes);
-    var tz = try std.Tz.parse(gpa, &reader);
+    var tz = std.Tz.parse(gpa, &reader) catch |e| switch (e) {
+        error.OutOfMemory => return error.OutOfMemory,
+        else => return error.Malformed,
+    };
     defer tz.deinit();
     const out = try gpa.alloc(Zone.Transition, tz.transitions.len);
     for (tz.transitions, out) |t, *o| o.* = .{ .at = t.ts, .offset = t.timetype.offset };
@@ -116,7 +124,14 @@ fn checkTzif(bytes: []const u8) error{Malformed}!void {
             if (b.len < h + header_len) return null;
             var c: [6]u64 = undefined;
             for (&c, 0..) |*n, k| n.* = std.mem.readInt(u32, b[h + 20 + 4 * k ..][0..4], .big);
-            return .{ .isut = c[0], .isstd = c[1], .leap = c[2], .time = c[3], .type = c[4], .char = c[5] };
+            return .{
+                .isut = c[0],
+                .isstd = c[1],
+                .leap = c[2],
+                .time = c[3],
+                .type = c[4],
+                .char = c[5],
+            };
         }
     };
     // Each block: its header, then times of 4 bytes (version 1) or 8.
@@ -129,7 +144,11 @@ fn checkTzif(bytes: []const u8) error{Malformed}!void {
         if (end > bytes.len) return error.Malformed;
         for (0..@intCast(c.leap)) |k| {
             const r = bytes[@intCast(leaps_at + k * (time_len + 4))..];
-            const occur: i64 = if (time_len == 4) std.mem.readInt(i32, r[0..4], .big) else std.mem.readInt(i64, r[0..8], .big);
+            const occur: i64 = if (time_len == 4) std.mem.readInt(
+                i32,
+                r[0..4],
+                .big,
+            ) else std.mem.readInt(i64, r[0..8], .big);
             const corr = std.mem.readInt(i32, r[@intCast(time_len)..][0..4], .big);
             if (occur > std.math.maxInt(i48) - 2419199) return error.Malformed;
             if (corr > std.math.maxInt(i16) or corr < std.math.minInt(i16)) return error.Malformed;
@@ -181,8 +200,14 @@ pub const Rule = struct {
                     const first: Date = .{ .year = year, .month = x.month, .day = 1 };
                     // Weekday 0 is Monday for `Date`, Sunday here.
                     const first_wd: i32 = @mod(@as(i32, @intFromEnum(first.weekday())) + 1, 7);
-                    var day: i32 = 1 + @mod(@as(i32, x.weekday) - first_wd, 7) + (@as(i32, x.week) - 1) * 7;
-                    const in_month: i32 = std.time.epoch.getDaysInMonth(year, @enumFromInt(x.month));
+                    var day: i32 = 1 + @mod(
+                        @as(i32, x.weekday) - first_wd,
+                        7,
+                    ) + (@as(i32, x.week) - 1) * 7;
+                    const in_month: i32 = std.time.epoch.getDaysInMonth(
+                        year,
+                        @enumFromInt(x.month),
+                    );
                     while (day > in_month) day -= 7;
                     break :blk first.toDays() + day - 1;
                 },
@@ -214,10 +239,15 @@ pub const Rule = struct {
         if (p.done()) return .{ .std_offset = std_offset };
         if (!p.name()) return null;
         // Summer time an hour ahead unless said otherwise.
-        const dst_offset = if (p.peek() == ',' or p.done()) std_offset + 3600 else -(p.time() orelse return null);
+        const dst_offset =
+            if (p.peek() == ',' or p.done()) std_offset + 3600 else -(p.time() orelse return null);
         // No rule: the US one, as most systems do.
-        var start: When = .{ .day = .{ .month_week_day = .{ .month = 3, .week = 2, .weekday = 0 } } };
-        var end: When = .{ .day = .{ .month_week_day = .{ .month = 11, .week = 1, .weekday = 0 } } };
+        var start: When = .{
+            .day = .{ .month_week_day = .{ .month = 3, .week = 2, .weekday = 0 } },
+        };
+        var end: When = .{
+            .day = .{ .month_week_day = .{ .month = 11, .week = 1, .weekday = 0 } },
+        };
         if (!p.done()) {
             if (!p.eat(',')) return null;
             start = p.when() orelse return null;
@@ -225,7 +255,10 @@ pub const Rule = struct {
             end = p.when() orelse return null;
             if (!p.done()) return null;
         }
-        return .{ .std_offset = std_offset, .dst = .{ .offset = dst_offset, .start = start, .end = end } };
+        return .{
+            .std_offset = std_offset,
+            .dst = .{ .offset = dst_offset, .start = start, .end = end },
+        };
     }
 
     const Parser = struct {
@@ -260,7 +293,9 @@ pub const Rule = struct {
         fn number(p: *Parser, max: u32) ?u32 {
             const from = p.i;
             var n: u32 = 0;
-            while (std.ascii.isDigit(p.peek()) and p.i - from < 3) : (p.i += 1) n = n * 10 + (p.peek() - '0');
+            while (std.ascii.isDigit(
+                p.peek(),
+            ) and p.i - from < 3) : (p.i += 1) n = n * 10 + (p.peek() - '0');
             if (p.i == from or n > max) return null;
             return n;
         }
@@ -285,7 +320,13 @@ pub const Rule = struct {
                 const week = p.number(5) orelse return null;
                 if (week == 0 or !p.eat('.')) return null;
                 const weekday = p.number(6) orelse return null;
-                w.day = .{ .month_week_day = .{ .month = @intCast(month), .week = @intCast(week), .weekday = @intCast(weekday) } };
+                w.day = .{
+                    .month_week_day = .{
+                        .month = @intCast(month),
+                        .week = @intCast(week),
+                        .weekday = @intCast(weekday),
+                    },
+                };
             } else if (p.eat('J')) {
                 const n = p.number(365) orelse return null;
                 if (n == 0) return null;
@@ -322,11 +363,24 @@ test "Rule: Berlin, Sydney, fixed and invalid" {
 
     const kolkata = Rule.parse("<+0530>-5:30").?;
     try t.expectEqual(@as(i32, 5 * 3600 + 1800), kolkata.offsetAt(0));
-    try t.expectEqual(@as(i32, -5 * 3600), Rule.parse("EST5EDT").?.offsetAt(utcAt("2026-01-15", 12, 0)));
-    try t.expectEqual(@as(i32, -4 * 3600), Rule.parse("EST5EDT").?.offsetAt(utcAt("2026-07-15", 12, 0)));
+    try t.expectEqual(
+        @as(i32, -5 * 3600),
+        Rule.parse("EST5EDT").?.offsetAt(utcAt("2026-01-15", 12, 0)),
+    );
+    try t.expectEqual(
+        @as(i32, -4 * 3600),
+        Rule.parse("EST5EDT").?.offsetAt(utcAt("2026-07-15", 12, 0)),
+    );
     try t.expectEqual(@as(i32, 0), Rule.parse("UTC0").?.offsetAt(0));
 
-    for ([_][]const u8{ "", "Europe/Berlin", "CET", "CET-1CEST,M3.5.0", "CET-1CEST,M13.5.0,M10.5.0", "X-1" }) |bad| {
+    for ([_][]const u8{
+        "",
+        "Europe/Berlin",
+        "CET",
+        "CET-1CEST,M3.5.0",
+        "CET-1CEST,M13.5.0,M10.5.0",
+        "X-1",
+    }) |bad| {
         try t.expect(Rule.parse(bad) == null);
     }
 }
@@ -358,7 +412,13 @@ test "parseTzif: a version 2 file" {
     var buf: std.ArrayList(u8) = .empty;
     defer buf.deinit(t.allocator);
     const header = struct {
-        fn f(b: *std.ArrayList(u8), gpa: Allocator, timecnt: u32, typecnt: u32, charcnt: u32) !void {
+        fn f(
+            b: *std.ArrayList(u8),
+            gpa: Allocator,
+            timecnt: u32,
+            typecnt: u32,
+            charcnt: u32,
+        ) !void {
             try b.appendSlice(gpa, "TZif2");
             try b.appendNTimes(gpa, 0, 15);
             for ([_]u32{ 0, 0, 0, timecnt, typecnt, charcnt }) |n| {
@@ -436,7 +496,10 @@ test "parseTzif: malformed counts and leap seconds are refused, not overflowed" 
         try header(&buf, '2', .{ 0, 0, 2, 0, 1, 4 });
         try buf.appendSlice(gpa, &.{ 0, 0, 0, 0, 0, 0 });
         try buf.appendSlice(gpa, "UTC\x00");
-        for ([_]struct { i64, i32 }{ .{ std.math.maxInt(i48), 1 }, .{ std.math.maxInt(i48), 2 } }) |r| {
+        for ([_]struct {
+            i64,
+            i32,
+        }{ .{ std.math.maxInt(i48), 1 }, .{ std.math.maxInt(i48), 2 } }) |r| {
             var be8: [8]u8 = undefined;
             std.mem.writeInt(i64, &be8, r[0], .big);
             try buf.appendSlice(gpa, &be8);

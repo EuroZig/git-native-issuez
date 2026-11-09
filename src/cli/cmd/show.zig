@@ -22,6 +22,8 @@ pub const help =
     \\
     \\   <issue-id>    Full UUID or a unique prefix
     \\   --ids         Show each update's comment ID (for comment --edit, ...)
+    \\   --history     Also every earlier version of the description and of
+    \\                 edited, deleted or restored comments
     \\   --json        The issue as JSON, comments included (docs/json.md)
     \\   -h, --help    Show this help
     \\
@@ -36,37 +38,23 @@ pub fn main(comptime B: type, ctx: *context.Context(B), argv: []const []const u8
     const arena = ctx.arena;
     var issue_prefix: ?[]const u8 = null;
     var ids = false;
+    var with_history = false;
     var as_json = false;
-    var args: common.Args = .{ .list = argv };
-    while (args.next()) |arg| {
-        if (!args.isOption(arg)) {
-            if (args.was_separator) continue;
-            if (issue_prefix == null) issue_prefix = arg;
-        } else if (common.isHelp(arg)) {
-            ctx.out.writeAll(help) catch {};
-            return common.exit_ok;
-        } else if (std.mem.eql(u8, arg, "--ids")) {
-            ids = true;
-        } else if (std.mem.eql(u8, arg, "--json")) {
-            as_json = true;
-        } else {
-            return common.unknownOption(ctx.err, "show", arg);
-        }
-    }
-    const prefix = issue_prefix orelse return common.missing(
-        ctx.err,
-        "show",
-        "issue ID is required",
-    );
+    if (common.parseArgs(ctx, argv, .{
+        .command = "show",
+        .help = help,
+        .positionals = .{ .first = &issue_prefix },
+        .flags = &.{
+            .{ "--ids", .{ .on = &ids } },
+            .{ "--history", .{ .on = &with_history } },
+            .{ "--json", .{ .on = &as_json } },
+        },
+    })) |exit| return exit;
+    const prefix = issue_prefix orelse
+        return common.missing(ctx.err, "show", "issue ID is required");
 
     const repo = common.openRepo(B, ctx) orelse return common.exit_fatal;
-    const ref = common.resolveOne(
-        B,
-        repo,
-        arena,
-        ctx.err,
-        prefix,
-    ) orelse return common.exit_error;
+    const ref = common.resolveOne(B, repo, arena, ctx.err, prefix) orelse return common.exit_error;
     const issue = repo.load(arena, ref) catch |e| return common.repoFailed(B, ctx, e);
 
     if (as_json) {
@@ -74,7 +62,7 @@ pub fn main(comptime B: type, ctx: *context.Context(B), argv: []const []const u8
         var s = json.begin(ctx.out);
         json.issue(&s, arena, issue, .{ .full = true, .projection = proj }) catch |e|
             return json.failed(ctx.err, e);
-        json.end(&s);
+        json.end(&s) catch |e| return json.failed(ctx.err, e);
         return common.exit_ok;
     }
     const w = ctx.out;
@@ -88,6 +76,12 @@ pub fn main(comptime B: type, ctx: *context.Context(B), argv: []const []const u8
         },
     ) catch {};
     w.print("Title:   {s}\n", .{issue.title}) catch {};
+    if (issue.number) |n| w.print("Number:  #{d}\n", .{n}) catch {};
+    if (issue.locked) w.print("Locked{s}{s}\n", .{
+        if (issue.lock_reason != null) ": " else "",
+        issue.lock_reason orelse "",
+    }) catch {};
+    if (issue.ref) |r| w.print("Ref:     {s}\n", .{r}) catch {};
     w.print("Author:  {s} <{s}>\n", .{ issue.author.name, issue.author.email }) catch {};
     w.print(
         "Created: {f}\n",
@@ -99,6 +93,14 @@ pub fn main(comptime B: type, ctx: *context.Context(B), argv: []const []const u8
     ) catch {};
     for (header_fields) |key| {
         if (issue.field(key)) |v| w.print("{s}: {s}\n", .{ key, v }) catch {};
+    }
+    if (issue.assignees.len > 1) {
+        w.writeAll("Assignees:") catch {};
+        for (
+            issue.assignees,
+            0..,
+        ) |a, k| w.print("{s} {s}", .{ if (k == 0) "" else ",", a.email }) catch {};
+        w.writeAll("\n") catch {};
     }
     for (issue.fields) |f| {
         if (isHeaderField(f.key) or isExtensionField(f.key)) continue;
@@ -121,7 +123,14 @@ pub fn main(comptime B: type, ctx: *context.Context(B), argv: []const []const u8
             a.name,
         }) catch {};
     }
+    for (issue.reactions) |r| if (r.target == null) {
+        w.print("Reaction {s}: {d}\n", .{ r.emoji, r.users.len }) catch {};
+    };
     if (issue.description.len > 0) w.print("\n{s}\n", .{issue.description}) catch {};
+    if (with_history and issue.description_history.len > 1) {
+        w.writeAll("\nDescription history:\n") catch {};
+        printHistory(w, issue.description_history);
+    }
 
     var shown: usize = 0;
     for (issue.comments) |c| {
@@ -136,11 +145,12 @@ pub fn main(comptime B: type, ctx: *context.Context(B), argv: []const []const u8
             if (c.deleted) continue;
             const hex = c.oid.hex();
             w.print(
-                "\n  {s} ({f}){s}{s}{s}:\n",
+                "\n  {s} ({f}){s}{s}{s}{s}:\n",
                 .{
                     c.author.name,
                     common.IsoDate{ .time = c.author.time, .tz = c.author.tz_offset_minutes },
                     if (c.edited) " (edited)" else "",
+                    if (c.purged) " (purged)" else "",
                     if (ids) " " else "",
                     if (ids) hex.short() else "",
                 },
@@ -149,6 +159,7 @@ pub fn main(comptime B: type, ctx: *context.Context(B), argv: []const []const u8
             w.print("  {s}\n", .{c.subject}) catch {};
             for (c.text) |line| {
                 if (std.mem.trim(u8, line, " \t\r").len == 0) continue;
+                if (isPurgeLine(line)) continue;
                 w.print("  {s}\n", .{line}) catch {};
             }
             for (c.attachments) |id| {
@@ -157,15 +168,38 @@ pub fn main(comptime B: type, ctx: *context.Context(B), argv: []const []const u8
                 } else continue;
                 w.print("  [attached {s} {s}]\n", .{ uuid.shortId(a.id), a.name }) catch {};
             }
+            if (with_history and c.history.len > 1) printHistory(w, c.history);
         }
     }
+    if (with_history) for (issue.comments) |c| {
+        if (!c.deleted or c.history.len < 2) continue;
+        const hex = c.oid.hex();
+        w.print("\n  Deleted comment {s}:\n", .{hex.short()}) catch {};
+        printHistory(w, c.history);
+    };
     return common.exit_ok;
+}
+
+/// Each version with its author and date, the text indented.
+fn printHistory(w: *std.Io.Writer, list: []const issuez.model.issue.Revision) void {
+    for (list) |r| {
+        const hex = r.oid.hex();
+        w.print("    {s} {s} by {s} ({f}):\n", .{
+            @tagName(r.kind),
+            hex.short(),
+            r.author.name,
+            common.IsoDate{ .time = r.author.time, .tz = r.author.tz_offset_minutes },
+        }) catch {};
+        var lines = std.mem.splitScalar(u8, r.text, '\n');
+        while (lines.next()) |line| w.print("      {s}\n", .{line}) catch {};
+    }
 }
 
 /// Shown by `printExtensions` instead of verbatim.
 const extension_fields = [_][]const u8{
-    "X-Parent",           "X-Start-Date",     "X-Due-Date",
-    "X-Estimate-Minutes", "X-Workflow-State",
+    "X-Parent", "X-Start-Date",       "X-Due-Date",
+    "X-Number", "X-Locked",           "X-Lock-Reason",
+    "X-Ref",    "X-Estimate-Minutes", "X-Workflow-State",
 };
 
 fn isExtensionField(key: []const u8) bool {
@@ -180,7 +214,7 @@ fn printExtensions(
     w: *std.Io.Writer,
     issue: issuez.engine.Issue,
 ) void {
-    const x = issue.ext;
+    const x = issue.extensions();
     if (x.parent) |p| w.print("Parent:  {s}\n", .{reference(B, repo, arena, p)}) catch {};
     for (x.blocked_by, 0..) |b, i| w.print("{s}{s}\n", .{
         if (i == 0) "Blocked by: " else "            ",
@@ -235,4 +269,12 @@ fn printProblems(
 fn isHeaderField(key: []const u8) bool {
     for (header_fields) |h| if (std.mem.eql(u8, h, key)) return true;
     return false;
+}
+
+/// What a purge wrote about the commit (format.md §10), not its text.
+fn isPurgeLine(line: []const u8) bool {
+    const sep = issuez.format.trailers.separatorPos(line) orelse return false;
+    const key = std.mem.trimEnd(u8, line[0..sep], " \t");
+    return std.ascii.eqlIgnoreCase(key, "X-Purged") or
+        std.ascii.eqlIgnoreCase(key, "X-Rewritten-From");
 }

@@ -12,6 +12,7 @@
 //! `unassigned`, `conflict`, `problem`, `unpushed`, `quarantined`.
 
 const std = @import("std");
+const stableSort = @import("issuez").sort.stable;
 const assert = std.debug.assert;
 const Allocator = std.mem.Allocator;
 const issuez = @import("issuez");
@@ -107,8 +108,11 @@ pub const MilestoneScope = union(enum) {
 
 /// No milestone link of its own: it has its parent's, if any.
 pub fn followsParent(snap: *const Snapshot, i: u32) bool {
-    const ext = snap.issues[i].ext;
-    return fields_fmt.MilestoneMode.of(ext.milestone_mode, ext.milestone_id != null, snap.proj.parent[i] != none) == .inherit;
+    const ext = &snap.issues[i];
+    return fields_fmt.MilestoneMode.of(
+        ext.milestone_mode,
+        .{ .has_id = ext.milestone_id != null, .has_parent = snap.proj.parent[i] != none },
+    ) == .inherit;
 }
 
 /// Its milestone is its parent's: no link of its own.
@@ -217,7 +221,10 @@ fn isMatches(snap: *const Snapshot, i: u32, v: []const u8) bool {
     if (eq(v, "child")) return snap.proj.parent[i] != none;
     if (eq(v, "root")) return snap.proj.parent[i] == none;
     if (eq(v, "parent")) return snap.proj.children[i].len > 0;
-    if (eq(v, "unassigned")) return snap.issues[i].field("Assignee") == null or snap.issues[i].field("Assignee").?.len == 0;
+    if (eq(v, "unassigned")) {
+        const assignee = snap.issues[i].field("Assignee");
+        return assignee == null or assignee.?.len == 0;
+    }
     if (eq(v, "conflict")) return snap.issues[i].conflicts.len > 0;
     if (eq(v, "problem")) return snap.proj.problemsOf(i).len > 0;
     if (eq(v, "unpushed")) return snap.remote.isUnpushed(snap.issues[i].id);
@@ -259,8 +266,8 @@ const Order = struct {
             .state => std.math.order(@intFromBool(o.snap.isDone(a)), @intFromBool(o.snap.isDone(b)))
                 .differ() orelse o.workflowOrder(a, b).differ() orelse
                 std.mem.order(u8, x.state.text(), y.state.text()),
-            .due => dateOrder(x.ext.due_date, y.ext.due_date),
-            .start => dateOrder(x.ext.start_date orelse x.ext.due_date, y.ext.start_date orelse y.ext.due_date),
+            .due => dateOrder(x.due_date, y.due_date),
+            .start => dateOrder(x.start_date orelse x.due_date, y.start_date orelse y.due_date),
             .id => std.mem.order(u8, x.id, y.id),
         };
         // Ties: the most recently touched first.
@@ -278,7 +285,10 @@ const Order = struct {
     fn workflowOrder(o: Order, a: u32, b: u32) std.math.Order {
         const wa = o.snap.proj.workflow(a);
         const wb = o.snap.proj.workflow(b);
-        if (wa == null or wb == null) return std.math.order(@intFromBool(wa == null), @intFromBool(wb == null));
+        if (wa == null or wb == null) return std.math.order(
+            @intFromBool(wa == null),
+            @intFromBool(wb == null),
+        );
         const states = o.snap.settings.workflow_states;
         const pa = position(states, wa.?);
         const pb = position(states, wb.?);
@@ -291,7 +301,7 @@ const Order = struct {
     }
 
     fn rank(i: Issue) u8 {
-        return if (i.priority()) |p| p.rank() else 0;
+        return if (i.priority) |p| p.rank() else 0;
     }
 
     fn titleOrder(a: []const u8, b: []const u8) std.math.Order {
@@ -312,7 +322,12 @@ const Order = struct {
 };
 
 fn sort(snap: *const Snapshot, items: []u32, q: Query) void {
-    std.mem.sort(u32, items, Order{ .snap = snap, .key = q.key, .reverse = q.reverse }, Order.lessThan);
+    stableSort(
+        u32,
+        items,
+        Order{ .snap = snap, .key = q.key, .reverse = q.reverse },
+        Order.lessThan,
+    );
 }
 
 /// The list's rows.
@@ -326,7 +341,9 @@ pub fn rows(arena: Allocator, snap: *const Snapshot, q: Query) Allocator.Error![
         for (0..n) |i| if (shown(snap, @intCast(i), q, terms)) try hits.append(arena, @intCast(i));
         sort(snap, hits.items, q);
         try out.ensureTotalCapacity(arena, hits.items.len);
-        for (hits.items) |i| out.appendAssumeCapacity(.{ .issue = i, .inherited = q.milestone != null and inherits(snap, i) });
+        for (hits.items) |i| out.appendAssumeCapacity(
+            .{ .issue = i, .inherited = q.milestone != null and inherits(snap, i) },
+        );
         return out.items;
     }
 
@@ -371,7 +388,10 @@ pub fn rows(arena: Allocator, snap: *const Snapshot, q: Query) Allocator.Error![
         k = level.items.len;
         while (k > 0) {
             k -= 1;
-            try stack.append(arena, .{ .issue = level.items[k], .depth = @min(f.depth + 1, max_depth) });
+            try stack.append(
+                arena,
+                .{ .issue = level.items[k], .depth = @min(f.depth + 1, max_depth) },
+            );
         }
     }
     assert(out.items.len <= n);

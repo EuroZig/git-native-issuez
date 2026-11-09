@@ -22,26 +22,14 @@ const uuid_fmt = @import("../format/uuid.zig");
 const issue_model = @import("../model/issue.zig");
 const repo_mod = @import("repo.zig");
 const attachments_mod = @import("attachments.zig");
+const purge_mod = @import("purge.zig");
 
 const Oid = object.Oid;
 
 pub const merge_identity_name = "git-issue";
 pub const merge_identity_email = "git-issue@invalid";
 pub const merge_subject = "Merge issue";
-
-/// Restated by merge commits after the core fields, as written (invalid
-/// values too), so upstream, which reads the newest trailer, shows the
-/// merged value. `X-Blocked-By` follows them.
-pub const restated_extensions = [_][]const u8{
-    "X-Parent",
-    "X-Start-Date",
-    "X-Due-Date",
-    "X-Estimate-Minutes",
-    "X-Workflow-State",
-    "X-Milestone-Id",
-    "X-Milestone-Mode",
-    "X-Deleted",
-};
+pub const purge_merge_subject = purge_mod.merge_subject;
 
 /// Refs per atomic push.
 pub const push_chunk = 128;
@@ -72,20 +60,26 @@ pub const Outcome = union(enum) {
     up_to_date,
     local_ahead,
     quarantined: Reason,
+    /// A tombstone purged the whole issue (format.md §10): the remote's
+    /// copy is ignored, and the next push deletes it.
+    purged,
 };
 
 /// `attachments` is fetched and pushed but never merged: the derived refs
-/// are rebuilt from the merged issues.
+/// are rebuilt from the merged issues. `purged` holds the tombstones,
+/// merged before the issues and applied to them.
 pub const Namespace = enum {
     issues,
     milestones,
     attachments,
+    purged,
 
     pub fn refPrefix(ns: Namespace) []const u8 {
         return switch (ns) {
             .issues => "refs/issues/",
             .milestones => "refs/milestones/",
             .attachments => "refs/attachments/",
+            .purged => purge_mod.ref_prefix,
         };
     }
 };
@@ -108,7 +102,7 @@ pub const Record = enum {
 };
 
 pub const namespaces = [_]Namespace{ .issues, .milestones };
-pub const fetched_namespaces = [_]Namespace{ .issues, .milestones, .attachments };
+pub const fetched_namespaces = [_]Namespace{ .issues, .milestones, .attachments, .purged };
 
 /// `before_push` gets the LFS objects that the pushed attachment refs
 /// point at and the remote doesn't have yet, before any ref is pushed, so
@@ -118,6 +112,9 @@ pub const fetched_namespaces = [_]Namespace{ .issues, .milestones, .attachments 
 /// to upload and no git-lfs.
 pub const PushOptions = struct {
     before_push: ?BeforePush = null,
+    /// false right after a `merge` that fetched (and checked the remote):
+    /// `seen/` is current, so the push doesn't fetch again.
+    fetch: bool = true,
     progress: ?Progress = null,
 };
 
@@ -177,7 +174,8 @@ pub const Status = struct {
 pub const Unpushed = struct {
     namespace: Namespace,
     id: []const u8,
-    tip: Oid,
+    /// Null for a purged issue whose remote ref the push deletes.
+    tip: ?Oid,
     /// Never pushed to this remote.
     new: bool,
 };
@@ -227,6 +225,10 @@ pub const PushReport = struct {
     lfs_uploaded: usize = 0,
     /// Not counted in `pushed`.
     attachment_refs: usize = 0,
+    /// Tombstones sent, not counted in `pushed`.
+    tombstones: usize = 0,
+    /// Remote copies of purged issues deleted, counted in `pushed`.
+    deleted: usize = 0,
     pushed: usize,
     up_to_date: usize,
     skipped_quarantined: usize,
@@ -234,6 +236,11 @@ pub const PushReport = struct {
     skipped: []const []const u8 = &.{},
     /// Merges done because the remote moved.
     merges: []const MergeReport,
+    /// The issues and milestones it sent, in order; `tip` null for a
+    /// purged issue's delete.
+    refs: []const Pushed = &.{},
+
+    pub const Pushed = struct { namespace: Namespace, id: []const u8, tip: ?Oid };
 };
 
 pub const SyncReport = struct {
@@ -259,6 +266,9 @@ pub fn Sync(comptime B: type) type {
         repo: R,
         /// Histories a merge read, by tip, so each is read once per merge.
         histories: ?*Histories = null,
+        /// A URL or path synced with instead of a named remote: fetch and
+        /// push go there, the refs under `remoteKey`'s name.
+        target: ?[]const u8 = null,
 
         /// Objects are immutable, so an entry never goes stale.
         const Histories = std.AutoHashMapUnmanaged([Oid.max_byte_len]u8, History);
@@ -283,10 +293,18 @@ pub fn Sync(comptime B: type) type {
             /// git-lfs is there but the upload failed, so nothing was
             /// pushed. The backend's last error output says why.
             LfsUploadFailed,
+            /// A purge has to replace the remote's history and the backend
+            /// can't push with a lease.
+            LeasedPushUnsupported,
         };
 
         pub fn init(backend: *B) Self {
             return .{ .repo = R.init(backend) };
+        }
+
+        /// With the repo's limits and settings.
+        pub fn fromRepo(repo: R) Self {
+            return .{ .repo = repo };
         }
 
         fn b(self: Self) *B {
@@ -307,18 +325,26 @@ pub fn Sync(comptime B: type) type {
         }
 
         fn mergeIn(
-            self: Self,
+            self_in: Self,
             arena: Allocator,
-            remote: []const u8,
-            options: MergeOptions,
+            remote_in: []const u8,
+            options_in: MergeOptions,
         ) Error!MergeReport {
-            if (!contract.isValidRemoteName(remote)) return error.InvalidRemoteName;
+            const self, const remote = try self_in.at(arena, remote_in);
+            var options = options_in;
+            // A URL has no staging refs of the user's own fetch to read.
+            if (self.target != null) options.fetch = true;
             if (options.fetch) {
                 try self.ensureRemote(arena, remote);
                 Progress.report(options.progress, .fetching);
                 try self.fetchSeen(arena, remote);
             }
             Progress.report(options.progress, .merging);
+            // Before the records are read: applying a tombstone drops
+            // those of the issues it rewrote.
+            const tombs = try arena.create(Tombs);
+            var purged_here: std.ArrayList([]const u8) = .empty;
+            tombs.* = try self.mergeTombstones(arena, remote, options, &purged_here);
             // Nothing below writes a record before the last namespace is
             // read, so one read serves all of them.
             const records = try self.readRecords(arena, remote);
@@ -333,6 +359,7 @@ pub fn Sync(comptime B: type) type {
                     try self.b().listRefs(arena, staging_prefix);
                 const k = try arena.create(Known);
                 k.* = try self.readKnown(arena, remote, ns, records);
+                k.tombs = tombs;
                 for (staged) |s| {
                     const id = s.name[staging_prefix.len..];
                     // Remote-tracking branches named `issues/...` land here
@@ -344,6 +371,18 @@ pub fn Sync(comptime B: type) type {
                     if (local.items.len > pending) local.items[pending].entry = entries.items.len;
                     try entries.append(arena, e);
                 }
+            }
+            // Purged here though the remote had no copy left to compare.
+            for (purged_here.items) |id| {
+                const listed = for (entries.items) |e| {
+                    if (e.namespace == .issues and std.mem.eql(u8, e.id, id)) break true;
+                } else false;
+                if (!listed) try entries.append(arena, .{
+                    .namespace = .issues,
+                    .id = id,
+                    .title = "(purged)",
+                    .outcome = .purged,
+                });
             }
             if (options.check) return .{ .entries = entries.items };
             try self.applyLocal(arena, remote, options, local.items, entries.items, &batch);
@@ -371,6 +410,7 @@ pub fn Sync(comptime B: type) type {
             else
                 try self.refsUnder(arena, staging_prefix);
             const local_tips = try self.refsUnder(arena, attachments_mod.ref_prefix);
+            const tombs = try self.refsUnder(arena, purge_mod.ref_prefix);
             const pushed = try mapUnder(
                 arena,
                 records,
@@ -385,11 +425,25 @@ pub fn Sync(comptime B: type) type {
                 // Issues that never had attachments cost no git process.
                 if (remote_tip == null and !local_tips.contains(id) and
                     issue.attachments.len == 0 and issue.removed_attachments.len == 0) continue;
-                const moved_now = try att.reconcile(arena, issue, remote_tip);
+                // Never on top of purged history: the push replaces it.
+                const tomb = tombs.contains(id);
+                const old_remote = tomb and remote_tip != null and
+                    try att.hasOldTips(arena, remote_tip.?, issue.tip);
+                const old_local = tomb and local_tips.contains(id) and
+                    try att.hasOldTips(arena, local_tips.get(id).?, issue.tip);
+                const moved_now = if (old_remote or old_local)
+                    try att.replacePurged(
+                        arena,
+                        issue,
+                        if (old_remote) null else remote_tip,
+                        old_local,
+                    )
+                else
+                    try att.reconcile(arena, issue, remote_tip);
                 if (moved_now) moved += 1;
                 const remote_derived = remote_tip orelse continue;
                 const local = if (moved_now)
-                    try self.b().resolveRef(try A.derivedRefName(arena, id))
+                    try self.b().resolveRef(try attachments_mod.refName(arena, id))
                 else
                     local_tips.get(id);
                 if (local != null and local.?.eql(remote_derived)) try batch.set(
@@ -417,7 +471,7 @@ pub fn Sync(comptime B: type) type {
             /// transaction with the others; null writes it here.
             local: ?*std.ArrayList(LocalWrite),
         ) Error!Entry {
-            const remote_tip = staged.oid;
+            var remote_tip = staged.oid;
             const local_name = try localRef(arena, ns, id);
             const q = Q{ .sync = self, .arena = arena, .remote = remote, .ns = ns, .id = id };
             assert(uuid_fmt.isCanonical(id));
@@ -425,7 +479,17 @@ pub fn Sync(comptime B: type) type {
             // Read before the fetch's results are used: if a local writer
             // moves the ref after this, the update below conflicts.
             const local_before = k.local.get(id);
-            const merged_before = k.merged.get(id);
+            var merged_before = k.merged.get(id);
+            // Purged here: the remote's copy is purged the same way before
+            // it is compared, so the purged text never comes back. The
+            // records keep the remote's own tips.
+            if (ns == .issues) if (k.tombs.get(id)) |t| {
+                if (t.issue) return .{ .id = id, .title = "(purged)", .outcome = .purged };
+                if (t.comments.len > 0) {
+                    remote_tip = try self.purgedTip(arena, remote_tip, t.comments);
+                    if (merged_before) |m| merged_before = try self.purgedTip(arena, m, t.comments);
+                }
+            };
             const records: RecordWrites = .{
                 .sync = self,
                 .arena = arena,
@@ -501,11 +565,10 @@ pub fn Sync(comptime B: type) type {
 
                 const deferred = attempt == 0 and local != null and new_tip != null;
                 if (new_tip) |t| {
-                    const op: contract.RefUpdate.Op = if (local_tip) |old|
-                        .{ .update = .{ .new = t, .old = old } }
-                    else
-                        .{ .create = t };
-                    const update: contract.RefUpdate = .{ .name = local_name, .op = op };
+                    const update: contract.RefUpdate = .{
+                        .name = local_name,
+                        .op = repo_mod.moveOp(local_tip, t),
+                    };
                     if (deferred) try local.?.append(arena, .{
                         .update = update,
                         .records = records,
@@ -540,7 +603,158 @@ pub fn Sync(comptime B: type) type {
             merged: std.StringHashMapUnmanaged(Oid),
             pushed: std.StringHashMapUnmanaged(Oid),
             quarantined: std.StringHashMapUnmanaged(Oid),
+            tombs: *const Tombs = &empty_tombs,
         };
+
+        /// Tombstones by issue ID.
+        const Tombs = std.StringHashMapUnmanaged(purge_mod.Tombstone);
+        const empty_tombs: Tombs = .empty;
+
+        /// Merges the remote's tombstones into the local ones, like issues
+        /// but without checks: a fast-forward or a "Merge purges" commit.
+        /// Then applies every tombstone, so purged text that came back
+        /// another way (upstream's merge, a plain fetch) goes again.
+        /// Returns every tombstone, merged; with `check`, the union, and
+        /// nothing is written.
+        fn mergeTombstones(
+            self: Self,
+            arena: Allocator,
+            remote: []const u8,
+            options: MergeOptions,
+            /// Issues a tombstone took out of this clone just now.
+            purged_here: *std.ArrayList([]const u8),
+        ) Error!Tombs {
+            const purger = purge_mod.Purge(B).fromRepo(self.repo);
+            const local = try self.refsUnder(arena, purge_mod.ref_prefix);
+            var out: Tombs = .empty;
+            var it = local.iterator();
+            while (it.next()) |e| {
+                const t = try purge_mod.readAt(arena, self.b(), e.value_ptr.*);
+                try out.put(arena, e.key_ptr.*, t);
+            }
+            const prefix = try sourcePrefix(arena, remote, .purged, options.fetch);
+            for (try self.b().listRefs(arena, prefix)) |r| {
+                const id = r.name[prefix.len..];
+                if (!uuid_fmt.isCanonical(id)) continue;
+                // Anyone can push anything there: only commits count.
+                const o = (try self.b().readObject(arena, r.oid)) orelse continue;
+                if (o.kind != .commit) continue;
+                const theirs = try purge_mod.readAt(arena, self.b(), r.oid);
+                const mine = local.get(id);
+                if (options.check) {
+                    const merged = if (out.get(id)) |t| try purge_mod.unionOf(
+                        arena,
+                        t,
+                        theirs,
+                    ) else theirs;
+                    try out.put(arena, id, merged);
+                    continue;
+                }
+                const new: Oid = if (mine) |m| blk: {
+                    if (m.eql(r.oid) or try self.b().isAncestor(r.oid, m)) continue;
+                    if (try self.b().isAncestor(m, r.oid)) break :blk r.oid;
+                    break :blk try self.mergeTombstoneCommit(arena, m, r.oid);
+                } else r.oid;
+                const name = try localRef(arena, .purged, id);
+                const op = repo_mod.moveOp(mine, new);
+                self.b().updateRefs(&.{.{ .name = name, .op = op }}) catch |err| switch (err) {
+                    // A purge here at the same time: the next merge.
+                    error.RefConflict => continue,
+                    else => |e| return e,
+                };
+                try out.put(arena, id, try purge_mod.readAt(arena, self.b(), new));
+            }
+            if (options.check) return out;
+            var all = out.iterator();
+            while (all.next()) |e| {
+                const changed = try purger.apply(arena, e.key_ptr.*, e.value_ptr.*);
+                if (changed and e.value_ptr.issue) try purged_here.append(arena, e.key_ptr.*);
+            }
+            return out;
+        }
+
+        /// A purged issue whose remote tip, purged, isn't in the local one.
+        fn leaseWouldLose(self: Self, arena: Allocator, view: *const PushView) Error!bool {
+            const seen = view.seen[@intFromEnum(Namespace.issues)];
+            var it = view.tombs.iterator();
+            while (it.next()) |e| {
+                if (e.value_ptr.issue or e.value_ptr.comments.len == 0) continue;
+                const remote_tip = seen.get(e.key_ptr.*) orelse continue;
+                const name = try localRef(arena, .issues, e.key_ptr.*);
+                const local = (try self.b().resolveRef(name)) orelse continue;
+                if (local.eql(remote_tip)) continue;
+                const purged = try self.purgedTip(arena, remote_tip, e.value_ptr.comments);
+                if (purged.eql(local) or try self.b().isAncestor(purged, local)) continue;
+                return true;
+            }
+            return false;
+        }
+
+        /// The remote has a tombstone this clone doesn't: merge it first,
+        /// or the push brings back what it purged.
+        fn tombstonesBehind(self: Self, view: *const PushView) Error!bool {
+            var it = view.seen[@intFromEnum(Namespace.purged)].iterator();
+            while (it.next()) |e| {
+                const local = view.tombs.get(e.key_ptr.*) orelse return true;
+                if (local.tip.eql(e.value_ptr.*)) continue;
+                if (!try self.b().isAncestor(e.value_ptr.*, local.tip)) return true;
+            }
+            return false;
+        }
+
+        fn applyTombstones(self: Self, arena: Allocator) Error!void {
+            const purger = purge_mod.Purge(B).fromRepo(self.repo);
+            for (try self.b().listRefs(arena, purge_mod.ref_prefix)) |r| {
+                const t = try purge_mod.readAt(arena, self.b(), r.oid);
+                _ = try purger.apply(arena, r.name[purge_mod.ref_prefix.len..], t);
+            }
+        }
+
+        /// Deterministic like issue merges: parents sorted, fixed identity,
+        /// dated by the later parent.
+        fn mergeTombstoneCommit(self: Self, arena: Allocator, x: Oid, y: Oid) Error!Oid {
+            var time: i64 = std.math.minInt(i64);
+            for ([_]Oid{ x, y }) |p| {
+                const o = (try self.b().readObject(arena, p)) orelse return error.CorruptIssue;
+                const c = object.Commit.parse(arena, self.b().objectFormat(), o.data) catch
+                    return error.CorruptIssue;
+                time = @max(time, c.committer.time);
+            }
+            const parents = try arena.dupe(Oid, &.{ x, y });
+            if (parents[1].order(parents[0]) == .lt) std.mem.swap(Oid, &parents[0], &parents[1]);
+            const sig: object.Signature = .{
+                .name = merge_identity_name,
+                .email = merge_identity_email,
+                .time = time,
+                .tz_offset_minutes = 0,
+            };
+            return self.repo.writeCommit(
+                arena,
+                parents,
+                .{ .author = sig, .committer = sig },
+                purge_merge_subject ++ "\n",
+            );
+        }
+
+        /// `tip` with the purged comments' text gone. History that doesn't
+        /// load is left for `vet` to refuse.
+        fn purgedTip(self: Self, arena: Allocator, tip: Oid, comments: []const Oid) Error!Oid {
+            const commits = self.history(arena, tip) catch |e| switch (e) {
+                error.CorruptIssue, error.HistoryTooLong => return tip,
+                else => |x| return x,
+            };
+            const r = purge_mod.rewrite(
+                arena,
+                self.b(),
+                commits,
+                tip,
+                comments,
+            ) catch |e| switch (e) {
+                error.CorruptIssue => return tip,
+                else => |x| return x,
+            };
+            return r.tip;
+        }
 
         fn readKnown(
             self: Self,
@@ -551,8 +765,16 @@ pub fn Sync(comptime B: type) type {
         ) Error!Known {
             return .{
                 .local = try self.refsUnder(arena, ns.refPrefix()),
-                .merged = try mapUnder(arena, records, try recordRef(arena, remote, .merged, ns, "")),
-                .pushed = try mapUnder(arena, records, try recordRef(arena, remote, .pushed, ns, "")),
+                .merged = try mapUnder(
+                    arena,
+                    records,
+                    try recordRef(arena, remote, .merged, ns, ""),
+                ),
+                .pushed = try mapUnder(
+                    arena,
+                    records,
+                    try recordRef(arena, remote, .pushed, ns, ""),
+                ),
                 .quarantined = try mapUnder(
                     arena,
                     records,
@@ -563,8 +785,15 @@ pub fn Sync(comptime B: type) type {
 
         /// Every ref under `refs/issuez-sync/<remote>/`, sorted, in one
         /// `for-each-ref`.
-        fn readRecords(self: Self, arena: Allocator, remote: []const u8) Error![]const contract.RefEntry {
-            return self.b().listRefs(arena, try std.fmt.allocPrint(arena, "refs/issuez-sync/{s}/", .{remote}));
+        fn readRecords(
+            self: Self,
+            arena: Allocator,
+            remote: []const u8,
+        ) Error![]const contract.RefEntry {
+            return self.b().listRefs(
+                arena,
+                try std.fmt.allocPrint(arena, "refs/issuez-sync/{s}/", .{remote}),
+            );
         }
 
         /// A merged issue's local ref write, held for one transaction.
@@ -601,7 +830,17 @@ pub fn Sync(comptime B: type) type {
                 else => |e| return e,
             }
             for (writes) |w| {
-                var e = self.mergeOne(arena, remote, w.ns, w.id, w.staged, options, w.records.k, batch, null) catch |err| {
+                var e = self.mergeOne(
+                    arena,
+                    remote,
+                    w.ns,
+                    w.id,
+                    w.staged,
+                    options,
+                    w.records.k,
+                    batch,
+                    null,
+                ) catch |err| {
                     // The issues merged so far wrote their local refs:
                     // their records go too.
                     self.apply(arena, batch) catch {};
@@ -643,10 +882,7 @@ pub fn Sync(comptime B: type) type {
 
             fn set(bt: *Batch, arena: Allocator, name: []const u8, old: ?Oid, new: Oid) !void {
                 if (old) |o| if (o.eql(new)) return;
-                try bt.ops.append(arena, .{ .name = name, .op = if (old) |o|
-                    .{ .update = .{ .new = new, .old = o } }
-                else
-                    .{ .create = new } });
+                try bt.ops.append(arena, .{ .name = name, .op = repo_mod.moveOp(old, new) });
             }
 
             fn delete(bt: *Batch, arena: Allocator, name: []const u8, old: ?Oid) !void {
@@ -794,7 +1030,6 @@ pub fn Sync(comptime B: type) type {
             local: Oid,
             remote: Oid,
         ) Error!Oid {
-            const format = self.b().objectFormat();
             const local_commits = try self.history(arena, local);
             const remote_commits = try self.history(arena, remote);
             var all: std.ArrayList(issue_model.CommitInput) = .empty;
@@ -817,49 +1052,22 @@ pub fn Sync(comptime B: type) type {
                 .tz_offset_minutes = 0,
             };
 
-            // Resolve through a synthetic merge node, then restate.
-            var synthetic: Oid = .{ .object_format = format, .bytes = @splat(0xff) };
-            synthetic.bytes[0] = 0xfe;
-            try all.append(arena, .{
-                .oid = synthetic,
-                .parents = parents,
-                .author = sig,
-                .committer = sig,
-                .message = merge_subject ++ "\n",
+            const resolved = try issue_model.resolveMerge(
+                arena,
+                id,
+                all.items,
+                parents,
+                sig,
+                merge_subject ++ "\n",
+            );
+            var list = try issue_model.restatedTrailers(arena, resolved);
+            // The remote has already given its number out, and a host keeps
+            // what it gave (format.md 4). Only the other side's differs here.
+            const theirs = try issue_model.materialize(arena, id, remote, remote_commits);
+            if (theirs.number) |n| if (resolved.number != n) try list.append(arena, .{
+                .key = "X-Number",
+                .value = try std.fmt.allocPrint(arena, "{d}", .{n}),
             });
-            const resolved = try issue_model.materialize(arena, id, synthetic, all.items);
-
-            // Cleared fields are restated empty, so a reader that takes
-            // the newest value doesn't find an older one.
-            var list: std.ArrayList(trailers.Trailer) = .empty;
-            const cleared = struct {
-                fn f(issue: issue_model.Issue, key: []const u8) ?[]const u8 {
-                    return if (labels_fmt.contains(issue.cleared, key)) "" else null;
-                }
-            }.f;
-            try list.append(arena, .{ .key = "State", .value = resolved.state.text() });
-            if (resolved.title_override orelse cleared(resolved, "Title")) |t| try list.append(
-                arena,
-                .{ .key = "Title", .value = t },
-            );
-            if (resolved.labels.len > 0) try list.append(
-                arena,
-                .{ .key = "Labels", .value = try labels_fmt.join(arena, resolved.labels) },
-            ) else if (cleared(resolved, "Labels")) |v| try list.append(
-                arena,
-                .{ .key = "Labels", .value = v },
-            );
-            for ([_][]const u8{ "Assignee", "Priority", "Milestone" } ++ restated_extensions) |key| {
-                const value = resolved.field(key) orelse cleared(resolved, key) orelse continue;
-                try list.append(arena, .{ .key = key, .value = value });
-            }
-            if (resolved.ext.blocked_by_written.len > 0) try list.append(arena, .{
-                .key = "X-Blocked-By",
-                .value = try labels_fmt.join(arena, resolved.ext.blocked_by_written),
-            }) else if (cleared(resolved, "X-Blocked-By")) |v| try list.append(
-                arena,
-                .{ .key = "X-Blocked-By", .value = v },
-            );
             const message = try trailers.build(arena, merge_subject, "", list.items);
             return self.repo.writeCommit(
                 arena,
@@ -869,19 +1077,9 @@ pub fn Sync(comptime B: type) type {
             );
         }
 
-        pub fn mergeCommitForTest(
-            self: Self,
-            arena: Allocator,
-            id: []const u8,
-            a: Oid,
-            c: Oid,
-        ) Error!Oid {
-            return self.mergeCommit(arena, id, a, c);
-        }
-
         /// From local state only, no fetch.
-        pub fn status(self: Self, arena: Allocator, remote: []const u8) Error!Status {
-            if (!contract.isValidRemoteName(remote)) return error.InvalidRemoteName;
+        pub fn status(self_in: Self, arena: Allocator, remote_in: []const u8) Error!Status {
+            const self, const remote = try self_in.at(arena, remote_in);
             // One read of the refs for all of it, so the parts agree.
             const view = try self.readView(arena, remote);
             var quarantined: std.ArrayList(Quarantined) = .empty;
@@ -907,7 +1105,10 @@ pub fn Sync(comptime B: type) type {
             const pending = try self.pendingIn(arena, &skipped, &view);
             var issues: std.ArrayList(repo_mod.IssueRef) = .empty;
             for (pending) |p| {
-                if (p.ns == .issues) try issues.append(arena, .{ .name = p.name, .tip = p.tip });
+                if (p.ns == .issues) if (p.tip) |t| try issues.append(
+                    arena,
+                    .{ .name = p.name, .tip = t },
+                );
             }
             return .{
                 .quarantined = quarantined.items,
@@ -929,7 +1130,10 @@ pub fn Sync(comptime B: type) type {
             var out: std.ArrayList(Unpushed) = .empty;
             for (pending) |p| {
                 if (p.ns == .attachments) continue;
-                try out.append(arena, .{ .namespace = p.ns, .id = p.id, .tip = p.tip, .new = p.record == null });
+                try out.append(
+                    arena,
+                    .{ .namespace = p.ns, .id = p.id, .tip = p.tip, .new = p.record == null },
+                );
             }
             return out.items;
         }
@@ -944,7 +1148,11 @@ pub fn Sync(comptime B: type) type {
             for (namespaces) |ns| {
                 // Kept local (`resolve(.keep_local)`) for this remote tip:
                 // answered, as `status` and the CLI have it.
-                const kept = try mapUnder(arena, view.records, try recordRef(arena, remote, .kept, ns, ""));
+                const kept = try mapUnder(
+                    arena,
+                    view.records,
+                    try recordRef(arena, remote, .kept, ns, ""),
+                );
                 var it = view.quarantined[@intFromEnum(ns)].iterator();
                 while (it.next()) |e| {
                     if (kept.get(e.key_ptr.*)) |k| if (k.eql(e.value_ptr.*)) continue;
@@ -1023,7 +1231,8 @@ pub fn Sync(comptime B: type) type {
                 else => |x| return x,
             };
             const loaded = try issue_model.materialize(arena, id, remote_tip, commits);
-            if ((try self.repo.checkCommits(arena, as_issue, commits, rootKeys(ns))).len > 0)
+            const check: R.CheckOptions = .{ .root_keys = rootKeys(ns) };
+            if ((try self.repo.checkCommits(arena, as_issue, commits, check)).len > 0)
                 return invalid;
             if (merged) |before| {
                 if (try self.isRewound(arena, before, remote_tip, local)) {
@@ -1050,9 +1259,17 @@ pub fn Sync(comptime B: type) type {
         fn relate(self: Self, arena: Allocator, local: ?Oid, remote_tip: Oid) Error!Relation {
             const l = local orelse return .absent;
             if (l.eql(remote_tip)) return .same;
-            const rh = (try self.ancestry(arena, remote_tip)) orelse return self.relateByGit(arena, l, remote_tip);
+            const rh = (try self.ancestry(arena, remote_tip)) orelse return self.relateByGit(
+                arena,
+                l,
+                remote_tip,
+            );
             if (rh.contains(l.bytes)) return .behind;
-            const lh = (try self.ancestry(arena, l)) orelse return self.relateByGit(arena, l, remote_tip);
+            const lh = (try self.ancestry(arena, l)) orelse return self.relateByGit(
+                arena,
+                l,
+                remote_tip,
+            );
             if (lh.contains(remote_tip.bytes)) return .ahead;
             // The common history is closed under parents, so its maximal
             // commits, the merge bases, are those with no child in it.
@@ -1083,13 +1300,13 @@ pub fn Sync(comptime B: type) type {
         /// keeping it in a ref. Returns the local tip that `accept_remote`
         /// replaced, kept under `replacedRef`.
         pub fn resolve(
-            self: Self,
+            self_in: Self,
             arena: Allocator,
-            remote: []const u8,
+            remote_in: []const u8,
             id: []const u8,
             how: Resolution,
         ) Error!?Oid {
-            if (!contract.isValidRemoteName(remote)) return error.InvalidRemoteName;
+            const self, const remote = try self_in.at(arena, remote_in);
             if (!uuid_fmt.isCanonical(id)) return error.NotQuarantined;
             // An issue or a milestone: UUIDs don't repeat across them.
             var found: ?struct { Namespace, []const u8, Oid } = null;
@@ -1156,63 +1373,56 @@ pub fn Sync(comptime B: type) type {
             return null;
         }
 
-        pub fn sync(self: Self, arena: Allocator, remote: []const u8) Error!SyncReport {
-            return self.syncWith(arena, remote, .{});
-        }
-
-        pub fn push(self: Self, arena: Allocator, remote: []const u8) Error!PushReport {
-            return self.pushWith(arena, remote, .{});
-        }
-
-        pub fn syncWith(
+        /// `merge`, then `push`: what `git issue sync` does.
+        pub fn sync(
             self: Self,
             arena: Allocator,
             remote: []const u8,
             options: PushOptions,
         ) Error!SyncReport {
             const merged = try self.merge(arena, remote, .{ .progress = options.progress });
-            return .{ .merge = merged, .push = try self.pushFetched(arena, remote, options) };
+            var after_merge = options;
+            after_merge.fetch = false;
+            return .{ .merge = merged, .push = try self.push(arena, remote, after_merge) };
         }
 
-        /// `push` right after a `merge` that fetched (and checked the
-        /// remote): `seen/` is current, so it doesn't fetch again.
-        pub fn pushFetched(
+        pub fn push(
             self: Self,
             arena: Allocator,
             remote: []const u8,
             options: PushOptions,
         ) Error!PushReport {
-            return self.pushIn(arena, remote, options, false);
-        }
-
-        pub fn pushWith(
-            self: Self,
-            arena: Allocator,
-            remote: []const u8,
-            options: PushOptions,
-        ) Error!PushReport {
-            return self.pushIn(arena, remote, options, true);
+            return self.pushIn(arena, remote, options, options.fetch);
         }
 
         fn pushIn(
-            self: Self,
+            self_in: Self,
             arena: Allocator,
-            remote: []const u8,
+            remote_in: []const u8,
             options: PushOptions,
             fetch: bool,
         ) Error!PushReport {
-            if (!contract.isValidRemoteName(remote)) return error.InvalidRemoteName;
+            const self, const remote = try self_in.at(arena, remote_in);
             if (fetch) try self.ensureRemote(arena, remote);
+            // Never push purged text, even when it came back another way.
+            try self.applyTombstones(arena);
             Progress.report(options.progress, if (fetch) .fetching else .pushing);
             var view = try self.refreshPushed(arena, remote, fetch);
             if (fetch) Progress.report(options.progress, .pushing);
             // Pushed issues should carry their pointers. Issues that came in
             // through upstream have no derived ref yet.
             const att = attachments_mod.Attachments(B).fromRepo(self.repo);
-            const local_tips = try mapUnder(arena, view.local(.attachments), attachments_mod.ref_prefix);
+            const local_tips = try mapUnder(
+                arena,
+                view.local(.attachments),
+                attachments_mod.ref_prefix,
+            );
             var moved = false;
             for (view.local(.issues)) |e| {
-                const issue = self.repo.load(arena, .{ .name = e.name, .tip = e.oid }) catch continue;
+                const issue = self.repo.load(
+                    arena,
+                    .{ .name = e.name, .tip = e.oid },
+                ) catch continue;
                 if (!local_tips.contains(e.name[Namespace.issues.refPrefix().len..]) and
                     issue.attachments.len == 0 and issue.removed_attachments.len == 0) continue;
                 if (try att.reconcile(arena, issue, null)) moved = true;
@@ -1228,14 +1438,26 @@ pub fn Sync(comptime B: type) type {
             var merges: std.ArrayList(MergeReport) = .empty;
             var skipped: std.ArrayList([]const u8) = .empty;
             var uploaded: std.StringHashMapUnmanaged(void) = .empty;
+            // A lease replaces the remote's history: first merge what it
+            // has that we don't, or the replace would drop it.
+            if (try self.leaseWouldLose(arena, &view) or try self.tombstonesBehind(&view)) {
+                try merges.append(arena, try self.merge(arena, remote, .{}));
+                view = try self.readView(arena, remote);
+            }
 
+            var sent: std.ArrayList(PushReport.Pushed) = .empty;
             var round: usize = 0;
             while (round < push_rounds) : (round += 1) {
                 skipped.clearRetainingCapacity();
-                const todo = try self.pendingIn(arena, &skipped, &view);
+                const todo = try self.purgeQuarantined(
+                    arena,
+                    try self.pendingIn(arena, &skipped, &view),
+                    &view,
+                );
                 report.skipped_quarantined = skipped.items.len;
                 if (todo.len == 0) {
                     report.merges = merges.items;
+                    report.refs = sent.items;
                     report.skipped = skipped.items;
                     return report;
                 }
@@ -1245,18 +1467,13 @@ pub fn Sync(comptime B: type) type {
                 var rejected = false;
                 var start: usize = 0;
                 while (start < todo.len) {
-                    // An issue and its derived ref go in the same push.
+                    // An issue, its derived ref and its tombstone go in the
+                    // same push.
                     var end = @min(start + push_chunk, todo.len);
-                    while (end < todo.len and todo[end].ns == .attachments and
-                        std.mem.eql(u8, todo[end].id, todo[end - 1].id)) end += 1;
+                    while (end < todo.len and todo[end].group == todo[end - 1].group) end += 1;
                     const chunk = todo[start..end];
                     start = end;
-                    var specs: std.ArrayList([]const u8) = .empty;
-                    for (chunk) |r| try specs.append(
-                        arena,
-                        try std.fmt.allocPrint(arena, "{s}:{s}", .{ r.name, r.name }),
-                    );
-                    const result = try self.b().push(arena, remote, specs.items, true);
+                    const result = try self.pushChunk(arena, remote, chunk, &view);
                     var batch: Batch = .{};
                     for (result.refs) |p| {
                         if (p.status == .rejected) {
@@ -1264,21 +1481,38 @@ pub fn Sync(comptime B: type) type {
                             continue;
                         }
                         const pushed = findPending(chunk, p.name) orelse continue;
-                        if (pushed.ns == .attachments) {
-                            if (p.status == .ok) report.attachment_refs += 1;
-                        } else if (p.status == .ok) report.pushed += 1 else report.up_to_date += 1;
-                        try batch.set(
-                            arena,
-                            try recordRef(arena, remote, .pushed, pushed.ns, pushed.id),
-                            pushed.record,
-                            pushed.tip,
-                        );
+                        const ok = p.status == .ok;
+                        switch (pushed.ns) {
+                            .attachments => {
+                                if (ok) report.attachment_refs += 1;
+                            },
+                            .purged => {
+                                if (ok) report.tombstones += 1;
+                            },
+                            .issues, .milestones => if (ok) {
+                                report.pushed += 1;
+                                if (pushed.tip == null) report.deleted += 1;
+                                try sent.append(arena, .{
+                                    .namespace = pushed.ns,
+                                    .id = pushed.id,
+                                    .tip = pushed.tip,
+                                });
+                            } else {
+                                report.up_to_date += 1;
+                            },
+                        }
+                        const record = try recordRef(arena, remote, .pushed, pushed.ns, pushed.id);
+                        if (pushed.tip) |t|
+                            try batch.set(arena, record, pushed.record, t)
+                        else
+                            try batch.delete(arena, record, pushed.record);
                     }
                     try self.apply(arena, &batch);
                     if (rejected) break;
                 }
                 if (!rejected) {
                     report.merges = merges.items;
+                    report.refs = sent.items;
                     report.skipped = skipped.items;
                     return report;
                 }
@@ -1295,6 +1529,10 @@ pub fn Sync(comptime B: type) type {
             locals: [fetched_namespaces.len][]const contract.RefEntry,
             pushed: [fetched_namespaces.len]std.StringHashMapUnmanaged(Oid),
             quarantined: [fetched_namespaces.len]std.StringHashMapUnmanaged(Oid),
+            /// The remote's refs as last fetched: what a lease expects.
+            seen: [fetched_namespaces.len]std.StringHashMapUnmanaged(Oid),
+            /// The local tombstones.
+            tombs: Tombs,
             records: []const contract.RefEntry,
 
             fn local(v: *const PushView, ns: Namespace) []const contract.RefEntry {
@@ -1308,18 +1546,34 @@ pub fn Sync(comptime B: type) type {
                 .locals = undefined,
                 .pushed = undefined,
                 .quarantined = undefined,
+                .seen = undefined,
+                .tombs = .empty,
                 .records = records,
             };
             for (fetched_namespaces) |ns| {
                 const i = @intFromEnum(ns);
                 v.locals[i] = try self.b().listRefs(arena, ns.refPrefix());
-                v.pushed[i] = try mapUnder(arena, records, try recordRef(arena, remote, .pushed, ns, ""));
+                v.seen[i] = try mapUnder(
+                    arena,
+                    records,
+                    try recordRef(arena, remote, .seen, ns, ""),
+                );
+                v.pushed[i] = try mapUnder(
+                    arena,
+                    records,
+                    try recordRef(arena, remote, .pushed, ns, ""),
+                );
                 v.quarantined[i] = try mapUnder(
                     arena,
                     records,
                     try recordRef(arena, remote, .quarantined, ns, ""),
                 );
             }
+            for (v.local(.purged)) |r| try v.tombs.put(
+                arena,
+                r.name[Namespace.purged.refPrefix().len..],
+                try purge_mod.readAt(arena, self.b(), r.oid),
+            );
             return v;
         }
 
@@ -1327,7 +1581,12 @@ pub fn Sync(comptime B: type) type {
         /// stale when someone else force-pushes or deletes a ref, and push
         /// only sends what differs from them.
         /// `fetch` false: `seen/` is current, a merge just fetched it.
-        fn refreshPushed(self: Self, arena: Allocator, remote: []const u8, fetch: bool) Error!PushView {
+        fn refreshPushed(
+            self: Self,
+            arena: Allocator,
+            remote: []const u8,
+            fetch: bool,
+        ) Error!PushView {
             if (fetch) try self.fetchSeen(arena, remote);
             var view = try self.readView(arena, remote);
             // One transaction for all records, not a git call per issue.
@@ -1335,7 +1594,11 @@ pub fn Sync(comptime B: type) type {
             const Change = struct { ns: Namespace, id: []const u8, new: ?Oid };
             var changes: std.ArrayList(Change) = .empty;
             for (fetched_namespaces) |ns| {
-                const remote_tips = try mapUnder(arena, view.records, try recordRef(arena, remote, .seen, ns, ""));
+                const remote_tips = try mapUnder(
+                    arena,
+                    view.records,
+                    try recordRef(arena, remote, .seen, ns, ""),
+                );
                 const pushed_prefix = try recordRef(arena, remote, .pushed, ns, "");
                 const pushed = &view.pushed[@intFromEnum(ns)];
                 for (view.local(ns)) |r| {
@@ -1375,7 +1638,7 @@ pub fn Sync(comptime B: type) type {
                 "+{s}*:{s}*",
                 .{ ns.refPrefix(), try recordRef(arena, remote, .seen, ns, "") },
             );
-            try self.b().fetch(arena, remote, &specs, true);
+            try self.b().fetch(arena, self.where(remote), &specs, .{ .prune = true });
         }
 
         /// The refs under `prefix`, by the rest of their name.
@@ -1393,12 +1656,59 @@ pub fn Sync(comptime B: type) type {
 
         const Pending = struct {
             name: []const u8,
-            tip: Oid,
+            /// Null deletes the remote's ref: a purged issue's.
+            tip: ?Oid,
             ns: Namespace,
             id: []const u8,
             /// The `pushed` record when it was read.
             record: ?Oid,
+            /// Refs that go in one atomic push share it.
+            group: usize = 0,
+            /// A purge: replace or delete the remote's ref, leased on what
+            /// it was at the fetch.
+            leased: bool = false,
+            /// Pushed in place of the local ref: an object ID in hex.
+            src: ?[]const u8 = null,
         };
+
+        /// One atomic push. With a lease in it, every ref is leased on the
+        /// fetched value, so only a remote that didn't move is replaced.
+        fn pushChunk(
+            self: Self,
+            arena: Allocator,
+            remote: []const u8,
+            chunk: []const Pending,
+            view: *const PushView,
+        ) Error!contract.PushResult {
+            // Only a purge's refs are leased: the rest stay fast-forwards,
+            // or a lease would replace what the remote has and we don't.
+            var specs: std.ArrayList([]const u8) = .empty;
+            var updates: std.ArrayList(contract.LeasedRef) = .empty;
+            for (chunk) |p| if (p.leased) try updates.append(arena, .{
+                .src = if (p.tip != null) p.src orelse p.name else null,
+                .dst = p.name,
+                .expect = view.seen[@intFromEnum(p.ns)].get(p.id),
+            }) else try specs.append(
+                arena,
+                try std.fmt.allocPrint(arena, "{s}:{s}", .{ p.name, p.name }),
+            );
+            var refs: std.ArrayList(contract.PushedRef) = .empty;
+            if (specs.items.len > 0) {
+                const r = try self.b().push(
+                    arena,
+                    self.where(remote),
+                    specs.items,
+                    .{ .atomic = true },
+                );
+                try refs.appendSlice(arena, r.refs);
+            }
+            if (updates.items.len > 0) {
+                if (comptime !contract.hasLeasedPush(B)) return error.LeasedPushUnsupported;
+                const r = try self.b().pushLeased(arena, self.where(remote), updates.items);
+                try refs.appendSlice(arena, r.refs);
+            }
+            return .{ .refs = refs.items };
+        }
 
         /// Uploads the objects the pending derived refs list and the
         /// remote's derived refs don't, once per push. Objects this clone
@@ -1433,12 +1743,12 @@ pub fn Sync(comptime B: type) type {
             const ups = try att.uploads(arena, wanted.items);
             if (ups.len == 0) return;
             if (options.before_push) |hook| {
-                hook.run(hook.context, remote, ups) catch return error.BeforePushFailed;
+                hook.run(hook.context, self.where(remote), ups) catch return error.BeforePushFailed;
             } else {
                 if (comptime !contract.hasLfsTransport(B)) return error.LfsUnavailable;
                 var shas: std.ArrayList([]const u8) = .empty;
                 for (ups) |u| try shas.append(arena, u.sha256);
-                self.b().lfsPush(arena, remote, shas.items) catch |e| switch (e) {
+                self.b().lfsPush(arena, self.where(remote), shas.items) catch |e| switch (e) {
                     error.LfsUnavailable => return error.LfsUnavailable,
                     error.LfsTransferFailed => return error.LfsUploadFailed,
                     else => |x| return x,
@@ -1448,7 +1758,53 @@ pub fn Sync(comptime B: type) type {
             report.lfs_uploaded += ups.len;
         }
 
-        /// What the remote doesn't have yet, by our records.
+        /// A quarantined issue isn't pushed, but the remote's copy of it
+        /// still loses the text our tombstone purged: its tip, purged,
+        /// goes with the tombstone, leased on the fetched tip.
+        fn purgeQuarantined(
+            self: Self,
+            arena: Allocator,
+            todo: []Pending,
+            view: *const PushView,
+        ) Error![]Pending {
+            var out: std.ArrayList(Pending) = .fromOwnedSlice(todo);
+            var group: usize = 0;
+            for (todo) |p| group = @max(group, p.group);
+            var it = view.quarantined[@intFromEnum(Namespace.issues)].keyIterator();
+            while (it.next()) |key| {
+                const id = key.*;
+                const t = view.tombs.get(id) orelse continue;
+                if (t.issue or t.comments.len == 0) continue;
+                const remote_tip = view.seen[@intFromEnum(Namespace.issues)].get(id) orelse
+                    continue;
+                const purged = try self.purgedTip(arena, remote_tip, t.comments);
+                if (purged.eql(remote_tip)) continue;
+                const hex = purged.hex();
+                var index = out.items.len;
+                var g = group + 1;
+                for (out.items, 0..) |p, i| if (p.ns == .purged and std.mem.eql(u8, p.id, id)) {
+                    index = i + 1;
+                    g = p.group;
+                    break;
+                };
+                if (g > group) group = g;
+                try out.insert(arena, index, .{
+                    .name = try localRef(arena, .issues, id),
+                    .tip = purged,
+                    .ns = .issues,
+                    .id = id,
+                    .record = view.pushed[@intFromEnum(Namespace.issues)].get(id),
+                    .group = g,
+                    .leased = true,
+                    .src = try arena.dupe(u8, hex.slice()),
+                });
+            }
+            return out.items;
+        }
+
+        /// What the remote doesn't have yet, by our records. Each issue
+        /// comes with its derived ref and tombstone; the tombstone of a
+        /// purged issue with the deletes of its remote copies.
         fn pendingIn(
             self: Self,
             arena: Allocator,
@@ -1456,7 +1812,29 @@ pub fn Sync(comptime B: type) type {
             view: *const PushView,
         ) Error![]Pending {
             _ = self;
+            const Extra = std.StringArrayHashMapUnmanaged(Pending);
+            // Derived refs and tombstones that differ from the records.
+            var extras: [2]Extra = .{ .empty, .empty };
+            const issue_markers = view.quarantined[@intFromEnum(Namespace.issues)];
+            for ([_]Namespace{ .attachments, .purged }, &extras) |ns, *extra| {
+                const records = view.pushed[@intFromEnum(ns)];
+                for (view.local(ns)) |r| {
+                    const id = r.name[ns.refPrefix().len..];
+                    if (ns == .attachments and issue_markers.contains(id)) continue;
+                    const pushed = records.get(id);
+                    if (pushed != null and pushed.?.eql(r.oid)) continue;
+                    try extra.put(arena, id, .{
+                        .name = r.name,
+                        .tip = r.oid,
+                        .ns = ns,
+                        .id = id,
+                        .record = pushed,
+                        .leased = ns == .purged,
+                    });
+                }
+            }
             var out: std.ArrayList(Pending) = .empty;
+            var group: usize = 0;
             for (namespaces) |ns| {
                 const markers = view.quarantined[@intFromEnum(ns)];
                 const records = view.pushed[@intFromEnum(ns)];
@@ -1468,45 +1846,99 @@ pub fn Sync(comptime B: type) type {
                     }
                     const pushed = records.get(id);
                     if (pushed != null and pushed.?.eql(r.oid)) continue;
+                    // A rewrite replaces the remote's history.
+                    const purged = ns == .issues and view.tombs.contains(id);
+                    group += 1;
                     try out.append(arena, .{
                         .name = r.name,
                         .tip = r.oid,
                         .ns = ns,
                         .id = id,
                         .record = pushed,
+                        .group = group,
+                        .leased = purged,
                     });
+                    if (ns != .issues) continue;
+                    for (&extras) |*extra| if (extra.fetchSwapRemove(id)) |d| {
+                        var x = d.value;
+                        x.group = group;
+                        x.leased = x.leased or purged;
+                        try out.append(arena, x);
+                    };
                 }
             }
-            // Derived refs right after their issue, or on their own if the
-            // issue is already pushed.
-            const ns: Namespace = .attachments;
-            const markers = view.quarantined[@intFromEnum(Namespace.issues)];
-            const records = view.pushed[@intFromEnum(ns)];
-            var derived: std.StringArrayHashMapUnmanaged(Pending) = .empty;
-            for (view.local(ns)) |r| {
-                const id = r.name[ns.refPrefix().len..];
-                if (markers.contains(id)) continue;
-                const pushed = records.get(id);
-                if (pushed != null and pushed.?.eql(r.oid)) continue;
-                try derived.put(arena, id, .{
-                    .name = r.name,
-                    .tip = r.oid,
-                    .ns = ns,
-                    .id = id,
-                    .record = pushed,
-                });
+            // Purged issues: delete the remote's copies.
+            var it = view.tombs.iterator();
+            while (it.next()) |e| {
+                if (!e.value_ptr.issue) continue;
+                const id = e.key_ptr.*;
+                const before = out.items.len;
+                for ([_]Namespace{ .issues, .attachments }) |ns| {
+                    if (view.seen[@intFromEnum(ns)].get(id) == null) continue;
+                    if (before == out.items.len) group += 1;
+                    try out.append(arena, .{
+                        .name = try localRef(arena, ns, id),
+                        .tip = null,
+                        .ns = ns,
+                        .id = id,
+                        .record = view.pushed[@intFromEnum(ns)].get(id),
+                        .group = group,
+                        .leased = true,
+                    });
+                }
+                if (out.items.len == before) continue;
+                for (&extras) |*extra| if (extra.fetchSwapRemove(id)) |d| {
+                    var x = d.value;
+                    x.group = group;
+                    try out.append(arena, x);
+                };
             }
-            var with_derived: std.ArrayList(Pending) = .empty;
-            for (out.items) |p| {
-                try with_derived.append(arena, p);
-                if (p.ns != .issues) continue;
-                if (derived.fetchSwapRemove(p.id)) |d| try with_derived.append(arena, d.value);
+            for (&extras) |*extra| for (extra.values()) |d| {
+                group += 1;
+                var x = d;
+                x.group = group;
+                // A derived ref rebuilt by a purge isn't a fast-forward.
+                x.leased = x.leased or view.tombs.contains(x.id);
+                try out.append(arena, x);
+            };
+            return out.items;
+        }
+
+        fn pendingRefs(
+            self: Self,
+            arena: Allocator,
+            remote: []const u8,
+            skipped: *std.ArrayList([]const u8),
+        ) Error![]repo_mod.IssueRef {
+            const view = try self.readView(arena, remote);
+            var out: std.ArrayList(repo_mod.IssueRef) = .empty;
+            for (try self.pendingIn(arena, skipped, &view)) |p| {
+                if (p.ns == .issues) if (p.tip) |t| try out.append(
+                    arena,
+                    .{ .name = p.name, .tip = t },
+                );
             }
-            try with_derived.appendSlice(arena, derived.values());
-            return with_derived.items;
+            return out.items;
+        }
+
+        /// The sync for `remote` and the name its refs go under: the
+        /// remote's own, or for a URL or path `remoteKey`'s. Idempotent,
+        /// so entry points that call each other may each call it.
+        fn at(self: Self, arena: Allocator, remote: []const u8) Error!struct { Self, []const u8 } {
+            if (self.target != null or contract.isValidRemoteName(remote)) return .{ self, remote };
+            if (!contract.isRemoteUrl(remote)) return error.InvalidRemoteName;
+            var me = self;
+            me.target = remote;
+            return .{ me, try remoteKey(arena, remote) };
+        }
+
+        /// Where fetch and push go.
+        fn where(self: Self, remote: []const u8) []const u8 {
+            return self.target orelse remote;
         }
 
         fn ensureRemote(self: Self, arena: Allocator, remote: []const u8) Error!void {
+            if (self.target != null) return;
             for (try self.b().remoteNames(arena)) |r| if (std.mem.eql(u8, r, remote)) return;
             return error.UnknownRemote;
         }
@@ -1518,10 +1950,7 @@ pub fn Sync(comptime B: type) type {
             while (attempt < self.repo.limits.cas_retries) : (attempt += 1) {
                 const current = try self.b().resolveRef(name);
                 if (current != null and current.?.eql(value)) return;
-                const op: contract.RefUpdate.Op = if (current) |c| .{ .update = .{
-                    .new = value,
-                    .old = c,
-                } } else .{ .create = value };
+                const op = repo_mod.moveOp(current, value);
                 self.b().updateRefs(&.{.{ .name = name, .op = op }}) catch |err| switch (err) {
                     error.RefConflict => continue,
                     else => |e| return e,
@@ -1600,8 +2029,16 @@ fn rootKeys(ns: Namespace) []const []const u8 {
     return switch (ns) {
         .issues => &.{ "State", "Format-Version" },
         .milestones => &.{ "Name", "Format-Version" },
-        .attachments => &.{},
+        .attachments, .purged => &.{},
     };
+}
+
+/// The name a URL or path's refs go under, in place of a remote's:
+/// `url-` and the first 16 hex digits of its SHA-256.
+pub fn remoteKey(arena: Allocator, url: []const u8) Allocator.Error![]const u8 {
+    var digest: [32]u8 = undefined;
+    std.crypto.hash.sha2.Sha256.hash(url, &digest, .{});
+    return std.fmt.allocPrint(arena, "url-{x}", .{digest[0..8]});
 }
 
 pub const remote_key = "issue.remote";
@@ -1610,9 +2047,23 @@ pub const remote_key = "issue.remote";
 /// issue.remote` names, else the only one, else `origin`, else the first
 /// by name. Null without remotes. `UnknownIssueRemote` when
 /// `issue.remote` names no remote: a typo shouldn't send issues elsewhere.
-pub fn defaultRemote(arena: Allocator, backend: anytype) !?[]const u8 {
+pub fn defaultRemote(
+    comptime B: type,
+    arena: Allocator,
+    backend: *B,
+) (B.Error || error{UnknownIssueRemote})!?[]const u8 {
     const names = try backend.remoteNames(arena);
-    if (try backend.configGet(arena, remote_key)) |want| {
+    return chooseRemote(names, try backend.configGet(arena, remote_key));
+}
+
+/// `defaultRemote` for remotes already read: `names`, and `configured`,
+/// the value of `issue.remote` (null when unset). The result is one of
+/// `names`.
+pub fn chooseRemote(
+    names: []const []const u8,
+    configured: ?[]const u8,
+) error{UnknownIssueRemote}!?[]const u8 {
+    if (configured) |want| {
         if (!contract.isValidRemoteName(want)) return error.UnknownIssueRemote;
         for (names) |n| if (std.mem.eql(u8, n, want)) return n;
         return error.UnknownIssueRemote;
@@ -1636,7 +2087,11 @@ pub fn recordRef(
     ns: Namespace,
     id: []const u8,
 ) Allocator.Error![]const u8 {
-    return std.fmt.allocPrint(arena, "refs/issuez-sync/{s}/{t}/{t}/{s}", .{ remote, record, ns, id });
+    return std.fmt.allocPrint(
+        arena,
+        "refs/issuez-sync/{s}/{t}/{t}/{s}",
+        .{ remote, record, ns, id },
+    );
 }
 
 /// Where `resolve(.accept_remote)` keeps the local tip it replaced.
@@ -1685,9 +2140,9 @@ test "push and merge converge" {
     var world = testWorld();
 
     var a = try onClone(arena, &world, 0);
-    const created = try a.sync.repo.create(arena, .{ .title = "Shared", .labels = &.{"bug"} });
-    const ref_name = try std.fmt.allocPrint(arena, "refs/issues/{s}", .{created.id.slice()});
-    const pushed = try a.sync.push(arena, "origin");
+    const created = try a.sync.repo.create(arena, .{ .title = "Shared", .labels = &.{"bug"} }, .{});
+    const ref_name = try std.fmt.allocPrint(arena, "refs/issues/{s}", .{created.id});
+    const pushed = try a.sync.push(arena, "origin", .{});
     try testing.expectEqual(@as(usize, 1), pushed.pushed);
     try a.sim.commit();
 
@@ -1697,26 +2152,32 @@ test "push and merge converge" {
     try bob.sim.commit();
 
     a = try onClone(arena, &world, 0);
-    _ = try a.sync.repo.edit(arena, ref_name, .{ .priority = .{ .set = .high }, .add_labels = &.{"ui"} });
+    _ = try a.sync.repo.edit(
+        arena,
+        ref_name,
+        .{ .priority = .{ .set = .high }, .add_labels = &.{"ui"} },
+        .{},
+    );
     try a.sim.commit();
     bob = try onClone(arena, &world, 1);
     _ = try bob.sync.repo.edit(
         arena,
         ref_name,
-        .{ .assignee = "bob@e.x", .remove_labels = &.{"bug"} },
+        .{ .set_assignees = &.{.byEmail("bob@e.x")}, .remove_labels = &.{"bug"} },
+        .{},
     );
-    _ = try bob.sync.push(arena, "origin");
+    _ = try bob.sync.push(arena, "origin", .{});
     try bob.sim.commit();
 
     // Alice's push is rejected, so she merges and retries.
     a = try onClone(arena, &world, 0);
-    const p2 = try a.sync.push(arena, "origin");
+    const p2 = try a.sync.push(arena, "origin", .{});
     try testing.expectEqual(@as(usize, 1), p2.merges.len);
     try testing.expectEqual(@as(usize, 1), p2.merges[0].count(.merged));
     try testing.expectEqual(@as(usize, 1), p2.pushed);
     const merged_issue = try a.sync.repo.load(
         arena,
-        (try a.sync.repo.resolve(arena, created.id.short())).one,
+        (try a.sync.repo.resolve(arena, uuid_fmt.shortId(created.id))).one,
     );
     try a.sim.commit();
     try testing.expectEqualStrings("high", merged_issue.field("Priority").?);
@@ -1736,10 +2197,166 @@ test "push and merge converge" {
     const m3 = try bob.sync.merge(arena, "origin", .{});
     try testing.expectEqual(@as(usize, 1), m3.count(.fast_forwarded));
     try testing.expect((try bob.sim.resolveRef(ref_name)).?.eql(merged_issue.tip));
-    const p3 = try bob.sync.push(arena, "origin");
+    const p3 = try bob.sync.push(arena, "origin", .{});
     try testing.expectEqual(@as(usize, 0), p3.pushed);
     try testing.expectEqual(@as(usize, 0), (try bob.sim.listRefs(arena, "refs/remotes/")).len);
     try bob.sim.commit();
+}
+
+test "purges sync: tombstones travel, remote copies are replaced and deleted" {
+    var arena_state: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var world = testWorld();
+    const P = purge_mod.Purge(GitSim);
+
+    var a = try onClone(arena, &world, 0);
+    const keep = try a.sync.repo.create(arena, .{ .title = "Keep" }, .{});
+    const keep_ref = try std.fmt.allocPrint(arena, "refs/issues/{s}", .{keep.id});
+    const bad = try a.sync.repo.comment(arena, keep_ref, .{ .text = "Abuse" }, .{});
+    _ = try a.sync.repo.comment(arena, keep_ref, .{ .text = "Fine" }, .{});
+    const gone = try a.sync.repo.create(arena, .{ .title = "Doxxing" }, .{});
+    const gone_ref = try std.fmt.allocPrint(arena, "refs/issues/{s}", .{gone.id});
+    _ = try a.sync.push(arena, "origin", .{});
+    try a.sim.commit();
+
+    var bob = try onClone(arena, &world, 1);
+    _ = try bob.sync.merge(arena, "origin", .{});
+    // Bob writes on the issue before he hears of the purge.
+    _ = try bob.sync.repo.comment(arena, keep_ref, .{ .text = "Bob's" }, .{});
+    try bob.sim.commit();
+
+    a = try onClone(arena, &world, 0);
+    const purger = P.fromRepo(a.sync.repo);
+    const r = try purger.comment(arena, keep_ref, bad.tip, .{ .reason = "abuse" }, .{});
+    _ = try purger.issue(arena, gone_ref, .{}, .{});
+    const p1 = try a.sync.sync(arena, "origin", .{});
+    try testing.expectEqual(@as(usize, 1), p1.push.deleted);
+    try testing.expectEqual(@as(usize, 2), p1.push.tombstones);
+    try a.sim.commit();
+
+    // The hub has the rewritten issue, not the old one.
+    var hub = try GitSim.init(arena, &world, 2);
+    try testing.expect((try hub.resolveRef(keep_ref)).?.eql(r.tip.?));
+    try testing.expect(try hub.resolveRef(gone_ref) == null);
+
+    // Bob's sync purges his copy, keeps his comment and pushes it.
+    bob = try onClone(arena, &world, 1);
+    const p2 = try bob.sync.sync(arena, "origin", .{});
+    // His comment now sits on the purged history.
+    try testing.expectEqual(@as(usize, 1), p2.merge.count(.local_ahead));
+    try testing.expectEqual(@as(usize, 1), p2.push.pushed);
+    try testing.expect(try bob.sim.resolveRef(gone_ref) == null);
+    const tip_b = (try bob.sim.resolveRef(keep_ref)).?;
+    const issue_b = try bob.sync.repo.load(arena, .{ .name = keep_ref, .tip = tip_b });
+    for (try bob.sync.repo.loadCommits(arena, tip_b)) |c|
+        try testing.expect(std.mem.find(u8, c.message, "Abuse") == null);
+    try testing.expect(issue_b.comments[0].purged);
+    try testing.expectEqualStrings("Bob's", issue_b.comments[issue_b.comments.len - 1].subject);
+    try bob.sim.commit();
+
+    // And Alice gets Bob's comment back without the purged text.
+    a = try onClone(arena, &world, 0);
+    _ = try a.sync.sync(arena, "origin", .{});
+    try testing.expect((try a.sim.resolveRef(keep_ref)).?.eql(tip_b));
+    try a.sim.commit();
+    hub = try GitSim.init(arena, &world, 2);
+    try testing.expect((try hub.resolveRef(keep_ref)).?.eql(tip_b));
+}
+
+test "a quarantined issue's remote copy loses the purged text too" {
+    var arena_state: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var world = testWorld();
+
+    var a = try onClone(arena, &world, 0);
+    const created = try a.sync.repo.create(arena, .{ .title = "Shared" }, .{});
+    const ref_name = try std.fmt.allocPrint(arena, "refs/issues/{s}", .{created.id});
+    const bad = try a.sync.repo.comment(arena, ref_name, .{ .text = "Abuse" }, .{});
+    _ = try a.sync.repo.comment(arena, ref_name, .{ .text = "Fine" }, .{});
+    _ = try a.sync.sync(arena, "origin", .{});
+    try a.sim.commit();
+
+    // Someone writes a broken merge (two roots) on the abusive comment
+    // straight to the hub, so Alice's merge quarantines it.
+    var hub = try GitSim.init(arena, &world, 2);
+    const stray = try foreignRoot(arena, &hub, "Stray");
+    const sig: object.Signature = .{
+        .name = "Mallory",
+        .email = "mallory@e.x",
+        .time = 1_700_000_000,
+        .tz_offset_minutes = 0,
+    };
+    const rewritten: object.Commit = .{
+        .tree = object.emptyTree(.sha1),
+        .parents = &.{ bad.tip, stray },
+        .author = sig,
+        .committer = sig,
+        .message = "Rewritten\n",
+    };
+    const hub_tip = (try hub.resolveRef(ref_name)).?;
+    const forced = try hub.writeObject(.commit, try rewritten.serializeAlloc(arena));
+    try hub.updateRefs(&.{.{
+        .name = ref_name,
+        .op = .{ .update = .{ .new = forced, .old = hub_tip } },
+    }});
+    try hub.commit();
+
+    // Alice purges the comment. The hub's history stays quarantined, but
+    // its copy goes out purged with the tombstone.
+    a = try onClone(arena, &world, 0);
+    _ = try purge_mod.Purge(GitSim).fromRepo(a.sync.repo).comment(
+        arena,
+        ref_name,
+        bad.tip,
+        .{ .reason = "abuse" },
+        .{},
+    );
+    const pushed = try a.sync.push(arena, "origin", .{});
+    try testing.expectEqual(@as(usize, 1), pushed.skipped_quarantined);
+    try testing.expectEqual(@as(usize, 1), pushed.tombstones);
+    try a.sim.commit();
+    const h = try onClone(arena, &world, 2);
+    const now = (try h.sim.resolveRef(ref_name)).?;
+    try testing.expect(!now.eql(forced));
+    for (try h.sync.repo.loadCommits(arena, now)) |c|
+        try testing.expect(std.mem.find(u8, c.message, "Abuse") == null);
+}
+
+test "a purge's leased push replaces nothing else" {
+    var arena_state: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var world = testWorld();
+
+    var a = try onClone(arena, &world, 0);
+    const gone = try a.sync.repo.create(arena, .{ .title = "Doxxing" }, .{});
+    const gone_ref = try std.fmt.allocPrint(arena, "refs/issues/{s}", .{gone.id});
+    const other = try a.sync.repo.create(arena, .{ .title = "Other" }, .{});
+    const other_ref = try std.fmt.allocPrint(arena, "refs/issues/{s}", .{other.id});
+    _ = try a.sync.push(arena, "origin", .{});
+    try a.sim.commit();
+
+    var bob = try onClone(arena, &world, 1);
+    _ = try bob.sync.merge(arena, "origin", .{});
+    const bobs = try bob.sync.repo.comment(arena, other_ref, .{ .text = "Bob's" }, .{});
+    _ = try bob.sync.push(arena, "origin", .{});
+    try bob.sim.commit();
+
+    // Alice comments on the other issue too, purges one, and pushes
+    // without merging first: the purge goes out leased, the other issue
+    // only as a fast-forward, so Bob's comment stays.
+    a = try onClone(arena, &world, 0);
+    _ = try a.sync.repo.comment(arena, other_ref, .{ .text = "Alice's" }, .{});
+    _ = try purge_mod.Purge(GitSim).fromRepo(a.sync.repo).issue(arena, gone_ref, .{}, .{});
+    const pushed = try a.sync.push(arena, "origin", .{});
+    try testing.expectEqual(@as(usize, 1), pushed.deleted);
+    try a.sim.commit();
+    var hub = try GitSim.init(arena, &world, 2);
+    try testing.expect(try hub.resolveRef(gone_ref) == null);
+    const hub_tip = (try hub.resolveRef(other_ref)).?;
+    try testing.expect(try hub.isAncestor(bobs.tip, hub_tip));
 }
 
 test "merge commits restate extension fields" {
@@ -1749,10 +2366,10 @@ test "merge commits restate extension fields" {
     var world = testWorld();
 
     var a = try onClone(arena, &world, 0);
-    const epic = try a.sync.repo.create(arena, .{ .title = "Epic" });
-    const created = try a.sync.repo.create(arena, .{ .title = "Shared" });
-    const ref_name = try std.fmt.allocPrint(arena, "refs/issues/{s}", .{created.id.slice()});
-    _ = try a.sync.push(arena, "origin");
+    const epic = try a.sync.repo.create(arena, .{ .title = "Epic" }, .{});
+    const created = try a.sync.repo.create(arena, .{ .title = "Shared" }, .{});
+    const ref_name = try std.fmt.allocPrint(arena, "refs/issues/{s}", .{created.id});
+    _ = try a.sync.push(arena, "origin", .{});
     try a.sim.commit();
     var bob = try onClone(arena, &world, 1);
     _ = try bob.sync.merge(arena, "origin", .{});
@@ -1760,21 +2377,21 @@ test "merge commits restate extension fields" {
 
     a = try onClone(arena, &world, 0);
     _ = try a.sync.repo.edit(arena, ref_name, .{
-        .parent = epic.id.slice(),
-        .due_date = "2026-12-01",
-    });
+        .parent = .{ .set = epic.id },
+        .due_date = .{ .set = .{ .year = 2026, .month = 12, .day = 1 } },
+    }, .{});
     try a.sim.commit();
     bob = try onClone(arena, &world, 1);
     _ = try bob.sync.repo.edit(arena, ref_name, .{
-        .add_blocked_by = &.{epic.id.slice()},
+        .add_blocked_by = &.{epic.id},
         .estimate_minutes = .{ .set = 90 },
-        .workflow = "ready",
-    });
-    _ = try bob.sync.push(arena, "origin");
+        .workflow = .{ .set = "ready" },
+    }, .{});
+    _ = try bob.sync.push(arena, "origin", .{});
     try bob.sim.commit();
 
     a = try onClone(arena, &world, 0);
-    const p = try a.sync.push(arena, "origin");
+    const p = try a.sync.push(arena, "origin", .{});
     try testing.expectEqual(@as(usize, 1), p.merges[0].count(.merged));
     const tip = (try a.sim.resolveRef(ref_name)).?;
     const commit = try object.Commit.parse(arena, .sha1, (try a.sim.readObject(arena, tip)).?.data);
@@ -1789,8 +2406,48 @@ test "merge commits restate extension fields" {
         \\X-Workflow-State: ready
         \\X-Blocked-By: {s}
         \\
-    , .{ epic.id.slice(), epic.id.slice() });
+    , .{ epic.id, epic.id });
     try testing.expectEqualStrings(want, commit.message);
+}
+
+test "a merge keeps the number the remote has" {
+    var arena_state: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var world = testWorld();
+
+    var a = try onClone(arena, &world, 0);
+    const first = try a.sync.repo.create(arena, .{ .title = "First" }, .{});
+    const second = try a.sync.repo.create(arena, .{ .title = "Second" }, .{});
+    const first_ref = try std.fmt.allocPrint(arena, "refs/issues/{s}", .{first.id});
+    const second_ref = try std.fmt.allocPrint(arena, "refs/issues/{s}", .{second.id});
+    _ = try a.sync.push(arena, "origin", .{});
+    try a.sim.commit();
+    var bob = try onClone(arena, &world, 1);
+    _ = try bob.sync.merge(arena, "origin", .{});
+    try bob.sim.commit();
+
+    // Whichever writes later: the remote's number stays, not the newer one.
+    a = try onClone(arena, &world, 0);
+    _ = try a.sync.repo.edit(arena, first_ref, .{ .number = 3 }, .{});
+    try a.sim.commit();
+    bob = try onClone(arena, &world, 1);
+    _ = try bob.sync.repo.edit(arena, first_ref, .{ .number = 2 }, .{});
+    _ = try bob.sync.repo.edit(arena, second_ref, .{ .number = 4 }, .{});
+    _ = try bob.sync.push(arena, "origin", .{});
+    try bob.sim.commit();
+    a = try onClone(arena, &world, 0);
+    _ = try a.sync.repo.edit(arena, second_ref, .{ .number = 5 }, .{});
+
+    _ = try a.sync.merge(arena, "origin", .{});
+    for ([_]struct { ref: []const u8, want: u64 }{
+        .{ .ref = first_ref, .want = 2 },
+        .{ .ref = second_ref, .want = 4 },
+    }) |x| {
+        const tip = (try a.sim.resolveRef(x.ref)).?;
+        const issue = try a.sync.repo.load(arena, .{ .name = x.ref, .tip = tip });
+        try testing.expectEqual(@as(?u64, x.want), issue.number);
+    }
 }
 
 test "merge commits restate cleared fields as empty" {
@@ -1804,25 +2461,28 @@ test "merge commits restate cleared fields as empty" {
         .title = "Shared",
         .labels = &.{"bug"},
         .priority = .high,
-    });
-    const ref_name = try std.fmt.allocPrint(arena, "refs/issues/{s}", .{created.id.slice()});
-    _ = try a.sync.push(arena, "origin");
+    }, .{});
+    const ref_name = try std.fmt.allocPrint(arena, "refs/issues/{s}", .{created.id});
+    _ = try a.sync.push(arena, "origin", .{});
     try a.sim.commit();
     var bob = try onClone(arena, &world, 1);
     _ = try bob.sync.merge(arena, "origin", .{});
-    _ = try bob.sync.repo.edit(arena, ref_name, .{ .set_labels = &.{}, .priority = .clear });
-    _ = try bob.sync.push(arena, "origin");
+    _ = try bob.sync.repo.edit(arena, ref_name, .{ .set_labels = &.{}, .priority = .clear }, .{});
+    _ = try bob.sync.push(arena, "origin", .{});
     try bob.sim.commit();
 
     a = try onClone(arena, &world, 0);
-    _ = try a.sync.repo.comment(arena, ref_name, .{ .text = "Meanwhile" });
-    const p = try a.sync.push(arena, "origin");
+    _ = try a.sync.repo.comment(arena, ref_name, .{ .text = "Meanwhile" }, .{});
+    const p = try a.sync.push(arena, "origin", .{});
     try testing.expectEqual(@as(usize, 1), p.merges[0].count(.merged));
     const tip = (try a.sim.resolveRef(ref_name)).?;
     const commit = try object.Commit.parse(arena, .sha1, (try a.sim.readObject(arena, tip)).?.data);
     try a.sim.commit();
     // A reader taking the newest value finds the cleared ones empty.
-    try testing.expectEqualStrings("Merge issue\n\nState: open\nLabels: \nPriority: \n", commit.message);
+    try testing.expectEqualStrings(
+        "Merge issue\n\nState: open\nLabels: \nPriority: \n",
+        commit.message,
+    );
 }
 
 test "deterministic merge commits" {
@@ -1839,20 +2499,20 @@ test "deterministic merge commits" {
     } };
 
     var a = try onClone(arena, &world, 0);
-    const created = try a.sync.repo.create(arena, .{ .title = "T", .priority = .low });
-    const ref_name = try std.fmt.allocPrint(arena, "refs/issues/{s}", .{created.id.slice()});
-    _ = try a.sync.push(arena, "origin");
+    const created = try a.sync.repo.create(arena, .{ .title = "T", .priority = .low }, .{});
+    const ref_name = try std.fmt.allocPrint(arena, "refs/issues/{s}", .{created.id});
+    _ = try a.sync.push(arena, "origin", .{});
     try a.sim.commit();
     var bob = try onClone(arena, &world, 1);
     _ = try bob.sync.merge(arena, "origin", .{});
     try bob.sim.commit();
 
     a = try onClone(arena, &world, 0);
-    _ = try a.sync.repo.edit(arena, ref_name, .{ .priority = .{ .set = .high } });
+    _ = try a.sync.repo.edit(arena, ref_name, .{ .priority = .{ .set = .high } }, .{});
     try a.sim.commit();
     bob = try onClone(arena, &world, 1);
-    _ = try bob.sync.repo.comment(arena, ref_name, .{ .text = "from bob" });
-    _ = try bob.sync.push(arena, "origin");
+    _ = try bob.sync.repo.comment(arena, ref_name, .{ .text = "from bob" }, .{});
+    _ = try bob.sync.push(arena, "origin", .{});
     try bob.sim.commit();
 
     // Alice merges bob's tip through the hub...
@@ -1870,7 +2530,7 @@ test "deterministic merge commits" {
     _ = try bob.sync.merge(arena, "alice", .{}); // fetches alice's refs (including the merge)
     try testing.expect((try bob.sim.resolveRef(ref_name)).?.eql(alice_merge));
     // Merging the pair explicitly gives the same OID too.
-    const again = try bob.sync.mergeCommitForTest(arena, created.id.slice(), bob_tip, alice_pre);
+    const again = try bob.sync.mergeCommit(arena, created.id, bob_tip, alice_pre);
     try testing.expect(again.eql(alice_merge));
 }
 
@@ -1881,17 +2541,17 @@ test "merge without fetch" {
     var world = testWorld();
 
     var a = try onClone(arena, &world, 0);
-    const created = try a.sync.repo.create(arena, .{ .title = "Staged" });
-    _ = try a.sync.push(arena, "origin");
+    const created = try a.sync.repo.create(arena, .{ .title = "Staged" }, .{});
+    _ = try a.sync.push(arena, "origin", .{});
     try a.sim.commit();
 
     // Bob fetches by hand, then merges twice without fetching.
     var bob = try onClone(arena, &world, 1);
-    try bob.sim.fetch(arena, "origin", &.{"+refs/issues/*:refs/remotes/origin/issues/*"}, false);
+    try bob.sim.fetch(arena, "origin", &.{"+refs/issues/*:refs/remotes/origin/issues/*"}, .{});
     const staged = try std.fmt.allocPrint(
         arena,
         "refs/remotes/origin/issues/{s}",
-        .{created.id.slice()},
+        .{created.id},
     );
     const first = try bob.sync.merge(arena, "origin", .{ .fetch = false });
     try testing.expectEqual(@as(usize, 1), first.count(.created));
@@ -1904,7 +2564,7 @@ test "merge without fetch" {
     const fetched = try bob.sync.merge(arena, "origin", .{});
     try testing.expectEqual(@as(usize, 1), fetched.count(.up_to_date));
     try testing.expect(try bob.sim.resolveRef(staged) != null);
-    const seen = try recordRef(arena, "origin", .seen, .issues, created.id.slice());
+    const seen = try recordRef(arena, "origin", .seen, .issues, created.id);
     try testing.expect(try bob.sim.resolveRef(seen) != null);
 }
 
@@ -1915,27 +2575,27 @@ test "merge: when the batched local writes lose a race, issues merge one by one"
     var world = testWorld();
 
     var a = try onClone(arena, &world, 0);
-    const shared = try a.sync.repo.create(arena, .{ .title = "Shared" });
-    const shared_ref = try std.fmt.allocPrint(arena, "refs/issues/{s}", .{shared.id.slice()});
-    _ = try a.sync.push(arena, "origin");
+    const shared = try a.sync.repo.create(arena, .{ .title = "Shared" }, .{});
+    const shared_ref = try std.fmt.allocPrint(arena, "refs/issues/{s}", .{shared.id});
+    _ = try a.sync.push(arena, "origin", .{});
     try a.sim.commit();
     var bob = try onClone(arena, &world, 1);
     _ = try bob.sync.merge(arena, "origin", .{});
     try bob.sim.commit();
 
     a = try onClone(arena, &world, 0);
-    _ = try a.sync.repo.comment(arena, shared_ref, .{ .text = "From alice" });
-    const fresh = try a.sync.repo.create(arena, .{ .title = "New" });
-    _ = try a.sync.push(arena, "origin");
+    _ = try a.sync.repo.comment(arena, shared_ref, .{ .text = "From alice" }, .{});
+    const fresh = try a.sync.repo.create(arena, .{ .title = "New" }, .{});
+    _ = try a.sync.push(arena, "origin", .{});
     try a.sim.commit();
 
     // Bob comments on the shared issue just before the merge's transaction.
     var bob_sim = try GitSim.init(arena, &world, 1);
-    var racing: repo_mod.RacingSim = .{
+    var racing: @import("racing_sim.zig").RacingSim = .{
         .sim = &bob_sim,
         .race = .{ .ref = shared_ref, .message = "From bob" },
     };
-    const s = Sync(repo_mod.RacingSim).init(&racing);
+    const s = Sync(@import("racing_sim.zig").RacingSim).init(&racing);
     const m = try s.merge(arena, "origin", .{});
     try testing.expectEqual(@as(usize, 1), m.count(.created));
     try testing.expectEqual(@as(usize, 1), m.count(.merged));
@@ -1946,7 +2606,7 @@ test "merge: when the batched local writes lose a race, issues merge one by one"
     var said: usize = 0;
     for (issue.comments) |c| said += @intFromBool(!c.is_merge);
     try testing.expectEqual(@as(usize, 2), said);
-    const fresh_ref = try std.fmt.allocPrint(arena, "refs/issues/{s}", .{fresh.id.slice()});
+    const fresh_ref = try std.fmt.allocPrint(arena, "refs/issues/{s}", .{fresh.id});
     try testing.expect((try bob_sim.resolveRef(fresh_ref)).?.eql(fresh.tip));
 }
 
@@ -1985,11 +2645,11 @@ test "seen refs follow the remote, deleted refs are pushed again" {
     var world = testWorld();
 
     var a = try onClone(arena, &world, 0);
-    const created = try a.sync.repo.create(arena, .{ .title = "Kept" });
-    const ref_name = try std.fmt.allocPrint(arena, "refs/issues/{s}", .{created.id.slice()});
-    _ = try a.sync.sync(arena, "origin");
+    const created = try a.sync.repo.create(arena, .{ .title = "Kept" }, .{});
+    const ref_name = try std.fmt.allocPrint(arena, "refs/issues/{s}", .{created.id});
+    _ = try a.sync.sync(arena, "origin", .{});
     // Fetches write `seen/`, pushes don't.
-    const seen = try recordRef(arena, "origin", .seen, .issues, created.id.slice());
+    const seen = try recordRef(arena, "origin", .seen, .issues, created.id);
     try testing.expect(try a.sim.resolveRef(seen) == null);
     _ = try a.sync.merge(arena, "origin", .{});
     try testing.expect((try a.sim.resolveRef(seen)).?.eql(created.tip));
@@ -2001,7 +2661,7 @@ test "seen refs follow the remote, deleted refs are pushed again" {
     try hub.updateRefs(&.{.{ .name = ref_name, .op = .{ .delete = created.tip } }});
     try hub.commit();
     a = try onClone(arena, &world, 0);
-    const s = try a.sync.sync(arena, "origin");
+    const s = try a.sync.sync(arena, "origin", .{});
     try testing.expectEqual(@as(usize, 1), s.push.pushed);
     try testing.expect(try a.sim.resolveRef(seen) == null);
     try a.sim.commit();
@@ -2016,27 +2676,27 @@ test "sync reports conflicts" {
     var world = testWorld();
 
     var a = try onClone(arena, &world, 0);
-    const created = try a.sync.repo.create(arena, .{ .title = "Contested", .priority = .low });
-    const ref_name = try std.fmt.allocPrint(arena, "refs/issues/{s}", .{created.id.slice()});
-    const first = try a.sync.sync(arena, "origin");
+    const created = try a.sync.repo.create(arena, .{ .title = "Contested", .priority = .low }, .{});
+    const ref_name = try std.fmt.allocPrint(arena, "refs/issues/{s}", .{created.id});
+    const first = try a.sync.sync(arena, "origin", .{});
     try testing.expectEqual(@as(usize, 1), first.push.pushed);
     try testing.expectEqual(@as(usize, 0), (try first.conflicted(arena)).len);
     try a.sim.commit();
 
     var bob = try onClone(arena, &world, 1);
-    _ = try bob.sync.sync(arena, "origin");
-    _ = try bob.sync.repo.edit(arena, ref_name, .{ .priority = .{ .set = .high } });
-    _ = try bob.sync.sync(arena, "origin");
+    _ = try bob.sync.sync(arena, "origin", .{});
+    _ = try bob.sync.repo.edit(arena, ref_name, .{ .priority = .{ .set = .high } }, .{});
+    _ = try bob.sync.sync(arena, "origin", .{});
     try bob.sim.commit();
 
     // Alice changed the same field concurrently. Her sync keeps one value
     // and reports the conflict.
     a = try onClone(arena, &world, 0);
-    _ = try a.sync.repo.edit(arena, ref_name, .{ .priority = .{ .set = .critical } });
-    const report = try a.sync.sync(arena, "origin");
+    _ = try a.sync.repo.edit(arena, ref_name, .{ .priority = .{ .set = .critical } }, .{});
+    const report = try a.sync.sync(arena, "origin", .{});
     const conflicted = try report.conflicted(arena);
     try testing.expectEqual(@as(usize, 1), conflicted.len);
-    try testing.expectEqualStrings(created.id.slice(), conflicted[0].id);
+    try testing.expectEqualStrings(created.id, conflicted[0].id);
     try testing.expectEqualStrings("Priority", conflicted[0].conflicts[0].target.field);
     try testing.expectEqual(@as(usize, 1), report.push.pushed);
     try testing.expectEqual(@as(usize, 0), report.push.skipped.len);
@@ -2062,10 +2722,10 @@ test "quarantine" {
     var world = testWorld();
 
     var a = try onClone(arena, &world, 0);
-    const created = try a.sync.repo.create(arena, .{ .title = "Alice's" });
-    const id = created.id.slice();
+    const created = try a.sync.repo.create(arena, .{ .title = "Alice's" }, .{});
+    const id = created.id;
     const ref_name = try std.fmt.allocPrint(arena, "refs/issues/{s}", .{id});
-    _ = try a.sync.push(arena, "origin");
+    _ = try a.sync.push(arena, "origin", .{});
     try a.sim.commit();
 
     var bob = try onClone(arena, &world, 1);
@@ -2106,13 +2766,16 @@ test "quarantine" {
         .name = ref_name,
         .op = .{ .update = .{ .new = again, .old = created.tip } },
     }});
-    try testing.expectEqual(@as(usize, 1), (try bob.sync.merge(arena, "origin", .{})).count(.quarantined));
+    try testing.expectEqual(
+        @as(usize, 1),
+        (try bob.sync.merge(arena, "origin", .{})).count(.quarantined),
+    );
     _ = try bob.sync.resolve(arena, "origin", id, .accept_remote);
     try testing.expect((try bob.sim.resolveRef(backup)).?.eql(bobs));
     const backup_again = try replacedRef(arena, "origin", .issues, id, again);
     try testing.expect((try bob.sim.resolveRef(backup_again)).?.eql(again));
     try testing.expectEqual(@as(usize, 0), (try bob.sync.status(arena, "origin")).quarantined.len);
-    const after = try bob.sync.sync(arena, "origin");
+    const after = try bob.sync.sync(arena, "origin", .{});
     try testing.expectEqual(@as(usize, 0), after.merge.count(.quarantined));
     try testing.expectEqual(@as(usize, 0), after.push.pushed);
 
@@ -2129,11 +2792,11 @@ test "quarantined milestones are reported and resolved" {
     var world = testWorld();
 
     var a = try onClone(arena, &world, 0);
-    const cat = @import("milestone.zig").Catalog(GitSim).of(a.sync.repo);
-    const created = try cat.create(arena, .{ .name = "v1" });
-    const id = created.id.slice();
+    const cat = @import("milestone.zig").Catalog(GitSim).fromRepo(a.sync.repo);
+    const created = try cat.create(arena, .{ .name = "v1" }, .{});
+    const id = created.id;
     const ref_name = try std.fmt.allocPrint(arena, "refs/milestones/{s}", .{id});
-    _ = try a.sync.push(arena, "origin");
+    _ = try a.sync.push(arena, "origin", .{});
     try a.sim.commit();
 
     // Bob has an unrelated milestone under the same UUID.
@@ -2169,12 +2832,12 @@ test "keep_local on a rewound remote" {
     var world = testWorld();
 
     var a = try onClone(arena, &world, 0);
-    const created = try a.sync.repo.create(arena, .{ .title = "Rewound" });
-    const id = created.id.slice();
+    const created = try a.sync.repo.create(arena, .{ .title = "Rewound" }, .{});
+    const id = created.id;
     const ref_name = try std.fmt.allocPrint(arena, "refs/issues/{s}", .{id});
-    _ = try a.sync.push(arena, "origin");
-    _ = try a.sync.repo.comment(arena, ref_name, .{ .text = "Second" });
-    _ = try a.sync.push(arena, "origin");
+    _ = try a.sync.push(arena, "origin", .{});
+    _ = try a.sync.repo.comment(arena, ref_name, .{ .text = "Second" }, .{});
+    _ = try a.sync.push(arena, "origin", .{});
     try a.sim.commit();
 
     var bob = try onClone(arena, &world, 1);
@@ -2215,7 +2878,7 @@ test "keep_local on a rewound remote" {
     try testing.expectEqual(@as(usize, 0), (try bob.sync.status(arena, "origin")).quarantined.len);
     // The rewritten history is the new baseline: sync merges it with Bob's
     // and pushes the result.
-    const s = try bob.sync.sync(arena, "origin");
+    const s = try bob.sync.sync(arena, "origin", .{});
     try testing.expectEqual(@as(usize, 0), s.merge.count(.quarantined));
     try testing.expectEqual(@as(usize, 1), s.merge.count(.merged));
     try testing.expectEqual(@as(usize, 1), s.push.pushed);
@@ -2228,10 +2891,10 @@ test "remote reset to an older tip gets the local tip again" {
     var world = testWorld();
 
     var a = try onClone(arena, &world, 0);
-    const created = try a.sync.repo.create(arena, .{ .title = "Reset" });
-    const ref_name = try std.fmt.allocPrint(arena, "refs/issues/{s}", .{created.id.slice()});
-    _ = try a.sync.repo.comment(arena, ref_name, .{ .text = "Second" });
-    _ = try a.sync.push(arena, "origin");
+    const created = try a.sync.repo.create(arena, .{ .title = "Reset" }, .{});
+    const ref_name = try std.fmt.allocPrint(arena, "refs/issues/{s}", .{created.id});
+    _ = try a.sync.repo.comment(arena, ref_name, .{ .text = "Second" }, .{});
+    _ = try a.sync.push(arena, "origin", .{});
     const local_tip = (try a.sim.resolveRef(ref_name)).?;
     try a.sim.commit();
 
@@ -2244,7 +2907,7 @@ test "remote reset to an older tip gets the local tip again" {
     try hub.commit();
 
     a = try onClone(arena, &world, 0);
-    const s = try a.sync.sync(arena, "origin");
+    const s = try a.sync.sync(arena, "origin", .{});
     try testing.expectEqual(@as(usize, 1), s.merge.count(.local_ahead));
     try testing.expectEqual(@as(usize, 1), s.push.pushed);
     try a.sim.commit();
@@ -2258,7 +2921,7 @@ test "remote reset to an older tip gets the local tip again" {
     }});
     try hub.commit();
     a = try onClone(arena, &world, 0);
-    const p = try a.sync.push(arena, "origin");
+    const p = try a.sync.push(arena, "origin", .{});
     try testing.expectEqual(@as(usize, 1), p.pushed);
     try a.sim.commit();
     hub = try GitSim.init(arena, &world, 2);
@@ -2276,7 +2939,7 @@ test "remote reset to an older tip gets the local tip again" {
     }});
     try hub.commit();
     a = try onClone(arena, &world, 0);
-    const again = try a.sync.sync(arena, "origin");
+    const again = try a.sync.sync(arena, "origin", .{});
     try testing.expectEqual(@as(usize, 0), again.merge.count(.quarantined));
     try testing.expectEqual(@as(usize, 1), again.merge.count(.local_ahead));
     try testing.expectEqual(@as(usize, 1), again.push.pushed);
@@ -2291,13 +2954,13 @@ test "attachment sync" {
     const A = attachments_mod.Attachments(GitSim);
 
     var a = try onClone(arena, &world, 0);
-    const created = try a.sync.repo.create(arena, .{ .title = "Shots" });
-    const ref = try std.fmt.allocPrint(arena, "refs/issues/{s}", .{created.id.slice()});
-    const derived = try A.derivedRefName(arena, created.id.slice());
+    const created = try a.sync.repo.create(arena, .{ .title = "Shots" }, .{});
+    const ref = try std.fmt.allocPrint(arena, "refs/issues/{s}", .{created.id});
+    const derived = try attachments_mod.refName(arena, created.id);
     _ = try A.fromRepo(a.sync.repo).add(arena, ref, .{
         .files = &.{.{ .name = "a.png", .data = samples.png }},
-    });
-    const first = try a.sync.sync(arena, "origin");
+    }, .{});
+    const first = try a.sync.sync(arena, "origin", .{});
     try testing.expectEqual(@as(usize, 1), first.push.lfs_uploaded);
     try testing.expectEqual(@as(usize, 1), first.push.pushed);
     try testing.expectEqual(@as(usize, 1), first.push.attachment_refs);
@@ -2320,19 +2983,24 @@ test "attachment sync" {
     try testing.expectEqual(@as(usize, 1), fetched.fetched);
     try testing.expect(try bob_att.read(arena, issue.attachments[0]) == .bytes);
 
-    _ = try bob_att.add(arena, ref, .{ .files = &.{.{ .name = "b.webp", .data = samples.webp }} });
+    _ = try bob_att.add(
+        arena,
+        ref,
+        .{ .files = &.{.{ .name = "b.webp", .data = samples.webp }} },
+        .{},
+    );
     try bob.sim.commit();
     a = try onClone(arena, &world, 0);
     _ = try A.fromRepo(a.sync.repo).add(arena, ref, .{
         .files = &.{.{ .name = "c.jpg", .data = samples.jpeg }},
-    });
-    _ = try a.sync.sync(arena, "origin");
+    }, .{});
+    _ = try a.sync.sync(arena, "origin", .{});
     try a.sim.commit();
     bob = try onClone(arena, &world, 1);
-    _ = try bob.sync.sync(arena, "origin"); // merges the issue, reconciles, pushes
+    _ = try bob.sync.sync(arena, "origin", .{}); // merges the issue, reconciles, pushes
     try bob.sim.commit();
     a = try onClone(arena, &world, 0);
-    const last = try a.sync.sync(arena, "origin");
+    const last = try a.sync.sync(arena, "origin", .{});
     try testing.expectEqual(@as(usize, 1), last.merge.attachment_refs); // fast-forward
     try a.sim.commit();
 
@@ -2355,6 +3023,101 @@ test "attachment sync" {
     try testing.expectEqual(@as(usize, 3), world.clones[2].lfs.len);
 }
 
+test "a purge's derived ref doesn't take the remote's old history back" {
+    var arena_state: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var world = testWorld();
+    const samples = @import("../format/attachment.zig").samples;
+    const A = attachments_mod.Attachments(GitSim);
+    const P = purge_mod.Purge(GitSim);
+
+    // One issue keeps an image, the other has none left after the purge.
+    var a = try onClone(arena, &world, 0);
+    const att = A.fromRepo(a.sync.repo);
+    const refs = [_][]const u8{
+        try std.fmt.allocPrint(
+            arena,
+            "refs/issues/{s}",
+            .{(try a.sync.repo.create(arena, .{ .title = "Kept" }, .{})).id},
+        ),
+        try std.fmt.allocPrint(
+            arena,
+            "refs/issues/{s}",
+            .{(try a.sync.repo.create(arena, .{ .title = "Empty" }, .{})).id},
+        ),
+    };
+    _ = try att.add(arena, refs[0], .{
+        .files = &.{.{ .name = "keep.webp", .data = samples.webp }},
+    }, .{});
+    var secrets: [2]Oid = undefined;
+    for (refs, &secrets) |ref, *secret| {
+        secret.* = (try att.add(arena, ref, .{
+            .files = &.{.{ .name = "secret.png", .data = samples.png }},
+            .comment = "Secret",
+        }, .{})).tip;
+    }
+    _ = try a.sync.sync(arena, "origin", .{});
+    try a.sim.commit();
+    var bob = try onClone(arena, &world, 1);
+    _ = try bob.sync.sync(arena, "origin", .{});
+    try bob.sim.commit();
+
+    a = try onClone(arena, &world, 0);
+    const old_derived = (try a.sim.resolveRef(
+        try attachments_mod.refName(arena, refs[0]["refs/issues/".len..]),
+    )).?;
+    for (refs, secrets) |ref, secret|
+        _ = try P.fromRepo(a.sync.repo).comment(arena, ref, secret, .{}, .{});
+    _ = try a.sync.sync(arena, "origin", .{});
+    try a.sim.commit();
+    bob = try onClone(arena, &world, 1);
+    _ = try bob.sync.sync(arena, "origin", .{});
+    try bob.sim.commit();
+
+    const clean = struct {
+        // No clone's derived ref has history from before the purge.
+        fn check(a2: Allocator, w: *GitSim.World, names: []const []const u8) !void {
+            for (0..3) |clone| {
+                var at = try onClone(a2, w, clone);
+                const here = attachments_mod.Attachments(GitSim).fromRepo(at.sync.repo);
+                for (names) |ref| {
+                    const tip = (try at.sim.resolveRef(ref)).?;
+                    const issue = try at.sync.repo.load(a2, .{ .name = ref, .tip = tip });
+                    const derived = (try at.sim.resolveRef(try attachments_mod.refName(
+                        a2,
+                        issue.id,
+                    ))).?;
+                    try testing.expect(!try here.hasOldTips(a2, derived, tip));
+                }
+            }
+        }
+    }.check;
+    try clean(arena, &world, &refs);
+
+    // The old history comes back, on the hub or in a clone: the next sync
+    // replaces it.
+    const name = try attachments_mod.refName(arena, refs[0]["refs/issues/".len..]);
+    for ([_]usize{ 2, 0 }) |where| {
+        var at = try onClone(arena, &world, where);
+        const now = (try at.sim.resolveRef(name)).?;
+        try at.sim.updateRefs(&.{.{
+            .name = name,
+            .op = .{ .update = .{ .new = old_derived, .old = now } },
+        }});
+        try at.sim.commit();
+        for (0..2) |_| {
+            a = try onClone(arena, &world, 0);
+            _ = try a.sync.sync(arena, "origin", .{});
+            try a.sim.commit();
+            bob = try onClone(arena, &world, 1);
+            _ = try bob.sync.sync(arena, "origin", .{});
+            try bob.sim.commit();
+        }
+        try clean(arena, &world, &refs);
+    }
+}
+
 test "before_push and no git-lfs" {
     var arena_state: std.heap.ArenaAllocator = .init(testing.allocator);
     defer arena_state.deinit();
@@ -2366,11 +3129,11 @@ test "before_push and no git-lfs" {
     const samples = @import("../format/attachment.zig").samples;
     const A = attachments_mod.Attachments(GitSim);
     var a = try onClone(arena, &world, 0);
-    const created = try a.sync.repo.create(arena, .{ .title = "Shots" });
-    const ref = try std.fmt.allocPrint(arena, "refs/issues/{s}", .{created.id.slice()});
+    const created = try a.sync.repo.create(arena, .{ .title = "Shots" }, .{});
+    const ref = try std.fmt.allocPrint(arena, "refs/issues/{s}", .{created.id});
     _ = try A.fromRepo(a.sync.repo).add(arena, ref, .{
         .files = &.{.{ .name = "a.png", .data = samples.png }},
-    });
+    }, .{});
 
     // A failing hook stops the push before any ref moves.
     const Hook = struct {
@@ -2389,14 +3152,14 @@ test "before_push and no git-lfs" {
         }
     };
     var failing: Hook = .{ .fail = true };
-    try testing.expectError(error.BeforePushFailed, a.sync.pushWith(arena, "origin", .{
+    try testing.expectError(error.BeforePushFailed, a.sync.push(arena, "origin", .{
         .before_push = .{ .context = &failing, .run = Hook.run },
     }));
     try a.sim.commit();
     try testing.expectEqual(@as(usize, 0), world.clones[1].refs.len);
     var ok: Hook = .{ .fail = false };
     a = try onClone(arena, &world, 0);
-    const pushed = try a.sync.pushWith(arena, "origin", .{
+    const pushed = try a.sync.push(arena, "origin", .{
         .before_push = .{ .context = &ok, .run = Hook.run },
     });
     try testing.expectEqual(@as(usize, 1), ok.calls);
@@ -2404,8 +3167,8 @@ test "before_push and no git-lfs" {
     // Only what the remote's derived ref doesn't list yet.
     _ = try A.fromRepo(a.sync.repo).add(arena, ref, .{
         .files = &.{.{ .name = "b.jpg", .data = samples.jpeg }},
-    });
-    _ = try a.sync.pushWith(arena, "origin", .{
+    }, .{});
+    _ = try a.sync.push(arena, "origin", .{
         .before_push = .{ .context = &ok, .run = Hook.run },
     });
     try testing.expectEqual(@as(usize, 2), ok.calls);
@@ -2414,24 +3177,57 @@ test "before_push and no git-lfs" {
     // bytes to upload fails before any ref moves.
     _ = try A.fromRepo(a.sync.repo).add(arena, ref, .{
         .files = &.{.{ .name = "c.webp", .data = samples.webp }},
-    });
+    }, .{});
     try a.sim.configAdd("sim.lfs", "false");
     const att = A.fromRepo(a.sync.repo);
     try testing.expectError(error.LfsUnavailable, att.add(arena, ref, .{
         .files = &.{.{ .name = "d.png", .data = samples.png }},
-    }));
+    }, .{}));
     const hub_before = world.clones[1].refs;
-    try testing.expectError(error.LfsUnavailable, a.sync.push(arena, "origin"));
+    try testing.expectError(error.LfsUnavailable, a.sync.push(arena, "origin", .{}));
     try a.sim.commit();
     try testing.expectEqualDeep(hub_before, world.clones[1].refs);
     // With nothing to upload, push needs no git-lfs.
     a = try onClone(arena, &world, 0);
     try a.sim.configAdd("sim.lfs", "true");
-    _ = try a.sync.push(arena, "origin");
+    _ = try a.sync.push(arena, "origin", .{});
     try a.sim.configAdd("sim.lfs", "false");
-    _ = try a.sync.repo.create(arena, .{ .title = "No images" });
-    const plain = try a.sync.push(arena, "origin");
+    _ = try a.sync.repo.create(arena, .{ .title = "No images" }, .{});
+    const plain = try a.sync.push(arena, "origin", .{});
     try testing.expectEqual(@as(usize, 1), plain.pushed);
+}
+
+test "a URL instead of a remote's name: its refs under url-<hash>" {
+    var arena_state: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    // No remote configured: the clones name the hub by its URL.
+    var world: GitSim.World = .{ .seed = 13, .clones = &.{
+        .{ .name = "alice" },
+        .{ .name = "bob" },
+        .{ .name = "hub" },
+    } };
+    const url = "sim:hub";
+    var a = try onClone(arena, &world, 0);
+    const made = try a.sync.repo.create(arena, .{ .title = "By URL" }, .{});
+    const pushed = try a.sync.sync(arena, url, .{});
+    try testing.expectEqual(@as(usize, 1), pushed.push.pushed);
+    try a.sim.commit();
+
+    var bob = try onClone(arena, &world, 1);
+    // `fetch = false` has no staging of its own to read: a URL fetches.
+    const merged = try bob.sync.merge(arena, url, .{ .fetch = false });
+    try testing.expectEqual(@as(usize, 1), merged.count(.created));
+    const key = try remoteKey(arena, url);
+    try testing.expect(std.mem.startsWith(u8, key, "url-") and key.len == 4 + 16);
+    const seen = try recordRef(arena, key, .seen, .issues, made.id);
+    try testing.expect(try bob.sim.resolveRef(seen) != null);
+    try testing.expectEqual(@as(usize, 0), (try bob.sync.status(arena, url)).quarantined.len);
+
+    try testing.expectError(error.InvalidRemoteName, bob.sync.merge(arena, "not a remote", .{}));
+    try testing.expect(contract.isRemoteUrl("../hub.git") and contract.isRemoteUrl("file:///x"));
+    try testing.expect(!contract.isRemoteUrl("-upload-pack=x:y"));
+    try testing.expect(!contract.isRemoteUrl("a\nb/c"));
 }
 
 test "progress phases, counts and the default remote" {
@@ -2440,9 +3236,9 @@ test "progress phases, counts and the default remote" {
     const arena = arena_state.allocator();
     var world = testWorld();
     const a = try onClone(arena, &world, 0);
-    const issue = try a.sync.repo.create(arena, .{ .title = "New here" });
+    const issue = try a.sync.repo.create(arena, .{ .title = "New here" }, .{});
     const Catalog = @import("milestone.zig").Catalog(GitSim);
-    _ = try Catalog.init(a.sim).create(arena, .{ .name = "v1" });
+    _ = try Catalog.init(a.sim).create(arena, .{ .name = "v1" }, .{});
 
     var c = try a.sync.counts(arena, "origin");
     try testing.expectEqual(@as(usize, 2), c.unpushed);
@@ -2460,19 +3256,23 @@ test "progress phases, counts and the default remote" {
         }
     };
     var seen: Seen = .{};
-    _ = try a.sync.syncWith(arena, "origin", .{ .progress = .{ .context = &seen, .phase = Seen.on } });
-    try testing.expectEqualSlices(Phase, &.{ .fetching, .merging, .pushing }, seen.phases[0..seen.n]);
+    _ = try a.sync.sync(arena, "origin", .{ .progress = .{ .context = &seen, .phase = Seen.on } });
+    try testing.expectEqualSlices(
+        Phase,
+        &.{ .fetching, .merging, .pushing },
+        seen.phases[0..seen.n],
+    );
     c = try a.sync.counts(arena, "origin");
     try testing.expectEqual(@as(usize, 0), c.unpushed);
     // Edited after a push: unpushed, but not new.
-    const ref = try std.fmt.allocPrint(arena, "refs/issues/{s}", .{issue.id.slice()});
-    _ = try a.sync.repo.edit(arena, ref, .{ .title = "Renamed" });
+    const ref = try std.fmt.allocPrint(arena, "refs/issues/{s}", .{issue.id});
+    _ = try a.sync.repo.edit(arena, ref, .{ .title = "Renamed" }, .{});
     const after = try a.sync.unpushed(arena, "origin");
     try testing.expectEqual(@as(usize, 1), after.len);
     try testing.expect(!after[0].new);
     try testing.expectEqual(@as(usize, 1), (try a.sync.status(arena, "origin")).unpushed.len);
 
-    try testing.expectEqualStrings("origin", (try defaultRemote(arena, a.sim)).?);
+    try testing.expectEqualStrings("origin", (try defaultRemote(GitSim, arena, a.sim)).?);
 }
 
 test "defaultRemote" {
@@ -2481,21 +3281,21 @@ test "defaultRemote" {
     const arena = arena_state.allocator();
     var world = testWorld();
     const sim = (try onClone(arena, &world, 2)).sim;
-    try testing.expect(try defaultRemote(arena, sim) == null);
+    try testing.expect(try defaultRemote(GitSim, arena, sim) == null);
     // Exactly one: that one, whatever its name.
     try sim.configAdd("remote.upstream.url", "sim:alice");
-    try testing.expectEqualStrings("upstream", (try defaultRemote(arena, sim)).?);
+    try testing.expectEqualStrings("upstream", (try defaultRemote(GitSim, arena, sim)).?);
     // Several without origin: the first by name.
     try sim.configAdd("remote.backup.url", "sim:bob");
-    try testing.expectEqualStrings("backup", (try defaultRemote(arena, sim)).?);
+    try testing.expectEqualStrings("backup", (try defaultRemote(GitSim, arena, sim)).?);
     try sim.configAdd("remote.origin.url", "sim:alice");
-    try testing.expectEqualStrings("origin", (try defaultRemote(arena, sim)).?);
+    try testing.expectEqualStrings("origin", (try defaultRemote(GitSim, arena, sim)).?);
     try sim.configAdd(remote_key, "upstream");
-    try testing.expectEqualStrings("upstream", (try defaultRemote(arena, sim)).?);
+    try testing.expectEqualStrings("upstream", (try defaultRemote(GitSim, arena, sim)).?);
     // A typo is an error, not another remote.
     try sim.configAdd(remote_key, "upstrem");
-    try testing.expectError(error.UnknownIssueRemote, defaultRemote(arena, sim));
+    try testing.expectError(error.UnknownIssueRemote, defaultRemote(GitSim, arena, sim));
     try sim.configAdd(remote_key, "-bad name");
-    try testing.expectError(error.UnknownIssueRemote, defaultRemote(arena, sim));
+    try testing.expectError(error.UnknownIssueRemote, defaultRemote(GitSim, arena, sim));
     try testing.expect(@import("errors.zig").describe(error.UnknownIssueRemote) != null);
 }

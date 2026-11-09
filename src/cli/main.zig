@@ -17,7 +17,9 @@ pub const std_options: std.Options = .{
 
 /// With the TUI, a panic first gives the terminal back: cooked mode, the
 /// main screen, no mouse reports.
-pub const panic = std.debug.FullPanic(if (build_options.tui) @import("tui").panic else std.debug.defaultPanic);
+pub const panic = std.debug.FullPanic(
+    if (build_options.tui) @import("tui").panic else std.debug.defaultPanic,
+);
 
 var stdout_buffer: [16 * 1024]u8 = undefined;
 var stderr_buffer: [4 * 1024]u8 = undefined;
@@ -34,8 +36,13 @@ pub fn main(init: std.process.Init) u8 {
     var stdout_writer = std.Io.File.stdout().writerStreaming(io, &stdout_buffer);
     var stderr_writer = std.Io.File.stderr().writerStreaming(io, &stderr_buffer);
 
+    const rest: []const []const u8 = @ptrCast(args[1..]);
+
     // Opened up front. Commands that need a repository report a failure.
-    var git = GitProcess.open(io, init.gpa, .{ .path = ".", .environ_map = init.environ_map });
+    var git = if (dispatch.usesRepository(args[0], rest))
+        GitProcess.open(io, init.gpa, .{ .path = ".", .environ_map = init.environ_map })
+    else
+        error.NotARepository;
     defer if (git) |*g| g.close() else |_| {};
 
     var ctx: context.Context(GitProcess) = .{
@@ -48,7 +55,6 @@ pub fn main(init: std.process.Init) u8 {
         .backend = if (git) |*g| g else |e| e,
     };
 
-    const rest: []const []const u8 = @ptrCast(args[1..]);
     const code = dispatch.run(GitProcess, &ctx, args[0], rest);
     stdout_writer.interface.flush() catch {};
     stderr_writer.interface.flush() catch {};
@@ -57,6 +63,7 @@ pub fn main(init: std.process.Init) u8 {
 
 test {
     _ = dispatch;
+    _ = @import("common.zig");
     _ = @import("simulate.zig");
     _ = @import("completion.zig");
     _ = @import("json.zig");

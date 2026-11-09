@@ -37,6 +37,7 @@ Conventions:
   "deleted": false,
   "labels": ["bug", "ui"],
   "assignee": "ada@example.com",
+  "assignees": ["ada@example.com", "bob@example.com"],
   "priority": "high",
   "milestone": "v1.0",
   "milestone_id": "95586de8-b8e3-47c9-ba85-887af6b78eba",
@@ -46,12 +47,17 @@ Conventions:
   "due": "2026-12-01",
   "estimate_minutes": 120,
   "workflow": "in-progress",
+  "locked": false,
+  "lock_reason": null,
+  "ref": null,
   "author": { "name": "Ada", "email": "ada@example.com" },
   "created": "2026-10-20T20:55:58+05:30",
   "updated": "2026-10-21T09:12:03+05:30",
   "fields": { "Priority": "high", "Milestone": "v1.0" },
   "conflicts": [{ "field": "Priority", "kept": "high", "lost": "low" }],
   "attachments": [],
+  "reactions": [{ "comment": null, "emoji": ":+1:", "users": ["ada@example.com"] }],
+  "closed": null,
   "effective_milestone_id": "95586de8-b8e3-47c9-ba85-887af6b78eba",
   "effective_workflow": "in-progress",
   "progress": { "closed": 1, "total": 3 },
@@ -61,13 +67,24 @@ Conventions:
 ```
 
 - `assignee` is the email, also for the `<uuid> <email>` form.
+  `assignees` lists everyone assigned, by email (format.md §3); `assignee`
+  is one of them, usually the first, `null` when there are none.
 - `milestone` is the readable text. `milestone_id` is the catalog link as
   written; `effective_milestone_id` follows `inherit` up the parent chain.
+- `number` is the issue's number in its host (`X-Number`), `null` when it
+  has none. `locked`, `lock_reason` and `ref` are `X-Locked`,
+  `X-Lock-Reason` and `X-Ref`.
 - `workflow` is as written. `effective_workflow` includes the default for
   open issues without one.
 - `fields` holds every other trailer field with a value, as written (for
   example `Fixed-By`, `Provider-ID` or other extensions).
+- `reactions` are grouped by target (`comment` is the comment's ID, `null`
+  for the issue's own) and emoji, `users` by email.
 - `conflicts` lists fields edited concurrently: `kept` won, `lost` lost.
+- `closed` says who closed a done issue (`closed` or one of
+  `issue.doneStates`) and when: `{ "author": { "name", "email" },
+  "author_id", "date", "commit" }`, the last commit that set a done state.
+  `null` for an issue that isn't done, or was created done.
 - `progress` counts the issue's leaves; it is `null` for an issue without
   sub-issues that aren't deleted. `closed` counts done leaves (`closed` and
   `issue.doneStates`).
@@ -96,9 +113,22 @@ With `show --json`, the issue also has:
       "merge": false,
       "edited": false,
       "deleted": false,
-      "attachments": ["720964d9-80f3-4953-bf91-3b32b2897504"]
+      "purged": false,
+      "attachments": ["720964d9-80f3-4953-bf91-3b32b2897504"],
+      "changes": [ { "key": "Labels", "op": "add", "old": null, "new": "ui" } ],
+      "history": [
+        {
+          "id": "1c0e3933b900007b3e513b8b33fb15245148e165",
+          "kind": "original",
+          "author": { "name": "Ada", "email": "ada@example.com" },
+          "date": "2026-10-20T20:57:44+05:30",
+          "text": "Here's a screenshot\n\nSecond paragraph."
+        }
+      ]
     }
-  ]
+  ],
+  "description_history": [ { "id": "…", "kind": "original", "author": { … }, "date": "…", "text": "…" } ],
+  "created_changes": [ { "key": "State", "op": "set", "old": null, "new": "open" } ]
 ```
 
 - `id` is the commit, the ID `comment --edit/--delete/--restore` takes.
@@ -113,6 +143,25 @@ With `show --json`, the issue also has:
   comments).
 - `deleted` comments are included, so check the flag before showing them.
 - `attachments` are the IDs this comment added.
+- `changes` (per comment) is what that commit changed in the resolved
+  fields, and `created_changes` what the first commit set: `op` is `set`
+  or `clear` for a field, `add` or `remove` for a member of a set
+  (`Labels`, `X-Blocked-By`) or an attachment (`X-Attachment`, by UUID).
+  Values are as written. A merge's are only what the merge itself
+  resolved, compared with what its parents merge to.
+- `purged` (per comment): `git issue purge --comment` took its text,
+  attachments and origin (format.md §10). Its fields and changes stay.
+- `original_author` and `original_id`, on the issue and on each comment,
+  say where imported text came from (`X-Original-Author`,
+  `X-Original-Id`); `null` otherwise. Host fields (`X-Forgejo-...`) are in
+  `fields`.
+- `history` (per comment) and `description_history` hold every version,
+  oldest first: `original` (the comment or the issue's root), then each
+  `edit`, `delete` and `restore` event, with its commit `id` and author.
+  `text` is the whole text after it (subject and body for a comment);
+  delete and restore keep the text they hide and show. After concurrent
+  edits the current text is the one §4 of format.md resolves to, which
+  needn't be the last version.
 
 ## Node
 

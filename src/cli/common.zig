@@ -48,6 +48,238 @@ pub const Args = struct {
     }
 };
 
+/// A flag's names, like "-m --message", and what it does. A missing value is
+/// reported under the first name, however the flag was spelled.
+pub const Flag = struct { []const u8, FlagAction };
+
+pub const FlagAction = union(enum) {
+    /// Takes a value; the last one stands.
+    text: *?[]const u8,
+    /// `text`, refusing a newline; the second is what to call the value then.
+    line: struct { *?[]const u8, []const u8 },
+    /// Takes a value; repeatable.
+    list: *std.ArrayList([]const u8),
+    /// `list`, of labels: one line and no commas.
+    label: *std.ArrayList([]const u8),
+    /// No value.
+    on: *bool,
+    /// No value.
+    off: *bool,
+    /// No value: stands for this text, for flags sharing a variable.
+    constant: struct { *?[]const u8, []const u8 },
+};
+
+pub const Positionals = union(enum) {
+    /// Takes none: anything but help is an unknown option, `--` too.
+    none,
+    /// Keeps the first and, like upstream, ignores the rest.
+    first: *?[]const u8,
+    /// Keeps one, and refuses another with this `missing` message.
+    only: struct { *?[]const u8, []const u8 },
+    words: *std.ArrayList([]const u8),
+    /// `words`, with the `--` that ends options as one of them.
+    words_and_separator: *std.ArrayList([]const u8),
+};
+
+pub const ArgSpec = struct {
+    command: []const u8,
+    help: []const u8,
+    positionals: Positionals,
+    flags: []const Flag = &.{},
+};
+
+/// For a command whose flags are all in its table. Null to go on; otherwise
+/// the command's exit code, with the reason already printed.
+pub fn parseArgs(ctx: anytype, argv: []const []const u8, spec: ArgSpec) ?u8 {
+    var parser = argParser(ctx, argv, spec);
+    if (parser.next()) |arg| return parser.unknown(arg);
+    return parser.exit;
+}
+
+/// For a command with flags a table can't say: it handles what `next` returns,
+/// then checks `exit`. `spec.flags` must outlive the parser.
+pub fn argParser(ctx: anytype, argv: []const []const u8, spec: ArgSpec) ArgParser {
+    return .{
+        .args = .{ .list = argv },
+        .out = ctx.out,
+        .err = ctx.err,
+        .arena = ctx.arena,
+        .spec = spec,
+    };
+}
+
+pub const ArgParser = struct {
+    args: Args,
+    out: *std.Io.Writer,
+    err: *std.Io.Writer,
+    arena: std.mem.Allocator,
+    spec: ArgSpec,
+    /// Set when parsing stopped early: help was shown or an argument refused.
+    exit: ?u8 = null,
+
+    /// Handles help, positionals and the table. Returns the next option that
+    /// isn't in the table; null at the end or once `exit` is set.
+    pub fn next(p: *ArgParser) ?[]const u8 {
+        while (p.exit == null) {
+            const arg = p.args.next() orelse return null;
+            if (p.spec.positionals != .none and !p.args.isOption(arg)) {
+                p.positional(arg);
+            } else if (isHelp(arg)) {
+                p.out.writeAll(p.spec.help) catch {};
+                p.exit = exit_ok;
+            } else {
+                const flag = for (p.spec.flags) |f| {
+                    if (isFlag(arg, f[0])) break f;
+                } else return arg;
+                p.apply(flag);
+            }
+        }
+        return null;
+    }
+
+    /// The value of a flag, or null with `exit` set.
+    pub fn value(p: *ArgParser, flag: []const u8) ?[]const u8 {
+        return p.args.value(p.err, flag) orelse {
+            p.exit = exit_error;
+            return null;
+        };
+    }
+
+    pub fn unknown(p: *ArgParser, arg: []const u8) u8 {
+        return unknownOption(p.err, p.spec.command, arg);
+    }
+
+    fn positional(p: *ArgParser, arg: []const u8) void {
+        const separator = p.args.was_separator;
+        switch (p.spec.positionals) {
+            .none => unreachable,
+            .first => |slot| if (!separator and slot.* == null) {
+                slot.* = arg;
+            },
+            .only => |only| if (!separator) {
+                if (only[0].* != null) p.exit = missing(p.err, p.spec.command, only[1]);
+                only[0].* = arg;
+            },
+            .words => |list| if (!separator) p.append(list, arg),
+            .words_and_separator => |list| p.append(list, arg),
+        }
+    }
+
+    fn apply(p: *ArgParser, flag: Flag) void {
+        const name = flag[0][0 .. std.mem.findScalar(u8, flag[0], ' ') orelse flag[0].len];
+        switch (flag[1]) {
+            .text => |target| target.* = p.value(name) orelse return,
+            .line => |line| {
+                const v = p.value(name) orelse return;
+                if (hasNewline(v)) {
+                    p.err.print("error: {s} must not contain newlines\n", .{line[1]}) catch {};
+                    p.exit = exit_error;
+                }
+                line[0].* = v;
+            },
+            .list => |list| p.append(list, p.value(name) orelse return),
+            .label => |list| {
+                const v = p.value(name) orelse return;
+                if (hasNewline(v)) {
+                    p.exit = fail(p.err, "error: label must not contain newlines\n");
+                } else if (std.mem.findScalar(u8, v, ',') != null) {
+                    p.err.print(
+                        "error: label '{s}' contains a comma (use multiple -l flags instead)\n",
+                        .{v},
+                    ) catch {};
+                    p.exit = exit_error;
+                } else p.append(list, v);
+            },
+            .on => |target| target.* = true,
+            .off => |target| target.* = false,
+            .constant => |constant| constant[0].* = constant[1],
+        }
+    }
+
+    fn append(p: *ArgParser, list: *std.ArrayList([]const u8), item: []const u8) void {
+        list.append(p.arena, item) catch {
+            p.exit = oom(p.err);
+        };
+    }
+};
+
+/// `names` as in a `Flag`.
+pub fn isFlag(arg: []const u8, names: []const u8) bool {
+    var it = std.mem.splitScalar(u8, names, ' ');
+    while (it.next()) |name| if (std.mem.eql(u8, arg, name)) return true;
+    return false;
+}
+
+test "ArgParser: the table, positionals and refusals" {
+    var arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer arena.deinit();
+    var buffer: [128]u8 = undefined;
+    var err: std.Io.Writer = .fixed(&buffer);
+    var out: std.Io.Writer = .fixed(&.{});
+    var first: ?[]const u8 = null;
+    var text: ?[]const u8 = null;
+    var words: std.ArrayList([]const u8) = .empty;
+    var on = false;
+    const flags = [_]Flag{
+        .{ "-t --text", .{ .text = &text } },
+        .{ "--line", .{ .line = .{ &text, "line" } } },
+        .{ "-l --label", .{ .label = &words } },
+        .{ "--on", .{ .on = &on } },
+    };
+    const start: ArgParser = .{
+        .args = .{ .list = &.{} },
+        .out = &out,
+        .err = &err,
+        .arena = arena.allocator(),
+        .spec = .{
+            .command = "x",
+            .help = "",
+            .positionals = .{ .first = &first },
+            .flags = &flags,
+        },
+    };
+
+    // The first positional wins; after `--` nothing is a flag.
+    var p = start;
+    p.args.list = &.{ "--text", "t", "a", "b", "--", "--on" };
+    try std.testing.expectEqual(null, p.next());
+    try std.testing.expectEqualStrings("a", first.?);
+    try std.testing.expectEqualStrings("t", text.?);
+    try std.testing.expect(p.exit == null and !on);
+
+    // Names match whole.
+    p = start;
+    p.args.list = &.{"-t --text"};
+    try std.testing.expectEqualStrings("-t --text", p.next().?);
+
+    // Taking no positionals, a word and `--` are unknown options, help isn't.
+    p = start;
+    p.spec.positionals = .none;
+    p.args.list = &.{ "w", "--", "-h", "--bogus" };
+    try std.testing.expectEqualStrings("w", p.next().?);
+    try std.testing.expectEqualStrings("--", p.next().?);
+    try std.testing.expectEqual(null, p.next());
+    try std.testing.expectEqual(exit_ok, p.exit.?);
+
+    // Refusals are reported under the first name, and stop the parse.
+    for ([_]struct { []const []const u8, []const u8 }{
+        .{ &.{ "--text", "t", "--text" }, "error: -t requires a value\n" },
+        .{ &.{ "--line", "a\nb", "--bogus" }, "error: line must not contain newlines\n" },
+        .{ &.{ "-l", "a\nb", "--bogus" }, "error: label must not contain newlines\n" },
+        .{
+            &.{ "-l", "a,b", "--bogus" },
+            "error: label 'a,b' contains a comma (use multiple -l flags instead)\n",
+        },
+    }) |refused| {
+        _ = err.consumeAll();
+        p = start;
+        p.args.list = refused[0];
+        try std.testing.expectEqual(null, p.next());
+        try std.testing.expectEqual(exit_error, p.exit.?);
+        try std.testing.expectEqualStrings(refused[1], err.buffered());
+    }
+}
+
 /// `-s/--state` of `ls` and `search`: a state, or `all` (null).
 pub fn stateFilter(value: []const u8) ?issuez.format.core.State {
     if (std.mem.eql(u8, value, "all")) return null;
@@ -102,22 +334,20 @@ pub fn openRepo(comptime B: type, ctx: *context.Context(B)) ?engine.Repo(B) {
         _ = oom(ctx.err);
         return null;
     };
-    if (settings.invalid_done_state) |v| {
+    var repo = engine.Repo(B).fromSettings(backend, settings) catch {
         ctx.err.print(
             "error: issue.doneStates has '{s}'; " ++ issuez.settings.done_states_rule ++ "\n",
-            .{v},
+            .{settings.invalid_done_state.?},
         ) catch {};
         return null;
-    }
-    var repo = engine.Repo(B).init(backend);
-    settings.apply(&repo);
+    };
     ctx.settings = settings;
     // One listing of the issues per command, until a write.
-    repo.listing = ctx.arena.create(engine.Repo(B).Listing) catch {
+    repo.call.listing = ctx.arena.create(engine.Repo(B).Listing) catch {
         _ = oom(ctx.err);
         return null;
     };
-    repo.listing.?.* = .{};
+    repo.call.listing.?.* = .{};
     return repo;
 }
 
@@ -133,7 +363,11 @@ pub fn openRepoQuiet(comptime B: type, ctx: *context.Context(B)) ?engine.Repo(B)
 /// Upstream's `init` sets `+refs/issues/*:refs/issues/*`, so a plain
 /// `git fetch` can overwrite local issue refs and lose unpushed commits.
 /// We warn on every command until it is fixed.
-fn warnUnsafeRefspecs(arena: std.mem.Allocator, config: anytype, err: *std.Io.Writer) void {
+fn warnUnsafeRefspecs(
+    arena: std.mem.Allocator,
+    config: []const issuez.backend.contract.ConfigEntry,
+    err: *std.Io.Writer,
+) void {
     var warned: std.ArrayList([]const u8) = .empty;
     for (config) |e| {
         if (!std.mem.startsWith(u8, e.key, "remote.") or !std.mem.endsWith(u8, e.key, ".fetch"))
@@ -199,6 +433,28 @@ pub fn resolveOne(
     }
 }
 
+/// The comment a prefix of its ID names, for `react --on` and `purge --comment`.
+/// Null after printing why.
+pub fn findCommentOid(
+    err: *std.Io.Writer,
+    issue: engine.Issue,
+    prefix: []const u8,
+) ?engine.Oid {
+    var found: ?engine.Oid = null;
+    for (issue.comments) |comment| {
+        if (comment.is_merge) continue;
+        const hex = comment.oid.hex();
+        if (!std.mem.startsWith(u8, hex.slice(), prefix)) continue;
+        if (found != null) {
+            _ = fail(err, "error: ambiguous comment ID\n");
+            return null;
+        }
+        found = comment.oid;
+    }
+    if (found == null) _ = fail(err, "error: no such comment on this issue\n");
+    return found;
+}
+
 /// `issuez.errors.describe`, with the CLI's own wording where it says
 /// more (a command to run, `fatal:` for setup problems).
 /// The CLI's repos run with the default limits.
@@ -233,11 +489,15 @@ pub fn reportEngineError(err: *std.Io.Writer, e: anyerror) void {
         error.NothingToEdit => "error: at least one edit option is required\n",
         // Its own messages say which value; this is the rest.
         error.InvalidValue => "error: invalid value\n",
-        error.MessageHasBody => "error: with --description, -m is only the subject (no blank lines)\n",
+        error.MessageHasBody => "error: with --description, -m is only the subject (no blank " ++
+            "lines)\n",
         error.CorruptIssue => "error: issue data is damaged (run 'git issue fsck')\n",
         error.GitSpawnFailed => "fatal: could not run git (is it installed and on PATH?)\n",
         else => {
-            err.print("error: {f}\n", .{issuez.errors.Description{ .err = e, .limits = .{} }}) catch {};
+            err.print(
+                "error: {f}\n",
+                .{issuez.errors.Description{ .err = e, .limits = .{} }},
+            ) catch {};
             return;
         },
     };
@@ -309,6 +569,11 @@ pub fn engineExitCode(e: anyerror) u8 {
 }
 
 /// An email, or `<uuid> <email>`.
+/// A value `validateAssignee` passed.
+pub fn assigneeOf(value: []const u8) issuez.format.fields.Assignee {
+    return issuez.format.fields.Assignee.parse(value).?;
+}
+
 pub fn validateAssignee(err: *std.Io.Writer, value: []const u8) bool {
     const space = std.mem.findScalar(u8, value, ' ') orelse
         return validateEmail(err, "assignee", value);
@@ -336,8 +601,74 @@ pub fn validateEmail(err: *std.Io.Writer, field: []const u8, email: []const u8) 
     return false;
 }
 
+/// `validateAssignee`, with the message for a newline first.
+pub fn validateAssigneeLine(err: *std.Io.Writer, value: []const u8) bool {
+    if (hasNewline(value)) {
+        err.writeAll("error: assignee must not contain newlines\n") catch {};
+        return false;
+    }
+    return validateAssignee(err, value);
+}
+
+/// Null after printing why.
+pub fn priorityOf(err: *std.Io.Writer, value: []const u8) ?issuez.format.core.Priority {
+    return issuez.format.core.Priority.parse(value) orelse {
+        err.writeAll("error: priority must be low, medium, high, or critical\n") catch {};
+        return null;
+    };
+}
+
+/// Null after printing why.
+pub fn numberOf(err: *std.Io.Writer, value: []const u8) ?u64 {
+    return issuez.format.fields.parseNumber(value) orelse {
+        err.writeAll("error: a number is a decimal from 1, without leading zeros\n") catch {};
+        return null;
+    };
+}
+
 pub fn hasNewline(s: []const u8) bool {
     return std.mem.findAny(u8, s, "\r\n") != null;
 }
 
 pub const IsoDate = issuez.format.time.IsoDate;
+
+/// `--field KEY=VALUE` and `--original-author`/`--original-id`, shared by
+/// create, edit and comment.
+pub const Extras = struct {
+    fields: std.ArrayList(issuez.engine.HostField) = .empty,
+    original: issuez.engine.Original = .{},
+
+    /// True when `arg` was one of them; false otherwise. Null on an error,
+    /// already reported.
+    pub fn parse(
+        x: *Extras,
+        arena: std.mem.Allocator,
+        err: *std.Io.Writer,
+        args: *Args,
+        arg: []const u8,
+    ) ?bool {
+        if (isFlag(arg, "--field")) {
+            const v = args.value(err, arg) orelse return null;
+            const eq = std.mem.findScalar(u8, v, '=') orelse {
+                err.writeAll("error: --field takes KEY=VALUE\n") catch {};
+                return null;
+            };
+            if (hasNewline(v)) {
+                err.writeAll("error: --field value must be one line\n") catch {};
+                return null;
+            }
+            x.fields.append(arena, .{ .key = v[0..eq], .value = v[eq + 1 ..] }) catch return null;
+            return true;
+        }
+        if (isFlag(arg, "--original-author --original-id")) {
+            const v = args.value(err, arg) orelse return null;
+            if (hasNewline(v) or v.len == 0) {
+                err.print("error: {s} takes one line of text\n", .{arg}) catch {};
+                return null;
+            }
+            if (isFlag(arg, "--original-author")) x.original.author = v else x.original.id = v;
+            return true;
+        }
+        return false;
+    }
+};

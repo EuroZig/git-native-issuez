@@ -54,25 +54,17 @@ pub fn main(comptime B: type, ctx: *context.Context(B), argv: []const []const u8
     var name: ?[]const u8 = null;
     var remote: ?[]const u8 = null;
     var as_json = false;
-    var args: common.Args = .{ .list = argv[1..] };
-    while (args.next()) |arg| {
-        if (!args.isOption(arg)) {
-            if (args.was_separator) continue;
-            words.append(arena, arg) catch return common.oom(ctx.err);
-        } else if (common.isHelp(arg)) {
-            ctx.out.writeAll(help) catch {};
-            return common.exit_ok;
-        } else if (std.mem.eql(u8, arg, "-m") or std.mem.eql(u8, arg, "--message")) {
-            const v = args.value(ctx.err, "-m") orelse return common.exit_error;
-            paragraphs.append(arena, v) catch return common.oom(ctx.err);
-        } else if (std.mem.eql(u8, arg, "--name")) {
-            name = args.value(ctx.err, arg) orelse return common.exit_error;
-        } else if (std.mem.eql(u8, arg, "--remote")) {
-            remote = args.value(ctx.err, arg) orelse return common.exit_error;
-        } else if (std.mem.eql(u8, arg, "--json")) {
-            as_json = true;
-        } else return common.unknownOption(ctx.err, "attach", arg);
-    }
+    if (common.parseArgs(ctx, argv[1..], .{
+        .command = "attach",
+        .help = help,
+        .positionals = .{ .words = &words },
+        .flags = &.{
+            .{ "-m --message", .{ .list = &paragraphs } },
+            .{ "--name", .{ .text = &name } },
+            .{ "--remote", .{ .text = &remote } },
+            .{ "--json", .{ .on = &as_json } },
+        },
+    })) |exit| return exit;
     const w = words.items;
     if (as_json and sub != .ls) return common.missing(ctx.err, "attach", "--json goes with ls");
     if (remote != null and sub != .fetch and sub != .cat)
@@ -119,18 +111,22 @@ pub fn main(comptime B: type, ctx: *context.Context(B), argv: []const []const u8
             const added = att.add(arena, ref.name, .{
                 .files = inputs,
                 .comment = text,
-            }) catch |e| return common.repoFailed(B, ctx, e);
+            }, .{}) catch |e| return common.repoFailed(B, ctx, e);
             for (added.ids) |id| {
                 ctx.out.print("Attached {s} to {s}\n", .{ uuid.shortId(id), short }) catch {};
             }
         },
         .ls => {
             const issue = repo.load(arena, ref) catch |e| return common.repoFailed(B, ctx, e);
-            const entries = att.list(arena, issue, .{}) catch |e| return common.repoFailed(B, ctx, e);
+            const entries = att.list(
+                arena,
+                issue,
+                .{},
+            ) catch |e| return common.repoFailed(B, ctx, e);
             if (as_json) {
                 var s = json.begin(ctx.out);
                 json.attachmentList(&s, entries) catch |e| return json.failed(ctx.err, e);
-                json.end(&s);
+                json.end(&s) catch |e| return json.failed(ctx.err, e);
                 return common.exit_ok;
             }
             for (entries) |e| {
@@ -180,7 +176,7 @@ pub fn main(comptime B: type, ctx: *context.Context(B), argv: []const []const u8
         .rename => {
             const issue = repo.load(arena, ref) catch |e| return common.repoFailed(B, ctx, e);
             const a = findOne(B, ctx, issue, w[1]) orelse return common.exit_error;
-            _ = att.rename(arena, ref.name, a.id, w[2], .{ .message = text }) catch |e|
+            _ = att.rename(arena, ref.name, a.id, w[2], .{ .message = text }, .{}) catch |e|
                 return common.repoFailed(B, ctx, e);
             ctx.out.print("Renamed {s} on {s}\n", .{ uuid.shortId(a.id), short }) catch {};
         },
@@ -192,7 +188,7 @@ pub fn main(comptime B: type, ctx: *context.Context(B), argv: []const []const u8
                 const a = findOne(B, ctx, issue, p) orelse return common.exit_error;
                 ids.append(arena, a.id) catch return common.oom(ctx.err);
             }
-            _ = att.remove(arena, ref.name, ids.items, .{ .message = text }) catch |e|
+            _ = att.remove(arena, ref.name, ids.items, .{ .message = text }, .{}) catch |e|
                 return common.repoFailed(B, ctx, e);
             for (ids.items) |id| {
                 ctx.out.print("Removed {s} from {s}\n", .{ uuid.shortId(id), short }) catch {};

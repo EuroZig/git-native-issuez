@@ -4,6 +4,7 @@
 //! engine or the CLI. Expected messages are built from scratch.
 
 const std = @import("std");
+const stableSort = @import("issuez").sort.stable;
 const Allocator = std.mem.Allocator;
 const issuez = @import("issuez");
 const object = issuez.backend.object;
@@ -32,7 +33,26 @@ pub const NaiveIssue = struct {
     title_override: ?[]const u8,
     state: []const u8,
     labels: []const []const u8,
+    /// The newest `Assignee` when it is one of `assignees`, "" when there
+    /// are none.
     assignee: []const u8,
+    /// Every member as written, by the oracle's own reading of format.md §3.
+    assignees: []const []const u8 = &.{},
+    /// The newest `Assignee` isn't one of `assignees`: the first of them
+    /// stands for it, and since the oracle doesn't model member order, any
+    /// of them may (`isAssignee`).
+    assignee_any: bool = false,
+    /// `X-Number` as written, "" when unset.
+    number: []const u8 = "",
+    /// Present reactions as `<comment hex or -> <emoji> <email>`, by the
+    /// oracle's own reading of format.md §5.
+    reactions: []const []const u8 = &.{},
+    /// `host_keys` as written, "" when unset.
+    host: [host_keys.len][]const u8 = @splat(""),
+    /// `X-Locked`, `X-Lock-Reason` and `X-Ref` as written, "" when unset.
+    locked: []const u8 = "",
+    lock_reason: []const u8 = "",
+    ref: []const u8 = "",
     priority: []const u8,
     milestone: []const u8,
     /// As written, "" when never set.
@@ -51,7 +71,14 @@ pub const NaiveIssue = struct {
     /// Of the fields a merge restates: written somewhere in the history,
     /// empty now.
     cleared: []const []const u8 = &.{},
+    /// The versions of the description and of each comment, by commit:
+    /// the original, then each event that targets it. Order isn't checked.
+    description_history: []const NaiveRevision = &.{},
+    comment_histories: []const NaiveHistory = &.{},
 };
+
+pub const NaiveRevision = struct { commit: []const u8, kind: []const u8 };
+pub const NaiveHistory = struct { comment: []const u8, revisions: []const NaiveRevision };
 
 /// Fields as text.
 pub const NaiveAttachment = struct {
@@ -106,6 +133,29 @@ pub const NaiveMilestone = struct {
     status: []const u8,
 };
 
+pub const Walk = struct {
+    clone: Clone,
+    /// Every ID met so far, missing commits too.
+    seen: std.StringHashMapUnmanaged(void) = .empty,
+    stack: std.ArrayList([]const u8) = .empty,
+    /// One of them wasn't there, or isn't a commit.
+    missing: bool = false,
+
+    pub fn next(w: *Walk) Allocator.Error!?struct { hex: []const u8, commit: object.Commit } {
+        const arena = w.clone.arena;
+        while (w.stack.pop()) |hex| {
+            if ((try w.seen.getOrPut(arena, hex)).found_existing) continue;
+            const cm = w.clone.commit(hex) orelse {
+                w.missing = true;
+                continue;
+            };
+            for (cm.parents) |p| try w.stack.append(arena, try p.hexAlloc(arena));
+            return .{ .hex = hex, .commit = cm };
+        }
+        return null;
+    }
+};
+
 pub const Clone = struct {
     arena: Allocator,
     format: object.ObjectFormat,
@@ -120,7 +170,7 @@ pub const Clone = struct {
         var set: std.StringHashMapUnmanaged(World.StoredObject) = .empty;
         for (clone.objects) |o| {
             const oid = object.hashObject(format, o.kind, o.data);
-            try set.put(arena, try arena.dupe(u8, oid.hex().slice()), o);
+            try set.put(arena, try oid.hexAlloc(arena), o);
         }
         return .{ .arena = arena, .format = format, .clone = clone, .objects = set };
     }
@@ -136,8 +186,42 @@ pub const Clone = struct {
         return object.Commit.parse(c.arena, c.format, o.data) catch null;
     }
 
+    /// A commit ID in this repository's format, lowercase.
+    pub fn isFullHex(c: Clone, s: []const u8) bool {
+        if (s.len != c.format.hexLen()) return false;
+        for (s) |ch| if (!std.ascii.isDigit(ch) and !(ch >= 'a' and ch <= 'f')) return false;
+        return true;
+    }
+
+    /// The commits reachable from `tip`, each once, as far as the objects go.
+    pub fn walk(c: Clone, tip: []const u8) Allocator.Error!Walk {
+        var w: Walk = .{ .clone = c };
+        try w.stack.append(c.arena, tip);
+        return w;
+    }
+
+    /// What `walk` meets from `tip`, missing commits too.
+    pub fn reach(c: Clone, tip: []const u8) Allocator.Error!std.StringHashMapUnmanaged(void) {
+        var w = try c.walk(tip);
+        while (try w.next()) |_| {}
+        return w.seen;
+    }
+
     pub fn matching(c: Clone, prefix: []const u8) Allocator.Error![]const []const u8 {
         var out: std.ArrayList([]const u8) = .empty;
+        // `#12`: the issues whose `X-Number` reads as exactly that.
+        if (prefix.len > 1 and prefix[0] == '#') {
+            for (c.clone.refs) |r| {
+                if (!std.mem.startsWith(u8, r.name, "refs/issues/")) continue;
+                const n = c.naive(r.oid) catch continue;
+                if (std.mem.eql(
+                    u8,
+                    n.number,
+                    prefix[1..],
+                ) and validNumber(n.number)) try out.append(c.arena, r.name);
+            }
+            return out.items;
+        }
         for (c.clone.refs) |r| {
             if (!std.mem.startsWith(u8, r.name, "refs/issues/")) continue;
             if (std.mem.startsWith(u8, r.name["refs/issues/".len..], prefix)) try out.append(
@@ -173,7 +257,117 @@ pub const Clone = struct {
         var dag = try Dag.load(c, tips);
         return dag.resolve();
     }
+
+    /// Whether every trailer in `want` is what the issue at `tip` already
+    /// has, by the oracle's own reading: a field its value as written (none
+    /// is the same as empty, no state open, no flag false), a list its
+    /// members. NoRule for what it
+    /// doesn't read that way: events, per-commit trailers.
+    pub fn restates(c: Clone, tip: []const u8, want: []const Trailer) RuleError!bool {
+        const dag = try Dag.load(c, &.{tip});
+        for (want) |t| {
+            if (std.ascii.eqlIgnoreCase(t.key, "X-Event") or
+                std.ascii.eqlIgnoreCase(t.key, "X-Comment") or
+                std.ascii.eqlIgnoreCase(t.key, "X-Message") or
+                std.ascii.startsWithIgnoreCase(t.key, "X-Original-")) return error.NoRule;
+            const is_set = for ([_][]const u8{ "Labels", "X-Blocked-By", "X-Assignees" }) |k| {
+                if (std.ascii.eqlIgnoreCase(k, t.key)) break true;
+            } else false;
+            if (is_set) {
+                const have = try dag.set(t.key);
+                const given = try splitLabels(c.arena, t.value);
+                if (have.len != given.len) return false;
+                for (given) |m| if (!contains(have, m)) return false;
+            } else {
+                const have = (try dag.scalar(t.key)) orelse "";
+                if (!std.mem.eql(u8, shown(t.key, have), shown(t.key, t.value))) return false;
+            }
+        }
+        return true;
+    }
 };
+
+pub const NaiveChange = struct {
+    key: []const u8,
+    op: []const u8,
+    old: ?[]const u8,
+    new: ?[]const u8,
+};
+
+/// The fields whose changes the oracle states.
+pub const change_scalars = [_][]const u8{
+    "Title",            "State",          "Assignee",         "Priority",
+    "Milestone",        "Fixed-By",       "Release",          "Reason",
+    "X-Parent",         "X-Start-Date",   "X-Due-Date",       "X-Estimate-Minutes",
+    "X-Workflow-State", "X-Milestone-Id", "X-Milestone-Mode", "X-Deleted",
+    "X-Number",         "X-Locked",       "X-Lock-Reason",    "X-Ref",
+};
+pub const change_sets = [_][]const u8{ "Labels", "X-Blocked-By", "X-Assignees" };
+
+const Values = struct {
+    scalars: [change_scalars.len]?[]const u8 = @splat(null),
+    sets: [change_sets.len][]const []const u8 = @splat(&.{}),
+    attachments: []const []const u8 = &.{},
+};
+
+/// What a commit changed: the fields read at the commit, against the
+/// fields read at its parents together (none for a root). Its own way of
+/// reading per-commit changes, from the tip-reading rule.
+pub fn changesOf(c: Clone, commit_hex: []const u8) RuleError![]const NaiveChange {
+    const cm = c.commit(commit_hex) orelse return error.NoRule;
+    var parents: std.ArrayList([]const u8) = .empty;
+    for (cm.parents) |p| try parents.append(c.arena, try p.hexAlloc(c.arena));
+    const before = try valuesAt(c, parents.items);
+    const after = try valuesAt(c, &.{commit_hex});
+    var out: std.ArrayList(NaiveChange) = .empty;
+    for (change_scalars, before.scalars, after.scalars) |k, old, new| {
+        if (old == null and new == null) continue;
+        if (old != null and new != null and std.mem.eql(u8, old.?, new.?)) continue;
+        try out.append(
+            c.arena,
+            .{ .key = k, .op = if (new == null) "clear" else "set", .old = old, .new = new },
+        );
+    }
+    for (
+        change_sets,
+        before.sets,
+        after.sets,
+    ) |k, old, new| try memberChanges(c.arena, &out, k, old, new);
+    try memberChanges(c.arena, &out, "X-Attachment", before.attachments, after.attachments);
+    return out.items;
+}
+
+fn memberChanges(
+    arena: Allocator,
+    out: *std.ArrayList(NaiveChange),
+    key: []const u8,
+    old: []const []const u8,
+    new: []const []const u8,
+) Allocator.Error!void {
+    for (new) |m| if (!contains(
+        old,
+        m,
+    )) try out.append(arena, .{ .key = key, .op = "add", .old = null, .new = m });
+    for (old) |m| if (!contains(
+        new,
+        m,
+    )) try out.append(arena, .{ .key = key, .op = "remove", .old = m, .new = null });
+}
+
+fn valuesAt(c: Clone, tips: []const []const u8) RuleError!Values {
+    var v: Values = .{};
+    if (tips.len == 0) return v;
+    var dag = try Dag.load(c, tips);
+    for (change_scalars, &v.scalars) |k, *x| {
+        const raw = try dag.scalar(k);
+        x.* = if (raw) |r| (if (r.len == 0) null else r) else null;
+    }
+    for (change_sets, &v.sets) |k, *x| x.* = try dag.set(k);
+    var ids: std.ArrayList([]const u8) = .empty;
+    for (try dag.attachments()) |a| try ids.append(c.arena, a.id);
+    v.attachments = ids.items;
+    return v;
+}
 
 /// The merge rule stated differently from the engine, which merges
 /// per-parent states pairwise. Here a field's setters are the commits in
@@ -207,7 +401,7 @@ const Dag = struct {
             const cm = c.commit(hex) orelse return error.NoRule;
             try index.put(c.arena, hex, order.items.len);
             try order.append(c.arena, hex);
-            for (cm.parents) |p| try stack.append(c.arena, try c.arena.dupe(u8, p.hex().slice()));
+            for (cm.parents) |p| try stack.append(c.arena, try p.hexAlloc(c.arena));
         }
         const nodes = try c.arena.alloc(Node, order.items.len);
         for (order.items, nodes) |hex, *n| {
@@ -335,9 +529,19 @@ const Dag = struct {
     }
 
     /// Labels, X-Blocked-By.
+    /// The value a commit lists for a set. For `X-Assignees`, a commit
+    /// that isn't a merge and writes `Assignee` without it lists that one
+    /// (format.md §3).
+    fn listed(d: Dag, i: usize, key: []const u8) ?[]const u8 {
+        const n = d.commits[i];
+        if (lastOf(n.block, key)) |v| return v;
+        if (!std.mem.eql(u8, key, "X-Assignees") or n.parents.len > 1) return null;
+        return lastOf(n.block, "Assignee");
+    }
+
     fn set(d: Dag, key: []const u8) Allocator.Error![]const []const u8 {
         var universe: std.ArrayList([]const u8) = .empty;
-        for (d.commits) |n| if (lastOf(n.block, key)) |v| {
+        for (0..d.commits.len) |ci| if (d.listed(ci, key)) |v| {
             for (try splitLabels(d.arena, v)) |l| {
                 if (!contains(universe.items, l)) try universe.append(d.arena, l);
             }
@@ -345,7 +549,7 @@ const Dag = struct {
         // Ancestors first.
         const order = try d.arena.alloc(usize, d.commits.len);
         for (order, 0..) |*o, i| o.* = i;
-        std.mem.sort(usize, order, d, struct {
+        stableSort(usize, order, d, struct {
             fn lt(dag: Dag, a: usize, b: usize) bool {
                 return dag.commits[a].ancestors.count() < dag.commits[b].ancestors.count();
             }
@@ -355,7 +559,7 @@ const Dag = struct {
         for (universe.items) |l| {
             var setters: std.ArrayList(LabelSetter) = .empty;
             for (order) |i| {
-                const v = lastOf(d.commits[i].block, key) orelse continue;
+                const v = d.listed(i, key) orelse continue;
                 const now = contains(try splitLabels(d.arena, v), l);
                 const before = try d.member(setters.items, AncestorScope{ .dag = d, .of = i });
                 if (now != before) try setters.append(d.arena, .{ .commit = i, .present = now });
@@ -398,7 +602,6 @@ const Dag = struct {
         // Of the fields a merge restates.
         for ([_][]const u8{
             "Title",
-            "Assignee",
             "Priority",
             "Milestone",
             "X-Parent",
@@ -420,6 +623,14 @@ const Dag = struct {
                 break;
             };
         }
+        // format.md §3: the assignees decide; `Assignee` names one of them.
+        const assignees = try d.set("X-Assignees");
+        const newest = try d.scalar("Assignee");
+        const assignee: []const u8 = if (newest) |v|
+            (if (contains(assignees, v)) v else "")
+        else
+            "";
+        if (assignees.len == 0 and newest != null) try cleared.append(d.arena, "Assignee");
         return .{
             .cleared = cleared.items,
             .title = if (title != null and title.?.len > 0) title.? else try trailers.subject(
@@ -429,7 +640,19 @@ const Dag = struct {
             .title_override = if (title != null and title.?.len > 0) title.? else null,
             .state = if (state != null and state.?.len > 0) state.? else "open",
             .labels = try d.set("Labels"),
-            .assignee = (try d.scalar("Assignee")) orelse "",
+            .assignee = assignee,
+            .assignees = assignees,
+            .assignee_any = assignee.len == 0 and assignees.len > 0,
+            .number = (try d.scalar("X-Number")) orelse "",
+            .locked = (try d.scalar("X-Locked")) orelse "",
+            .lock_reason = (try d.scalar("X-Lock-Reason")) orelse "",
+            .ref = (try d.scalar("X-Ref")) orelse "",
+            .reactions = try d.reactions(),
+            .host = blk: {
+                var h: [host_keys.len][]const u8 = undefined;
+                for (host_keys, &h) |k, *v| v.* = (try d.scalar(k)) orelse "";
+                break :blk h;
+            },
             .priority = (try d.scalar("Priority")) orelse "",
             .milestone = (try d.scalar("Milestone")) orelse "",
             .deleted = (try d.scalar("X-Deleted")) orelse "",
@@ -442,9 +665,141 @@ const Dag = struct {
             .milestone_id = (try d.scalar("X-Milestone-Id")) orelse "",
             .milestone_mode = (try d.scalar("X-Milestone-Mode")) orelse "",
             .attachments = try d.attachments(),
+            .description_history = try d.revisionsOf(r, null),
+            .comment_histories = try d.histories(),
         };
     }
+
+    /// An event commit, stated plainly: one parent, one `X-Event` of a
+    /// known kind; those that target a comment name, in `X-Comment`, a
+    /// commit of this history with one parent that is no event itself.
+    fn eventOf(d: Dag, i: usize) ?struct { kind: []const u8, target: ?usize } {
+        const n = d.commits[i];
+        const kind = soleEvent(n.block) orelse return null;
+        if (std.mem.eql(u8, kind, "description-edit")) return .{ .kind = "edit", .target = null };
+        const name = if (std.mem.eql(u8, kind, "comment-edit"))
+            "edit"
+        else if (std.mem.eql(u8, kind, "comment-delete"))
+            "delete"
+        else if (std.mem.eql(u8, kind, "comment-restore")) "restore" else return null;
+        const target = lastOf(n.block, "X-Comment") orelse return null;
+        for (d.commits, 0..) |t, ti| {
+            if (!std.mem.eql(u8, t.hex, target) or !d.inHistory(ti)) continue;
+            if (t.parents.len != 1 or d.hasEvent(ti)) return null;
+            return .{ .kind = name, .target = ti };
+        }
+        return null;
+    }
+
+    /// The value of a commit's one `X-Event`; null for none or several.
+    fn soleEvent(block: trailers.Block) ?[]const u8 {
+        var found: ?[]const u8 = null;
+        for (block.trailers) |t| if (std.ascii.eqlIgnoreCase(t.key, "X-Event")) {
+            if (found != null) return null;
+            found = t.value;
+        };
+        return found;
+    }
+
+    fn hasEvent(d: Dag, i: usize) bool {
+        return lastOf(d.commits[i].block, "X-Event") != null;
+    }
+
+    /// `first` and the events that target `comment` (null: the
+    /// description's).
+    fn revisionsOf(d: Dag, first: usize, comment: ?usize) Allocator.Error![]const NaiveRevision {
+        var out: std.ArrayList(NaiveRevision) = .empty;
+        try out.append(d.arena, .{ .commit = d.commits[first].hex, .kind = "original" });
+        for (d.commits, 0..) |n, i| {
+            if (!d.inHistory(i) or n.parents.len != 1) continue;
+            const e = d.eventOf(i) orelse continue;
+            if (comment) |c| {
+                if (e.target != c) continue;
+            } else if (e.target != null) continue;
+            try out.append(d.arena, .{ .commit = n.hex, .kind = e.kind });
+        }
+        return out.items;
+    }
+
+    /// A reaction commit: one parent, one `X-Event: reaction`, a valid
+    /// `X-Reaction`, and an `X-Comment`, if any, naming a comment here.
+    /// The member it sets, and whether it adds it.
+    fn reactionOf(d: Dag, i: usize) Allocator.Error!?struct { member: []const u8, add: bool } {
+        const n = d.commits[i];
+        if (n.parents.len != 1) return null;
+        const kind = soleEvent(n.block) orelse return null;
+        if (!std.mem.eql(u8, kind, "reaction")) return null;
+        const r = lastOf(n.block, "X-Reaction") orelse return null;
+        if (r.len < 2 or (r[0] != '+' and r[0] != '-')) return null;
+        const emoji = r[1..];
+        if (emoji.len > 64) return null;
+        for (emoji) |ch| if (ch <= 0x20 or ch == 0x7f or ch == ',') return null;
+        var target: []const u8 = "-";
+        if (lastOf(n.block, "X-Comment")) |t| {
+            const ok = for (d.commits, 0..) |x, xi| {
+                if (!std.mem.eql(u8, x.hex, t) or !d.inHistory(xi)) continue;
+                break x.parents.len == 1 and !d.hasEvent(xi);
+            } else false;
+            if (!ok) return null;
+            target = t;
+        }
+        return .{
+            .member = try std.fmt.allocPrint(
+                d.arena,
+                "{s} {s} {s}",
+                .{ target, emoji, n.commit.author.email },
+            ),
+            .add = r[0] == '+',
+        };
+    }
+
+    /// Per member, its setters that no other setter descends from; present
+    /// when one of them adds it.
+    fn reactions(d: Dag) Allocator.Error![]const []const u8 {
+        const Setter = struct { commit: usize, member: []const u8, add: bool };
+        var setters: std.ArrayList(Setter) = .empty;
+        for (0..d.commits.len) |i| {
+            if (!d.inHistory(i)) continue;
+            const r = (try d.reactionOf(i)) orelse continue;
+            try setters.append(d.arena, .{ .commit = i, .member = r.member, .add = r.add });
+        }
+        var out: std.ArrayList([]const u8) = .empty;
+        for (setters.items) |s| {
+            if (contains(out.items, s.member)) continue;
+            var present = false;
+            for (setters.items) |t| {
+                if (!std.mem.eql(u8, t.member, s.member)) continue;
+                const overtaken = for (setters.items) |u| {
+                    if (u.commit != t.commit and std.mem.eql(
+                        u8,
+                        u.member,
+                        t.member,
+                    ) and d.isAncestor(t.commit, u.commit))
+                        break true;
+                } else false;
+                if (!overtaken and t.add) present = true;
+            }
+            if (present) try out.append(d.arena, s.member);
+        }
+        return out.items;
+    }
+
+    /// For every comment commit: one parent and no event.
+    fn histories(d: Dag) Allocator.Error![]const NaiveHistory {
+        var out: std.ArrayList(NaiveHistory) = .empty;
+        for (d.commits, 0..) |n, i| {
+            if (!d.inHistory(i) or n.parents.len != 1 or d.hasEvent(i)) continue;
+            try out.append(d.arena, .{ .comment = n.hex, .revisions = try d.revisionsOf(i, i) });
+        }
+        return out.items;
+    }
 };
+
+/// Whether `got`, as written, is the assignee `n` resolves to.
+pub fn isAssignee(n: NaiveIssue, got: []const u8) bool {
+    if (n.assignee_any) return contains(n.assignees, got);
+    return std.mem.eql(u8, got, n.assignee);
+}
 
 pub fn sameSet(a: []const []const u8, b: []const []const u8) bool {
     if (a.len != b.len) return false;
@@ -452,9 +807,22 @@ pub fn sameSet(a: []const []const u8, b: []const []const u8) bool {
     return true;
 }
 
+/// format.md: an issue without `State` is open; `X-Deleted` and
+/// `X-Locked` are false unless `true`.
+fn shown(key: []const u8, value: []const u8) []const u8 {
+    if (std.ascii.eqlIgnoreCase(key, "State")) return if (value.len > 0) value else "open";
+    if (std.ascii.eqlIgnoreCase(key, "X-Deleted") or std.ascii.eqlIgnoreCase(key, "X-Locked"))
+        return if (std.mem.eql(u8, value, "true")) "true" else "false";
+    return value;
+}
+
 fn containsIndex(list: []const usize, item: usize) bool {
     for (list) |x| if (x == item) return true;
     return false;
+}
+
+pub fn containsText(list: []const []const u8, item: []const u8) bool {
+    return contains(list, item);
 }
 
 fn contains(list: []const []const u8, item: []const u8) bool {
@@ -557,7 +925,12 @@ fn resolveMilestone(
             hits += 1;
         };
         if (hits != 1) return false;
-        if (!eql(u8, hit.?.status, "open")) return false;
+        // Restating the issue's own link changes nothing, so no guard runs
+        // and a completed or retired milestone is fine.
+        const unchanged = if (previous) |p| eql(u8, p.milestone_id, hit.?.id) and
+            eql(u8, p.milestone, hit.?.name) and
+            (p.milestone_mode.len == 0 or eql(u8, p.milestone_mode, "explicit")) else false;
+        if (!eql(u8, hit.?.status, "open") and !unchanged) return false;
         out.milestone_text = hit.?.name;
         out.milestone_id = hit.?.id;
         out.milestone_mode = "explicit";
@@ -704,16 +1077,29 @@ pub fn expectedCreateMessage(
         "Labels: {s}\n",
         .{try joinLabels(arena, labels)},
     ) catch return error.OutOfMemory;
-    if (a.assignee) |v| if (v.len > 0) w.writer.print(
-        "Assignee: {s}\n",
-        .{v},
-    ) catch return error.OutOfMemory;
+    var people: std.ArrayList([]const u8) = .empty;
+    if (a.assignee) |v| if (v.len > 0) try people.append(arena, v);
+    try people.appendSlice(arena, a.more_assignees);
+    for (try assigneeTrailers(arena, try assigneeSet(arena, people.items, &.{}), false)) |t| {
+        w.writer.print("{s}: {s}\n", .{ t.key, t.value }) catch return error.OutOfMemory;
+    }
     if (a.priority) |v| w.writer.print("Priority: {s}\n", .{v}) catch return error.OutOfMemory;
     if (x.milestone_text) |v| if (v.len > 0) w.writer.print(
         "Milestone: {s}\n",
         .{v},
     ) catch return error.OutOfMemory;
     for (try extTrailers(arena, a.ext, x, null)) |t| {
+        w.writer.print("{s}: {s}\n", .{ t.key, t.value }) catch return error.OutOfMemory;
+    }
+    if (a.number) |n| w.writer.print("X-Number: {s}\n", .{n}) catch return error.OutOfMemory;
+    for (a.fields) |f| {
+        const eq = std.mem.findScalar(u8, f, '=').?;
+        if (eq + 1 < f.len) w.writer.print(
+            "{s}: {s}\n",
+            .{ f[0..eq], f[eq + 1 ..] },
+        ) catch return error.OutOfMemory;
+    }
+    for (try originalTrailers(arena, a.original_author, a.original_id)) |t| {
         w.writer.print("{s}: {s}\n", .{ t.key, t.value }) catch return error.OutOfMemory;
     }
     w.writer.writeAll("Format-Version: 1\n") catch return error.OutOfMemory;
@@ -784,7 +1170,15 @@ pub fn expectedEditTrailers(
     previous: NaiveIssue,
 ) Allocator.Error![]const trailers.Trailer {
     var list: std.ArrayList(trailers.Trailer) = .empty;
+    if (a.state) |st| {
+        try list.append(arena, .{ .key = "State", .value = st });
+        if (a.fixed_by) |v| try list.append(arena, .{ .key = "Fixed-By", .value = v });
+        if (a.reason) |v| try list.append(arena, .{ .key = "Reason", .value = v });
+    }
     if (a.title) |t| try list.append(arena, .{ .key = "Title", .value = t });
+    // Written once: only when it has none (or none that reads as one).
+    if (a.number) |n| if (!validNumber(previous.number))
+        try list.append(arena, .{ .key = "X-Number", .value = n });
     const no_labels = a.ext.cleared("labels");
     if (a.set_labels != null or a.add.len > 0 or a.remove.len > 0 or no_labels) {
         var next: std.ArrayList([]const u8) = .empty;
@@ -806,8 +1200,22 @@ pub fn expectedEditTrailers(
         const normalized = try splitLabels(arena, try std.mem.join(arena, ",", kept.items));
         try list.append(arena, .{ .key = "Labels", .value = try joinLabels(arena, normalized) });
     }
+    const cleared = a.ext.cleared("assignee");
+    // `--add-assignee ""` adds nobody, as the CLI reads it.
+    var adds: std.ArrayList([]const u8) = .empty;
+    for (a.add_assignees) |v| if (v.len > 0) try adds.append(arena, v);
+    if (a.assignee != null or cleared or adds.items.len > 0 or a.unassign.len > 0) {
+        var next: std.ArrayList([]const u8) = .empty;
+        if (cleared) {} else if (a.assignee) |v| {
+            if (v.len > 0) try next.append(arena, v);
+        } else try next.appendSlice(arena, previous.assignees);
+        try next.appendSlice(arena, adds.items);
+        try list.appendSlice(
+            arena,
+            try assigneeTrailers(arena, try assigneeSet(arena, next.items, a.unassign), true),
+        );
+    }
     const core = [_]struct { []const u8, []const u8, ?[]const u8 }{
-        .{ "Assignee", "assignee", a.assignee },
         .{ "Priority", "priority", a.priority },
     };
     for (core) |f| {
@@ -817,7 +1225,165 @@ pub fn expectedEditTrailers(
     }
     if (x.milestone_text) |v| try list.append(arena, .{ .key = "Milestone", .value = v });
     try list.appendSlice(arena, try extTrailers(arena, a.ext, x, previous));
+    if (a.lock) |l| {
+        try list.append(arena, .{ .key = "X-Locked", .value = if (l) "true" else "false" });
+        const reason = if (l) (a.lock_reason orelse "") else "";
+        // Unlocking, or locking without one, clears an earlier reason.
+        if (reason.len > 0 or previous.lock_reason.len > 0)
+            try list.append(arena, .{ .key = "X-Lock-Reason", .value = reason });
+    }
+    if (a.ref) |v| try list.append(arena, .{ .key = "X-Ref", .value = v });
+    for (a.fields) |f| {
+        const eq = std.mem.findScalar(u8, f, '=').?;
+        try list.append(arena, .{ .key = f[0..eq], .value = f[eq + 1 ..] });
+    }
+    try list.appendSlice(arena, try originalTrailers(arena, a.original_author, a.original_id));
+    if (a.comment.len > 0) try list.append(arena, comment_marker);
     return list.items;
+}
+
+/// Without duplicates and the ones removed, by value or email.
+fn assigneeSet(
+    arena: Allocator,
+    members: []const []const u8,
+    remove: []const []const u8,
+) Allocator.Error![]const []const u8 {
+    var out: std.ArrayList([]const u8) = .empty;
+    for (members) |raw| {
+        const m = std.mem.trim(u8, raw, " \t");
+        if (m.len == 0 or contains(out.items, m)) continue;
+        // The email is the last word.
+        const email = if (std.mem.findScalarLast(u8, m, ' ')) |sp| m[sp + 1 ..] else m;
+        const gone = for (remove) |r| {
+            const t = std.mem.trim(u8, r, " \t");
+            if (std.mem.eql(u8, t, m) or std.mem.eql(u8, t, email)) break true;
+        } else false;
+        if (!gone) try out.append(arena, m);
+    }
+    return out.items;
+}
+
+/// format.md §3: `Assignee` with the first, `X-Assignees` for several.
+fn assigneeTrailers(
+    arena: Allocator,
+    set: []const []const u8,
+    clear: bool,
+) Allocator.Error![]const trailers.Trailer {
+    var list: std.ArrayList(trailers.Trailer) = .empty;
+    if (set.len == 0 and !clear) return list.items;
+    try list.append(arena, .{ .key = "Assignee", .value = if (set.len > 0) set[0] else "" });
+    if (set.len > 1) try list.append(
+        arena,
+        .{ .key = "X-Assignees", .value = try std.mem.join(arena, ", ", set) },
+    );
+    return list.items;
+}
+
+/// format.md §3: decimal from 1, no leading zero, at most 2^53.
+/// What a merge commit restates, as this oracle reads format.md §4. A field
+/// written before but empty now is restated empty.
+pub fn restatedBy(arena: Allocator, n: NaiveIssue) Allocator.Error!std.ArrayList(Trailer) {
+    var want: std.ArrayList(Trailer) = .empty;
+    const was = struct {
+        fn f(x: NaiveIssue, key: []const u8) bool {
+            for (x.cleared) |k| if (std.mem.eql(u8, k, key)) return true;
+            return false;
+        }
+    }.f;
+    try want.append(arena, .{ .key = "State", .value = n.state });
+    if (n.title_override) |t|
+        try want.append(arena, .{ .key = "Title", .value = t })
+    else if (was(n, "Title"))
+        try want.append(arena, .{ .key = "Title", .value = "" });
+    if (n.labels.len > 0) try want.append(
+        arena,
+        .{ .key = "Labels", .value = try std.mem.join(arena, ", ", n.labels) },
+    ) else if (was(n, "Labels")) try want.append(arena, .{ .key = "Labels", .value = "" });
+    for ([_]Trailer{
+        // Any assignee may stand in (`isAssignee`): the first here.
+        .{ .key = "Assignee", .value = if (n.assignee_any) n.assignees[0] else n.assignee },
+        .{ .key = "Priority", .value = n.priority },
+        .{ .key = "Milestone", .value = n.milestone },
+    }) |t| if (t.value.len > 0 or was(n, t.key)) try want.append(arena, t);
+    // Extension fields as written, then the blockers.
+    for ([_]Trailer{
+        .{ .key = "X-Parent", .value = n.parent },
+        .{ .key = "X-Start-Date", .value = n.start },
+        .{ .key = "X-Due-Date", .value = n.due },
+        .{ .key = "X-Estimate-Minutes", .value = n.estimate },
+        .{ .key = "X-Workflow-State", .value = n.workflow },
+        .{ .key = "X-Milestone-Id", .value = n.milestone_id },
+        .{ .key = "X-Milestone-Mode", .value = n.milestone_mode },
+        .{ .key = "X-Deleted", .value = n.deleted },
+    }) |t| if (t.value.len > 0 or was(n, t.key)) try want.append(arena, t);
+    if (n.blocked_by.len > 0) try want.append(arena, .{
+        .key = "X-Blocked-By",
+        .value = try std.mem.join(arena, ", ", n.blocked_by),
+    }) else if (was(n, "X-Blocked-By")) try want.append(
+        arena,
+        .{ .key = "X-Blocked-By", .value = "" },
+    );
+    return want;
+}
+
+pub fn validNumber(s: []const u8) bool {
+    if (s.len == 0 or s.len > 16 or s[0] == '0') return false;
+    for (s) |ch| if (!std.ascii.isDigit(ch)) return false;
+    return (std.fmt.parseInt(u64, s, 10) catch return false) <= 1 << 53;
+}
+
+pub fn originalTrailers(
+    arena: Allocator,
+    author: ?[]const u8,
+    id: ?[]const u8,
+) Allocator.Error![]const trailers.Trailer {
+    var list: std.ArrayList(trailers.Trailer) = .empty;
+    if (author) |v| try list.append(arena, .{ .key = "X-Original-Author", .value = v });
+    if (id) |v| try list.append(arena, .{ .key = "X-Original-Id", .value = v });
+    return list.items;
+}
+
+/// The keys format.md gives a meaning, stated here on their own.
+const format_keys = [_][]const u8{
+    "State",                "Title",             "Labels",         "Assignee",
+    "Priority",             "Milestone",         "Fixed-By",       "Release",
+    "Reason",               "Format-Version",    "X-Milestone-Id", "X-Milestone-Mode",
+    "X-Parent",             "X-Blocked-By",      "X-Start-Date",   "X-Due-Date",
+    "X-Estimate-Minutes",   "X-Workflow-State",  "X-Deleted",      "X-Attachment",
+    "X-Attachment-Removed", "X-Event",           "X-Comment",      "X-Assignees",
+    "X-Number",             "X-Locked",          "X-Lock-Reason",  "X-Ref",
+    "X-Message",            "X-Original-Author", "X-Original-Id",  "Provider-Comment-ID",
+    "Exported-Commit",      "X-Author-Id",
+};
+
+/// format.md §2: a host field is an `X-` key the format doesn't use, made
+/// of letters, digits and `-`.
+pub fn hostFieldOk(spec: []const u8) bool {
+    const eq = std.mem.findScalar(u8, spec, '=') orelse return false;
+    const key = spec[0..eq];
+    if (key.len < 3 or !std.ascii.startsWithIgnoreCase(key, "X-")) return false;
+    for (key) |ch| if (!std.ascii.isAlphanumeric(ch) and ch != '-') return false;
+    for (format_keys) |k| if (std.ascii.eqlIgnoreCase(k, key)) return false;
+    return std.mem.findAny(u8, spec[eq + 1 ..], "\r\n") == null;
+}
+
+/// The host fields the fuzzer writes, read back.
+pub const host_keys = [_][]const u8{ "X-Forgejo-Project", "X-Forgejo-Ref-Id" };
+
+/// format.md §2: a comment beside fields says so.
+pub const comment_marker: trailers.Trailer = .{ .key = "X-Message", .value = "comment" };
+
+/// The message without its trailer block, as content lines.
+pub fn textLines(arena: Allocator, message: []const u8) Allocator.Error![]const []const u8 {
+    const block = try trailers.parse(arena, message, .{});
+    var lines: std.ArrayList([]const u8) = .empty;
+    var it = std.mem.splitScalar(u8, message, '\n');
+    var i: usize = 0;
+    while (it.next()) |l| : (i += 1) {
+        if (block.first_line) |f| if (i >= f) break;
+        try lines.append(arena, l);
+    }
+    return contentLines(arena, try std.mem.join(arena, "\n", lines.items));
 }
 
 pub fn expectedStateTrailers(
@@ -829,6 +1395,7 @@ pub fn expectedStateTrailers(
     if (a.fixed_by) |v| try list.append(arena, .{ .key = "Fixed-By", .value = v });
     if (a.release) |v| try list.append(arena, .{ .key = "Release", .value = v });
     if (a.reason) |v| try list.append(arena, .{ .key = "Reason", .value = v });
+    if (a.comment.len > 0) try list.append(arena, comment_marker);
     return list.items;
 }
 

@@ -14,6 +14,7 @@ pub fn isLower(s: []const u8) bool {
     return true;
 }
 
+/// Internal: the library's own plumbing, not API; it may change.
 /// True in each lane holding 0-9 or a-f.
 pub fn lowerMask(comptime n: comptime_int, v: @Vector(n, u8)) @Vector(n, bool) {
     const V = @Vector(n, u8);

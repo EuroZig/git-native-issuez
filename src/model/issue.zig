@@ -13,6 +13,7 @@
 //! base is needed, so criss-cross histories are fine too.
 
 const std = @import("std");
+const stableSort = @import("../sort.zig").stable;
 const assert = std.debug.assert;
 const Allocator = std.mem.Allocator;
 const object = @import("../backend/object.zig");
@@ -65,6 +66,15 @@ pub const Conflict = struct {
     };
 };
 
+/// A commit's `X-Author-Id`.
+pub const AuthorId = struct { oid: Oid, id: []const u8 };
+
+/// The author UUID of `oid`, one of the issue's commits.
+pub fn authorIdAt(author_ids: []const AuthorId, oid: Oid) ?[]const u8 {
+    for (author_ids) |a| if (a.oid.eql(oid)) return a.id;
+    return null;
+}
+
 pub const Comment = struct {
     oid: Oid,
     author: Signature,
@@ -85,6 +95,20 @@ pub const Comment = struct {
     /// order.
     attachments: []const []const u8 = &.{},
     kind: Kind = .comment,
+    /// Every version of the comment, oldest first: the original, then each
+    /// edit, delete and restore event that targets it.
+    history: []const Revision = &.{},
+    /// Where an imported comment came from (`X-Original-Author`,
+    /// `X-Original-Id`): its author and ID in the other tracker.
+    original_author: ?[]const u8 = null,
+    original_id: ?[]const u8 = null,
+    /// `X-Purged: true`: a purge took its text, attachments and origin
+    /// (format.md §10). Its fields stay.
+    purged: bool = false,
+    /// What this commit changed in the resolved fields, compared with its
+    /// parent; for a merge, with what its parents merge to, so only what
+    /// the merge itself resolved.
+    changes: []const Change = &.{},
 
     pub const Kind = enum {
         /// Text someone wrote, possibly with fields or attachments.
@@ -94,6 +118,59 @@ pub const Comment = struct {
         /// wrote ("Update labels").
         update,
     };
+};
+
+pub const Step = struct {
+    oid: Oid,
+    author: Signature,
+    what: union(enum) {
+        comment: usize,
+        event: struct {
+            kind: fields_fmt.Event,
+            /// The comment it targets; null for a description edit.
+            target: ?Oid,
+        },
+    },
+};
+
+/// Who reacted with one emoji, on the issue (`target` null) or a comment.
+pub const Reaction = struct {
+    target: ?Oid,
+    emoji: []const u8,
+    users: []const ReactionUser,
+};
+
+pub const ReactionUser = struct {
+    email: []const u8,
+    /// From the commit that added it.
+    name: []const u8,
+};
+
+/// One field change of a commit, values as written (`<uuid> <email>`, a
+/// label, a date). Sets change by member, attachments by UUID.
+pub const Change = struct {
+    /// The trailer key: `Labels`, `X-Due-Date`, `X-Attachment`, ...
+    key: []const u8,
+    op: Op,
+    /// Null when the field had no value (set) or for an added member.
+    old: ?[]const u8,
+    /// Null when cleared or for a removed member.
+    new: ?[]const u8,
+
+    pub const Op = enum { set, clear, add, remove };
+};
+
+/// One version of the description or of a comment. The current text is the
+/// one §4 resolves to, which after concurrent edits needn't be the last.
+pub const Revision = struct {
+    /// The commit that wrote it: the comment or root itself, or an event.
+    oid: Oid,
+    author: Signature,
+    kind: Kind,
+    /// The whole text after it; for delete and restore, the text then.
+    text: []const u8,
+
+    pub const Kind = enum { original, edit, delete, restore };
 };
 
 /// Read the bytes through `issuez.Attachments`.
@@ -119,6 +196,13 @@ pub const AttachmentProblem = struct {
         /// A different hash, size or media type for an existing UUID.
         /// Attachments are immutable.
         changed_object,
+
+        pub fn text(k: Kind) []const u8 {
+            return switch (k) {
+                .malformed => "malformed",
+                .changed_object => "object-changing",
+            };
+        }
     };
 };
 
@@ -138,9 +222,21 @@ pub const EventProblem = struct {
 };
 
 /// References are full UUIDs. Whether their targets exist is up to the
-/// projection. Values that don't parse end up in `invalid`.
+/// projection. Values that don't parse end up in `invalid_fields`.
 pub const Extensions = struct {
     assignee: ?fields_fmt.Assignee = null,
+    /// Everyone assigned, in order (format.md §3): `X-Assignees`, which a
+    /// plain `Assignee` (upstream's edit) sets to that one.
+    assignees: []const fields_fmt.Assignee = &.{},
+    /// As written.
+    assignees_written: []const []const u8 = &.{},
+    /// `X-Number`, the issue's number in its host (format.md §3).
+    number: ?u64 = null,
+    /// `X-Locked`: the host limits who may comment (its policy, not ours).
+    locked: bool = false,
+    lock_reason: ?[]const u8 = null,
+    /// `X-Ref`: the branch or tag the issue is about.
+    ref: ?[]const u8 = null,
     parent: ?[]const u8 = null,
     blocked_by: []const []const u8 = &.{},
     /// Every member as written, invalid ones included, in set order.
@@ -152,7 +248,7 @@ pub const Extensions = struct {
     workflow: ?[]const u8 = null,
     milestone_id: ?[]const u8 = null,
     milestone_mode: ?fields_fmt.MilestoneMode = null,
-    invalid: []const Field = &.{},
+    invalid_fields: []const Field = &.{},
 };
 
 pub const Issue = struct {
@@ -162,11 +258,58 @@ pub const Issue = struct {
     roots: usize,
     title: []const u8,
     title_override: ?[]const u8,
+    /// The root's subject: the title until a `Title` sets one.
+    root_subject: []const u8 = "",
     description: []const u8,
+    /// Every version of the description, oldest first: the root's, then
+    /// each `description-edit`.
+    description_history: []const Revision = &.{},
+    /// The fields the root commit set.
+    created_changes: []const Change = &.{},
+    /// An imported issue's author and ID in the other tracker, from the
+    /// root commit.
+    original_author: ?[]const u8 = null,
+    original_id: ?[]const u8 = null,
+    /// Present reactions, by target, then emoji, in the order they came.
+    reactions: []const Reaction = &.{},
+    /// Every commit after the root, oldest first, in the order of
+    /// `comments`: a comment (an index into `comments`) or an event.
+    steps: []const Step = &.{},
     /// `open` when never set.
     state: core_fmt.State,
     labels: []const []const u8,
-    ext: Extensions = .{},
+    // The extension fields (format.md §3), as `Extensions` has them.
+    assignee: ?fields_fmt.Assignee = null,
+    /// Everyone assigned, in order (format.md §3): `X-Assignees`, which a
+    /// plain `Assignee` (upstream's edit) sets to that one.
+    assignees: []const fields_fmt.Assignee = &.{},
+    /// As written.
+    assignees_written: []const []const u8 = &.{},
+    /// `X-Number`, the issue's number in its host (format.md §3).
+    number: ?u64 = null,
+    /// `X-Locked`: the host limits who may comment (its policy, not ours).
+    locked: bool = false,
+    lock_reason: ?[]const u8 = null,
+    /// `X-Ref`: the branch or tag the issue is about.
+    ref: ?[]const u8 = null,
+    parent: ?[]const u8 = null,
+    blocked_by: []const []const u8 = &.{},
+    /// Every member as written, invalid ones included, in set order.
+    blocked_by_written: []const []const u8 = &.{},
+    start_date: ?fields_fmt.Date = null,
+    due_date: ?fields_fmt.Date = null,
+    estimate_minutes: ?u32 = null,
+    /// As written. The projection applies the default for open issues.
+    workflow: ?[]const u8 = null,
+    milestone_id: ?[]const u8 = null,
+    milestone_mode: ?fields_fmt.MilestoneMode = null,
+    /// Extension values that don't parse.
+    invalid_fields: []const Field = &.{},
+    /// `Priority`; null when unset or not one of the four levels (another
+    /// tool may write `urgent`: `field("Priority")` has the text).
+    priority: ?core_fmt.Priority = null,
+    /// The `Milestone` text, as written; `milestone_id` is the catalog link.
+    milestone: ?[]const u8 = null,
     deleted: bool = false,
     event_problems: []const EventProblem = &.{},
     /// Oldest first.
@@ -183,6 +326,10 @@ pub const Issue = struct {
     cleared: []const []const u8 = &.{},
     conflicts: []const Conflict,
     author: Signature,
+    /// The root author's host UUID (`X-Author-Id`), if it has one.
+    author_id: ?[]const u8 = null,
+    /// Every commit's author UUID, by commit, for those that have one.
+    author_ids: []const AuthorId = &.{},
     created: i64,
     /// The tip's author time.
     updated: i64,
@@ -194,13 +341,19 @@ pub const Issue = struct {
     /// Raw messages in `git log` order, for `search`.
     log: []const []const u8,
 
-    /// Null when unset or not one of the four levels (another tool may
-    /// write `urgent`); `field("Priority")` has the text.
-    pub fn priority(issue: Issue) ?core_fmt.Priority {
-        return core_fmt.Priority.parse(issue.field("Priority") orelse return null);
+    /// The extension fields as one value, as the parser has them.
+    pub fn extensions(issue: *const Issue) Extensions {
+        var x: Extensions = .{};
+        inline for (std.meta.fields(Extensions)) |f| @field(x, f.name) = @field(issue, f.name);
+        return x;
     }
 
-    pub fn field(issue: Issue, key: []const u8) ?[]const u8 {
+    /// Sets the extension fields from `x`.
+    pub fn setExtensions(issue: *Issue, x: Extensions) void {
+        inline for (std.meta.fields(Extensions)) |f| @field(issue, f.name) = @field(x, f.name);
+    }
+
+    pub fn field(issue: *const Issue, key: []const u8) ?[]const u8 {
         for (issue.fields) |f| if (std.mem.eql(u8, f.key, key)) return f.value;
         return null;
     }
@@ -295,7 +448,7 @@ const AttachmentCell = struct {
     }
 };
 
-pub const set_keys = [_][]const u8{ "Labels", "X-Blocked-By" };
+pub const set_keys = [_][]const u8{ "Labels", "X-Blocked-By", "X-Assignees" };
 
 fn setKey(key: []const u8) ?[]const u8 {
     for (set_keys) |k| if (std.ascii.eqlIgnoreCase(k, key)) return k;
@@ -308,54 +461,243 @@ const Node = struct {
     block: trailers.Block,
 };
 
-pub fn materialize(
-    arena: Allocator,
-    id: []const u8,
-    tip: Oid,
-    commits: []const CommitInput,
-) Error!Issue {
+/// Every commit folded in topological order: the state after each.
+const Folded = struct {
+    nodes: []Node,
+    index: std.AutoHashMapUnmanaged([object.Oid.max_byte_len]u8, u32),
+    events: []const ?Event,
+    event_problems: std.ArrayList(EventProblem),
+    attachment_problems: std.ArrayList(AttachmentProblem),
+    states: []FoldState,
+    /// What each merge's parents merge to, before its own trailers.
+    merged_parents: []?FoldState,
+};
+
+fn fold(arena: Allocator, commits: []const CommitInput) Error!*Folded {
     assert(commits.len > 0);
-    var index: std.AutoHashMapUnmanaged([object.Oid.max_byte_len]u8, u32) = .empty;
-    for (commits, 0..) |c, i| try index.put(arena, c.oid.bytes, @intCast(i));
-    const nodes = try arena.alloc(Node, commits.len);
-    for (commits, nodes) |c, *n| {
+    const f = try arena.create(Folded);
+    f.* = .{
+        .nodes = try arena.alloc(Node, commits.len),
+        .index = .empty,
+        .events = &.{},
+        .event_problems = .empty,
+        .attachment_problems = .empty,
+        .states = try arena.alloc(FoldState, commits.len),
+        .merged_parents = try arena.alloc(?FoldState, commits.len),
+    };
+    for (commits, 0..) |c, i| try f.index.put(arena, c.oid.bytes, @intCast(i));
+    for (commits, f.nodes) |c, *n| {
         const parents = try arena.alloc(u32, c.parents.len);
         for (
             c.parents,
             parents,
-        ) |p, *pi| pi.* = index.get(p.bytes) orelse return error.MissingParent;
+        ) |p, *pi| pi.* = f.index.get(p.bytes) orelse return error.MissingParent;
         n.* = .{
             .input = c,
             .parents = parents,
             .block = try trailers.parse(arena, c.message, .{}),
         };
     }
-    const tip_index = index.get(tip.bytes) orelse return error.MissingParent;
-
-    const order = try topoOrder(arena, nodes);
-    const ancestors = try ancestorSets(arena, nodes, order);
-    var attachment_problems: std.ArrayList(AttachmentProblem) = .empty;
+    const order = try topoOrder(arena, f.nodes);
     const ctx: Ctx = .{
-        .nodes = nodes,
-        .ancestors = ancestors,
-        .attachment_problems = &attachment_problems,
+        .nodes = f.nodes,
+        .ancestors = try ancestorSets(arena, f.nodes, order),
+        .attachment_problems = &f.attachment_problems,
     };
-    var event_problems: std.ArrayList(EventProblem) = .empty;
-    const events = try classifyEvents(arena, nodes, &index, &event_problems);
-
-    const states = try arena.alloc(FoldState, nodes.len);
+    f.events = try classifyEvents(arena, f.nodes, &f.index, &f.event_problems);
     for (order) |i| {
-        const n = nodes[i];
+        const n = f.nodes[i];
+        f.merged_parents[i] = null;
         var s: FoldState = if (n.parents.len == 0)
             .{}
         else blk: {
-            var merged = try cloneState(arena, states[n.parents[0]]);
-            for (n.parents[1..]) |p| merged = try ctx.mergeStates(arena, merged, states[p]);
+            var merged = try cloneState(arena, f.states[n.parents[0]]);
+            for (n.parents[1..]) |p| merged = try ctx.mergeStates(arena, merged, f.states[p]);
+            if (n.parents.len > 1) f.merged_parents[i] = try cloneState(arena, merged);
             break :blk merged;
         };
-        try applyTrailers(arena, &s, n, i, events[i], &attachment_problems);
-        states[i] = s;
+        try applyTrailers(arena, &s, n, i, f.events[i], &f.attachment_problems);
+        f.states[i] = s;
     }
+    return f;
+}
+
+/// Whether `candidate`, a child of `tip`, would change nothing an issue
+/// shows: every field, set, event and attachment as it was, and no
+/// conflict it resolves. An empty value is the same as none. Writers
+/// use it to skip a commit that only restates what's there.
+pub fn changesNothing(
+    arena: Allocator,
+    commits: []const CommitInput,
+    tip: Oid,
+    candidate: CommitInput,
+) Error!bool {
+    // What the fold doesn't hold: a comment, provenance, a reaction.
+    const block = try trailers.parse(arena, candidate.message, .{});
+    // Who wrote it isn't a change.
+    for (block.trailers) |t| if (isPerCommitKey(t.key) and
+        !std.ascii.eqlIgnoreCase(t.key, author_id_key)) return false;
+    // Attachments are checked by the writer: present to remove, new to add.
+    for (block.trailers) |t| if (std.ascii.eqlIgnoreCase(t.key, attachment_fmt.add_key) or
+        std.ascii.eqlIgnoreCase(t.key, attachment_fmt.remove_key)) return false;
+    if (trailers.lastValue(block, "X-Event") == null) {
+        const body = try trailers.bodyLines(arena, candidate.message);
+        if ((try trailers.textLines(arena, body, .{})).len > 0) return false;
+    }
+    const all = try arena.alloc(CommitInput, commits.len + 1);
+    @memcpy(all[0..commits.len], commits);
+    all[commits.len] = candidate;
+    const f = try fold(arena, all);
+    const before = f.states[f.index.get(tip.bytes) orelse return error.MissingParent];
+    const after = f.states[commits.len];
+    // The candidate's own problems (a bad event target) are a change too.
+    for (f.event_problems.items) |p| if (p.oid.eql(candidate.oid)) return false;
+    // The title is the root's subject until a `Title` sets it.
+    var root: ?u32 = null;
+    for (f.nodes, 0..) |n, i| if (n.parents.len == 0) {
+        if (root == null or n.input.committer.time > f.nodes[root.?].input.committer.time)
+            root = @intCast(i);
+    };
+    const subject = try trailers.subject(
+        arena,
+        f.nodes[root orelse return error.NoRoot].input.message,
+    );
+    for (after.scalars.keys(), after.scalars.values()) |k, c| {
+        const prev = before.scalars.get(k);
+        if (std.mem.eql(u8, k, "Title")) {
+            const was = nonEmpty(prev) orelse subject;
+            if (!std.mem.eql(u8, was, nonEmpty(c) orelse subject)) return false;
+            if (prev != null and prev.?.lost != null and c.lost == null) return false;
+            continue;
+        }
+        const old = if (prev) |x| x.value else "";
+        if (!std.mem.eql(u8, shownValue(k, old), shownValue(k, c.value))) return false;
+        if (prev != null and prev.?.lost != null and c.lost == null) return false;
+    }
+    for (after.sets.keys()) |k| {
+        const old = try setMembers(arena, before, k);
+        const new = try setMembers(arena, after, k);
+        if (old.len != new.len) return false;
+        for (old, new) |a, b| if (!std.mem.eql(u8, a, b)) return false;
+    }
+    for (after.attachments.keys(), after.attachments.values()) |k, cell| {
+        const prev = before.attachments.get(k) orelse return false;
+        const same = prev.spec.sameObject(cell.spec) and
+            std.mem.eql(u8, prev.spec.name, cell.spec.name);
+        if (prev.present != cell.present or !same) return false;
+    }
+    return true;
+}
+
+/// A scalar as an issue shows it: no state is open, no flag is false.
+fn shownValue(key: []const u8, value: []const u8) []const u8 {
+    if (std.mem.eql(
+        u8,
+        key,
+        "State",
+    )) return core_fmt.State.parse(if (value.len > 0) value else "open").text();
+    if (std.mem.eql(u8, key, "X-Deleted") or std.mem.eql(u8, key, "X-Locked"))
+        return if (fields_fmt.parseBool(value) orelse false) "true" else "false";
+    return value;
+}
+
+/// Restated by merge commits after the core fields, as written (invalid
+/// values too), so a reader that takes the newest trailer it finds gets the
+/// merged value. `X-Blocked-By` follows them.
+pub const restated_extensions = [_][]const u8{
+    "X-Parent",
+    "X-Start-Date",
+    "X-Due-Date",
+    "X-Estimate-Minutes",
+    "X-Workflow-State",
+    "X-Milestone-Id",
+    "X-Milestone-Mode",
+    "X-Deleted",
+};
+
+/// What a merge of `parents` resolves to, through a synthetic node. `commits`
+/// are the parents' histories.
+pub fn resolveMerge(
+    arena: Allocator,
+    id: []const u8,
+    commits: []const CommitInput,
+    parents: []const Oid,
+    sig: Signature,
+    subject: []const u8,
+) Error!Issue {
+    assert(parents.len > 0);
+    var synthetic: Oid = .{ .object_format = parents[0].object_format, .bytes = @splat(0xff) };
+    synthetic.bytes[0] = 0xfe;
+    const all = try arena.alloc(CommitInput, commits.len + 1);
+    @memcpy(all[0..commits.len], commits);
+    all[commits.len] = .{
+        .oid = synthetic,
+        .parents = parents,
+        .author = sig,
+        .committer = sig,
+        .message = subject,
+    };
+    return materialize(arena, id, synthetic, all);
+}
+
+/// The trailers a merge commit restates (format.md §4). Cleared fields are
+/// restated empty, so a reader that takes the newest value doesn't find an
+/// older one.
+pub fn restatedTrailers(
+    arena: Allocator,
+    resolved: Issue,
+) Allocator.Error!std.ArrayList(trailers.Trailer) {
+    var list: std.ArrayList(trailers.Trailer) = .empty;
+    const cleared = struct {
+        fn f(issue: Issue, key: []const u8) ?[]const u8 {
+            return if (labels_fmt.contains(issue.cleared, key)) "" else null;
+        }
+    }.f;
+    try list.append(arena, .{ .key = "State", .value = resolved.state.text() });
+    if (resolved.title_override orelse cleared(resolved, "Title")) |t| try list.append(
+        arena,
+        .{ .key = "Title", .value = t },
+    );
+    if (resolved.labels.len > 0) try list.append(
+        arena,
+        .{ .key = "Labels", .value = try labels_fmt.join(arena, resolved.labels) },
+    ) else if (cleared(resolved, "Labels")) |v| try list.append(
+        arena,
+        .{ .key = "Labels", .value = v },
+    );
+    for ([_][]const u8{
+        "Assignee",
+        "Priority",
+        "Milestone",
+    } ++ restated_extensions) |key| {
+        const value = resolved.field(key) orelse cleared(resolved, key) orelse continue;
+        try list.append(arena, .{ .key = key, .value = value });
+    }
+    if (resolved.blocked_by_written.len > 0) try list.append(arena, .{
+        .key = "X-Blocked-By",
+        .value = try labels_fmt.join(arena, resolved.blocked_by_written),
+    }) else if (cleared(resolved, "X-Blocked-By")) |v| try list.append(
+        arena,
+        .{ .key = "X-Blocked-By", .value = v },
+    );
+    return list;
+}
+
+pub fn materialize(
+    arena: Allocator,
+    id: []const u8,
+    tip: Oid,
+    commits: []const CommitInput,
+) Error!Issue {
+    const f = try fold(arena, commits);
+    const nodes = f.nodes;
+    const index = &f.index;
+    const tip_index = index.get(tip.bytes) orelse return error.MissingParent;
+    const events = f.events;
+    const states = f.states;
+    const merged_parents = f.merged_parents;
+    const attachment_problems = f.attachment_problems;
+    const event_problems = f.event_problems;
 
     // With several roots (unrelated histories merged) take the newest by
     // committer time, like upstream.
@@ -369,10 +711,13 @@ pub fn materialize(
     const r = root orelse return error.NoRoot;
     const root_node = nodes[r];
     const final = states[tip_index];
+    const walk = try oldestFirst(arena, nodes, tip_index, r);
+    var steps: std.ArrayList(Step) = .empty;
 
     const title = nonEmpty(final.scalars.get("Title"));
+    const root_subject = try trailers.subject(arena, root_node.input.message);
     const root_body = try trailers.bodyLines(arena, root_node.input.message);
-    const description_lines = try trailers.textLines(arena, root_body, false);
+    const description_lines = try trailers.textLines(arena, root_body, .{});
     const description = if (final.scalars.get(description_key)) |c|
         c.value
     else
@@ -381,8 +726,10 @@ pub fn materialize(
     var fields: std.ArrayList(Field) = .empty;
     var cleared: std.ArrayList([]const u8) = .empty;
     var conflicts: std.ArrayList(Conflict) = .empty;
+    const assignees = try setMembers(arena, final, "X-Assignees");
+    const assignee = resolvedAssignee(final, assignees);
     const keys = try arena.dupe([]const u8, final.scalars.keys());
-    std.mem.sort([]const u8, keys, {}, lessThan);
+    stableSort([]const u8, keys, {}, lessThan);
     for (keys) |k| {
         const c = final.scalars.get(k).?;
         if (c.lost) |lost| try conflicts.append(arena, .{
@@ -392,6 +739,7 @@ pub fn materialize(
         });
         if (isInternalKey(k)) continue;
         if (std.mem.eql(u8, k, "State") or std.mem.eql(u8, k, "Format-Version")) continue;
+        if (std.mem.eql(u8, k, "Assignee")) continue;
         if (c.value.len == 0) {
             try cleared.append(arena, k);
             continue;
@@ -399,6 +747,11 @@ pub fn materialize(
         if (std.mem.eql(u8, k, "Title")) continue;
         try fields.append(arena, .{ .key = k, .value = c.value });
     }
+    if (assignee) |v| {
+        var at: usize = 0;
+        while (at < fields.items.len and lessThan({}, fields.items[at].key, "Assignee")) at += 1;
+        try fields.insert(arena, at, .{ .key = "Assignee", .value = v });
+    } else if (final.scalars.contains("Assignee")) try cleared.append(arena, "Assignee");
 
     const labels = try setMembers(arena, final, "Labels");
     const blocked_by = try setMembers(arena, final, "X-Blocked-By");
@@ -406,17 +759,19 @@ pub fn materialize(
         .{ "Labels", labels.len },
         .{ "X-Blocked-By", blocked_by.len },
     }) |set| if (set[1] == 0 and final.sets.contains(set[0])) try cleared.append(arena, set[0]);
-    std.mem.sort([]const u8, cleared.items, {}, lessThan);
+    stableSort([]const u8, cleared.items, {}, lessThan);
 
     const state_value = core_fmt.State.parse(nonEmpty(final.scalars.get("State")) orelse "open");
 
-    return .{
+    const ext = try extensions(arena, final, blocked_by, assignee, assignees);
+    var issue: Issue = .{
         .id = id,
         .tip = tip,
         .root = root_node.input.oid,
         .roots = roots,
-        .title = title orelse try trailers.subject(arena, root_node.input.message),
+        .title = title orelse root_subject,
         .title_override = title,
+        .root_subject = root_subject,
         .description = description,
         .deleted = if (final.scalars.get("X-Deleted")) |c|
             fields_fmt.parseBool(c.value) orelse false
@@ -428,19 +783,44 @@ pub fn materialize(
         .attachment_problems = try dedupProblems(arena, attachment_problems.items),
         .state = state_value,
         .labels = labels,
-        .ext = try extensions(arena, final, blocked_by),
         .fields = try fields.toOwnedSlice(arena),
         .cleared = cleared.items,
         .conflicts = try conflicts.toOwnedSlice(arena),
         .author = root_node.input.author,
+        .author_id = authorIdIn(root_node.block),
+        .author_ids = try authorIds(arena, nodes),
         .created = root_node.input.author.time,
         .updated = nodes[tip_index].input.author.time,
         .updated_tz_offset_minutes = nodes[tip_index].input.author.tz_offset_minutes,
-        .comments = try comments(arena, nodes, tip_index, r, events, final),
+        .comments = try comments(arena, nodes, walk, events, final, states, merged_parents, &steps),
+        .steps = steps.items,
+        .reactions = try reactionsOf(arena, nodes, final, root_node.input.oid.object_format),
+        .created_changes = try diffStates(arena, null, states[r]),
+        .original_author = trailers.lastValue(root_node.block, "X-Original-Author"),
+        .original_id = trailers.lastValue(root_node.block, "X-Original-Id"),
+        .description_history = try descriptionHistory(arena, nodes, walk, r, events),
         .log = try logMessages(arena, nodes, tip_index),
         .format_version = trailers.lastValue(root_node.block, "Format-Version"),
         .commit_count = nodes.len,
     };
+    issue.setExtensions(ext);
+    issue.priority = core_fmt.Priority.parse(issue.field("Priority") orelse "");
+    issue.milestone = issue.field("Milestone");
+    return issue;
+}
+
+fn authorIdIn(block: trailers.Block) ?[]const u8 {
+    const v = trailers.lastValue(block, author_id_key) orelse return null;
+    return if (uuid_fmt.isCanonical(v)) v else null;
+}
+
+fn authorIds(arena: Allocator, nodes: []const Node) Allocator.Error![]const AuthorId {
+    var out: std.ArrayList(AuthorId) = .empty;
+    for (nodes) |n| if (authorIdIn(n.block)) |id| try out.append(
+        arena,
+        .{ .oid = n.input.oid, .id = id },
+    );
+    return out.items;
 }
 
 const Ctx = struct {
@@ -459,7 +839,12 @@ const Ctx = struct {
         return ctx.nodes[a].input.oid.order(ctx.nodes[b].input.oid) == .gt;
     }
 
-    fn mergeStates(ctx: Ctx, arena: Allocator, a: FoldState, b: FoldState) Allocator.Error!FoldState {
+    fn mergeStates(
+        ctx: Ctx,
+        arena: Allocator,
+        a: FoldState,
+        b: FoldState,
+    ) Allocator.Error!FoldState {
         var out = try cloneState(arena, a);
         for (b.scalars.keys(), b.scalars.values()) |k, bc| {
             const gop = try out.scalars.getOrPut(arena, k);
@@ -516,7 +901,12 @@ const Ctx = struct {
             if (present and !x.present) continue;
             if (best == null or ctx.lwwWins(x.commit, best.?.commit)) best = x;
         }
-        return .{ .spec = best.?.spec, .present = present, .setters = setters, .added_in = added_in };
+        return .{
+            .spec = best.?.spec,
+            .present = present,
+            .setters = setters,
+            .added_in = added_in,
+        };
     }
 
     /// The setters of both sides that no setter on either side descends
@@ -545,7 +935,7 @@ const Ctx = struct {
                 try out.append(arena, x);
             }
         }
-        std.mem.sort(T, out.items, {}, struct {
+        stableSort(T, out.items, {}, struct {
             fn lt(_: void, x: T, y: T) bool {
                 return x.commit < y.commit;
             }
@@ -609,7 +999,38 @@ const Ctx = struct {
 /// Upstream's provider bridges put these on single commits (imported
 /// comments, export records). As issue fields they would show whichever
 /// came last. `Provider-ID` names the issue and stays a field.
-pub const per_commit_keys = [_][]const u8{ "Provider-Comment-ID", "Exported-Commit" };
+pub const per_commit_keys = [_][]const u8{
+    "Provider-Comment-ID", "Exported-Commit",  "X-Message",  "X-Original-Author", "X-Original-Id",
+    "X-Purged",            "X-Rewritten-From", "X-Reaction", author_id_key,
+};
+
+/// The host's UUID of a commit's author (format.md §3): the identity
+/// behind the name and email, which may change.
+pub const author_id_key = "X-Author-Id";
+
+/// The commit's author UUID: its last `X-Author-Id` when that is a
+/// canonical UUID.
+pub fn authorIdOf(arena: Allocator, message: []const u8) Allocator.Error!?[]const u8 {
+    const block = try trailers.parse(arena, message, .{});
+    const v = trailers.lastValue(block, author_id_key) orelse return null;
+    return if (uuid_fmt.isCanonical(v)) v else null;
+}
+
+/// A key the format gives a meaning (fields, events, attachments,
+/// per-commit trailers): host fields can't use it.
+pub fn isFormatKey(key: []const u8) bool {
+    if (setKey(key) != null or isPerCommitKey(key) or isEventKey(key)) return true;
+    if (std.ascii.eqlIgnoreCase(key, attachment_fmt.add_key) or
+        std.ascii.eqlIgnoreCase(key, attachment_fmt.remove_key)) return true;
+    for (scalar_keys) |k| if (std.ascii.eqlIgnoreCase(k, key)) return true;
+    return false;
+}
+
+/// A host's own field (format.md §2): an `X-` key the format doesn't use.
+pub fn isHostKey(key: []const u8) bool {
+    const namespaced = key.len > 2 and std.ascii.startsWithIgnoreCase(key, "X-");
+    return namespaced and !isFormatKey(key);
+}
 
 fn isPerCommitKey(key: []const u8) bool {
     for (per_commit_keys) |k| if (std.ascii.eqlIgnoreCase(k, key)) return true;
@@ -627,6 +1048,15 @@ fn applyTrailers(
     const setter: u32 = @intCast(self);
     const is_merge = n.parents.len > 1;
     if (event) |e| try applyEvent(arena, s, e, setter);
+    // A plain `Assignee` without `X-Assignees`, as upstream (which knows
+    // only one) writes it, sets the assignees to that one. Merges restate
+    // `Assignee`, so they don't count.
+    if (!is_merge and trailers.lastValue(n.block, "X-Assignees") == null) {
+        if (trailers.lastValue(
+            n.block,
+            "Assignee",
+        )) |v| try applySet(arena, s, "X-Assignees", v, setter);
+    }
     // Within a commit the last occurrence of a key wins, like git's
     // %(trailers:key=...).
     for (n.block.trailers) |t| {
@@ -717,7 +1147,7 @@ fn attachmentList(
             .added_by = added.author,
         });
     }
-    std.mem.sort(Attachment, out.items, {}, struct {
+    stableSort(Attachment, out.items, {}, struct {
         fn lt(_: void, x: Attachment, y: Attachment) bool {
             if (x.added_by.time != y.added_by.time) return x.added_by.time < y.added_by.time;
             // Same commit: trailer order, the sort is stable.
@@ -733,6 +1163,53 @@ const description_key = "event description";
 
 fn commentKey(arena: Allocator, what: []const u8, target: []const u8) Allocator.Error![]const u8 {
     return std.fmt.allocPrint(arena, "comment-{s} {s}", .{ what, target });
+}
+
+fn reactionsOf(
+    arena: Allocator,
+    nodes: []const Node,
+    final: FoldState,
+    format: object.ObjectFormat,
+) Allocator.Error![]const Reaction {
+    var out: std.ArrayList(Reaction) = .empty;
+    for (final.sets.keys(), final.sets.values()) |k, set| {
+        if (!std.mem.startsWith(u8, k, "reaction ")) continue;
+        const t = k["reaction ".len..];
+        const target: ?Oid = if (std.mem.eql(
+            u8,
+            t,
+            "-",
+        )) null else Oid.parseHex(format, t) catch continue;
+        var emojis: std.ArrayList([]const u8) = .empty;
+        var users: std.ArrayList(std.ArrayList(ReactionUser)) = .empty;
+        for (set.members.keys(), set.members.values()) |member, cell| {
+            if (!cell.present) continue;
+            const sp = std.mem.findScalar(u8, member, ' ') orelse continue;
+            const emoji = member[0..sp];
+            var name: []const u8 = "";
+            for (cell.setters) |st| if (st.present) {
+                name = nodes[st.commit].input.author.name;
+            };
+            const at = for (emojis.items, 0..) |e, i| {
+                if (std.mem.eql(u8, e, emoji)) break i;
+            } else blk: {
+                try emojis.append(arena, emoji);
+                try users.append(arena, .empty);
+                break :blk emojis.items.len - 1;
+            };
+            try users.items[at].append(arena, .{ .email = member[sp + 1 ..], .name = name });
+        }
+        for (
+            emojis.items,
+            users.items,
+        ) |e, u| try out.append(arena, .{ .target = target, .emoji = e, .users = u.items });
+    }
+    return out.items;
+}
+
+/// "reaction -" for the issue's, "reaction <oid>" for a comment's.
+fn reactionKey(arena: Allocator, target: []const u8) Allocator.Error![]const u8 {
+    return std.fmt.allocPrint(arena, "reaction {s}", .{if (target.len == 0) "-" else target});
 }
 
 fn isInternalKey(k: []const u8) bool {
@@ -757,6 +1234,9 @@ const Event = struct {
     kind: fields_fmt.Event,
     target: []const u8 = "",
     text: []const u8 = "",
+    reaction: ?fields_fmt.Reaction = null,
+    /// The author's email: whose reaction it is.
+    actor: []const u8 = "",
 };
 
 fn classifyEvents(
@@ -787,9 +1267,23 @@ fn classifyEvents(
         var e: Event = .{ .kind = kind };
         if (kind.carriesText()) {
             const body = try trailers.bodyLines(arena, n.input.message);
-            e.text = try std.mem.join(arena, "\n", try trailers.textLines(arena, body, false));
+            e.text = try std.mem.join(arena, "\n", try trailers.textLines(arena, body, .{}));
         }
-        if (kind.targetsComment()) {
+        if (kind == .reaction) {
+            e.reaction = fields_fmt.Reaction.parse(trailers.lastValue(
+                n.block,
+                "X-Reaction",
+            ) orelse "") orelse {
+                try problems.append(arena, bad);
+                continue;
+            };
+            e.actor = n.input.author.email;
+        }
+        const optional_target = kind == .reaction and trailers.lastValue(
+            n.block,
+            "X-Comment",
+        ) != null;
+        if (kind.targetsComment() or optional_target) {
             const target = trailers.lastValue(n.block, "X-Comment") orelse {
                 try problems.append(arena, bad);
                 continue;
@@ -833,6 +1327,18 @@ fn applyEvent(arena: Allocator, s: *FoldState, e: Event, setter: u32) Allocator.
             const visible = if (e.kind == .comment_delete) "0" else "1";
             try put(arena, s, try commentKey(arena, "visible", e.target), visible, setter);
         },
+        // Per target, a set of `<emoji> <email>`: §4 per member, so a
+        // concurrent add and remove resolve to add.
+        .reaction => {
+            const r = e.reaction.?;
+            const key = try reactionKey(arena, e.target);
+            const gop = try s.sets.getOrPut(arena, key);
+            if (!gop.found_existing) gop.value_ptr.* = .{};
+            const member = try std.fmt.allocPrint(arena, "{s} {s}", .{ r.emoji, e.actor });
+            const mg = try gop.value_ptr.members.getOrPut(arena, member);
+            if (!mg.found_existing or mg.value_ptr.present != r.add)
+                mg.value_ptr.* = try .set(arena, r.add, setter);
+        },
     }
 }
 
@@ -874,6 +1380,8 @@ fn extensions(
     arena: Allocator,
     s: FoldState,
     blocked_by: []const []const u8,
+    assignee: ?[]const u8,
+    assignees: []const []const u8,
 ) Allocator.Error!Extensions {
     var ext: Extensions = .{};
     var invalid: std.ArrayList(Field) = .empty;
@@ -883,11 +1391,19 @@ fn extensions(
             return if (c.value.len == 0) null else c.value;
         }
     }.of;
-    if (value(s, "Assignee")) |v| {
+    if (assignee) |v| {
         if (fields_fmt.Assignee.parse(v)) |a| ext.assignee = a else {
             try invalid.append(arena, .{ .key = "Assignee", .value = v });
         }
     }
+    var people: std.ArrayList(fields_fmt.Assignee) = .empty;
+    for (assignees) |a| {
+        if (fields_fmt.Assignee.parse(a)) |parsed| try people.append(arena, parsed) else {
+            try invalid.append(arena, .{ .key = "X-Assignees", .value = a });
+        }
+    }
+    ext.assignees = people.items;
+    ext.assignees_written = assignees;
     if (value(s, "X-Parent")) |v| {
         if (uuid_fmt.isCanonical(v)) ext.parent = v else {
             try invalid.append(arena, .{ .key = "X-Parent", .value = v });
@@ -924,15 +1440,44 @@ fn extensions(
         }
     }
     if (value(s, "X-Deleted")) |v| {
-        if (fields_fmt.parseBool(v) == null) try invalid.append(arena, .{ .key = "X-Deleted", .value = v });
+        if (fields_fmt.parseBool(v) == null) try invalid.append(
+            arena,
+            .{ .key = "X-Deleted", .value = v },
+        );
+    }
+    if (value(s, "X-Number")) |v| {
+        if (fields_fmt.parseNumber(v)) |n| ext.number = n else {
+            try invalid.append(arena, .{ .key = "X-Number", .value = v });
+        }
+    }
+    if (value(s, "X-Locked")) |v| {
+        if (fields_fmt.parseBool(v)) |b| ext.locked = b else {
+            try invalid.append(arena, .{ .key = "X-Locked", .value = v });
+        }
+    }
+    ext.lock_reason = value(s, "X-Lock-Reason");
+    if (value(s, "X-Ref")) |v| {
+        if (fields_fmt.isRefName(v)) ext.ref = v else {
+            try invalid.append(arena, .{ .key = "X-Ref", .value = v });
+        }
     }
     if (value(s, "X-Workflow-State")) |v| {
         if (fields_fmt.isSlug(v)) ext.workflow = v else {
             try invalid.append(arena, .{ .key = "X-Workflow-State", .value = v });
         }
     }
-    ext.invalid = invalid.items;
+    ext.invalid_fields = invalid.items;
     return ext;
+}
+
+/// format.md §3: the newest `Assignee` while it is one of the assignees,
+/// else the first of them. Concurrent edits can remove the newest one from
+/// the set (an upstream edit on one side, `X-Assignees` on the other), and
+/// then the set is what is assigned.
+fn resolvedAssignee(s: FoldState, assignees: []const []const u8) ?[]const u8 {
+    const newest = if (s.scalars.get("Assignee")) |c| c.value else "";
+    if (newest.len > 0 and labels_fmt.contains(assignees, newest)) return newest;
+    return if (assignees.len > 0) assignees[0] else null;
 }
 
 fn setMembers(arena: Allocator, s: FoldState, key: []const u8) Allocator.Error![]const []const u8 {
@@ -971,6 +1516,10 @@ const scalar_keys = [_][]const u8{
     "X-Deleted",
     "X-Milestone-Id",
     "X-Milestone-Mode",
+    "X-Number",
+    "X-Locked",
+    "X-Lock-Reason",
+    "X-Ref",
 };
 
 /// git matches keys case-insensitively, so `state:` and `State:` are one
@@ -980,10 +1529,11 @@ fn canonicalKey(key: []const u8) []const u8 {
     return key;
 }
 
-/// A trailer that a write of this tool or upstream's makes: a field, or an
-/// export record. A comment's last paragraph can parse as trailers too
-/// (`Version: 2.3.1`); those are none of these.
+/// A trailer that a write of this tool or upstream's makes: a field (a
+/// host's too), or an export record. A comment's last paragraph can parse
+/// as trailers too (`Version: 2.3.1`); those are none of these.
 fn isToolKey(key: []const u8) bool {
+    if (isHostKey(key)) return true;
     for (scalar_keys ++ set_keys ++ [_][]const u8{"Exported-Commit"}) |k| {
         if (std.ascii.eqlIgnoreCase(k, key)) return true;
     }
@@ -1061,14 +1611,13 @@ fn ancestorSets(
 }
 
 /// Oldest first, in `git rev-list --reverse <root>..<tip>` order.
-fn comments(
+/// Every commit but the root, oldest first, in `git log` order reversed.
+fn oldestFirst(
     arena: Allocator,
     nodes: []const Node,
     tip: u32,
     root: u32,
-    events: []const ?Event,
-    final: FoldState,
-) Allocator.Error![]const Comment {
+) Allocator.Error![]const u32 {
     const seen = try arena.alloc(bool, nodes.len);
     @memset(seen, false);
     var queue: std.ArrayList(u32) = .empty;
@@ -1084,12 +1633,154 @@ fn comments(
             try queue.append(arena, p);
         };
     }
+    std.mem.reverse(u32, walk.items);
+    return walk.items;
+}
+
+/// The text a comment commit wrote: its subject, then its body without
+/// the trailer block.
+fn commentText(
+    arena: Allocator,
+    subject_line: []const u8,
+    body: []const []const u8,
+) Allocator.Error![]const u8 {
+    if (body.len == 0) return subject_line;
+    return std.fmt.allocPrint(
+        arena,
+        "{s}\n\n{s}",
+        .{ subject_line, try std.mem.join(arena, "\n", body) },
+    );
+}
+
+/// The events that target `target` (a comment's full hex OID), as
+/// versions after the one it starts from.
+fn eventRevisions(
+    arena: Allocator,
+    nodes: []const Node,
+    walk: []const u32,
+    events: []const ?Event,
+    target: ?[]const u8,
+    first: Revision,
+) Allocator.Error![]const Revision {
+    var out: std.ArrayList(Revision) = .empty;
+    try out.append(arena, first);
+    var text = first.text;
+    for (walk) |n| {
+        const e = events[n] orelse continue;
+        const kind: Revision.Kind = if (target) |t| blk: {
+            if (!e.kind.targetsComment() or !std.mem.eql(u8, e.target, t)) continue;
+            break :blk switch (e.kind) {
+                .comment_edit => .edit,
+                .comment_delete => .delete,
+                .comment_restore => .restore,
+                .description_edit, .reaction => unreachable,
+            };
+        } else if (e.kind == .description_edit) .edit else continue;
+        if (kind == .edit) text = e.text;
+        try out.append(
+            arena,
+            .{
+                .oid = nodes[n].input.oid,
+                .author = nodes[n].input.author,
+                .kind = kind,
+                .text = text,
+            },
+        );
+    }
+    return out.items;
+}
+
+fn descriptionHistory(
+    arena: Allocator,
+    nodes: []const Node,
+    walk: []const u32,
+    root: u32,
+    events: []const ?Event,
+) Allocator.Error![]const Revision {
+    const root_body = try trailers.bodyLines(arena, nodes[root].input.message);
+    const original = try std.mem.join(arena, "\n", try trailers.textLines(arena, root_body, .{}));
+    return eventRevisions(arena, nodes, walk, events, null, .{
+        .oid = nodes[root].input.oid,
+        .author = nodes[root].input.author,
+        .kind = .original,
+        .text = original,
+    });
+}
+
+/// Field changes from `before` (null: nothing) to `after`. Internal event
+/// state and `Format-Version` aren't fields.
+fn diffStates(
+    arena: Allocator,
+    before: ?FoldState,
+    after: FoldState,
+) Allocator.Error![]const Change {
+    var out: std.ArrayList(Change) = .empty;
+    const empty: FoldState = .{};
+    const b = before orelse empty;
+    for (after.scalars.keys(), after.scalars.values()) |k, c| {
+        if (isInternalKey(k) or std.mem.eql(u8, k, "Format-Version")) continue;
+        const prev = b.scalars.get(k);
+        const old: ?[]const u8 = if (prev != null and prev.?.value.len > 0) prev.?.value else null;
+        const new: ?[]const u8 = if (c.value.len == 0) null else c.value;
+        if (old == null and new == null) continue;
+        if (old != null and new != null and std.mem.eql(u8, old.?, new.?)) continue;
+        try out.append(
+            arena,
+            .{ .key = k, .op = if (new == null) .clear else .set, .old = old, .new = new },
+        );
+    }
+    for (after.sets.keys(), after.sets.values()) |k, set| {
+        if (isInternalKey(k)) continue;
+        const before_set = b.sets.get(k);
+        for (set.members.keys(), set.members.values()) |m, cell| {
+            const prior = if (before_set) |bs| bs.members.get(m) else null;
+            const was = if (prior) |x| x.present else false;
+            if (was == cell.present) continue;
+            try out.append(arena, .{
+                .key = k,
+                .op = if (cell.present) .add else .remove,
+                .old = if (cell.present) null else m,
+                .new = if (cell.present) m else null,
+            });
+        }
+    }
+    for (after.attachments.keys(), after.attachments.values()) |id, cell| {
+        const was = if (b.attachments.get(id)) |x| x.present else false;
+        if (was == cell.present) continue;
+        try out.append(arena, .{
+            .key = attachment_fmt.add_key,
+            .op = if (cell.present) .add else .remove,
+            .old = if (cell.present) null else id,
+            .new = if (cell.present) id else null,
+        });
+    }
+    return out.items;
+}
+
+fn comments(
+    arena: Allocator,
+    nodes: []const Node,
+    walk: []const u32,
+    events: []const ?Event,
+    final: FoldState,
+    states: []const FoldState,
+    merged_parents: []const ?FoldState,
+    steps: *std.ArrayList(Step),
+) Allocator.Error![]const Comment {
     var out: std.ArrayList(Comment) = .empty;
-    var k = walk.items.len;
-    while (k > 0) { // oldest first
-        k -= 1;
-        const n = walk.items[k];
+    for (walk) |n| {
         const node = nodes[n];
+        if (events[n]) |e| try steps.append(arena, .{
+            .oid = node.input.oid,
+            .author = node.input.author,
+            .what = .{ .event = .{
+                .kind = e.kind,
+                .target = if (e.target.len > 0)
+                    Oid.parseHex(node.input.oid.object_format, e.target) catch unreachable
+                else
+                    null,
+            } },
+        });
         // Event commits, valid or not, aren't comments.
         if (events[n] != null or trailers.lastValue(node.block, "X-Event") != null) continue;
         const body = try trailers.bodyLines(arena, node.input.message);
@@ -1101,12 +1792,22 @@ fn comments(
             .oid = node.input.oid,
             .author = node.input.author,
             .subject = try trailers.subject(arena, node.input.message),
-            .text = try trailers.textLines(arena, body, true),
-            .body = try trailers.textLines(arena, body, false),
-            .state_change = if (trailers.lastValue(node.block, "State")) |v| core_fmt.State.parse(v) else null,
+            .text = try trailers.textLines(arena, body, .{ .has_title = true }),
+            .body = try trailers.textLines(arena, body, .{}),
+            .state_change = if (trailers.lastValue(node.block, "State")) |v|
+                core_fmt.State.parse(v)
+            else
+                null,
             .is_merge = node.parents.len > 1,
             .deleted = visible != null and std.mem.eql(u8, visible.?.value, "0"),
+            .original_author = trailers.lastValue(node.block, "X-Original-Author"),
+            .original_id = trailers.lastValue(node.block, "X-Original-Id"),
+            .purged = if (trailers.lastValue(node.block, "X-Purged")) |v|
+                std.mem.eql(u8, v, "true")
+            else
+                false,
         };
+        const original_body = c.body;
         var added: std.ArrayList([]const u8) = .empty;
         for (node.block.trailers) |t| {
             if (!std.ascii.eqlIgnoreCase(t.key, attachment_fmt.add_key)) continue;
@@ -1121,7 +1822,12 @@ fn comments(
         const tool_trailer = for (node.block.trailers) |t| {
             if (isToolKey(t.key)) break true;
         } else false;
-        if (c.body.len == 0 and (tool_trailer or c.is_merge)) c.kind = .update;
+        // `X-Message: comment` says the text is a comment, fields or not.
+        const marked = if (trailers.lastValue(node.block, "X-Message")) |v|
+            std.ascii.eqlIgnoreCase(v, "comment")
+        else
+            false;
+        if (c.body.len == 0 and (tool_trailer or c.is_merge) and !marked) c.kind = .update;
         if (edited) |e| {
             // The edit replaces the whole comment.
             var lines = std.mem.splitScalar(u8, e.value, '\n');
@@ -1134,6 +1840,28 @@ fn comments(
             c.edited = true;
             c.kind = .comment;
         }
+        // A second root (unrelated histories merged) changed from nothing.
+        const before: ?FoldState = merged_parents[n] orelse
+            if (node.parents.len > 0) states[node.parents[0]] else null;
+        c.changes = try diffStates(arena, before, states[n]);
+        c.history = try eventRevisions(arena, nodes, walk, events, hex_s, .{
+            .oid = node.input.oid,
+            .author = node.input.author,
+            .kind = .original,
+            .text = try commentText(
+                arena,
+                try trailers.subject(arena, node.input.message),
+                original_body,
+            ),
+        });
+        try steps.append(
+            arena,
+            .{
+                .oid = node.input.oid,
+                .author = node.input.author,
+                .what = .{ .comment = out.items.len },
+            },
+        );
         try out.append(arena, c);
     }
     return out.items;
@@ -1179,15 +1907,23 @@ fn lessThan(_: void, a: []const u8, b: []const u8) bool {
 const testing = std.testing;
 
 const TestDag = struct {
-    arena: Allocator,
+    arena_state: std.heap.ArenaAllocator = .init(testing.allocator),
     commits: std.ArrayList(CommitInput) = .empty,
+
+    fn deinit(d: *TestDag) void {
+        d.arena_state.deinit();
+    }
+
+    fn arena(d: *TestDag) Allocator {
+        return d.arena_state.allocator();
+    }
 
     fn add(d: *TestDag, parents: []const usize, time: i64, message: []const u8) !usize {
         const idx = d.commits.items.len;
         var oid: Oid = .{ .object_format = .sha1, .bytes = @splat(0) };
         oid.bytes[0] = @intCast(idx + 1);
         oid.bytes[1] = 0xab;
-        const ps = try d.arena.alloc(Oid, parents.len);
+        const ps = try d.arena().alloc(Oid, parents.len);
         for (parents, ps) |p, *o| o.* = d.commits.items[p].oid;
         const sig: Signature = .{
             .name = "T",
@@ -1196,7 +1932,7 @@ const TestDag = struct {
             .tz_offset_minutes = 0,
         };
         try d.commits.append(
-            d.arena,
+            d.arena(),
             .{ .oid = oid, .parents = ps, .author = sig, .committer = sig, .message = message },
         );
         return idx;
@@ -1204,7 +1940,7 @@ const TestDag = struct {
 
     fn issue(d: *TestDag, tip: usize) !Issue {
         return materialize(
-            d.arena,
+            d.arena(),
             "a7f3b2c1-4e5d-4a8b-9c1e-2f3a4b5c6d7e",
             d.commits.items[tip].oid,
             d.commits.items,
@@ -1213,9 +1949,8 @@ const TestDag = struct {
 };
 
 test "linear history" {
-    var arena_state: std.heap.ArenaAllocator = .init(testing.allocator);
-    defer arena_state.deinit();
-    var d: TestDag = .{ .arena = arena_state.allocator() };
+    var d: TestDag = .{};
+    defer d.deinit();
     const root = try d.add(
         &.{},
         100,
@@ -1246,9 +1981,8 @@ test "linear history" {
 }
 
 test "causality beats clocks" {
-    var arena_state: std.heap.ArenaAllocator = .init(testing.allocator);
-    defer arena_state.deinit();
-    var d: TestDag = .{ .arena = arena_state.allocator() };
+    var d: TestDag = .{};
+    defer d.deinit();
     const root = try d.add(&.{}, 1000, "T\n\nState: open\nPriority: low\nFormat-Version: 1\n");
     const skewed = try d.add(&.{root}, 10, "Update priority\n\nPriority: critical\n");
     const i = try d.issue(skewed);
@@ -1257,9 +1991,8 @@ test "causality beats clocks" {
 }
 
 test "concurrent edits" {
-    var arena_state: std.heap.ArenaAllocator = .init(testing.allocator);
-    defer arena_state.deinit();
-    var d: TestDag = .{ .arena = arena_state.allocator() };
+    var d: TestDag = .{};
+    defer d.deinit();
     const root = try d.add(
         &.{},
         100,
@@ -1280,10 +2013,65 @@ test "concurrent edits" {
     try testing.expectEqualStrings("high", i.conflicts[0].lost);
 }
 
+test "changesNothing: restated fields, a resolved conflict, what the fold doesn't hold" {
+    var d: TestDag = .{};
+    defer d.deinit();
+    const arena = d.arena();
+    const root = try d.add(
+        &.{},
+        100,
+        "T\n\nState: open\nPriority: low\nLabels: bug, ui\nFormat-Version: 1\n",
+    );
+    const left = try d.add(&.{root}, 200, "L\n\nPriority: high\n");
+    const right = try d.add(&.{root}, 300, "R\n\nPriority: medium\n");
+    const merge = try d.add(&.{ left, right }, 400, "Merge issue from origin\n");
+    const tip = d.commits.items[root].oid;
+    const Case = struct { []const u8, bool };
+    for ([_]Case{
+        .{ "Edit\n\nState: open\nPriority: low\nX-Deleted: false\n", true },
+        .{ "Edit\n\nX-Deleted: true\n", false },
+        // A list is its members, in order; none is the same as empty.
+        .{ "Edit\n\nLabels: bug, ui\nX-Parent: \n", true },
+        .{ "Edit\n\nLabels: ui, bug\n", false },
+        .{ "Edit\n\nPriority: high\n", false },
+        // The root's subject is the title.
+        .{ "Edit\n\nTitle: T\n", true },
+        .{ "Edit\n\nTitle: U\n", false },
+        // A comment, provenance, a reaction: not in the fold.
+        .{ "Same\n\nwith text\n\nPriority: low\n", false },
+        .{ "Same\n\nPriority: low\nX-Message: comment\n", false },
+        .{ "Same\n\nPriority: low\nX-Original-Id: 7\n", false },
+    }) |c| {
+        var candidate = d.commits.items[root];
+        candidate.oid.bytes = @splat(0);
+        candidate.parents = &.{tip};
+        candidate.message = c[0];
+        errdefer std.debug.print("{s}\n", .{c[0]});
+        try testing.expectEqual(c[1], try changesNothing(arena, d.commits.items, tip, candidate));
+    }
+    // Restating the winner of a conflict resolves it: a change.
+    var candidate = d.commits.items[merge];
+    candidate.oid.bytes = @splat(0);
+    candidate.parents = &.{d.commits.items[merge].oid};
+    candidate.message = "Edit\n\nPriority: medium\n";
+    try testing.expect(!try changesNothing(
+        arena,
+        d.commits.items,
+        d.commits.items[merge].oid,
+        candidate,
+    ));
+    candidate.message = "Edit\n\nLabels: bug, ui\n";
+    try testing.expect(try changesNothing(
+        arena,
+        d.commits.items,
+        d.commits.items[merge].oid,
+        candidate,
+    ));
+}
+
 test "restating merges" {
-    var arena_state: std.heap.ArenaAllocator = .init(testing.allocator);
-    defer arena_state.deinit();
-    var d: TestDag = .{ .arena = arena_state.allocator() };
+    var d: TestDag = .{};
+    defer d.deinit();
     const root = try d.add(&.{}, 100, "T\n\nState: open\nFormat-Version: 1\n");
     const left = try d.add(&.{root}, 200, "L\n\nPriority: high\n");
     const right = try d.add(&.{root}, 300, "R\n\nPriority: low\n");
@@ -1302,9 +2090,8 @@ test "restating merges" {
 }
 
 test "concurrent add vs remove of a label: add wins" {
-    var arena_state: std.heap.ArenaAllocator = .init(testing.allocator);
-    defer arena_state.deinit();
-    var d: TestDag = .{ .arena = arena_state.allocator() };
+    var d: TestDag = .{};
+    defer d.deinit();
     const root = try d.add(&.{}, 100, "T\n\nState: open\nLabels: a\nFormat-Version: 1\n");
     const removed = try d.add(&.{root}, 900, "R\n\nLabels: \n");
     const readded = try d.add(&.{root}, 200, "A\n\nLabels: a, b\n");
@@ -1328,9 +2115,8 @@ test "concurrent add vs remove of a label: add wins" {
 }
 
 test "a set member added on two branches survives a removal on one" {
-    var arena_state: std.heap.ArenaAllocator = .init(testing.allocator);
-    defer arena_state.deinit();
-    var d: TestDag = .{ .arena = arena_state.allocator() };
+    var d: TestDag = .{};
+    defer d.deinit();
     const root = try d.add(&.{}, 100, "T\n\nState: open\nFormat-Version: 1\n");
     const left = try d.add(&.{root}, 120, "L\n\nLabels: x\n");
     const right = try d.add(&.{root}, 180, "R\n\nLabels: x\n");
@@ -1345,9 +2131,8 @@ test "a set member added on two branches survives a removal on one" {
 }
 
 test "criss-cross merges are deterministic" {
-    var arena_state: std.heap.ArenaAllocator = .init(testing.allocator);
-    defer arena_state.deinit();
-    var d: TestDag = .{ .arena = arena_state.allocator() };
+    var d: TestDag = .{};
+    defer d.deinit();
     const root = try d.add(&.{}, 100, "T\n\nState: open\nFormat-Version: 1\n");
     const a = try d.add(&.{root}, 200, "A\n\nPriority: high\n");
     const b = try d.add(&.{root}, 300, "B\n\nAssignee: b@e.x\n");
@@ -1361,9 +2146,8 @@ test "criss-cross merges are deterministic" {
 }
 
 test "upstream merges keep X- fields" {
-    var arena_state: std.heap.ArenaAllocator = .init(testing.allocator);
-    defer arena_state.deinit();
-    var d: TestDag = .{ .arena = arena_state.allocator() };
+    var d: TestDag = .{};
+    defer d.deinit();
     const root = try d.add(
         &.{},
         100,
@@ -1378,9 +2162,8 @@ test "upstream merges keep X- fields" {
 }
 
 test "description and comment text" {
-    var arena_state: std.heap.ArenaAllocator = .init(testing.allocator);
-    defer arena_state.deinit();
-    var d: TestDag = .{ .arena = arena_state.allocator() };
+    var d: TestDag = .{};
+    defer d.deinit();
     const root = try d.add(
         &.{},
         100,
@@ -1401,9 +2184,8 @@ test "description and comment text" {
 }
 
 test "comment kinds" {
-    var arena_state: std.heap.ArenaAllocator = .init(testing.allocator);
-    defer arena_state.deinit();
-    var d: TestDag = .{ .arena = arena_state.allocator() };
+    var d: TestDag = .{};
+    defer d.deinit();
     const root = try d.add(&.{}, 100, "T\n\nState: open\nFormat-Version: 1\n");
     const one_line = try d.add(&.{root}, 200, "LGTM\n");
     const with_text = try d.add(&.{one_line}, 300, "Draft\n\nIn the wiki.\n\nPriority: high\n");
@@ -1411,7 +2193,11 @@ test "comment kinds" {
     const image = try d.add(&.{edit}, 500, "Screenshot\n\n" ++
         "X-Attachment: 720964d9-80f3-4953-bf91-3b32b2897504 image/png 10 " ++
         "0000000000000000000000000000000000000000000000000000000000000000 a.png\n");
-    const imported = try d.add(&.{image}, 600, "Looks bad\n\nProvider-Comment-ID: github:o/r#c-1\n");
+    const imported = try d.add(
+        &.{image},
+        600,
+        "Looks bad\n\nProvider-Comment-ID: github:o/r#c-1\n",
+    );
     const trailer_like = try d.add(&.{imported}, 650, "Still happens\n\nVersion: 2.3.1\n");
     const record = try d.add(&.{trailer_like}, 700, "Record export\n\nExported-Commit: 0123abc\n");
     const side = try d.add(&.{record}, 800, "Update priority\n\nPriority: low\n");
@@ -1419,7 +2205,7 @@ test "comment kinds" {
     const merge = try d.add(&.{ side, other }, 900, "Merge issue\n\nPriority: low\n");
     const i = try d.issue(merge);
     var kinds: std.ArrayList(Comment.Kind) = .empty;
-    for (i.comments) |c| try kinds.append(arena_state.allocator(), c.kind);
+    for (i.comments) |c| try kinds.append(d.arena(), c.kind);
     try testing.expectEqualSlices(Comment.Kind, &.{
         .comment, // LGTM
         .comment, // text with a field
@@ -1435,9 +2221,8 @@ test "comment kinds" {
 }
 
 test "per-commit trailers" {
-    var arena_state: std.heap.ArenaAllocator = .init(testing.allocator);
-    defer arena_state.deinit();
-    var d: TestDag = .{ .arena = arena_state.allocator() };
+    var d: TestDag = .{};
+    defer d.deinit();
     const root = try d.add(
         &.{},
         100,
@@ -1463,9 +2248,8 @@ test "per-commit trailers" {
 }
 
 test "invalid extension values" {
-    var arena_state: std.heap.ArenaAllocator = .init(testing.allocator);
-    defer arena_state.deinit();
-    var d: TestDag = .{ .arena = arena_state.allocator() };
+    var d: TestDag = .{};
+    defer d.deinit();
     const parent = "b8e4c3d2-5f6e-4b9c-8d2f-3a4b5c6d7e8f";
     const root = try d.add(&.{}, 100, "Child\n\nState: open\n" ++
         "Assignee: a7f3b2c1-4e5d-4a8b-9c1e-2f3a4b5c6d7e ada@e.x\n" ++
@@ -1474,29 +2258,38 @@ test "invalid extension values" {
         "X-Start-Date: 2026-11-01\nX-Due-Date: 2026-02-30\n" ++
         "X-Estimate-Minutes: 90\nX-Workflow-State: in-progress\nFormat-Version: 1\n");
     const i = try d.issue(root);
-    try testing.expectEqualStrings(parent, i.ext.parent.?);
-    try testing.expectEqualStrings("ada@e.x", i.ext.assignee.?.email);
-    try testing.expectEqual(@as(usize, 1), i.ext.blocked_by.len);
-    try testing.expectEqual(@as(u8, 11), i.ext.start_date.?.month);
-    try testing.expect(i.ext.due_date == null);
-    try testing.expectEqual(@as(?u32, 90), i.ext.estimate_minutes);
-    try testing.expectEqualStrings("in-progress", i.ext.workflow.?);
-    try testing.expectEqual(@as(usize, 2), i.ext.invalid.len); // not-a-uuid, Feb 30
+    try testing.expectEqualStrings(parent, i.parent.?);
+    try testing.expectEqualStrings("ada@e.x", i.assignee.?.email);
+    try testing.expectEqual(@as(usize, 1), i.blocked_by.len);
+    try testing.expectEqual(@as(u8, 11), i.start_date.?.month);
+    try testing.expect(i.due_date == null);
+    try testing.expectEqual(@as(?u32, 90), i.estimate_minutes);
+    try testing.expectEqualStrings("in-progress", i.workflow.?);
+    try testing.expectEqual(@as(usize, 2), i.invalid_fields.len); // not-a-uuid, Feb 30
 
     // Only exactly `true` deletes. Anything else but `false` is reported.
     const maybe = try d.add(&.{root}, 200, "Delete?\n\nX-Deleted: True\n");
     const m = try d.issue(maybe);
     try testing.expect(!m.deleted);
-    try testing.expectEqual(@as(usize, 3), m.ext.invalid.len);
-    try testing.expectEqualStrings("X-Deleted", m.ext.invalid[2].key);
+    try testing.expectEqual(@as(usize, 3), m.invalid_fields.len);
+    try testing.expectEqualStrings("X-Deleted", m.invalid_fields[2].key);
     const cleared = try d.issue(try d.add(&.{maybe}, 300, "Undo\n\nX-Deleted:\n"));
-    try testing.expectEqual(@as(usize, 2), cleared.ext.invalid.len);
+    try testing.expectEqual(@as(usize, 2), cleared.invalid_fields.len);
+}
+
+test "an X-Ref git refuses reads as invalid, kept as written" {
+    var d: TestDag = .{};
+    defer d.deinit();
+    const root = try d.add(&.{}, 100, "T\n\nState: open\nX-Ref: a/.b\nFormat-Version: 1\n");
+    const i = try d.issue(root);
+    try testing.expect(i.ref == null);
+    try testing.expectEqualStrings("X-Ref", i.invalid_fields[0].key);
+    try testing.expectEqualStrings("a/.b", i.field("X-Ref").?);
 }
 
 test "blocked-by merges per member" {
-    var arena_state: std.heap.ArenaAllocator = .init(testing.allocator);
-    defer arena_state.deinit();
-    var d: TestDag = .{ .arena = arena_state.allocator() };
+    var d: TestDag = .{};
+    defer d.deinit();
     const a = "c9f5d4e3-6a7f-4cad-9e3a-4b5c6d7e8f90";
     const b = "d0a6e5f4-7b8a-4dbe-8f4b-5c6d7e8f9012";
     const c = "e1b7f6a5-8c9b-4ecf-9a5c-6d7e8f901234";
@@ -1511,8 +2304,8 @@ test "blocked-by merges per member" {
     const i = try d.issue(merge);
     // b and c were added concurrently, so both stay. a was removed on one
     // side and untouched on the other, so it's gone.
-    try testing.expectEqual(@as(usize, 2), i.ext.blocked_by.len);
-    for ([_][]const u8{ b, c }) |x| try testing.expect(labels_fmt.contains(i.ext.blocked_by, x));
+    try testing.expectEqual(@as(usize, 2), i.blocked_by.len);
+    for ([_][]const u8{ b, c }) |x| try testing.expect(labels_fmt.contains(i.blocked_by, x));
 
     // A concurrent re-add and remove: the add wins.
     const all = a ++ ", " ++ b ++ ", " ++ c;
@@ -1520,26 +2313,25 @@ test "blocked-by merges per member" {
     const drop = try d.add(&.{merge}, 600, "Drop b\n\nX-Blocked-By: " ++ c ++ "\n");
     const again = try d.add(&.{ readd, drop }, 700, "Merge issue\n\nState: open\n");
     const j = try d.issue(again);
-    try testing.expect(labels_fmt.contains(j.ext.blocked_by, a));
-    try testing.expect(!labels_fmt.contains(j.ext.blocked_by, b));
+    try testing.expect(labels_fmt.contains(j.blocked_by, a));
+    try testing.expect(!labels_fmt.contains(j.blocked_by, b));
 }
 
 fn hexOf(d: *TestDag, i: usize) ![]const u8 {
-    return d.arena.dupe(u8, d.commits.items[i].oid.hex().slice());
+    return d.commits.items[i].oid.hexAlloc(d.arena());
 }
 
 fn eventMsg(d: *TestDag, head: []const u8, kind: []const u8, target: ?usize) ![]const u8 {
     const comment_line = if (target) |t|
-        try std.fmt.allocPrint(d.arena, "X-Comment: {s}\n", .{try hexOf(d, t)})
+        try std.fmt.allocPrint(d.arena(), "X-Comment: {s}\n", .{try hexOf(d, t)})
     else
         "";
-    return std.fmt.allocPrint(d.arena, "{s}\n\nX-Event: {s}\n{s}", .{ head, kind, comment_line });
+    return std.fmt.allocPrint(d.arena(), "{s}\n\nX-Event: {s}\n{s}", .{ head, kind, comment_line });
 }
 
 test "events" {
-    var arena_state: std.heap.ArenaAllocator = .init(testing.allocator);
-    defer arena_state.deinit();
-    var d: TestDag = .{ .arena = arena_state.allocator() };
+    var d: TestDag = .{};
+    defer d.deinit();
     const root = try d.add(&.{}, 100, "Title\n\nOld text.\n\nState: open\nFormat-Version: 1\n");
     const c1 = try d.add(&.{root}, 200, "First comment\n\nwith text\n");
     const c2 = try d.add(&.{c1}, 300, "Second comment\n");
@@ -1578,11 +2370,167 @@ test "events" {
     try testing.expect(!i.comments[1].deleted);
 }
 
+test "history: every version of the description and of each comment" {
+    var d: TestDag = .{};
+    defer d.deinit();
+    const root = try d.add(&.{}, 100, "Title\n\nOld text.\n\nState: open\nFormat-Version: 1\n");
+    const c1 = try d.add(&.{root}, 200, "First comment\n\nwith text\n");
+    const e1 = try d.add(&.{c1}, 300, try eventMsg(&d, "Edit\n\nSecond take", "comment-edit", c1));
+    const del = try d.add(&.{e1}, 400, try eventMsg(&d, "Delete comment", "comment-delete", c1));
+    const back = try d.add(&.{del}, 500, try eventMsg(&d, "Restore", "comment-restore", c1));
+    const desc = try d.add(&.{back}, 600, try eventMsg(
+        &d,
+        "Edit description\n\nNew description.",
+        "description-edit",
+        null,
+    ));
+    const i = try d.issue(desc);
+
+    const dh = i.description_history;
+    try testing.expectEqual(@as(usize, 2), dh.len);
+    try testing.expectEqual(Revision.Kind.original, dh[0].kind);
+    try testing.expectEqualStrings("Old text.", dh[0].text);
+    try testing.expect(dh[0].oid.eql(d.commits.items[root].oid));
+    try testing.expectEqualStrings("New description.", dh[1].text);
+    try testing.expect(dh[1].oid.eql(d.commits.items[desc].oid));
+
+    const h = i.comments[0].history;
+    try testing.expectEqual(@as(usize, 4), h.len);
+    try testing.expectEqualStrings("First comment\n\nwith text", h[0].text);
+    try testing.expectEqual(Revision.Kind.edit, h[1].kind);
+    try testing.expectEqualStrings("Second take", h[1].text);
+    // Delete and restore keep the text they hide and show.
+    try testing.expectEqual(Revision.Kind.delete, h[2].kind);
+    try testing.expectEqualStrings("Second take", h[2].text);
+    try testing.expectEqual(Revision.Kind.restore, h[3].kind);
+    try testing.expect(h[3].oid.eql(d.commits.items[back].oid));
+}
+
+test "changes: what each commit changed" {
+    var d: TestDag = .{};
+    defer d.deinit();
+    const root = try d.add(
+        &.{},
+        100,
+        "T\n\nState: open\nLabels: bug, ui\nPriority: high\nFormat-Version: 1\n",
+    );
+    const a = try d.add(&.{root}, 200, "Update\n\nLabels: bug, api\nPriority: \n");
+    const b = try d.add(&.{root}, 210, "Update\n\nX-Due-Date: 2026-12-01\n");
+    // Merges both sides; restates nothing, so it changed nothing itself.
+    const m = try d.add(&.{ a, b }, 300, "Merge issue\n");
+    const i = try d.issue(m);
+
+    const created = i.created_changes;
+    try testing.expect(hasChange(created, "State", .set, null, "open"));
+    try testing.expect(hasChange(created, "Labels", .add, null, "bug"));
+    try testing.expect(hasChange(created, "Priority", .set, null, "high"));
+    try testing.expect(!hasChange(created, "Format-Version", .set, null, "1"));
+
+    const ca = i.comments[0].changes;
+    try testing.expectEqual(@as(usize, 3), ca.len);
+    try testing.expect(hasChange(ca, "Labels", .add, null, "api"));
+    try testing.expect(hasChange(ca, "Labels", .remove, "ui", null));
+    try testing.expect(hasChange(ca, "Priority", .clear, "high", null));
+    const cb = i.comments[1].changes;
+    try testing.expectEqual(@as(usize, 1), cb.len);
+    try testing.expect(hasChange(cb, "X-Due-Date", .set, null, "2026-12-01"));
+    try testing.expect(i.comments[2].is_merge);
+    try testing.expectEqual(@as(usize, 0), i.comments[2].changes.len);
+
+    try testing.expectEqual(@as(usize, 3), i.steps.len);
+    try testing.expectEqual(@as(usize, 2), i.steps[2].what.comment);
+}
+
+fn hasChange(
+    list: []const Change,
+    key: []const u8,
+    op: Change.Op,
+    old: ?[]const u8,
+    new: ?[]const u8,
+) bool {
+    const same = struct {
+        fn f(x: ?[]const u8, y: ?[]const u8) bool {
+            if (x == null or y == null) return x == null and y == null;
+            return std.mem.eql(u8, x.?, y.?);
+        }
+    }.f;
+    for (list) |c| if (std.mem.eql(
+        u8,
+        c.key,
+        key,
+    ) and c.op == op and same(c.old, old) and same(c.new, new))
+        return true;
+    return false;
+}
+
+test "assignees: upstream's Assignee sets them to one, a merge's restatement doesn't" {
+    var d: TestDag = .{};
+    defer d.deinit();
+    const root = try d.add(
+        &.{},
+        100,
+        "T\n\nState: open\nAssignee: a@e.x\nX-Assignees: a@e.x, b@e.x\nFormat-Version: 1\n",
+    );
+    var i = try d.issue(root);
+    try testing.expectEqual(@as(usize, 2), i.assignees.len);
+    // A merge restates only the first; the set stays.
+    const side = try d.add(&.{root}, 200, "Update\n\nLabels: x\n");
+    const other = try d.add(&.{root}, 210, "Update\n\nPriority: high\n");
+    const m = try d.add(&.{ side, other }, 300, "Merge issue\n\nState: open\nAssignee: a@e.x\n");
+    i = try d.issue(m);
+    try testing.expectEqual(@as(usize, 2), i.assignees.len);
+    // Upstream's edit names one: that's the set now.
+    const up = try d.add(&.{m}, 400, "Update assignee\n\nAssignee: c@e.x\n");
+    i = try d.issue(up);
+    try testing.expectEqual(@as(usize, 1), i.assignees.len);
+    try testing.expectEqualStrings("c@e.x", i.assignees[0].email);
+}
+
+test "assignees: the assignee is one of them after concurrent edits" {
+    var d: TestDag = .{};
+    defer d.deinit();
+    const root = try d.add(&.{}, 100, "T\n\nState: open\nAssignee: a@e.x\nFormat-Version: 1\n");
+    // Upstream's edit on one side, an added assignee on the newer other.
+    const up = try d.add(&.{root}, 200, "Update assignee\n\nAssignee: c@e.x\n");
+    const add = try d.add(
+        &.{root},
+        300,
+        "Update assignees\n\nAssignee: a@e.x\nX-Assignees: a@e.x, b@e.x\n",
+    );
+    const m = try d.add(&.{ up, add }, 300, "Merge issue\n\nState: open\n");
+    const i = try d.issue(m);
+    try testing.expectEqual(@as(usize, 2), i.assignees.len);
+    const emails = [_][]const u8{ i.assignees[0].email, i.assignees[1].email };
+    try testing.expect(labels_fmt.contains(&emails, "b@e.x"));
+    try testing.expect(labels_fmt.contains(&emails, "c@e.x"));
+    // Not the newest `Assignee` (a, removed by the upstream side): the first.
+    try testing.expectEqualStrings(i.assignees[0].email, i.assignee.?.email);
+    try testing.expectEqualStrings(i.assignees[0].email, i.field("Assignee").?);
+    // A merge restates it, so upstream shows one of them too.
+    const restated = try restatedTrailers(d.arena(), i);
+    const v = for (restated.items) |t| {
+        if (std.mem.eql(u8, t.key, "Assignee")) break t.value;
+    } else return error.TestUnexpectedResult;
+    try testing.expectEqualStrings(i.assignees[0].email, v);
+
+    // Every assignee removed on one side: none, and the merge restates it empty.
+    const none = try d.add(&.{root}, 200, "Update assignee\n\nAssignee: \n");
+    const kept = try d.add(&.{root}, 300, "Update\n\nAssignee: a@e.x\nPriority: high\n");
+    const m2 = try d.add(&.{ none, kept }, 300, "Merge issue\n\nState: open\n");
+    const j = try d.issue(m2);
+    try testing.expectEqual(@as(usize, 0), j.assignees.len);
+    try testing.expect(j.assignee == null and j.field("Assignee") == null);
+    try testing.expect(labels_fmt.contains(j.cleared, "Assignee"));
+}
+
 test "event text with a divider line, and a lowercase description trailer" {
-    var arena_state: std.heap.ArenaAllocator = .init(testing.allocator);
-    defer arena_state.deinit();
-    var d: TestDag = .{ .arena = arena_state.allocator() };
-    const root = try d.add(&.{}, 100, "T\n\nIntro\n\n---\n\nMore\n\nState: open\nFormat-Version: 1\n");
+    var d: TestDag = .{};
+    defer d.deinit();
+    const root = try d.add(
+        &.{},
+        100,
+        "T\n\nIntro\n\n---\n\nMore\n\nState: open\nFormat-Version: 1\n",
+    );
     var i = try d.issue(root);
     try testing.expectEqualStrings("Intro\n\n---\n\nMore", i.description);
     // `---` doesn't end the text: the trailers after it are still fields,
@@ -1606,9 +2554,8 @@ test "event text with a divider line, and a lowercase description trailer" {
 }
 
 test "concurrent and bad events" {
-    var arena_state: std.heap.ArenaAllocator = .init(testing.allocator);
-    defer arena_state.deinit();
-    var d: TestDag = .{ .arena = arena_state.allocator() };
+    var d: TestDag = .{};
+    defer d.deinit();
     const root = try d.add(&.{}, 100, "T\n\nState: open\nFormat-Version: 1\n");
     const c = try d.add(&.{root}, 200, "Comment\n");
     const left = try d.add(&.{c}, 300, try eventMsg(&d, "Edit\n\nLeft text", "comment-edit", c));
@@ -1642,9 +2589,8 @@ test "concurrent and bad events" {
 }
 
 test "attachments" {
-    var arena_state: std.heap.ArenaAllocator = .init(testing.allocator);
-    defer arena_state.deinit();
-    var d: TestDag = .{ .arena = arena_state.allocator() };
+    var d: TestDag = .{};
+    defer d.deinit();
     const id1 = "1b4e28ba-2fa1-4d3b-a3f5-ef19b5a7633b";
     const id2 = "2c5f39cb-3ab2-4e4c-b4a6-f02ac6b8744c";
     const h1 = " image/png 10 sha256:" ++ "a" ** 64 ++ " ";
@@ -1681,9 +2627,8 @@ test "attachments" {
 }
 
 test "attachment merges" {
-    var arena_state: std.heap.ArenaAllocator = .init(testing.allocator);
-    defer arena_state.deinit();
-    var d: TestDag = .{ .arena = arena_state.allocator() };
+    var d: TestDag = .{};
+    defer d.deinit();
     const id = "1b4e28ba-2fa1-4d3b-a3f5-ef19b5a7633b";
     const h = " image/png 10 sha256:" ++ "a" ** 64 ++ " ";
     const root = try d.add(&.{}, 100, "Crash\n\nState: open\nX-Attachment: " ++ id ++ h ++
@@ -1713,9 +2658,8 @@ test "attachment merges" {
 }
 
 test "a skewed clock after a merge doesn't hide a concurrent setter" {
-    var arena_state: std.heap.ArenaAllocator = .init(testing.allocator);
-    defer arena_state.deinit();
-    var d: TestDag = .{ .arena = arena_state.allocator() };
+    var d: TestDag = .{};
+    defer d.deinit();
     const root = try d.add(&.{}, 100, "T\n\nState: open\nFormat-Version: 1\n");
     const x = try d.add(&.{root}, 300, "X\n\nPriority: high\n");
     const y = try d.add(&.{root}, 200, "Y\n\nPriority: medium\n");
@@ -1731,9 +2675,8 @@ test "a skewed clock after a merge doesn't hide a concurrent setter" {
 }
 
 test "an attachment renamed on two branches survives a removal on one" {
-    var arena_state: std.heap.ArenaAllocator = .init(testing.allocator);
-    defer arena_state.deinit();
-    var d: TestDag = .{ .arena = arena_state.allocator() };
+    var d: TestDag = .{};
+    defer d.deinit();
     const id = "1b4e28ba-2fa1-4d3b-a3f5-ef19b5a7633b";
     const h = " image/png 10 sha256:" ++ "a" ** 64 ++ " ";
     const root = try d.add(&.{}, 100, "Crash\n\nState: open\nX-Attachment: " ++ id ++ h ++

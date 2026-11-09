@@ -7,9 +7,12 @@ const assert = std.debug.assert;
 const Allocator = std.mem.Allocator;
 const vaxis = @import("vaxis");
 const filter = @import("filter.zig");
+const TextArea = @import("text.zig").TextArea;
 const milestone_filter = @import("milestone_filter.zig");
 const timeline_view = @import("timeline_view.zig");
 const issuez = @import("issuez");
+
+const ui = @This();
 
 pub const Window = vaxis.Window;
 pub const Style = vaxis.Style;
@@ -53,14 +56,44 @@ pub const Target = union(enum) {
 
     pub const Card = struct { column: u16, index: u32 };
 
+    /// One of a modal form field's options.
+    pub fn option(field: u8, o: u8) Target {
+        return .{ .modal = .{ .option = .{ .field = field, .option = o } } };
+    }
+
     pub fn eql(a: Target, b: Target) bool {
         return std.meta.eql(a, b);
     }
 };
 
-pub const Command = enum { new_issue, new_milestone, reload, help, sort, quit, back, ms_edit, ms_complete, ms_add, ms_move, pick_pane, sync_panel };
+pub const Command = enum {
+    new_issue,
+    new_milestone,
+    reload,
+    help,
+    sort,
+    quit,
+    back,
+    ms_edit,
+    ms_complete,
+    ms_add,
+    ms_move,
+    pick_pane,
+    sync_panel,
+};
 
-pub const TimelineCommand = enum { earlier, later, today, deps, grouping, edit, apply, discard, undo, redo };
+pub const TimelineCommand = enum {
+    earlier,
+    later,
+    today,
+    deps,
+    grouping,
+    edit,
+    apply,
+    discard,
+    undo,
+    redo,
+};
 
 pub const ModalTarget = union(enum) {
     ok,
@@ -209,7 +242,16 @@ const eighths = [_][]const u8{ "", "▏", "▎", "▍", "▌", "▋", "▊", "�
 
 /// A bar of `width` cells: `done` of `total` solid, then `active` lighter,
 /// then the rest faint, in eighths of a cell.
-pub fn progressBar(win: Window, col: u16, row: u16, width: u16, done: u32, active: u32, total: u32, bg: vaxis.Color) void {
+pub fn progressBar(
+    win: Window,
+    col: u16,
+    row: u16,
+    width: u16,
+    done: u32,
+    active: u32,
+    total: u32,
+    bg: vaxis.Color,
+) void {
     if (width == 0 or row >= win.height) return;
     const cells: u64 = width;
     const done_8: u64 = if (total == 0) 0 else @as(u64, done) * cells * 8 / total;
@@ -224,12 +266,30 @@ pub fn progressBar(win: Window, col: u16, row: u16, width: u16, done: u32, activ
             // Partly done, the rest in progress: the done part shows.
             const part = done_8 -| lo;
             if (part > 0) {
-                _ = text(cell, 0, 0, eighths[@intCast(part)], .{ .fg = palette.ok, .bg = palette.low });
+                _ = text(
+                    cell,
+                    0,
+                    0,
+                    eighths[@intCast(part)],
+                    .{ .fg = palette.ok, .bg = palette.low },
+                );
             } else _ = text(cell, 0, 0, "█", .{ .fg = palette.low, .bg = bg });
         } else if (done_8 > lo) {
-            _ = text(cell, 0, 0, eighths[@intCast(done_8 - lo)], .{ .fg = palette.ok, .bg = palette.faint_bg });
+            _ = text(
+                cell,
+                0,
+                0,
+                eighths[@intCast(done_8 - lo)],
+                .{ .fg = palette.ok, .bg = palette.faint_bg },
+            );
         } else if (active_8 > lo) {
-            _ = text(cell, 0, 0, eighths[@intCast(active_8 - lo)], .{ .fg = palette.low, .bg = palette.faint_bg });
+            _ = text(
+                cell,
+                0,
+                0,
+                eighths[@intCast(active_8 - lo)],
+                .{ .fg = palette.low, .bg = palette.faint_bg },
+            );
         } else {
             _ = text(cell, 0, 0, " ", .{ .bg = palette.faint_bg });
         }
@@ -255,17 +315,37 @@ pub fn text(win: Window, col: u16, row: u16, s: []const u8, style: Style) u16 {
         .wrap = .none,
     });
     if (res.overflow and win.width > 0) {
-        win.writeCell(win.width - 1, row, .{ .char = .{ .grapheme = "…", .width = 1 }, .style = style });
+        win.writeCell(
+            win.width - 1,
+            row,
+            .{ .char = .{ .grapheme = "…", .width = 1 }, .style = style },
+        );
         return win.width - col;
     }
     return res.col -| col;
 }
 
-/// `text`, then a gap of one column.
-pub fn word(win: Window, col: *u16, row: u16, s: []const u8, style: Style) void {
-    col.* += text(win, col.*, row, s, style);
-    col.* += 1;
-}
+/// One row written left to right: each piece goes after the last.
+pub const Line = struct {
+    f: Frame,
+    win: Window,
+    x: u16 = 0,
+    y: u16 = 0,
+
+    pub fn text(l: *Line, s: []const u8, style: Style) void {
+        l.x += ui.text(l.win, l.x, l.y, s, style);
+    }
+
+    /// `text`, then a gap of one column.
+    pub fn word(l: *Line, s: []const u8, style: Style) void {
+        l.text(s, style);
+        l.x += 1;
+    }
+
+    pub fn button(l: *Line, label: []const u8, target: Target, style: Style) Allocator.Error!void {
+        l.x += try ui.button(l.f, l.win, l.x, l.y, label, target, style);
+    }
+};
 
 /// Paints a row's background.
 pub fn fillRow(win: Window, row: u16, style: Style) void {
@@ -274,7 +354,15 @@ pub fn fillRow(win: Window, row: u16, style: Style) void {
 }
 
 /// ` label ` on a button background, clickable. Returns its width.
-pub fn button(f: Frame, win: Window, col: u16, row: u16, label: []const u8, target: Target, style: Style) Allocator.Error!u16 {
+pub fn button(
+    f: Frame,
+    win: Window,
+    col: u16,
+    row: u16,
+    label: []const u8,
+    target: Target,
+    style: Style,
+) Allocator.Error!u16 {
     if (col >= win.width or row >= win.height) return 0;
     const w: u16 = @intCast(@min(win.gwidth(label) + 2, win.width - col));
     const b = win.child(.{ .x_off = col, .y_off = row, .width = w, .height = 1 });
@@ -301,6 +389,55 @@ pub fn panel(win: Window, title: []const u8, style: Style) Window {
         _ = text(win, 2, 0, title, .{ .fg = palette.accent, .bg = style.bg, .bold = true });
     }
     return inner;
+}
+
+/// A view's filter: the `/` and its box, on a bar filled for it. Returns the
+/// column after them.
+pub fn filterBox(
+    f: Frame,
+    bar: Window,
+    input: *TextArea,
+    focused: bool,
+    width: u16,
+    placeholder: []const u8,
+) Allocator.Error!u16 {
+    const bg = palette.panel_bg;
+    bar.fill(.{ .style = .{ .bg = bg } });
+    const fg = if (focused) palette.accent else palette.muted;
+    const col = 1 + text(bar, 1, 0, "/ ", .{ .fg = fg, .bg = bg });
+    const box = bar.child(.{ .x_off = col, .width = width, .height = 1 });
+    try input.draw(f.arena, box, .{ .bg = palette.input_bg }, focused, placeholder);
+    try f.hit(box, .search);
+    return col + width + 2;
+}
+
+/// Scrolls so that the row `selected` is among `rows` shown.
+pub fn keepInView(scroll: *u32, selected: u32, rows: u32) void {
+    if (selected < scroll.*) scroll.* = selected;
+    if (rows > 0 and selected >= scroll.* + rows) scroll.* = selected - rows + 1;
+}
+
+/// A table's scroll for this frame: to the selection when asked to follow
+/// it, and never past the last of `rows`.
+pub fn settleScroll(scroll: *u32, follow: *bool, selected: u32, rows: usize, visible: u16) void {
+    if (follow.*) keepInView(scroll, selected, visible);
+    follow.* = false;
+    scroll.* = @min(scroll.*, @as(u32, @intCast(rows -| visible)));
+}
+
+/// The row a table's movement key goes to, before clamping; null for any
+/// other key.
+pub fn rowKey(k: vaxis.Key, selected: u32, rows: usize, visible: u16) ?i64 {
+    const K = vaxis.Key;
+    const sel: i64 = selected;
+    const page: i64 = @max(visible, 2) - 1;
+    if (k.matches(K.down, .{}) or k.matches('j', .{})) return sel + 1;
+    if (k.matches(K.up, .{}) or k.matches('k', .{})) return sel - 1;
+    if (k.matches(K.page_down, .{}) or k.matches('d', .{ .ctrl = true })) return sel + page;
+    if (k.matches(K.page_up, .{}) or k.matches('u', .{ .ctrl = true })) return sel - page;
+    if (k.matches(K.home, .{}) or k.matches('g', .{})) return 0;
+    if (k.matches(K.end, .{}) or k.matches('G', .{})) return @as(i64, @intCast(rows)) - 1;
+    return null;
 }
 
 /// A centered child of at most `w` by `h`.
@@ -345,7 +482,10 @@ pub fn duration(f: Frame, minutes: u32) []const u8 {
 
 test "hits: topmost wins, modal barrier" {
     const gpa = std.testing.allocator;
-    var screen = try vaxis.Screen.init(gpa, .{ .rows = 10, .cols = 20, .x_pixel = 0, .y_pixel = 0 });
+    var screen = try vaxis.Screen.init(
+        gpa,
+        .{ .rows = 10, .cols = 20, .x_pixel = 0, .y_pixel = 0 },
+    );
     defer screen.deinit(gpa);
     const win: Window = .{
         .x_off = 0,

@@ -59,7 +59,7 @@ the attachments.
 
 ```zig
 const issuez = @import("issuez");
-const Attachments = issuez.Attachments(issuez.backend.GitProcess);
+const Attachments = issuez.Attachments(issuez.GitProcess);
 
 const att = Attachments.fromRepo(repo); // shares repo.limits
 ```
@@ -74,9 +74,12 @@ to refuse before reading any file.
 | Call | Does |
 | --- | --- |
 | `att.validate(input) !Media` | what `add` would accept, without writing (call it on drop or paste) |
-| `att.add(arena, issue_ref, .{ .files, .comment, .author, .expect }) !Added` | stores the bytes, then one commit with one `X-Attachment` per file, plus the comment text if given; returns the new tip and the new IDs in input order |
-| `att.rename(arena, issue_ref, id, name, .{}) !Oid` | new name, same object |
-| `att.remove(arena, issue_ref, ids, .{}) !Oid` | hides them; the bytes stay, since history references them |
+| `att.add(arena, issue_ref, .{ .files, .comment, .author, .expect }, .{}) !Added` | stores the bytes, then one commit with one `X-Attachment` per file, plus the comment text if given; returns the new tip and the new IDs in input order |
+| `att.rename(arena, issue_ref, id, name, .{}, .{}) !Oid` | new name, same object |
+| `att.remove(arena, issue_ref, ids, .{}, .{}) !Oid` | hides them; the bytes stay, since history references them |
+
+The last argument is `WriteOptions`, as for `Repo.update`: an author ID,
+a dry run (no bytes stored, nothing written) and diagnostics.
 
 `Input` is `{ .name, .data, .media = null }`. The name is sanitised: last
 path component, no control characters, at most 255 bytes. `media` is
@@ -92,6 +95,33 @@ Errors a GUI can tell apart: `UnsupportedType`, `AnimatedImage`,
 `TooManyAttachments` (only when adding: removing works on an issue over
 the limit), `AttachmentNotFound`, `NoAttachments`, `LfsUnavailable`, and
 `AttachmentsUnsupported` (a backend without LFS operations).
+
+### In the commit of another write
+
+A write can carry images in its own commit: the root of a new issue (its
+description's images), a comment, a description edit or a comment edit.
+`Repo.create` takes `CreateSpec.attachments`, `Repo.edit`
+`EditSpec.attachments` (adds and removes), and `Repo.commentEvent` (edits)
+`CommentEventSpec.attachments`. Build each with `att.prepare(arena, input)`,
+which validates, hashes and names it, and keeps `input.id` when the
+caller has its own UUID for the upload. Then store the bytes with
+`att.storeBytes`, or keep them yourself: a host with its own LFS store
+needs no copy in the repository and no git-lfs. The derived ref
+moves in the same transaction, as with `add`.
+
+A removal alone (`EditSpec.attachments` with only `remove`, in the C API
+`REMOVE ATTACHMENTS` alone) is a commit of its own: no text changes, and
+the attachment stays under the comment it belonged to.
+
+In the C API the same goes through op lists: `ADD ATTACHMENTS` with the
+bytes as `str`, the file name as `name` and the caller's UUID, if any, as `id`,
+`REMOVE ATTACHMENTS` with a UUID, and `ISSUEZ_OPT_EDIT_COMMENT` for a
+comment edit. `ISSUEZ_OPT_ATTACHMENT_STORE 0` on open leaves the bytes to
+the caller. `issuez_issue_attachment_count`/`_at` read them back and
+`issuez_attachment_prepare` checks bytes without writing. The Go binding
+has `Edit.AddAttachment`, `RemoveAttachment`, `EditComment`,
+`WithAttachmentStore(false)`, `Issue.Attachments` and
+`Repo.PrepareAttachment`.
 
 ### Reading
 
@@ -154,7 +184,7 @@ counts as `local`; `.{ .verify = true }` reads and hashes every object, as
 - merges fetch the remote's `refs/attachments/*` and reconcile them with
   the merged issues;
 - pushes upload the bytes before the refs, with `git lfs push`. With
-  `Sync.pushWith(arena, remote, .{ .before_push = hook })` (or `syncWith`),
+  `Sync.push(arena, remote, .{ .before_push = hook })` (or `sync`),
   your hook receives the objects instead, for example to upload them
   through your own LFS client. If the hook fails, nothing is pushed;
 - without a hook, objects to upload and no git-lfs fail the push with

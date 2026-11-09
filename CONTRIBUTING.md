@@ -15,6 +15,10 @@ approach before you put in the work.
   test is skipped.
 - For the completion and man page test: zsh, fish and mandoc. Each check
   is skipped without its tool.
+- For the C API and Go binding (`zig build test-bindings`, part of
+  `zig build ci`): a C compiler and Go 1.26 or newer; git-lfs for the
+  attachment scenarios. For `zig build test-bindings-linux`, the same in a
+  Linux container: docker.
 - For the MCP server's end-to-end tests (`zig build e2e`, part of
   `zig build ci`): Node.js 20 or newer and npm. They drive `git-issue mcp`
   with the official MCP TypeScript SDK client (`test/e2e/`). The TUI's,
@@ -25,6 +29,8 @@ approach before you put in the work.
 ```sh
 zig build test                 # the quick check, TUI included
 zig build test -Dtui=false     # the same without the TUI
+zig build test-bindings        # the C API and Go binding (needs cc and Go 1.26+)
+zig build test-bindings-linux  # the same in a Linux container (needs docker)
 zig build ci                   # what CI runs: also interop, upstream's suite, perf
                                # and long fuzz runs (-Dseed=N for other cases)
 ```
@@ -64,7 +70,8 @@ a replay command for that case
 
 ## Code
 
-- Lines stay at or under 100 columns, and `zig fmt` is applied.
+- Lines stay at or under 100 columns (`zig build test` checks the Zig
+  files), and `zig fmt` is applied.
 - Comments explain why, not what. Match the density of the surrounding code.
 - Tests sit next to the code (`test "…"` blocks), plus:
   - `test/backend_git.zig` and `test/trailers_git.zig`: the backend and the
@@ -93,8 +100,10 @@ names the tests that cover it. Update [CHANGELOG.md](CHANGELOG.md) under
 ## Releasing
 
 1. Move the entries under `## [Unreleased]` in `CHANGELOG.md` to a new
-   `## [X.Y.Z] - YYYY-MM-DD` section and set `.version = "X.Y.Z"` in
-   `build.zig.zon`.
+   `## [X.Y.Z] - YYYY-MM-DD` section, set `.version = "X.Y.Z"` in
+   `build.zig.zon`, and run `zig build capi-header`: the committed C header
+   and API description carry the version. Point the examples in `README.md`,
+   `bindings/go/README.md` and `install.sh` at it.
 2. Merge to `main`, then tag the merge commit and push the tag:
 
    ```sh
@@ -107,7 +116,18 @@ names the tests that cover it. Update [CHANGELOG.md](CHANGELOG.md) under
    `zig build ci` on x86_64 Linux), and only if they all pass runs
    `zig build release` and publishes the release with the changelog entry
    as its notes. A failed gate publishes nothing: fix it, then move the
-   tag (`git tag -f vX.Y.Z && git push -f origin vX.Y.Z`).
+   tag (`git tag -f vX.Y.Z && git push -f origin vX.Y.Z`). After publishing
+   it tags the Go module as `bindings/go/vX.Y.Z`, and updates the Homebrew tap
+   and `EuroZig/git-native-issuez-go`, the Go module with the archives
+   (`tools/go-module.sh`, deploy key in the secret `GO_MODULE_DEPLOY_KEY`).
+   Don't move the Go tags: Go's checksum database remembers a version for good.
+   If a job fails after the gate, rerun the failed jobs: `release` takes
+   up a release that is already there (it replaces the archives and
+   publishes a draft) and keeps a `bindings/go/vX.Y.Z` tag that is already
+   at the tagged commit. If only `go-module` or `homebrew` fails, the
+   release is out and rerunning that job is enough. `go-module` also works
+   on an empty `EuroZig/git-native-issuez-go`, so the first release
+   creates its `main`.
 
 `zig build release` cross-compiles both flavors for every platform and
 writes the archives and their `SHA256SUMS` to `zig-out/release/`; run it

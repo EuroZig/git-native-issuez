@@ -25,14 +25,19 @@ pub fn Context(comptime B: type) type {
 
         const Self = @This();
 
-        /// A date as typed (`2026-12-01`, `today`, `+3d`, `fri`, `eom`),
-        /// as git stores it; empty stays empty. Null when it isn't one.
-        pub fn date(ctx: *Self, text: []const u8) std.mem.Allocator.Error!?[]const u8 {
+        /// A date as typed (`2026-12-01`, `today`, `+3d`, `fri`, `eom`).
+        /// Null when it isn't one.
+        pub fn date(ctx: *Self, text: []const u8) ?@import("issuez").format.fields.Date {
             const issuez = @import("issuez");
-            const today = ctx.today orelse issuez.local_time.today(ctx.io, ctx.gpa, ctx.environ_map);
+            const today = ctx.today orelse issuez.local_time.today(
+                ctx.io,
+                ctx.gpa,
+                ctx.environ_map,
+            );
             ctx.today = today;
-            const work_days: issuez.format.fields.WorkDays = if (ctx.settings) |s| s.work_days else .all;
-            return issuez.format.dates.resolve(ctx.arena, text, today, work_days);
+            const work_days: issuez.format.fields.WorkDays =
+                if (ctx.settings) |st| st.work_days else .all;
+            return issuez.format.dates.parse(text, today, work_days);
         }
 
         /// A file named on the command line. A backend with files of its
@@ -52,6 +57,15 @@ pub fn Context(comptime B: type) type {
                     error.OutOfMemory => error.OutOfMemory,
                     else => error.ReadFailed,
                 };
+        }
+
+        /// All of stdin. The simulator serves its world's file `<stdin>`.
+        pub fn readStdin(ctx: *Self, limit: usize) ReadFileError![]const u8 {
+            if (@hasDecl(B, "readFile")) {
+                const sim = ctx.backend catch return error.ReadFailed;
+                return sim.readFile("<stdin>") orelse "";
+            }
+            return ctx.readFile("/dev/stdin", limit);
         }
     };
 }

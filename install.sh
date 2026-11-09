@@ -5,8 +5,8 @@
 # --uninstall removes all of it again; the issues in your repositories stay.
 #
 #   curl -fsSL https://raw.githubusercontent.com/EuroZig/git-native-issuez/main/install.sh | sh
-#   curl -fsSL .../install.sh | sh -s -- --flavor minimal --version 0.3.0 --prefix ~/opt
-#   sh install.sh --from zig-out/release --version 0.3.0    # local archives
+#   curl -fsSL .../install.sh | sh -s -- --flavor minimal --version 0.4.0 --prefix ~/opt
+#   sh install.sh --from zig-out/release --version 0.4.0    # local archives
 #   sh install.sh --uninstall --prefix ~/opt                 # or: update-git-native-issuez --uninstall
 set -eu
 

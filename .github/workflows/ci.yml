@@ -16,6 +16,11 @@ jobs:
       - uses: EuroZig/setup-zig@v3
         with:
           version: 0.16.0
+      # The Go binding's tests (zig build test-bindings, part of ci).
+      - uses: actions/setup-go@v6
+        with:
+          go-version: '1.26'
+          cache: false
 
       # gawk: upstream's fsck needs awk interval regexes, which mawk lacks.
       # uuid-runtime: upstream's test-merge.sh uses uuidgen.

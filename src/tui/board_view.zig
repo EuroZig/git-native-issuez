@@ -49,7 +49,9 @@ pub const State = struct {
         const last_col: i64 = @intCast(b.columns.len - 1);
         b.column = @intCast(std.math.clamp(column, 0, last_col));
         const cards = b.columns[b.column].cards;
-        b.index = if (cards.len == 0) 0 else @intCast(std.math.clamp(index, 0, @as(i64, @intCast(cards.len - 1))));
+        b.index = if (cards.len == 0) 0 else @intCast(
+            std.math.clamp(index, 0, @as(i64, @intCast(cards.len - 1))),
+        );
         b.selected_id = if (b.selectedIssue()) |i| Id.of(snap.issues[i].id) else null;
         b.follow = true;
     }
@@ -97,7 +99,13 @@ pub fn draw(s: *AppState, f: ui.Frame, win: ui.Window) Allocator.Error!void {
     }
     // More columns than fit.
     if (b.first > 0) _ = ui.text(area, 0, 0, "‹", .{ .fg = palette.accent, .bold = true });
-    if (b.first + fit < ncols) _ = ui.text(area, area.width - 1, 0, "›", .{ .fg = palette.accent, .bold = true });
+    if (b.first + fit < ncols) _ = ui.text(
+        area,
+        area.width - 1,
+        0,
+        "›",
+        .{ .fg = palette.accent, .bold = true },
+    );
     b.follow = false;
 }
 
@@ -133,8 +141,20 @@ fn drawColumn(s: *AppState, f: ui.Frame, win: ui.Window, c: u16) Allocator.Error
     const fg = if (col.done) palette.done else palette.accent;
     var hx = ui.text(head, 1, 0, col.name, .{ .fg = fg, .bg = head_bg, .bold = true });
     hx += 2;
-    _ = ui.text(head, hx, 0, f.fmt("{d}", .{col.cards.len}), .{ .fg = palette.muted, .bg = head_bg });
-    if (target) _ = ui.text(head, head.width -| 8, 0, "drop ⤓", .{ .fg = .{ .index = 231 }, .bg = head_bg });
+    _ = ui.text(
+        head,
+        hx,
+        0,
+        f.fmt("{d}", .{col.cards.len}),
+        .{ .fg = palette.muted, .bg = head_bg },
+    );
+    if (target) _ = ui.text(
+        head,
+        head.width -| 8,
+        0,
+        "drop ⤓",
+        .{ .fg = .{ .index = 231 }, .bg = head_bg },
+    );
 
     const body = inner.child(.{ .y_off = 2, .height = inner.height -| 2 });
     if (col.done and s.query.scope == .open) {
@@ -148,10 +168,7 @@ fn drawColumn(s: *AppState, f: ui.Frame, win: ui.Window, c: u16) Allocator.Error
     }
     // Scroll the selected card into view.
     const top = &b.scroll[c];
-    if (b.follow and c == b.column) {
-        if (b.index < top.*) top.* = b.index;
-        if (b.index >= top.* + b.visible) top.* = b.index - b.visible + 1;
-    }
+    if (b.follow and c == b.column) ui.keepInView(top, b.index, b.visible);
     top.* = @min(top.*, @as(u32, @intCast(col.cards.len -| b.visible)));
     var n: u32 = 0;
     while (n < b.visible and top.* + n < col.cards.len) : (n += 1) {
@@ -159,47 +176,75 @@ fn drawColumn(s: *AppState, f: ui.Frame, win: ui.Window, c: u16) Allocator.Error
         const y: u16 = @intCast(n * (card_height + card_gap));
         const card = body.child(.{ .y_off = y, .height = card_height });
         const selected = c == b.column and index == b.index;
-        const dragged = if (s.drag) |d| d.moved and d.card.column == c and d.card.index == index else false;
+        const dragged = if (s.drag) |d|
+            d.moved and d.card.column == c and d.card.index == index
+        else
+            false;
         try drawCard(s, f, card, col.cards[index], selected, dragged);
         try f.hit(card, .{ .card = .{ .column = c, .index = index } });
     }
     const hidden = col.cards.len - top.* - n;
-    if (top.* > 0) _ = ui.text(inner, inner.width -| 4, 1, f.fmt("↑{d}", .{top.*}), .{ .fg = palette.muted });
-    if (hidden > 0) _ = ui.text(inner, inner.width -| 4, inner.height -| 1, f.fmt("↓{d}", .{hidden}), .{ .fg = palette.muted });
+    if (top.* > 0) _ = ui.text(
+        inner,
+        inner.width -| 4,
+        1,
+        f.fmt("↑{d}", .{top.*}),
+        .{ .fg = palette.muted },
+    );
+    if (hidden > 0) _ = ui.text(
+        inner,
+        inner.width -| 4,
+        inner.height -| 1,
+        f.fmt("↓{d}", .{hidden}),
+        .{ .fg = palette.muted },
+    );
 }
 
-fn drawCard(s: *AppState, f: ui.Frame, win: ui.Window, i: u32, selected: bool, dragged: bool) Allocator.Error!void {
+fn drawCard(
+    s: *AppState,
+    f: ui.Frame,
+    win: ui.Window,
+    i: u32,
+    selected: bool,
+    dragged: bool,
+) Allocator.Error!void {
     const snap = s.snap;
     const issue = snap.issues[i];
-    const bg: vaxis.Color = if (dragged) palette.hover_bg else if (selected) palette.select_bg else palette.panel_bg;
+    const bg: vaxis.Color = if (dragged)
+        palette.hover_bg
+    else if (selected)
+        palette.select_bg
+    else
+        palette.panel_bg;
     win.fill(.{ .style = .{ .bg = bg } });
-    const edge: ui.Style = .{ .fg = if (selected) palette.accent else ui.priorityColor(issue.field("Priority")), .bg = bg };
+    const edge: ui.Style = .{
+        .fg = if (selected) palette.accent else ui.priorityColor(issue.field("Priority")),
+        .bg = bg,
+    };
     var y: u16 = 0;
     while (y < win.height) : (y += 1) _ = ui.text(win, 0, y, if (selected) "┃" else "│", edge);
     const inner = win.child(.{ .x_off = 2, .width = win.width -| 3 });
 
     // ID, priority, progress.
-    var x: u16 = 0;
-    x += ui.text(inner, x, 0, issuez.format.uuid.shortId(issue.id), .{ .fg = palette.id, .bg = bg });
+    var l: ui.Line = .{ .f = f, .win = inner };
+    l.text(issuez.format.uuid.shortId(issue.id), .{ .fg = palette.id, .bg = bg });
     if (s.snap.remote.isQuarantined(issue.id)) {
-        x += ui.text(inner, x, 0, "!", .{ .fg = palette.err, .bg = bg, .bold = true });
-    } else if (s.snap.remote.isUnpushed(issue.id)) x += ui.text(inner, x, 0, "↑", .{ .fg = palette.faint, .bg = bg });
-    x += 1;
-    if (issue.field("Priority")) |p| {
-        x += ui.text(inner, x, 0, p, .{ .fg = ui.priorityColor(p), .bg = bg });
-        x += 1;
-    }
-    if (snap.proj.activelyBlocked(i)) {
-        x += ui.text(inner, x, 0, "blocked", .{ .fg = palette.err, .bg = bg });
-        x += 1;
-    }
+        l.text("!", .{ .fg = palette.err, .bg = bg, .bold = true });
+    } else if (s.snap.remote.isUnpushed(issue.id)) l.text("↑", .{ .fg = palette.faint, .bg = bg });
+    l.x += 1;
+    if (issue.field("Priority")) |p| l.word(p, .{ .fg = ui.priorityColor(p), .bg = bg });
+    if (snap.proj.activelyBlocked(i)) l.word("blocked", .{ .fg = palette.err, .bg = bg });
     if (snap.proj.progress(i)) |p| {
-        _ = ui.text(inner, x, 0, f.fmt("{d}/{d}", .{ p.closed, p.total }), .{ .fg = palette.muted, .bg = bg });
+        l.text(f.fmt("{d}/{d}", .{ p.closed, p.total }), .{ .fg = palette.muted, .bg = bg });
     }
 
     // Title, two rows.
     const rows = try text_mod.layout(f.arena, issue.title, inner.width);
-    const ts: ui.Style = .{ .bg = bg, .bold = true, .fg = if (snap.isDone(i)) palette.muted else .default };
+    const ts: ui.Style = .{
+        .bg = bg,
+        .bold = true,
+        .fg = if (snap.isDone(i)) palette.muted else .default,
+    };
     for (rows[0..@min(rows.len, 2)], 1..) |r, ry| {
         const line = issue.title[r.start..r.end];
         _ = ui.text(inner, 0, @intCast(ry), line, ts);
@@ -207,16 +252,24 @@ fn drawCard(s: *AppState, f: ui.Frame, win: ui.Window, i: u32, selected: bool, d
     if (rows.len > 2) _ = ui.text(inner, inner.width -| 1, 2, "…", ts);
 
     // Labels, assignee.
-    x = 0;
-    for (issue.labels) |l| {
-        if (x >= inner.width) break;
-        x += ui.text(inner, x, 3, l, .{ .fg = palette.label, .bg = bg });
-        x += 1;
+    l = .{ .f = f, .win = inner, .y = 3 };
+    for (issue.labels) |label| {
+        if (l.x >= inner.width) break;
+        l.word(label, .{ .fg = palette.label, .bg = bg });
     }
-    if (issue.ext.assignee) |a| {
-        const who = f.fmt("@{s}", .{a.email[0 .. std.mem.findScalar(u8, a.email, '@') orelse a.email.len]});
+    if (issue.assignee) |a| {
+        const who = f.fmt(
+            "@{s}",
+            .{a.email[0 .. std.mem.findScalar(u8, a.email, '@') orelse a.email.len]},
+        );
         const ww = inner.gwidth(who);
-        if (x + ww < inner.width) _ = ui.text(inner, inner.width - ww, 3, who, .{ .fg = palette.muted, .bg = bg });
+        if (l.x + ww < inner.width) _ = ui.text(
+            inner,
+            inner.width - ww,
+            3,
+            who,
+            .{ .fg = palette.muted, .bg = bg },
+        );
     }
 }
 
@@ -239,9 +292,13 @@ pub fn key(s: *AppState, k: vaxis.Key) Allocator.Error!AppState.Action {
         b.select(snap, col, std.math.maxInt(i32));
     } else if (k.matches(K.enter, .{})) {
         if (b.selectedIssue()) |i| s.openIssue(snap.issues[i].id);
-    } else if (k.matches('<', .{}) or k.matches('H', .{}) or k.matches(K.left, .{ .shift = true })) {
+    } else if (k.matches('<', .{}) or k.matches('H', .{}) or
+        k.matches(K.left, .{ .shift = true }))
+    {
         return move(s, -1);
-    } else if (k.matches('>', .{}) or k.matches('L', .{}) or k.matches(K.right, .{ .shift = true })) {
+    } else if (k.matches('>', .{}) or k.matches('L', .{}) or
+        k.matches(K.right, .{ .shift = true }))
+    {
         return move(s, 1);
     } else if (k.matches('a', .{})) {
         if (b.selectedIssue()) |i| s.newIssue(i);
@@ -292,7 +349,9 @@ pub fn wheel(s: *AppState, found: ?ui.Hits.Found, delta: i32) void {
     if (c >= b.columns.len) return;
     const len: i64 = @intCast(b.columns[c].cards.len);
     const step: i64 = if (delta < 0) -1 else 1;
-    b.scroll[c] = @intCast(std.math.clamp(@as(i64, b.scroll[c]) + step, 0, @max(len - b.visible, 0)));
+    b.scroll[c] = @intCast(
+        std.math.clamp(@as(i64, b.scroll[c]) + step, 0, @max(len - b.visible, 0)),
+    );
 }
 
 pub fn drop(s: *AppState, d: AppState.Drag) AppState.Action {

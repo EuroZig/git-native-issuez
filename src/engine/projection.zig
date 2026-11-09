@@ -10,6 +10,7 @@
 //! than `max_depth` are reported but stay in the tree.
 
 const std = @import("std");
+const stableSort = @import("../sort.zig").stable;
 const Allocator = std.mem.Allocator;
 const issue_model = @import("../model/issue.zig");
 const fields_fmt = @import("../format/fields.zig");
@@ -48,18 +49,13 @@ pub const Problem = struct {
 
     /// What `ls --problems` prints: the kind's description, with the other
     /// issue's short ID or the invalid value.
-    pub fn describe(p: Problem, arena: Allocator) Allocator.Error![]const u8 {
-        if (p.kind == .invalid_value) return std.fmt.allocPrint(
-            arena,
+    pub fn format(p: Problem, w: *std.Io.Writer) std.Io.Writer.Error!void {
+        if (p.kind == .invalid_value) return w.print(
             "{s} '{s}' is not valid and is ignored",
             .{ p.key.?, p.value.? },
         );
-        if (p.other) |o| return std.fmt.allocPrint(
-            arena,
-            "{s} ({s})",
-            .{ p.kind.describe(), uuid_fmt.shortId(o) },
-        );
-        return p.kind.describe();
+        if (p.other) |o| return w.print("{s} ({s})", .{ p.kind.describe(), uuid_fmt.shortId(o) });
+        try w.writeAll(p.kind.describe());
     }
 
     pub const Kind = enum {
@@ -86,6 +82,8 @@ pub const Problem = struct {
         /// `X-Milestone-Id` names no milestone we know.
         milestone_missing,
         milestone_retired,
+        /// Another issue has the same `X-Number` (clones gave it twice).
+        duplicate_number,
         /// Open work in a completed milestone.
         open_in_completed_milestone,
 
@@ -107,6 +105,7 @@ pub const Problem = struct {
                 .pending_event => "event waits for a comment not here yet",
                 .event_in_other_issue => "event targets a comment of another issue",
                 .milestone_missing => "milestone not found",
+                .duplicate_number => "another issue has the same number",
                 .milestone_retired => "milestone is retired",
                 .open_in_completed_milestone => "open in a completed milestone",
             };
@@ -138,30 +137,51 @@ pub const Projection = struct {
     /// `problems` per issue, in the same order.
     problems_of: []const []const Problem,
 
-    pub fn find(p: Projection, id: []const u8) ?u32 {
+    /// Over no issues.
+    pub const empty: Projection = .{
+        .issues = &.{},
+        .parent = &.{},
+        .children = &.{},
+        .blockers = &.{},
+        .blocks = &.{},
+        .depth = &.{},
+        .problems = &.{},
+        .roots = &.{},
+        .options = .{},
+        .index = .empty,
+        .milestone = &.{},
+        .leaves = &.{},
+        .problems_of = &.{},
+    };
+
+    pub fn find(p: *const Projection, id: []const u8) ?u32 {
         return p.index.get(id);
     }
 
     /// `closed` or one of `Options.done_states`.
-    pub fn isDone(p: Projection, i: u32) bool {
+    pub fn isDone(p: *const Projection, i: u32) bool {
         return p.issues[i].state.isDone(p.options.done_states);
     }
 
     /// Not done and not deleted: what blocks, and what the open/closed
     /// rules look at.
-    pub fn isActive(p: Projection, i: u32) bool {
+    pub fn isActive(p: *const Projection, i: u32) bool {
         return !p.isDone(i) and !p.issues[i].deleted;
     }
 
     /// Open, with at least one open blocker that exists.
-    pub fn activelyBlocked(p: Projection, i: u32) bool {
+    pub fn activelyBlocked(p: *const Projection, i: u32) bool {
         if (!p.isActive(i)) return false;
         for (p.blockers[i]) |b| if (p.isActive(b)) return true;
         return false;
     }
 
     /// The blockers `activelyBlocked` counts.
-    pub fn activeBlockers(p: Projection, arena: Allocator, i: u32) Allocator.Error![]const u32 {
+    pub fn activeBlockers(
+        p: *const Projection,
+        arena: Allocator,
+        i: u32,
+    ) Allocator.Error![]const u32 {
         var out: std.ArrayList(u32) = .empty;
         for (p.blockers[i]) |b| if (p.isActive(b)) try out.append(arena, b);
         return out.items;
@@ -169,16 +189,16 @@ pub const Projection = struct {
 
     /// Done leaves out of all leaves below `i`. Null for a leaf, or over
     /// the leaf limit.
-    pub fn progress(p: Projection, i: u32) ?Progress {
+    pub fn progress(p: *const Projection, i: u32) ?Progress {
         const l = p.leaves[i];
         if (l.total == 0 or l.total > p.options.max_progress_leaves) return null;
         return l;
     }
 
     /// Its own, else the first state for open issues. Null when done.
-    pub fn workflow(p: Projection, i: u32) ?[]const u8 {
+    pub fn workflow(p: *const Projection, i: u32) ?[]const u8 {
         if (p.issues[i].deleted) return null;
-        if (p.issues[i].ext.workflow) |w| return w;
+        if (p.issues[i].workflow) |w| return w;
         if (p.isDone(i) or p.options.workflow.len == 0) return null;
         return p.options.workflow[0];
     }
@@ -186,7 +206,7 @@ pub const Projection = struct {
     /// Non-deleted leaves in milestone `id`: what progress and completion
     /// count.
     pub fn milestoneLeaves(
-        p: Projection,
+        p: *const Projection,
         arena: Allocator,
         id: []const u8,
     ) Allocator.Error![]const u32 {
@@ -202,7 +222,11 @@ pub const Projection = struct {
     }
 
     /// Done leaves out of `milestoneLeaves`.
-    pub fn milestoneProgress(p: Projection, arena: Allocator, id: []const u8) Allocator.Error!Progress {
+    pub fn milestoneProgress(
+        p: *const Projection,
+        arena: Allocator,
+        id: []const u8,
+    ) Allocator.Error!Progress {
         const leaves = try p.milestoneLeaves(arena, id);
         var closed: u32 = 0;
         for (leaves) |i| {
@@ -213,7 +237,7 @@ pub const Projection = struct {
 
     /// Non-deleted issues in milestone `id`, inherited ones included.
     pub fn milestoneIssues(
-        p: Projection,
+        p: *const Projection,
         arena: Allocator,
         id: []const u8,
     ) Allocator.Error![]const u32 {
@@ -226,7 +250,7 @@ pub const Projection = struct {
         return out.items;
     }
 
-    pub fn problemsOf(p: Projection, i: u32) []const Problem {
+    pub fn problemsOf(p: *const Projection, i: u32) []const Problem {
         return p.problems_of[i];
     }
 };
@@ -250,7 +274,7 @@ pub fn build(arena: Allocator, issues: []const Issue, options: Options) Allocato
     // A missing event target may be a comment of another issue.
     var comment_owner: std.StringHashMapUnmanaged([]const u8) = .empty;
     for (issues) |issue| for (issue.comments) |c| {
-        try comment_owner.put(arena, try arena.dupe(u8, c.oid.hex().slice()), issue.id);
+        try comment_owner.put(arena, try c.oid.hexAlloc(arena), issue.id);
     };
     for (issues) |issue| for (issue.event_problems) |ep| switch (ep.kind) {
         .invalid => try problems.append(arena, .{ .id = issue.id, .kind = .invalid_event }),
@@ -264,7 +288,39 @@ pub fn build(arena: Allocator, issues: []const Issue, options: Options) Allocato
             try problems.append(arena, .{ .id = issue.id, .kind = .pending_event }),
     };
 
-    for (issues) |issue| for (issue.ext.invalid) |f| try problems.append(arena, .{
+    // The same number twice: each one names the other.
+    var by_number: std.AutoHashMapUnmanaged(u64, []const u8) = .empty;
+    for (issues) |issue| {
+        if (issue.deleted) continue;
+        const num = issue.number orelse continue;
+        const gop = try by_number.getOrPut(arena, num);
+        if (!gop.found_existing) {
+            gop.value_ptr.* = issue.id;
+            continue;
+        }
+        const value = try std.fmt.allocPrint(arena, "{d}", .{num});
+        try problems.append(
+            arena,
+            .{
+                .id = issue.id,
+                .kind = .duplicate_number,
+                .other = gop.value_ptr.*,
+                .key = "X-Number",
+                .value = value,
+            },
+        );
+        try problems.append(
+            arena,
+            .{
+                .id = gop.value_ptr.*,
+                .kind = .duplicate_number,
+                .other = issue.id,
+                .key = "X-Number",
+                .value = value,
+            },
+        );
+    }
+    for (issues) |issue| for (issue.invalid_fields) |f| try problems.append(arena, .{
         .id = issue.id,
         .kind = .invalid_value,
         .key = f.key,
@@ -275,7 +331,7 @@ pub fn build(arena: Allocator, issues: []const Issue, options: Options) Allocato
     const parent = try arena.alloc(u32, n);
     for (issues, parent) |issue, *p| {
         p.* = none;
-        const target = issue.ext.parent orelse continue;
+        const target = issue.parent orelse continue;
         if (std.mem.eql(u8, target, issue.id)) {
             try problems.append(arena, .{ .id = issue.id, .kind = .parent_self });
         } else if (index.get(target)) |t| {
@@ -337,10 +393,10 @@ pub fn build(arena: Allocator, issues: []const Issue, options: Options) Allocato
             return std.mem.lessThan(u8, x.id, y.id);
         }
     };
-    std.mem.sort(u32, roots.items, Order{ .issues = issues }, Order.lt);
+    stableSort(u32, roots.items, Order{ .issues = issues }, Order.lt);
     const children = try arena.alloc([]const u32, n);
     for (kids, children) |*k, *c| {
-        std.mem.sort(u32, k.items, Order{ .issues = issues }, Order.lt);
+        stableSort(u32, k.items, Order{ .issues = issues }, Order.lt);
         c.* = k.items;
     }
     const depth = try arena.alloc(u32, n);
@@ -368,7 +424,7 @@ pub fn build(arena: Allocator, issues: []const Issue, options: Options) Allocato
     for (blocks_lists) |*b| b.* = .empty;
     for (issues, blockers, 0..) |issue, *bl, i| {
         var list: std.ArrayList(u32) = .empty;
-        for (issue.ext.blocked_by) |target| {
+        for (issue.blocked_by) |target| {
             if (std.mem.eql(u8, target, issue.id)) {
                 try problems.append(arena, .{ .id = issue.id, .kind = .blocker_self });
             } else if (index.get(target)) |t| {
@@ -453,11 +509,14 @@ pub fn build(arena: Allocator, issues: []const Issue, options: Options) Allocato
     for (options.milestones orelse &.{}) |m| try statuses.put(arena, m.id, m.status);
     for (post.items) |i| {
         const issue = issues[i];
-        const ext = issue.ext;
+        const ext = issue.extensions();
         const up: ?[]const u8 = if (parent[i] == none) null else pass[parent[i]];
         const has_id = ext.milestone_id != null;
         const has_parent = parent[i] != none;
-        eff[i] = switch (fields_fmt.MilestoneMode.of(ext.milestone_mode, has_id, has_parent)) {
+        eff[i] = switch (fields_fmt.MilestoneMode.of(ext.milestone_mode, .{
+            .has_id = has_id,
+            .has_parent = has_parent,
+        })) {
             .none => null,
             .inherit => up,
             .explicit => blk: {
@@ -578,7 +637,7 @@ fn blockerCycles(
 const testing = std.testing;
 
 fn fakeIssue(id: []const u8, created: i64, state: []const u8, ext: issue_model.Extensions) Issue {
-    return .{
+    var issue: Issue = .{
         .id = id,
         .tip = undefined,
         .root = undefined,
@@ -588,7 +647,6 @@ fn fakeIssue(id: []const u8, created: i64, state: []const u8, ext: issue_model.E
         .description = "",
         .state = .parse(state),
         .labels = &.{},
-        .ext = ext,
         .fields = &.{},
         .conflicts = &.{},
         .author = undefined,
@@ -599,6 +657,8 @@ fn fakeIssue(id: []const u8, created: i64, state: []const u8, ext: issue_model.E
         .commit_count = 1,
         .log = &.{},
     };
+    issue.setExtensions(ext);
+    return issue;
 }
 
 test "hierarchy, blocking, progress and workflow" {

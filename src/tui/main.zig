@@ -77,7 +77,13 @@ const SyncWorker = struct {
     summary: sync_job.Summary = .{},
 
     /// error.SyncRunning when one runs already.
-    fn start(context: *anyopaque, remote: []const u8, kind: sync_job.Kind, auto: bool, fetched: bool) anyerror!void {
+    fn start(
+        context: *anyopaque,
+        remote: []const u8,
+        kind: sync_job.Kind,
+        auto: bool,
+        fetched: bool,
+    ) anyerror!void {
         const w: *SyncWorker = @ptrCast(@alignCast(context));
         if (w.task != null) return error.SyncRunning;
         w.remote_len = @min(remote.len, w.remote_buf.len);
@@ -88,7 +94,9 @@ const SyncWorker = struct {
         // Read each time: git config may have changed meanwhile.
         var arena_state: std.heap.ArenaAllocator = .init(w.gpa);
         defer arena_state.deinit();
-        w.own_ssh = w.environ_map.get("GIT_SSH_COMMAND") != null or w.environ_map.get("GIT_SSH") != null or
+        w.own_ssh = w.environ_map.get(
+            "GIT_SSH_COMMAND",
+        ) != null or w.environ_map.get("GIT_SSH") != null or
             (w.config.configGet(arena_state.allocator(), "core.sshCommand") catch null) != null;
         w.task = try w.io.concurrent(work, .{w});
     }
@@ -111,12 +119,22 @@ const SyncWorker = struct {
             env.put("SSH_ASKPASS_REQUIRE", "never") catch |e| break :blk e;
             if (!w.own_ssh) {
                 var ssh_buf: [512]u8 = undefined;
-                env.put("GIT_SSH_COMMAND", sync_job.sshCommand(&ssh_buf, w.controlDir(a))) catch |e| break :blk e;
+                env.put(
+                    "GIT_SSH_COMMAND",
+                    sync_job.sshCommand(&ssh_buf, w.controlDir(a)),
+                ) catch |e| break :blk e;
             }
-            break :blk GitProcess.open(w.io, w.gpa, .{ .path = ".", .environ_map = &env, .no_terminal = true });
+            break :blk GitProcess.open(
+                w.io,
+                w.gpa,
+                .{ .path = ".", .environ_map = &env, .no_terminal = true },
+            );
         };
         var git = git_or_error catch |e| {
-            out.fail("{s} with {s} failed: {f}", .{ w.kind.label(), remote, issuez.errors.Description{ .err = e, .limits = .{} } });
+            out.fail(
+                "{s} with {s} failed: {f}",
+                .{ w.kind.label(), remote, issuez.errors.Description{ .err = e, .limits = .{} } },
+            );
             return out;
         };
         defer git.close();
@@ -139,7 +157,12 @@ const SyncWorker = struct {
             return null;
         };
         if (!sync_job.sshSharesSafely(version.stderr)) return null;
-        w.control = sync_job.controlDir(w.io, &w.control_buf, w.environ_map.get("XDG_RUNTIME_DIR"), sync_job.currentUid());
+        w.control = sync_job.controlDir(
+            w.io,
+            &w.control_buf,
+            w.environ_map.get("XDG_RUNTIME_DIR"),
+            sync_job.currentUid(),
+        );
         return w.control;
     }
 
@@ -237,7 +260,10 @@ pub fn main(
     }
 
     var git = GitProcess.open(io, gpa, .{ .path = ".", .environ_map = environ_map }) catch |e| {
-        err.print("git-issue: {f}\n", .{issuez.errors.Description{ .err = e, .limits = .{} }}) catch {};
+        err.print(
+            "git-issue: {f}\n",
+            .{issuez.errors.Description{ .err = e, .limits = .{} }},
+        ) catch {};
         return 1;
     };
     defer git.close();
@@ -327,7 +353,13 @@ fn run(
     if (watching) app.changedElsewhere(false);
 
     // Syncs in the background, with git that never prompts.
-    var worker: SyncWorker = .{ .io = io, .gpa = gpa, .environ_map = environ_map, .loop = &loop, .config = app.store.backend };
+    var worker: SyncWorker = .{
+        .io = io,
+        .gpa = gpa,
+        .environ_map = environ_map,
+        .loop = &loop,
+        .config = app.store.backend,
+    };
     app.runner = .{ .context = &worker, .start = SyncWorker.start };
     // Before the loop stops: the task posts to it.
     defer {
@@ -352,7 +384,9 @@ fn run(
             // The loop has already turned pixel positions into cells.
             // The pointer moving with no button held changes nothing:
             // no frame for it.
-            .mouse => |m| if (m.type == .motion and m.button == .none) continue else .{ .mouse = m },
+            .mouse => |m| if (m.type == .motion and m.button == .none) continue else .{
+                .mouse = m,
+            },
             .paste_start => .paste_start,
             .paste_end => .paste_end,
             .winsize => |ws| blk: {
@@ -398,4 +432,5 @@ test {
     _ = @import("timeline_draft.zig");
     _ = @import("sync_job.zig");
     _ = app_mod;
+    _ = @import("app_test.zig");
 }

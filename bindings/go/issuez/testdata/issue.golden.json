@@ -1,0 +1,432 @@
+{
+  "ID": "<issue>",
+  "Tip": "<oid>",
+  "Number": 12,
+  "FormatVersion": "1",
+  "CommitCount": 5,
+  "Title": "Golden",
+  "Description": "Every field.",
+  "Author": {
+    "Name": "Ada",
+    "Email": "ada@example.com",
+    "UserID": ""
+  },
+  "Created": "2026-01-02T03:01:00Z",
+  "Updated": "2026-01-02T03:05:00Z",
+  "State": "open",
+  "Done": false,
+  "WorkflowState": "backlog",
+  "Closed": null,
+  "Deleted": false,
+  "Locked": true,
+  "LockReason": "heated",
+  "Priority": 3,
+  "Labels": [
+    "bug",
+    "ui"
+  ],
+  "Assignees": [
+    {
+      "Name": "",
+      "Email": "grace@example.invalid",
+      "UserID": "0c8d7a52-3f1e-4b6a-9d2c-5e4f3a2b1c0d"
+    }
+  ],
+  "MilestoneID": "<milestone>",
+  "ParentID": "",
+  "BlockedBy": null,
+  "StartDate": null,
+  "DueDate": {
+    "Year": 2026,
+    "Month": 12,
+    "Day": 1
+  },
+  "Estimate": 5400000000000,
+  "Ref": "v2",
+  "OriginalAuthor": "octo@github",
+  "OriginalID": "gh-12",
+  "Extra": {
+    "X-Forgejo-Project": "3"
+  },
+  "Reactions": null,
+  "Comments": [
+    {
+      "ID": "<oid>",
+      "Author": {
+        "Name": "Ada",
+        "Email": "ada@example.com",
+        "UserID": ""
+      },
+      "Created": "2026-01-02T03:02:00Z",
+      "Updated": "2026-01-02T03:03:00Z",
+      "Text": "An edited comment",
+      "Edited": true,
+      "Deleted": false,
+      "AttachmentIDs": null,
+      "OriginalAuthor": "",
+      "OriginalID": "",
+      "Purged": false,
+      "Reactions": [
+        {
+          "Emoji": "heart",
+          "Users": [
+            {
+              "Name": "Ada",
+              "Email": "ada@example.com",
+              "UserID": ""
+            }
+          ]
+        }
+      ],
+      "History": [
+        {
+          "Commit": "<oid>",
+          "Author": {
+            "Name": "Ada",
+            "Email": "ada@example.com",
+            "UserID": ""
+          },
+          "At": "2026-01-02T03:02:00Z",
+          "Kind": 1,
+          "Text": "A comment",
+          "Previous": ""
+        },
+        {
+          "Commit": "<oid>",
+          "Author": {
+            "Name": "Ada",
+            "Email": "ada@example.com",
+            "UserID": ""
+          },
+          "At": "2026-01-02T03:03:00Z",
+          "Kind": 2,
+          "Text": "An edited comment",
+          "Previous": "A comment"
+        }
+      ],
+      "Edits": 1
+    }
+  ],
+  "Attachments": null,
+  "Timeline": [
+    {
+      "Kind": 1,
+      "Commit": "<oid>",
+      "Author": {
+        "Name": "Ada",
+        "Email": "ada@example.com",
+        "UserID": ""
+      },
+      "At": "2026-01-02T03:01:00Z",
+      "Comment": "",
+      "CommentAuthor": null,
+      "Changes": [
+        {
+          "Field": 4,
+          "Key": "State",
+          "Op": 1,
+          "Old": "",
+          "New": "open",
+          "OldPerson": null,
+          "NewPerson": null,
+          "OldDate": null,
+          "NewDate": null,
+          "OldDone": false,
+          "NewDone": false,
+          "Reason": ""
+        },
+        {
+          "Field": 8,
+          "Key": "Priority",
+          "Op": 1,
+          "Old": "",
+          "New": "high",
+          "OldPerson": null,
+          "NewPerson": null,
+          "OldDate": null,
+          "NewDate": null,
+          "OldDone": false,
+          "NewDone": false,
+          "Reason": ""
+        },
+        {
+          "Field": 9,
+          "Key": "Milestone",
+          "Op": 1,
+          "Old": "",
+          "New": "v1",
+          "OldPerson": null,
+          "NewPerson": null,
+          "OldDate": null,
+          "NewDate": null,
+          "OldDone": false,
+          "NewDone": false,
+          "Reason": ""
+        },
+        {
+          "Field": 13,
+          "Key": "X-Due-Date",
+          "Op": 1,
+          "Old": "",
+          "New": "2026-12-01",
+          "OldPerson": null,
+          "NewPerson": null,
+          "OldDate": null,
+          "NewDate": {
+            "Year": 2026,
+            "Month": 12,
+            "Day": 1
+          },
+          "OldDone": false,
+          "NewDone": false,
+          "Reason": ""
+        },
+        {
+          "Field": 14,
+          "Key": "X-Estimate-Minutes",
+          "Op": 1,
+          "Old": "",
+          "New": "90",
+          "OldPerson": null,
+          "NewPerson": null,
+          "OldDate": null,
+          "NewDate": null,
+          "OldDone": false,
+          "NewDone": false,
+          "Reason": ""
+        },
+        {
+          "Field": 9,
+          "Key": "X-Milestone-Id",
+          "Op": 1,
+          "Old": "",
+          "New": "<milestone>",
+          "OldPerson": null,
+          "NewPerson": null,
+          "OldDate": null,
+          "NewDate": null,
+          "OldDone": false,
+          "NewDone": false,
+          "Reason": ""
+        },
+        {
+          "Field": 9,
+          "Key": "X-Milestone-Mode",
+          "Op": 1,
+          "Old": "",
+          "New": "explicit",
+          "OldPerson": null,
+          "NewPerson": null,
+          "OldDate": null,
+          "NewDate": null,
+          "OldDone": false,
+          "NewDone": false,
+          "Reason": ""
+        },
+        {
+          "Field": 15,
+          "Key": "X-Number",
+          "Op": 1,
+          "Old": "",
+          "New": "12",
+          "OldPerson": null,
+          "NewPerson": null,
+          "OldDate": null,
+          "NewDate": null,
+          "OldDone": false,
+          "NewDone": false,
+          "Reason": ""
+        },
+        {
+          "Field": 26,
+          "Key": "X-Forgejo-Project",
+          "Op": 1,
+          "Old": "",
+          "New": "3",
+          "OldPerson": null,
+          "NewPerson": null,
+          "OldDate": null,
+          "NewDate": null,
+          "OldDone": false,
+          "NewDone": false,
+          "Reason": ""
+        },
+        {
+          "Field": 7,
+          "Key": "X-Assignees",
+          "Op": 3,
+          "Old": "",
+          "New": "0c8d7a52-3f1e-4b6a-9d2c-5e4f3a2b1c0d grace@example.invalid",
+          "OldPerson": null,
+          "NewPerson": {
+            "Name": "",
+            "Email": "grace@example.invalid",
+            "UserID": "0c8d7a52-3f1e-4b6a-9d2c-5e4f3a2b1c0d"
+          },
+          "OldDate": null,
+          "NewDate": null,
+          "OldDone": false,
+          "NewDone": false,
+          "Reason": ""
+        },
+        {
+          "Field": 6,
+          "Key": "Labels",
+          "Op": 3,
+          "Old": "",
+          "New": "bug",
+          "OldPerson": null,
+          "NewPerson": null,
+          "OldDate": null,
+          "NewDate": null,
+          "OldDone": false,
+          "NewDone": false,
+          "Reason": ""
+        },
+        {
+          "Field": 6,
+          "Key": "Labels",
+          "Op": 3,
+          "Old": "",
+          "New": "ui",
+          "OldPerson": null,
+          "NewPerson": null,
+          "OldDate": null,
+          "NewDate": null,
+          "OldDone": false,
+          "NewDone": false,
+          "Reason": ""
+        }
+      ],
+      "New": true
+    },
+    {
+      "Kind": 2,
+      "Commit": "<oid>",
+      "Author": {
+        "Name": "Ada",
+        "Email": "ada@example.com",
+        "UserID": ""
+      },
+      "At": "2026-01-02T03:02:00Z",
+      "Comment": "<oid>",
+      "CommentAuthor": {
+        "Name": "Ada",
+        "Email": "ada@example.com",
+        "UserID": ""
+      },
+      "Changes": null,
+      "New": true
+    },
+    {
+      "Kind": 5,
+      "Commit": "<oid>",
+      "Author": {
+        "Name": "Ada",
+        "Email": "ada@example.com",
+        "UserID": ""
+      },
+      "At": "2026-01-02T03:03:00Z",
+      "Comment": "<oid>",
+      "CommentAuthor": {
+        "Name": "Ada",
+        "Email": "ada@example.com",
+        "UserID": ""
+      },
+      "Changes": null,
+      "New": true
+    },
+    {
+      "Kind": 8,
+      "Commit": "<oid>",
+      "Author": {
+        "Name": "Ada",
+        "Email": "ada@example.com",
+        "UserID": ""
+      },
+      "At": "2026-01-02T03:04:00Z",
+      "Comment": "<oid>",
+      "CommentAuthor": {
+        "Name": "Ada",
+        "Email": "ada@example.com",
+        "UserID": ""
+      },
+      "Changes": null,
+      "New": true
+    },
+    {
+      "Kind": 3,
+      "Commit": "<oid>",
+      "Author": {
+        "Name": "Ada",
+        "Email": "ada@example.com",
+        "UserID": ""
+      },
+      "At": "2026-01-02T03:05:00Z",
+      "Comment": "",
+      "CommentAuthor": null,
+      "Changes": [
+        {
+          "Field": 16,
+          "Key": "X-Locked",
+          "Op": 1,
+          "Old": "",
+          "New": "true",
+          "OldPerson": null,
+          "NewPerson": null,
+          "OldDate": null,
+          "NewDate": null,
+          "OldDone": false,
+          "NewDone": false,
+          "Reason": "heated"
+        },
+        {
+          "Field": 27,
+          "Key": "X-Lock-Reason",
+          "Op": 1,
+          "Old": "",
+          "New": "heated",
+          "OldPerson": null,
+          "NewPerson": null,
+          "OldDate": null,
+          "NewDate": null,
+          "OldDone": false,
+          "NewDone": false,
+          "Reason": ""
+        },
+        {
+          "Field": 17,
+          "Key": "X-Ref",
+          "Op": 1,
+          "Old": "",
+          "New": "v2",
+          "OldPerson": null,
+          "NewPerson": null,
+          "OldDate": null,
+          "NewDate": null,
+          "OldDone": false,
+          "NewDone": false,
+          "Reason": ""
+        }
+      ],
+      "New": true
+    }
+  ],
+  "History": [
+    {
+      "Commit": "<oid>",
+      "Author": {
+        "Name": "Ada",
+        "Email": "ada@example.com",
+        "UserID": ""
+      },
+      "At": "2026-01-02T03:01:00Z",
+      "Kind": 1,
+      "Text": "Every field.",
+      "Previous": ""
+    }
+  ],
+  "Edits": 0,
+  "Problems": null,
+  "Rewritten": false
+}

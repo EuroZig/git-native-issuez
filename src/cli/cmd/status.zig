@@ -26,21 +26,12 @@ pub fn main(comptime B: type, ctx: *context.Context(B), argv: []const []const u8
     const arena = ctx.arena;
     var only: ?[]const u8 = null;
     var as_json = false;
-    var args: common.Args = .{ .list = argv };
-    while (args.next()) |arg| {
-        if (!args.isOption(arg)) {
-            if (args.was_separator) continue;
-            if (only != null) return common.missing(ctx.err, "status", "only one remote");
-            only = arg;
-        } else if (common.isHelp(arg)) {
-            ctx.out.writeAll(help) catch {};
-            return common.exit_ok;
-        } else if (std.mem.eql(u8, arg, "--json")) {
-            as_json = true;
-        } else {
-            return common.unknownOption(ctx.err, "status", arg);
-        }
-    }
+    if (common.parseArgs(ctx, argv, .{
+        .command = "status",
+        .help = help,
+        .positionals = .{ .only = .{ &only, "only one remote" } },
+        .flags = &.{.{ "--json", .{ .on = &as_json } }},
+    })) |exit| return exit;
 
     const repo = common.openRepo(B, ctx) orelse return common.exit_fatal;
     const s = issuez.Sync(B).init(repo.backend);
@@ -62,7 +53,7 @@ pub fn main(comptime B: type, ctx: *context.Context(B), argv: []const []const u8
         const issues = repo.loadAll(arena) catch |e| return common.repoFailed(B, ctx, e);
         var js = json.begin(w);
         writeJson(&js, remotes, statuses, issues) catch |e| return json.failed(ctx.err, e);
-        json.end(&js);
+        json.end(&js) catch |e| return json.failed(ctx.err, e);
         return common.exit_ok;
     }
     if (remotes.len == 0) w.writeAll("No remotes configured.\n") catch {};
@@ -168,7 +159,7 @@ test "status --json" {
     var world: GitSim.World = .{ .seed = 12, .clones = &.{.{ .name = "a" }} };
     var sim = try GitSim.init(arena, &world, 0);
     const repo = issuez.Repo(GitSim).init(&sim);
-    _ = try repo.create(arena, .{ .title = "Login \xff broken" });
+    _ = try repo.create(arena, .{ .title = "Login \xff broken" }, .{});
     const ref = (try repo.refs(arena))[0];
     var issue = try repo.load(arena, ref);
     issue.conflicts = &.{
@@ -185,14 +176,20 @@ test "status --json" {
                 .reason = null,
                 .kept_local = true,
             },
-            .{ .id = ref.id(), .title = issue.title, .remote_tip = ref.tip, .reason = .rewound, .kept_local = false },
+            .{
+                .id = ref.id(),
+                .title = issue.title,
+                .remote_tip = ref.tip,
+                .reason = .rewound,
+                .kept_local = false,
+            },
         } },
         .{ .pending = &.{}, .quarantined = &.{} },
     };
     var out: std.Io.Writer.Allocating = .init(arena);
     var js = json.begin(&out.writer);
     try writeJson(&js, &.{ "origin", "backup" }, &statuses, &.{issue});
-    json.end(&js);
+    try json.end(&js);
     const v = try std.json.parseFromSliceLeaky(std.json.Value, arena, out.written(), .{});
 
     const keys = struct {

@@ -18,11 +18,13 @@ const oracle = @import("oracle");
 const GitProcess = issuez.backend.GitProcess;
 const object = issuez.backend.object;
 const Oid = object.Oid;
+const EmailProblem = issuez.format.core.EmailProblem;
 const Repo = issuez.Repo(GitProcess);
 
 const io = testing.io;
 
-const Output = struct { stdout: []const u8, stderr: []const u8, code: u8 };
+const shared = @import("sandbox.zig");
+const Output = shared.Output;
 
 /// A scratch directory for repositories. Git sees a fixed identity and no
 /// user or system config, so results don't depend on the machine.
@@ -105,29 +107,12 @@ const Sandbox = struct {
         return path;
     }
 
-    fn exec(
-        sb: *Sandbox,
-        cwd: []const u8,
-        argv: []const []const u8,
-        env: *const std.process.Environ.Map,
-    ) !Output {
-        const result = try std.process.run(sb.allocator(), io, .{
-            .argv = argv,
-            .cwd = .{ .path = cwd },
-            .environ_map = env,
-        });
-        const code: u8 = switch (result.term) {
-            .exited => |c| c,
-            else => 255,
-        };
-        return .{ .stdout = result.stdout, .stderr = result.stderr, .code = code };
-    }
-
     /// `git <args>`, which has to succeed. Returns stdout without the final
     /// newline.
     fn git(sb: *Sandbox, cwd: []const u8, args: []const []const u8) ![]const u8 {
         const argv = try std.mem.concat(sb.allocator(), []const u8, &.{ &.{"git"}, args });
-        const out = try succeed(sb.allocator(), argv, try sb.exec(cwd, argv, &sb.env));
+        const a = sb.allocator();
+        const out = try succeed(a, argv, try shared.exec(a, cwd, argv, &sb.env));
         return std.mem.trimEnd(u8, out, "\n");
     }
 };
@@ -195,7 +180,7 @@ const Clone = struct {
             try env.put("LC_ALL", "C"); // upstream sorts labels with sort(1)
         }
         const argv = try std.mem.concat(arena, []const u8, &.{ &.{ "git", "issue" }, args });
-        return c.sb.exec(c.path, argv, &env);
+        return shared.exec(arena, c.path, argv, &env);
     }
 
     /// The same clone, writing with a fixed date ("1700000000 +0000").
@@ -221,7 +206,7 @@ const Clone = struct {
 
     /// Any program, run in this repository.
     fn exec(c: Clone, argv: []const []const u8) !Output {
-        return c.sb.exec(c.path, argv, &c.sb.env);
+        return shared.exec(c.sb.allocator(), c.path, argv, &c.sb.env);
     }
 
     /// The repository as the library sees it. Close it when done.
@@ -311,7 +296,7 @@ test "we read upstream's issues" {
     try testing.expectEqual(@as(usize, 1), issue.comments.len);
     try testing.expectEqualStrings("A comment from upstream", issue.comments[0].subject);
     // Valid format 1 by our own check, too.
-    try testing.expectEqual(@as(usize, 0), (try issues.check(arena, ref)).len);
+    try testing.expectEqual(@as(usize, 0), (try issues.check(arena, ref, .{})).len);
 }
 
 test "upstream reads our issues" {
@@ -329,11 +314,11 @@ test "upstream reads our issues" {
         .body = "Created through the library.",
         .labels = &.{ "interop", "p0" },
         .priority = .medium,
-    });
-    const id = created.id.short();
+    }, .{});
+    const id = issuez.shortId(created.id);
     const ref = try findIssue(issues, arena, id);
-    _ = try issues.comment(arena, ref.name, .{ .text = "Reproduced on main." });
-    _ = try issues.setState(arena, ref.name, .{ .state = .closed, .fixed_by = "abc1234" });
+    _ = try issues.comment(arena, ref.name, .{ .text = "Reproduced on main." }, .{});
+    _ = try issues.setState(arena, ref.name, .{ .state = .closed, .fixed_by = "abc1234" }, .{});
 
     // Upstream lists, shows and checks it.
     try expectContains(try repo.read(.upstream, "ls -s closed", .{}), id);
@@ -350,6 +335,90 @@ test "upstream reads our issues" {
     try testing.expectEqualStrings("closed", issue.state.text());
     try testing.expectEqual(@as(usize, 3), issue.comments.len);
     try testing.expectEqualStrings("Upstream replies", issue.comments[2].subject);
+}
+
+test "a comment that closes the issue, through upstream" {
+    var sb = try Sandbox.init();
+    defer sb.deinit();
+    const arena = sb.allocator();
+    const repo = try sb.repo("repo", .{});
+
+    var git = try repo.open();
+    defer git.close();
+    const issues = Repo.init(&git);
+    const created = try issues.create(arena, .{ .title = "Closed by a comment" }, .{});
+    const id = issuez.shortId(created.id);
+    const ref = try findIssue(issues, arena, id);
+    // One commit: the comment, the state change and a label, X-Message: comment.
+    _ = try issues.edit(arena, ref.name, .{
+        .comment = "Fixed in abc1234.",
+        .state = .closed,
+        .fixed_by = "abc1234",
+        .add_labels = &.{"shipped"},
+    }, .{});
+
+    // Upstream sees it closed, with the label and the comment, and fsck
+    // passes.
+    try expectContains(try repo.read(.upstream, "ls -s closed", .{}), id);
+    const shown = try repo.read(.upstream, "show {s}", .{id});
+    try expectContains(shown, "Fixed in abc1234.");
+    try expectContains(shown, "shipped");
+    try repo.upstream("fsck", .{});
+
+    // Upstream writes over it; the comment still reads as a comment here.
+    try repo.upstream("comment {s} -m 'Thanks'", .{id});
+    const issue = try issues.load(arena, try findIssue(issues, arena, id));
+    try testing.expectEqualStrings("closed", issue.state.text());
+    try testing.expectEqual(@as(usize, 2), issue.comments.len);
+    try testing.expectEqual(issuez.model.issue.Comment.Kind.comment, issue.comments[0].kind);
+    try testing.expectEqualStrings("Fixed in abc1234.", issue.comments[0].subject);
+}
+
+test "several assignees, through upstream" {
+    var sb = try Sandbox.init();
+    defer sb.deinit();
+    const arena = sb.allocator();
+    const repo = try sb.repo("repo", .{});
+
+    var git = try repo.open();
+    defer git.close();
+    const issues = Repo.init(&git);
+    const created = try issues.create(arena, .{
+        .title = "Pairing",
+        .assignees = &.{ .byEmail("ada@example.com"), .byEmail("bob@example.com") },
+    }, .{});
+    const id = issuez.shortId(created.id);
+    // Upstream shows the first one and passes fsck.
+    try expectContains(try repo.read(.upstream, "show {s}", .{id}), "ada@example.com");
+    try repo.upstream("fsck", .{});
+
+    // Upstream's merge-free edit names one assignee: that's who it is now.
+    try repo.upstream("edit {s} -a carol@example.com", .{id});
+    const issue = try issues.load(arena, try findIssue(issues, arena, id));
+    try testing.expectEqual(@as(usize, 1), issue.assignees.len);
+    try testing.expectEqualStrings("carol@example.com", issue.assignees[0].email);
+}
+
+test "reactions, through upstream" {
+    var sb = try Sandbox.init();
+    defer sb.deinit();
+    const arena = sb.allocator();
+    const repo = try sb.repo("repo", .{});
+
+    var git = try repo.open();
+    defer git.close();
+    const issues = Repo.init(&git);
+    const created = try issues.create(arena, .{ .title = "Liked" }, .{});
+    const id = issuez.shortId(created.id);
+    const ref = try findIssue(issues, arena, id);
+    _ = try issues.react(arena, ref.name, .{ .emoji = ":+1:" }, .{});
+    // Upstream checks and shows it, the reaction as an update.
+    try repo.upstream("fsck", .{});
+    try expectContains(try repo.read(.upstream, "show {s}", .{id}), "Liked");
+    try repo.upstream("comment {s} -m 'Agreed'", .{id});
+    const issue = try issues.load(arena, try findIssue(issues, arena, id));
+    try testing.expectEqual(@as(usize, 1), issue.reactions.len);
+    try testing.expectEqual(@as(usize, 1), issue.comments.len);
 }
 
 test "top-level dispatcher parity with upstream" {
@@ -602,6 +671,87 @@ test "sync with upstream" {
     try expectLacks(shown, "Conflict:");
 }
 
+test "upstream's pushes pass our push check" {
+    var sb = try Sandbox.init();
+    defer sb.deinit();
+    const arena = sb.allocator();
+    const hub = try sb.hub("hub.git", &.{});
+    const hook = try std.fmt.allocPrint(arena, "{s}/hooks/pre-receive", .{hub});
+    const script = try std.fmt.allocPrint(
+        arena,
+        "#!/bin/sh\nexec '{s}/git-issue' push-check --authors enforce " ++
+            "--pusher-email interop@example.invalid\n",
+        .{sb.ours_bin},
+    );
+    _ = try shared.exec(sb.allocator(), sb.root, &.{
+        "sh", "-c", "printf '%s' \"$2\" > \"$1\" && chmod +x \"$1\"", "sh", hook, script,
+    }, &sb.env);
+    const a = try sb.repo("a", .{ .origin = hub });
+    const b = try sb.repo("b", .{ .origin = hub });
+
+    // Upstream creates, edits and comments, and pushes its refs as they are.
+    try b.upstream("create 'From upstream' -l bug", .{});
+    const id = (try b.git("for-each-ref --format=%(refname:lstrip=2) refs/issues/", .{}))[0..8];
+    try b.upstream("edit {s} -p high", .{id});
+    try b.upstream("comment {s} -m 'More detail'", .{id});
+    _ = try b.git("push -q origin refs/issues/*:refs/issues/*", .{});
+
+    // Ours merges, comments, and its sync passes too; then upstream's merge.
+    try a.ours("merge origin", .{});
+    try a.ours("comment {s} -m 'from ours'", .{id});
+    try b.upstream("comment {s} -m 'from upstream'", .{id});
+    try a.ours("sync origin", .{});
+    try expectContains(try b.read(.upstream, "merge origin", .{}), "Merged ");
+    _ = try b.git("push -q origin refs/issues/*:refs/issues/*", .{});
+    try expectContains(try a.read(.ours, "sync origin", .{}), "Fast-forwarded");
+}
+
+test "purges sync, and survive upstream's merge" {
+    var sb = try Sandbox.init();
+    defer sb.deinit();
+    // `a` and `b` use our CLI, `c` upstream's, all through one hub.
+    const hub = try sb.hub("hub.git", &.{});
+    const a = try sb.repo("a", .{ .origin = hub });
+    const b = try sb.repo("b", .{ .origin = hub });
+    const c = try sb.repo("c", .{ .origin = hub });
+
+    const id = try a.create(.ours, "Shared", .{});
+    try a.ours("comment {s} -m 'Abusive text'", .{id});
+    try a.ours("comment {s} -m 'Fine'", .{id});
+    const gone = try a.create(.ours, "Doxxing", .{});
+    try a.ours("push origin", .{});
+    try b.ours("sync origin", .{});
+    try c.upstream("merge origin", .{});
+
+    // The comment's ID from `show --ids`: the header line before its text.
+    const shown = try a.read(.ours, "show {s} --ids", .{id});
+    const at = std.mem.find(u8, shown, "Abusive text").?;
+    const header_end = std.mem.findLast(u8, shown[0..at], ":\n").?;
+    const comment = shown[header_end - 7 .. header_end];
+    try a.ours("purge {s} --comment {s} --reason abuse --yes", .{ id, comment });
+    try a.ours("purge {s} --yes", .{gone});
+    try expectLacks(try a.read(.ours, "show {s}", .{id}), "Abusive");
+    try a.ours("sync origin", .{});
+    const hub_log: []const []const u8 = &.{ "log", "--glob=refs/issues/*", "--format=%B" };
+    try expectLacks(try sb.git(hub, hub_log), "Abusive");
+
+    // b's copy is purged by its sync.
+    try b.ours("sync origin", .{});
+    try expectLacks(try b.read(.ours, "show {s}", .{id}), "Abusive");
+    try expectLacks(try b.read(.ours, "ls", .{}), "Doxxing");
+    try b.ours("fsck", .{});
+
+    // Upstream doesn't know tombstones: its merge brings the text back
+    // to the hub, and our next sync takes it out again.
+    try c.upstream("merge origin", .{});
+    _ = try c.git("push -q origin refs/issues/*:refs/issues/*", .{});
+    try c.upstream("fsck", .{});
+    try a.ours("sync origin", .{});
+    try expectLacks(try a.read(.ours, "show {s}", .{id}), "Abusive");
+    try expectContains(try a.read(.ours, "show {s}", .{id}), "Fine");
+    try expectLacks(try sb.git(hub, hub_log), "Abusive");
+}
+
 test "quarantine" {
     var sb = try Sandbox.init();
     defer sb.deinit();
@@ -657,7 +807,7 @@ test "email validation" {
             try cases.append(arena, s);
         }
     }
-    try cases.appendSlice(arena, &.{
+    const hand_picked = [_][]const u8{
         "user@example.com", "first.last@sub.example.co.uk", "a+tag@b.c",
         "a@b@c.d",          "a.b@c",                        "@example.com",
         "user@.com",        "user@com.",                    "user@example",
@@ -665,31 +815,74 @@ test "email validation" {
         "ü@exämple.de",
         "a@b..c",           "a@@b.c",                       "a@.b.c",
         "a@b.",             "a@b.c.",
-    });
+    };
+    try cases.appendSlice(arena, &hand_picked);
 
+    // Upstream: the real validate_email from its git-issue-lib, every case
+    // in one shell, in a subshell because a refusal ends it. Each record is
+    // the exit code, then stderr.
     const lib = try std.fmt.allocPrint(arena, "{s}/git-issue-lib", .{paths.upstream_bin});
-    for (cases.items) |email| {
-        // Upstream: the real validate_email from its git-issue-lib.
-        const theirs = try repo.exec(&.{
-            "sh", "-c", ". \"$0\" && validate_email \"$1\" assignee", lib, email,
-        });
-        // Ours: validation runs before the issue is looked up, so a valid
-        // address ends in "not found" and nothing is written.
-        const ours = try repo.runArgv(.ours, &.{ "edit", "ffff", "-a", email });
+    const script =
+        \\. "$0"
+        \\for email; do
+        \\  err=$( (validate_email "$email" assignee) 2>&1 )
+        \\  printf '%s\036%s\037' "$?" "$err"
+        \\done
+    ;
+    const argv = try std.mem.concat(
+        arena,
+        []const u8,
+        &.{ &.{ "sh", "-c", script, lib }, cases.items },
+    );
+    const theirs = try repo.exec(argv);
+    var records = std.mem.splitScalar(u8, theirs.stdout, 0x1f);
 
-        const upstream_ok = theirs.code == 0;
-        const ours_ok = !std.mem.startsWith(u8, ours.stderr, "error: assignee");
-        if (upstream_ok != ours_ok or (!ours_ok and !std.mem.eql(u8, theirs.stderr, ours.stderr))) {
-            const verdict = [_][]const u8{ "rejects", "accepts" };
-            std.debug.print("email '{s}': upstream {s} \"{s}\", ours {s} \"{s}\"\n", .{
+    // Ours: the check the CLI runs. What upstream says for each kind of
+    // refusal has to be one message, the one our CLI prints below.
+    var messages: std.EnumArray(EmailProblem, ?[]const u8) = .initFill(null);
+    for (cases.items) |email| {
+        const record = records.next() orelse return error.EmailValidationDiffers;
+        const separator = std.mem.findScalar(u8, record, 0x1e) orelse
+            return error.EmailValidationDiffers;
+        const upstream_ok = std.mem.eql(u8, record[0..separator], "0");
+        const message = record[separator + 1 ..];
+        const problem = issuez.format.core.checkEmail(email);
+        const seen = if (problem) |p| messages.getPtr(p) else null;
+        const same_message = if (seen) |m| m.* == null or std.mem.eql(u8, m.*.?, message) else true;
+        if (upstream_ok != (problem == null) or !same_message) {
+            std.debug.print("email '{s}': upstream {s} \"{s}\", ours {?t}\n", .{
                 email,
-                verdict[@intFromBool(upstream_ok)],
-                std.mem.trimEnd(u8, theirs.stderr, "\n"),
-                verdict[@intFromBool(ours_ok)],
-                std.mem.trimEnd(u8, ours.stderr, "\n"),
+                if (upstream_ok) "accepts" else "rejects",
+                message,
+                problem,
             });
             return error.EmailValidationDiffers;
         }
+        if (seen) |m| m.* = message;
+    }
+
+    // The command line ties it together: it agrees on the shapes above and
+    // prints upstream's words. Validation runs before the issue is looked
+    // up, so a valid address ends in "not found" and nothing is written.
+    for (hand_picked) |email| {
+        const ours = try repo.runArgv(.ours, &.{ "edit", "ffff", "-a", email });
+        const ours_ok = !std.mem.startsWith(u8, ours.stderr, "error: assignee");
+        const problem = issuez.format.core.checkEmail(email);
+        const expected = if (problem) |p| messages.get(p) orelse "" else "";
+        const printed = std.mem.trimEnd(u8, ours.stderr, "\n");
+        if (ours_ok != (problem == null) or (!ours_ok and !std.mem.eql(u8, expected, printed))) {
+            std.debug.print("email '{s}': upstream \"{s}\", ours \"{s}\"\n", .{
+                email,
+                expected,
+                printed,
+            });
+            return error.EmailValidationDiffers;
+        }
+    }
+    // Every kind of refusal was seen, and reached the comparison above.
+    for (std.enums.values(EmailProblem)) |p| {
+        const message = messages.get(p) orelse return error.EmailValidationDiffers;
+        try testing.expect(message.len > 0);
     }
 }
 

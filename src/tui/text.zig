@@ -149,7 +149,8 @@ pub fn posAt(text: []const u8, row: Row, col: u32) u32 {
     var c: u32 = 0;
     var i = row.start;
     // A soft row ends with the space it broke at; stay before it.
-    const end = if (row.soft and row.end > row.start and text[row.end - 1] == ' ') row.end - 1 else row.end;
+    const trailing_space = row.soft and row.end > row.start and text[row.end - 1] == ' ';
+    const end = if (trailing_space) row.end - 1 else row.end;
     while (i < end) {
         const len = clusterLen(text, i);
         const cw = width(text[i .. i + len]);
@@ -312,7 +313,12 @@ pub const TextArea = struct {
 
     /// Editing keys. Enter in a single-line box, Escape, Tab and anything
     /// with Ctrl it doesn't know are `ignored`, for the caller.
-    pub fn key(t: *TextArea, gpa: Allocator, arena: Allocator, k: vaxis.Key) Allocator.Error!Outcome {
+    pub fn key(
+        t: *TextArea,
+        gpa: Allocator,
+        arena: Allocator,
+        k: vaxis.Key,
+    ) Allocator.Error!Outcome {
         const K = vaxis.Key;
         const ctrl: K.Modifiers = .{ .ctrl = true };
         const alt: K.Modifiers = .{ .alt = true };
@@ -342,7 +348,9 @@ pub const TextArea = struct {
             try t.vertical(arena, true, page_rows);
         } else if (k.matches(K.backspace, .{}) or k.matches('h', ctrl)) {
             t.remove(t.prevPos(t.cursor), t.cursor);
-        } else if (k.matches(K.backspace, alt) or k.matches('w', ctrl) or k.matches(K.backspace, ctrl)) {
+        } else if (k.matches(K.backspace, alt) or k.matches('w', ctrl) or
+            k.matches(K.backspace, ctrl))
+        {
             t.remove(t.wordLeft(t.cursor), t.cursor);
         } else if (k.matches(K.delete, .{}) or k.matches('d', ctrl)) {
             t.remove(t.cursor, t.nextPos(t.cursor));
@@ -417,12 +425,18 @@ pub const TextArea = struct {
         }
         if (t.scroll >= rows.len) t.scroll = @intCast(rows.len - 1);
         if (s.len == 0) {
-            _ = win.printSegment(.{ .text = placeholder, .style = dimmed(style) }, .{ .wrap = .word });
+            _ = win.printSegment(
+                .{ .text = placeholder, .style = dimmed(style) },
+                .{ .wrap = .word },
+            );
         }
         var y: u16 = 0;
         while (y < win.height and t.scroll + y < rows.len) : (y += 1) {
             const r = rows[t.scroll + y];
-            _ = win.printSegment(.{ .text = expandTabs(arena, s[r.start..r.end]), .style = style }, .{
+            _ = win.printSegment(.{
+                .text = expandTabs(arena, s[r.start..r.end]),
+                .style = style,
+            }, .{
                 .row_offset = y,
                 .wrap = .none,
             });
@@ -432,7 +446,13 @@ pub const TextArea = struct {
         }
     }
 
-    fn drawLine(t: *TextArea, win: vaxis.Window, style: vaxis.Style, focused: bool, placeholder: []const u8) void {
+    fn drawLine(
+        t: *TextArea,
+        win: vaxis.Window,
+        style: vaxis.Style,
+        focused: bool,
+        placeholder: []const u8,
+    ) void {
         const s = t.buf.items;
         const row: Row = .{ .start = 0, .end = @intCast(s.len), .soft = false };
         const visible = win.width -| 1;
@@ -442,7 +462,10 @@ pub const TextArea = struct {
         if (col < t.scroll) t.scroll = col;
         if (col > t.scroll + visible) t.scroll = col - visible;
         if (s.len == 0) {
-            _ = win.printSegment(.{ .text = placeholder, .style = dimmed(style) }, .{ .wrap = .none });
+            _ = win.printSegment(
+                .{ .text = placeholder, .style = dimmed(style) },
+                .{ .wrap = .none },
+            );
         }
         const from = posAt(s, row, @intCast(t.scroll));
         _ = win.printSegment(.{ .text = s[from..], .style = style }, .{ .wrap = .none });
@@ -512,13 +535,19 @@ test "TextArea editing" {
     try testing.expectEqual(@as(u32, 1), t.cursor);
     _ = try t.key(gpa, arena, .{ .codepoint = 'w', .mods = .{ .ctrl = true } });
     try testing.expectEqualStrings("\nxlo", t.text());
-    try testing.expectEqual(TextArea.Outcome.ignored, try t.key(gpa, arena, .{ .codepoint = K.escape }));
+    try testing.expectEqual(
+        TextArea.Outcome.ignored,
+        try t.key(gpa, arena, .{ .codepoint = K.escape }),
+    );
 
     var line: TextArea = .init(false);
     defer line.deinit(gpa);
     try line.set(gpa, "a\nb");
     try testing.expectEqualStrings("a b", line.text());
-    try testing.expectEqual(TextArea.Outcome.ignored, try line.key(gpa, arena, .{ .codepoint = K.enter }));
+    try testing.expectEqual(
+        TextArea.Outcome.ignored,
+        try line.key(gpa, arena, .{ .codepoint = K.enter }),
+    );
 }
 
 test "an emoji with a skin tone or joined ones is one cluster, as drawn" {

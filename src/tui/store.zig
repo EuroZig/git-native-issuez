@@ -134,7 +134,11 @@ pub const CreateInput = struct {
 pub const BatchItem = struct { id: []const u8, spec: issuez.engine.EditSpec };
 
 /// A milestone's due date in `applyPlan`; empty clears it.
-pub const DueItem = struct { id: []const u8, due: []const u8, expect: ?Oid = null };
+pub const DueItem = struct {
+    id: []const u8,
+    due: issuez.engine.EditSpec.DateEdit,
+    expect: ?Oid = null,
+};
 
 /// Where an issue's milestone comes from.
 pub const MilestoneLink = union(enum) {
@@ -150,7 +154,7 @@ pub const MilestoneLink = union(enum) {
 /// clears it.
 pub const MilestoneEdit = struct {
     name: ?[]const u8 = null,
-    due: ?[]const u8 = null,
+    due: ?issuez.engine.EditSpec.DateEdit = null,
     description: ?[]const u8 = null,
     status: ?issuez.format.fields.MilestoneStatus = null,
     /// Null: the tip the snapshot shows.
@@ -160,7 +164,7 @@ pub const MilestoneEdit = struct {
 /// A new milestone. Strings are copied by the write.
 pub const MilestoneInput = struct {
     name: []const u8,
-    due: ?[]const u8 = null,
+    due: ?issuez.format.fields.Date = null,
     description: []const u8 = "",
 };
 
@@ -173,19 +177,20 @@ pub fn Store(comptime B: type) type {
 
         gpa: Allocator,
         backend: *B,
+        /// Issues, milestones and settings, and their refresh.
+        live: issuez.Store(B),
+        /// The remote state, which `snap` adds to `live`'s snapshot.
         snap_arena: std.heap.ArenaAllocator,
         snap: Snapshot,
         /// For one write, reset after it.
         scratch: std.heap.ArenaAllocator,
         /// Bumped by every reload that worked, so views can tell.
         generation: u32 = 0,
-        /// The refs as the snapshot read them, in its arena.
-        refs: issuez.changes.RefState = .{},
         /// Sync records change the badge even when no issue tip moves.
         sync_refs: issuez.changes.RefState = .{},
         /// Why the reload after a write that worked failed, until taken.
         reload_error: ?anyerror = null,
-        /// The remote picked for this session, over `sync.defaultRemote`.
+        /// The remote picked for this session, over `sync.chooseRemote`.
         remote_buf: [256]u8 = undefined,
         remote_len: u16 = 0,
 
@@ -193,73 +198,57 @@ pub fn Store(comptime B: type) type {
             return .{
                 .gpa = gpa,
                 .backend = backend,
+                .live = .init(gpa, backend),
                 .snap_arena = .init(gpa),
-                .snap = .{ .proj = emptyProjection() },
+                .snap = .{ .proj = .empty },
                 .scratch = .init(gpa),
             };
         }
 
         pub fn deinit(self: *Self) void {
+            self.live.deinit();
             self.snap_arena.deinit();
             self.scratch.deinit();
             self.* = undefined;
         }
 
-        fn emptyProjection() Projection {
-            return .{
-                .issues = &.{},
-                .parent = &.{},
-                .children = &.{},
-                .blockers = &.{},
-                .blocks = &.{},
-                .depth = &.{},
-                .problems = &.{},
-                .roots = &.{},
-                .options = .{},
-                .index = .empty,
-                .milestone = &.{},
-                .leaves = &.{},
-                .problems_of = &.{},
-            };
-        }
-
         fn repo(self: *Self) Repo {
-            var r = Repo.init(self.backend);
-            self.snap.settings.apply(&r);
-            return r;
+            return self.live.repo();
         }
 
-        /// Reads everything again. On failure the old snapshot stays.
+        /// Brings the snapshot up to date: loads the issues that moved and
+        /// reads the remote state again. On failure the old snapshot stays.
         pub fn reload(self: *Self) !void {
-            if (@hasDecl(B, "refresh")) self.backend.refresh();
             var next: std.heap.ArenaAllocator = .init(self.gpa);
             errdefer next.deinit();
             const a = next.allocator();
+            const sync_refs = try self.readSyncRefs(a);
+            _ = try self.live.refresh();
+            self.adopt(next, sync_refs);
+        }
 
-            // Before the issues: a write in between then shows as a change
-            // next time, never the other way round.
-            const refs = try issuez.changes.RefState.read(a, self.backend);
-            const sync_refs: issuez.changes.RefState = .{
-                .refs = try self.backend.listRefs(a, "refs/issuez-sync/"),
-            };
-            const settings = try issuez.settings.read(a, self.backend);
-            if (settings.invalid_done_state != null) return error.InvalidDoneStates;
-            var r = Repo.init(self.backend);
-            settings.apply(&r);
-            // Issues that can't be loaded are left out; `git issue fsck`
-            // reports them.
-            const issues = try r.loadForGuards(a);
-            const cat = Catalog.of(r);
-            const milestones = try cat.list(a);
-            const proj = try cat.project(a, issues, .{ .milestones = milestones });
-            assert(proj.issues.len == issues.len);
+        fn readSyncRefs(self: *Self, a: Allocator) !issuez.changes.RefState {
+            return .{ .refs = try self.backend.listRefs(a, "refs/issuez-sync/") };
+        }
 
-            const remote = self.readRemote(a);
-
+        /// `live`'s snapshot with the remote state read into `next`.
+        fn adopt(
+            self: *Self,
+            next: std.heap.ArenaAllocator,
+            sync_refs: issuez.changes.RefState,
+        ) void {
+            var arena = next;
+            const remote = self.readRemote(arena.allocator());
             self.snap_arena.deinit();
-            self.snap_arena = next;
-            self.snap = .{ .issues = issues, .proj = proj, .settings = settings, .milestones = milestones, .remote = remote };
-            self.refs = refs;
+            self.snap_arena = arena;
+            const l = &self.live.snap;
+            self.snap = .{
+                .issues = l.issues,
+                .proj = l.proj,
+                .settings = l.settings,
+                .milestones = l.milestones,
+                .remote = remote,
+            };
             self.sync_refs = sync_refs;
             self.generation +%= 1;
         }
@@ -269,13 +258,19 @@ pub fn Store(comptime B: type) type {
         /// data. What was read stays, and the problem says what wasn't.
         fn readRemote(self: *Self, a: Allocator) RemoteState {
             var out: RemoteState = .{};
-            out.remotes = self.backend.remoteNames(a) catch |e| return self.remoteProblem(a, out, "can't list the remotes", e);
+            out.remotes = self.backend.remoteNames(
+                a,
+            ) catch |e| return self.remoteProblem(a, out, "can't list the remotes", e);
             if (out.remotes.len == 0) return out;
             const chosen = self.remote_buf[0..self.remote_len];
             out.name = for (out.remotes) |n| {
                 if (chosen.len > 0 and std.mem.eql(u8, n, chosen)) break n;
-            } else issuez.sync.defaultRemote(a, Known{ .backend = self.backend, .names = out.remotes }) catch |e|
-                return self.remoteProblem(a, out, "git config issue.remote", e);
+            } else blk: {
+                const configured = self.backend.configGet(a, issuez.sync.remote_key) catch |e|
+                    return self.remoteProblem(a, out, "git config issue.remote", e);
+                break :blk issuez.sync.chooseRemote(out.remotes, configured) catch |e|
+                    return self.remoteProblem(a, out, "git config issue.remote", e);
+            };
             const name = out.name orelse return out;
             self.readCounts(a, name, &out) catch |e| {
                 out.unpushed = .empty;
@@ -290,31 +285,30 @@ pub fn Store(comptime B: type) type {
             for (try s.unpushed(a, name)) |u| try out.unpushed.put(a, u.id, u.new);
             for (issuez.sync.namespaces) |ns| {
                 const prefix = try issuez.sync.recordRef(a, name, .quarantined, ns, "");
-                for (try self.backend.listRefs(a, prefix)) |m| try out.quarantined.put(a, m.name[prefix.len..], {});
+                for (try self.backend.listRefs(a, prefix)) |m| try out.quarantined.put(
+                    a,
+                    m.name[prefix.len..],
+                    {},
+                );
             }
         }
 
-        fn remoteProblem(self: *Self, a: Allocator, out: RemoteState, what: []const u8, err: anyerror) RemoteState {
+        fn remoteProblem(
+            self: *Self,
+            a: Allocator,
+            out: RemoteState,
+            what: []const u8,
+            err: anyerror,
+        ) RemoteState {
             var with = out;
             var buf: [400]u8 = undefined;
-            with.problem = std.fmt.allocPrint(a, "{s}: {s}", .{ what, self.describe(err, &buf) }) catch what;
+            with.problem = std.fmt.allocPrint(
+                a,
+                "{s}: {s}",
+                .{ what, self.describe(err, &buf) },
+            ) catch what;
             return with;
         }
-
-        /// The backend for `sync.defaultRemote`, with the remotes read
-        /// already.
-        const Known = struct {
-            backend: *B,
-            names: []const []const u8,
-
-            pub fn remoteNames(k: Known, _: Allocator) error{}![]const []const u8 {
-                return k.names;
-            }
-
-            pub fn configGet(k: Known, a: Allocator, key: []const u8) !?[]const u8 {
-                return k.backend.configGet(a, key);
-            }
-        };
 
         /// The remote's URL, for showing; empty when unknown.
         pub fn remoteUrl(self: *Self, a: Allocator, name: []const u8) []const u8 {
@@ -355,16 +349,25 @@ pub fn Store(comptime B: type) type {
         /// since the last reload or git config may have changed.
         /// Null when it didn't reload.
         pub fn reloadIfChanged(self: *Self, settings: bool) !?Outside {
-            const a = self.begin();
-            const now = try issuez.changes.RefState.read(a, self.backend);
-            const d = try issuez.changes.diff(a, self.refs, now);
-            const sync_refs: issuez.changes.RefState = .{
-                .refs = try self.backend.listRefs(a, "refs/issuez-sync/"),
+            var next: std.heap.ArenaAllocator = .init(self.gpa);
+            errdefer next.deinit();
+            const a = next.allocator();
+            const sync_refs = try self.readSyncRefs(a);
+            const changed = if (settings)
+                try self.live.reproject()
+            else
+                try self.live.refresh();
+            const d = changed orelse {
+                if (self.sync_refs.eql(sync_refs)) {
+                    next.deinit();
+                    return null;
+                }
+                self.adopt(next, sync_refs);
+                return .{};
             };
-            if (d.empty() and self.sync_refs.eql(sync_refs) and !settings) return null;
             var out: Outside = .{ .issues = @intCast(d.issues.len), .milestones = d.milestones };
             if (d.issues.len > 0) out.first = .of(d.issues[0]);
-            try self.reload();
+            self.adopt(next, sync_refs);
             return out;
         }
 
@@ -404,29 +407,47 @@ pub fn Store(comptime B: type) type {
         pub fn create(self: *Self, input: CreateInput) !Id {
             const a = self.begin();
             if (input.workflow) |w| try self.snap.settings.checkWorkflow(w);
+            var people: []const issuez.format.fields.Assignee = &.{};
+            if (input.assignee) |v| {
+                const one = try a.alloc(issuez.format.fields.Assignee, 1);
+                one[0] = issuez.format.fields.Assignee.parse(v) orelse return error.InvalidValue;
+                people = one;
+            }
             const created = try self.repo().create(a, .{
                 .title = input.title,
                 .body = input.body,
                 .labels = input.labels,
-                .assignee = input.assignee,
+                .assignees = people,
                 .priority = input.priority,
                 .workflow = input.workflow,
                 .parent = input.parent,
-                .milestone_id = input.milestone_id,
-            });
-            const id: Id = .of(created.id.slice());
+                .milestone = if (input.milestone_id) |m| .linked(m) else null,
+            }, .{});
+            const id: Id = .of(created.id);
             self.reloadAfterWrite();
             return id;
         }
 
+        /// Every write to an existing issue goes through here, then
+        /// reloads. `u.edit.expect` null: what the snapshot shows.
+        pub fn update(self: *Self, id: []const u8, u: issuez.Update) !issuez.Receipt {
+            return self.write(self.begin(), id, u);
+        }
+
+        /// `update` in a scratch arena already begun.
+        fn write(self: *Self, a: Allocator, id: []const u8, u_in: issuez.Update) !issuez.Receipt {
+            var u = u_in;
+            u.edit.expect = self.expect(id, u.edit.expect);
+            const settings = self.snap.settings;
+            if (u.edit.workflow) |w| if (w == .set) try settings.checkWorkflow(w.set);
+            const receipt = try self.repo().update(a, id, u, .{});
+            if (receipt.wrote) self.reloadAfterWrite();
+            return receipt;
+        }
+
         /// `spec.expect` null: what the snapshot shows.
-        pub fn edit(self: *Self, id: []const u8, spec_in: issuez.engine.EditSpec) !void {
-            const a = self.begin();
-            var spec = spec_in;
-            spec.expect = self.expect(id, spec.expect);
-            if (spec.workflow) |w| if (w.len > 0) try self.snap.settings.checkWorkflow(w);
-            _ = try self.repo().edit(a, try refName(a, id), spec);
-            self.reloadAfterWrite();
+        pub fn edit(self: *Self, id: []const u8, spec: issuez.engine.EditSpec) !void {
+            _ = try self.update(id, .{ .edit = spec });
         }
 
         /// Links an open catalog milestone of that name, else writes the
@@ -434,7 +455,7 @@ pub fn Store(comptime B: type) type {
         pub fn setMilestone(self: *Self, id: []const u8, name: []const u8, expected: ?Oid) !void {
             const a = self.begin();
             const i = self.snap.find(id) orelse return error.IssueDisappeared;
-            const chosen = try Catalog.of(self.repo()).choose(a, .{
+            const chosen = try Catalog.fromRepo(self.repo()).choose(a, .{
                 .name = name,
                 .current = self.snap.issues[i],
             });
@@ -442,27 +463,23 @@ pub fn Store(comptime B: type) type {
                 .ok => |c| c,
                 .refused => return error.InvalidMilestone,
             };
-            _ = try self.repo().edit(a, try refName(a, id), .{
-                .milestone = c.text,
-                .milestone_id = c.id,
-                .milestone_mode = c.mode,
-                .expect = self.expect(id, expected),
-            });
-            self.reloadAfterWrite();
+            _ = try self.write(a, id, .{ .edit = .{ .milestone = c.edit(), .expect = expected } });
         }
 
         /// Links the issue as `link` says, like `git issue edit
         /// --milestone-id`, `--no-milestone` and `--milestone-mode inherit`.
-        pub fn setMilestoneLink(self: *Self, id: []const u8, link: MilestoneLink, expected: ?Oid) !void {
-            const a = self.begin();
-            var spec: issuez.engine.EditSpec = .{ .expect = self.expect(id, expected) };
-            switch (link) {
-                .id => |mid| spec.milestone_id = mid,
-                .none => spec.milestone_mode = .none,
-                .inherit => spec.milestone_mode = .inherit,
-            }
-            _ = try self.repo().edit(a, try refName(a, id), spec);
-            self.reloadAfterWrite();
+        pub fn setMilestoneLink(
+            self: *Self,
+            id: []const u8,
+            link: MilestoneLink,
+            expected: ?Oid,
+        ) !void {
+            const m: issuez.MilestoneEdit = switch (link) {
+                .id => |mid| .linked(mid),
+                .none => .{ .link = .none },
+                .inherit => .{ .link = .inherit },
+            };
+            _ = try self.update(id, .{ .edit = .{ .milestone = m, .expect = expected } });
         }
 
         /// Every edit or none. `spec.expect` null: what the snapshot shows.
@@ -472,10 +489,10 @@ pub fn Store(comptime B: type) type {
             for (items, edits) |it, *e| {
                 var spec = it.spec;
                 spec.expect = self.expect(it.id, spec.expect);
-                if (spec.workflow) |w| if (w.len > 0) try self.snap.settings.checkWorkflow(w);
+                if (spec.workflow) |w| if (w == .set) try self.snap.settings.checkWorkflow(w.set);
                 e.* = .{ .ref_name = try refName(a, it.id), .spec = spec };
             }
-            _ = try self.repo().editBatch(a, edits);
+            _ = try self.repo().editBatch(a, edits, .{});
             self.reloadAfterWrite();
         }
 
@@ -490,19 +507,19 @@ pub fn Store(comptime B: type) type {
             }
             const due_edits = try a.alloc(Catalog.DueEdit, dues.len);
             for (dues, due_edits) |d, *e| e.* = .{ .id = d.id, .due = d.due, .expect = d.expect };
-            _ = try Catalog.of(self.repo()).editBatch(a, edits, due_edits);
+            _ = try Catalog.fromRepo(self.repo()).editBatch(a, edits, due_edits, .{});
             self.reloadAfterWrite();
         }
 
         /// Returns the new milestone's ID.
         pub fn createMilestone(self: *Self, input: MilestoneInput) !Id {
             const a = self.begin();
-            const created = try Catalog.of(self.repo()).create(a, .{
+            const created = try Catalog.fromRepo(self.repo()).create(a, .{
                 .name = input.name,
                 .due = input.due,
                 .description = input.description,
-            });
-            const id: Id = .of(created.id.slice());
+            }, .{});
+            const id: Id = .of(created.id);
             self.reloadAfterWrite();
             return id;
         }
@@ -513,33 +530,23 @@ pub fn Store(comptime B: type) type {
             if (expected == null) {
                 if (self.snap.findMilestone(id)) |n| expected = self.snap.milestones[n].tip;
             }
-            _ = try Catalog.of(self.repo()).edit(a, id, .{
+            _ = try Catalog.fromRepo(self.repo()).edit(a, id, .{
                 .name = e.name,
                 .due = e.due,
                 .description = e.description,
                 .status = e.status,
                 .expect = expected,
-            });
+            }, .{});
             self.reloadAfterWrite();
         }
 
         /// `expected` null: what the snapshot shows.
         pub fn setState(self: *Self, id: []const u8, state: core.State, expected: ?Oid) !void {
-            const a = self.begin();
-            _ = try self.repo().setState(a, try refName(a, id), .{
-                .state = state,
-                .expect = self.expect(id, expected),
-            });
-            self.reloadAfterWrite();
+            _ = try self.update(id, .{ .edit = .{ .state = state, .expect = expected } });
         }
 
         pub fn comment(self: *Self, id: []const u8, text: []const u8) !void {
-            const a = self.begin();
-            _ = try self.repo().comment(a, try refName(a, id), .{
-                .text = text,
-                .expect = self.expect(id, null),
-            });
-            self.reloadAfterWrite();
+            _ = try self.update(id, .{ .edit = .{ .comment = text } });
         }
 
         /// What went wrong, for the status line, in `buf`.
@@ -560,8 +567,14 @@ pub fn Store(comptime B: type) type {
                     "it changed meanwhile; reloaded, try again",
                 ) catch {},
                 else => {
-                    w.print("{f}", .{issuez.errors.Description{ .err = err, .limits = .{} }}) catch {};
-                    if (issuez.errors.gitDetail(self.backend, err)) |d| w.print(": {s}", .{d}) catch {};
+                    w.print(
+                        "{f}",
+                        .{issuez.errors.Description{ .err = err, .limits = .{} }},
+                    ) catch {};
+                    if (issuez.errors.gitDetail(self.backend, err)) |d| w.print(
+                        ": {s}",
+                        .{d},
+                    ) catch {};
                 },
             }
             return w.buffered();
@@ -584,7 +597,9 @@ test "create, edit, comment and close through the store" {
     try testing.expectEqual(@as(usize, 0), store.snap.issues.len);
 
     const parent = try store.create(.{ .title = "Parent", .priority = .high });
-    const child = try store.create(.{ .title = "Child", .parent = parent.slice(), .workflow = "ready" });
+    const child = try store.create(
+        .{ .title = "Child", .parent = parent.slice(), .workflow = "ready" },
+    );
     try testing.expectEqual(@as(usize, 2), store.snap.issues.len);
     const pi = store.snap.find(parent.slice()).?;
     const ci = store.snap.find(child.slice()).?;
@@ -599,8 +614,13 @@ test "create, edit, comment and close through the store" {
     try testing.expect(store.snap.isDone(store.snap.find(child.slice()).?));
 
     var buf: [256]u8 = undefined;
-    try testing.expectError(error.UnknownWorkflowState, store.create(.{ .title = "x", .workflow = "nope" }));
-    try testing.expect(std.mem.startsWith(u8, store.describe(error.UnknownWorkflowState, &buf), "not one of"));
+    try testing.expectError(
+        error.UnknownWorkflowState,
+        store.create(.{ .title = "x", .workflow = "nope" }),
+    );
+    try testing.expect(
+        std.mem.startsWith(u8, store.describe(error.UnknownWorkflowState, &buf), "not one of"),
+    );
 }
 
 test "reloadIfChanged: only when the refs moved" {
@@ -620,11 +640,11 @@ test "reloadIfChanged: only when the refs moved" {
     try testing.expectEqual(@as(?Store(GitSim).Outside, null), try store.reloadIfChanged(false));
 
     // Another process's.
-    const theirs = try issuez.Repo(GitSim).init(&sim).create(arena, .{ .title = "Theirs" });
+    const theirs = try issuez.Repo(GitSim).init(&sim).create(arena, .{ .title = "Theirs" }, .{});
     const generation = store.generation;
     const out = (try store.reloadIfChanged(false)).?;
     try testing.expectEqual(@as(u32, 1), out.issues);
-    try testing.expect(out.first.eql(theirs.id.slice()));
+    try testing.expect(out.first.eql(theirs.id));
     try testing.expect(store.generation != generation);
     try testing.expectEqual(@as(usize, 2), store.snap.issues.len);
     try testing.expect(store.snap.find(mine.slice()) != null);

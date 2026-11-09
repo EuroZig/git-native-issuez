@@ -49,7 +49,7 @@ pub const Summary = struct {
 /// (a retired one's, say).
 pub fn summarize(
     arena: Allocator,
-    proj: Projection,
+    proj: *const Projection,
     milestones: []const Milestone,
     today: Date,
 ) Allocator.Error![]Summary {
@@ -70,11 +70,11 @@ pub fn summarize(
         if (done) s.done += 1 else s.open += 1;
         if (proj.activelyBlocked(i)) s.blocked += 1;
         if (proj.problemsOf(i).len > 0) s.problems += 1;
-        if (issue.ext.due_date) |d| {
+        if (issue.due_date) |d| {
             if (!done and d.order(today) == .lt) s.overdue += 1;
             if (s.last_due == null or d.order(s.last_due.?) == .gt) s.last_due = d;
         }
-        if (issue.ext.start_date) |d| {
+        if (issue.start_date) |d| {
             if (s.first_start == null or d.order(s.first_start.?) == .lt) s.first_start = d;
         }
         // A leaf, as progress counts them.
@@ -82,7 +82,7 @@ pub fn summarize(
             s.leaves.total += 1;
             if (done) s.leaves.closed += 1;
             if (!done and isStarted(proj, i)) s.leaves_active += 1;
-            if (issue.ext.estimate_minutes) |e| {
+            if (issue.estimate_minutes) |e| {
                 s.estimate_total += e;
                 if (done) s.estimate_done += e;
             }
@@ -93,9 +93,9 @@ pub fn summarize(
 
 /// Open, in a workflow state other than the first configured one. A
 /// state that isn't configured counts: it isn't where work begins.
-pub fn isStarted(proj: Projection, i: u32) bool {
+pub fn isStarted(proj: *const Projection, i: u32) bool {
     if (!proj.isActive(i)) return false;
-    const w = proj.issues[i].ext.workflow orelse return false;
+    const w = proj.issues[i].workflow orelse return false;
     const states = proj.options.workflow;
     if (states.len == 0) return false;
     return !std.mem.eql(u8, w, states[0]);
@@ -188,11 +188,11 @@ pub const Dates = struct {
     due: ?Date = null,
     estimate_minutes: ?u32 = null,
 
-    pub fn of(issue: @import("../model/issue.zig").Issue) Dates {
+    pub fn of(issue: *const @import("../model/issue.zig").Issue) Dates {
         return .{
-            .start = issue.ext.start_date,
-            .due = issue.ext.due_date,
-            .estimate_minutes = issue.ext.estimate_minutes,
+            .start = issue.start_date,
+            .due = issue.due_date,
+            .estimate_minutes = issue.estimate_minutes,
         };
     }
 };
@@ -243,31 +243,47 @@ pub fn span(dates: Dates, cal: Calendar) ?Span {
     if (dates.estimate_minutes) |m| {
         const n: i32 = @intCast(@min(cal.days(m), 10_000));
         const last = if (w.isWorkDay(due)) due else w.add(due, -1);
-        return .{ .start = w.add(last, -(n - 1)), .end = due, .shape = .bar, .derived_start = true };
+        return .{
+            .start = w.add(last, -(n - 1)),
+            .end = due,
+            .shape = .bar,
+            .derived_start = true,
+        };
     }
     return .{ .start = due, .end = due, .shape = .due };
 }
 
-/// The spans of every issue, by snapshot position; `dates` overrides
-/// some (a draft), null leaves an issue's own.
+/// Dates that override some issues' own (a draft's): `dates(context, i)`
+/// for issue `i`, null for its own.
+pub const Overlay = struct {
+    context: *const anyopaque,
+    dates: *const fn (context: *const anyopaque, i: u32) ?Dates,
+};
+
+/// The spans of every issue, by snapshot position, with `overlay`'s dates
+/// where it has some.
 pub fn spans(
     arena: Allocator,
-    proj: Projection,
+    proj: *const Projection,
     cal: Calendar,
-    overlay: ?*const fn (ctx: *const anyopaque, i: u32) ?Dates,
-    ctx: *const anyopaque,
+    overlay: ?Overlay,
 ) Allocator.Error![]?Span {
     const out = try arena.alloc(?Span, proj.issues.len);
-    for (proj.issues, out, 0..) |issue, *o, n| {
-        const d = if (overlay) |f| f(ctx, @intCast(n)) orelse Dates.of(issue) else Dates.of(issue);
-        o.* = span(d, cal);
+    for (proj.issues, out, 0..) |*issue, *o, n| {
+        const given = if (overlay) |x| x.dates(x.context, @intCast(n)) else null;
+        o.* = span(given orelse Dates.of(issue), cal);
     }
     return out;
 }
 
 /// A milestone on a timeline: from its first issue's start to its due
 /// date, or to the last issue's end when later.
-pub fn milestoneSpan(proj: Projection, all: []const ?Span, id: []const u8, due: ?Date) ?Span {
+pub fn milestoneSpan(
+    proj: *const Projection,
+    all: []const ?Span,
+    id: []const u8,
+    due: ?Date,
+) ?Span {
     var first: ?Date = null;
     var last: ?Date = due;
     for (proj.issues, proj.milestone, all) |issue, m, sp| {
@@ -302,7 +318,7 @@ pub const Warning = union(enum) {
 
 /// What doesn't fit for issue `i`, at most `out.len` of it.
 pub fn warnings(
-    proj: Projection,
+    proj: *const Projection,
     all: []const ?Span,
     dates: Dates,
     milestone_due: ?Date,
@@ -335,7 +351,7 @@ const testing = std.testing;
 const issue_model = @import("../model/issue.zig");
 
 fn fake(id: []const u8, state: []const u8, ext: issue_model.Extensions) issue_model.Issue {
-    return .{
+    var issue: issue_model.Issue = .{
         .id = id,
         .tip = undefined,
         .root = undefined,
@@ -345,7 +361,6 @@ fn fake(id: []const u8, state: []const u8, ext: issue_model.Extensions) issue_mo
         .description = "",
         .state = .parse(state),
         .labels = &.{},
-        .ext = ext,
         .fields = &.{},
         .conflicts = &.{},
         .author = undefined,
@@ -356,9 +371,16 @@ fn fake(id: []const u8, state: []const u8, ext: issue_model.Extensions) issue_mo
         .commit_count = 1,
         .log = &.{},
     };
+    issue.setExtensions(ext);
+    return issue;
 }
 
-fn fakeMilestone(id: []const u8, due: ?[]const u8, status: fields_fmt.MilestoneStatus, created: []const u8) Milestone {
+fn fakeMilestone(
+    id: []const u8,
+    due: ?[]const u8,
+    status: fields_fmt.MilestoneStatus,
+    created: []const u8,
+) Milestone {
     return .{
         .id = id,
         .tip = undefined,
@@ -378,8 +400,22 @@ test summarize {
     const d = Date.parse;
     var issues = [_]issue_model.Issue{
         fake("root", "open", .{ .milestone_id = "m1", .start_date = d("2026-11-02") }),
-        fake("kid", "closed", .{ .parent = "root", .estimate_minutes = 60, .due_date = d("2026-11-01") }),
-        fake("kid2", "open", .{ .parent = "root", .estimate_minutes = 30, .due_date = d("2026-11-03"), .blocked_by = &.{"other"}, .workflow = "review" }),
+        fake(
+            "kid",
+            "closed",
+            .{ .parent = "root", .estimate_minutes = 60, .due_date = d("2026-11-01") },
+        ),
+        fake(
+            "kid2",
+            "open",
+            .{
+                .parent = "root",
+                .estimate_minutes = 30,
+                .due_date = d("2026-11-03"),
+                .blocked_by = &.{"other"},
+                .workflow = "review",
+            },
+        ),
         fake("gone", "open", .{ .milestone_id = "m1" }),
         fake("other", "open", .{}),
         fake("old", "open", .{ .milestone_id = "m2" }),
@@ -393,7 +429,7 @@ test summarize {
         .{ .id = "m1", .status = .open },
         .{ .id = "m2", .status = .retired },
     } });
-    const out = try summarize(arena, proj, &ms, d("2026-11-04").?);
+    const out = try summarize(arena, &proj, &ms, d("2026-11-04").?);
     try testing.expectEqual(@as(usize, 3), out.len);
     const m1 = out[0];
     try testing.expectEqual(@as(u32, 3), m1.issues);
@@ -418,19 +454,34 @@ test health {
     const all: Summary = .{ .leaves = .{ .closed = 10, .total = 10 } };
     const none: Summary = .{ .leaves = .{ .closed = 0, .total = 10 } };
     const m = fakeMilestone("m", "2026-12-01", .open, "2026-11-01");
-    try testing.expectEqual(Health.done, health(fakeMilestone("m", null, .completed, "2026-11-01"), half, d("2026-11-04").?, 0));
-    try testing.expectEqual(Health.retired, health(fakeMilestone("m", null, .retired, "2026-11-01"), half, d("2026-11-04").?, 0));
-    try testing.expectEqual(Health.no_date, health(fakeMilestone("m", null, .open, "2026-11-01"), half, d("2026-11-04").?, 0));
+    try testing.expectEqual(
+        Health.done,
+        health(fakeMilestone("m", null, .completed, "2026-11-01"), half, d("2026-11-04").?, 0),
+    );
+    try testing.expectEqual(
+        Health.retired,
+        health(fakeMilestone("m", null, .retired, "2026-11-01"), half, d("2026-11-04").?, 0),
+    );
+    try testing.expectEqual(
+        Health.no_date,
+        health(fakeMilestone("m", null, .open, "2026-11-01"), half, d("2026-11-04").?, 0),
+    );
     // Early on, anything goes.
     try testing.expectEqual(Health.on_track, health(m, none, d("2026-11-04").?, 0));
     // Two thirds of the time gone, half done.
     try testing.expectEqual(Health.at_risk, health(m, half, d("2026-11-21").?, 0));
-    try testing.expectEqual(Health.on_track, health(m, .{ .leaves = .{ .closed = 8, .total = 10 } }, d("2026-11-21").?, 0));
+    try testing.expectEqual(
+        Health.on_track,
+        health(m, .{ .leaves = .{ .closed = 8, .total = 10 } }, d("2026-11-21").?, 0),
+    );
     // Nothing open: on track, even late.
     try testing.expectEqual(Health.on_track, health(m, all, d("2026-12-05").?, 0));
     try testing.expectEqual(Health.overdue, health(m, half, d("2026-12-02").?, 0));
     // The last day with work open.
-    try testing.expectEqual(Health.at_risk, health(m, .{ .leaves = .{ .closed = 9, .total = 10 } }, d("2026-12-01").?, 0));
+    try testing.expectEqual(
+        Health.at_risk,
+        health(m, .{ .leaves = .{ .closed = 9, .total = 10 } }, d("2026-12-01").?, 0),
+    );
     // Empty: on track until its due date, then overdue.
     try testing.expectEqual(Health.on_track, health(m, .{}, d("2026-12-01").?, 0));
     try testing.expectEqual(Health.overdue, health(m, .{}, d("2026-12-02").?, 0));
@@ -500,28 +551,67 @@ test warnings {
     const arena = arena_state.allocator();
     const d = Date.parse;
     var issues = [_]issue_model.Issue{
-        fake("blocker", "open", .{ .start_date = d("2026-11-02"), .due_date = d("2026-11-10"), .milestone_id = "m" }),
-        fake("late", "open", .{ .start_date = d("2026-11-09"), .due_date = d("2026-11-20"), .blocked_by = &.{"blocker"}, .milestone_id = "m" }),
-        fake("fine", "open", .{ .start_date = d("2026-11-11"), .due_date = d("2026-11-12"), .blocked_by = &.{"blocker"} }),
-        fake("closed", "closed", .{ .start_date = d("2026-11-01"), .due_date = d("2026-11-02"), .blocked_by = &.{"blocker"} }),
+        fake(
+            "blocker",
+            "open",
+            .{ .start_date = d("2026-11-02"), .due_date = d("2026-11-10"), .milestone_id = "m" },
+        ),
+        fake(
+            "late",
+            "open",
+            .{
+                .start_date = d("2026-11-09"),
+                .due_date = d("2026-11-20"),
+                .blocked_by = &.{"blocker"},
+                .milestone_id = "m",
+            },
+        ),
+        fake(
+            "fine",
+            "open",
+            .{
+                .start_date = d("2026-11-11"),
+                .due_date = d("2026-11-12"),
+                .blocked_by = &.{"blocker"},
+            },
+        ),
+        fake(
+            "closed",
+            "closed",
+            .{
+                .start_date = d("2026-11-01"),
+                .due_date = d("2026-11-02"),
+                .blocked_by = &.{"blocker"},
+            },
+        ),
         fake("open-ended", "open", .{ .start_date = d("2026-11-02") }),
         fake("after", "open", .{ .start_date = d("2026-11-20"), .blocked_by = &.{"open-ended"} }),
     };
-    const proj = try projection_mod.build(arena, &issues, .{ .milestones = &.{.{ .id = "m", .status = .open }} });
-    const all = try spans(arena, proj, .{}, null, undefined);
+    const proj = try projection_mod.build(
+        arena,
+        &issues,
+        .{ .milestones = &.{.{ .id = "m", .status = .open }} },
+    );
+    const all = try spans(arena, &proj, .{}, null);
     var buf: [4]Warning = undefined;
     const late = proj.find("late").?;
-    const w = warnings(proj, all, Dates.of(issues[late]), d("2026-11-15"), late, &buf);
+    const w = warnings(&proj, all, Dates.of(&issues[late]), d("2026-11-15"), late, &buf);
     try testing.expectEqual(@as(usize, 2), w.len);
     try testing.expectEqual(Warning.after_milestone, w[0]);
     try testing.expectEqual(proj.find("blocker").?, w[1].before_blocker);
-    try testing.expectEqual(@as(usize, 0), warnings(proj, all, Dates.of(issues[2]), null, proj.find("fine").?, &buf).len);
-    try testing.expectEqual(@as(usize, 0), warnings(proj, all, Dates.of(issues[3]), null, proj.find("closed").?, &buf).len);
+    try testing.expectEqual(
+        @as(usize, 0),
+        warnings(&proj, all, Dates.of(&issues[2]), null, proj.find("fine").?, &buf).len,
+    );
+    try testing.expectEqual(
+        @as(usize, 0),
+        warnings(&proj, all, Dates.of(&issues[3]), null, proj.find("closed").?, &buf).len,
+    );
     // A blocker with a start only may end any day: always a warning.
-    const after = warnings(proj, all, Dates.of(issues[5]), null, proj.find("after").?, &buf);
+    const after = warnings(&proj, all, Dates.of(&issues[5]), null, proj.find("after").?, &buf);
     try testing.expectEqual(@as(usize, 1), after.len);
     try testing.expectEqual(proj.find("open-ended").?, after[0].before_blocker);
-    const ms = milestoneSpan(proj, all, "m", d("2026-11-15")).?;
+    const ms = milestoneSpan(&proj, all, "m", d("2026-11-15")).?;
     try testing.expect(ms.start.eql(d("2026-11-02").?) and ms.end.eql(d("2026-11-20").?));
-    try testing.expect(milestoneSpan(proj, all, "nothing", null) == null);
+    try testing.expect(milestoneSpan(&proj, all, "nothing", null) == null);
 }

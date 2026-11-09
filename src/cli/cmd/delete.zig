@@ -40,20 +40,12 @@ pub fn main(
     const name = if (deleted) "delete" else "restore";
     var prefix: ?[]const u8 = null;
     var message: ?[]const u8 = null;
-    var args: common.Args = .{ .list = argv };
-    while (args.next()) |arg| {
-        if (!args.isOption(arg)) {
-            if (args.was_separator) continue;
-            if (prefix == null) prefix = arg;
-        } else if (common.isHelp(arg)) {
-            ctx.out.writeAll(if (deleted) delete_help else restore_help) catch {};
-            return common.exit_ok;
-        } else if (std.mem.eql(u8, arg, "-m") or std.mem.eql(u8, arg, "--message")) {
-            message = args.value(ctx.err, "-m") orelse return common.exit_error;
-        } else {
-            return common.unknownOption(ctx.err, name, arg);
-        }
-    }
+    if (common.parseArgs(ctx, argv, .{
+        .command = name,
+        .help = if (deleted) delete_help else restore_help,
+        .positionals = .{ .first = &prefix },
+        .flags = &.{.{ "-m --message", .{ .text = &message } }},
+    })) |exit| return exit;
     const p = prefix orelse return common.missing(ctx.err, name, "issue ID is required");
     const repo = common.openRepo(B, ctx) orelse return common.exit_fatal;
     const ref = common.resolveOne(B, repo, ctx.arena, ctx.err, p) orelse
@@ -67,7 +59,12 @@ pub fn main(
         }) catch {};
         return common.exit_ok;
     }
-    _ = repo.setDeleted(ctx.arena, ref.name, deleted, .{ .message = message }) catch |e|
+    _ = repo.setDeleted(
+        ctx.arena,
+        ref.name,
+        .{ .deleted = deleted, .message = message },
+        .{},
+    ) catch |e|
         return common.repoFailed(B, ctx, e);
     ctx.out.print("{s} issue {s}\n", .{ if (deleted) "Deleted" else "Restored", short }) catch {};
     return common.exit_ok;

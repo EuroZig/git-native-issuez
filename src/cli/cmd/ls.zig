@@ -62,54 +62,44 @@ pub fn main(comptime B: type, ctx: *context.Context(B), argv: []const []const u8
     var only_deleted = false;
     var as_json = false;
 
-    var args: common.Args = .{ .list = argv };
-    while (args.next()) |arg| {
-        if (common.isHelp(arg)) {
-            ctx.out.writeAll(help) catch {};
-            return common.exit_ok;
-        } else if (std.mem.eql(u8, arg, "-s") or std.mem.eql(u8, arg, "--state")) {
-            state_filter = common.stateFilter(args.value(ctx.err, "-s") orelse return common.exit_error);
+    const flags = [_]common.Flag{
+        .{ "-l --label", .{ .text = &label_filter } },
+        .{ "--assignee", .{ .text = &assignee_filter } },
+        .{ "--reverse", .{ .on = &reverse } },
+        .{ "--problems", .{ .on = &only_problems } },
+        .{ "--conflicts", .{ .on = &only_conflicts } },
+        .{ "--deleted", .{ .on = &only_deleted } },
+        .{ "--json", .{ .on = &as_json } },
+    };
+    var parser = common.argParser(ctx, argv, .{
+        .command = "ls",
+        .help = help,
+        .positionals = .none,
+        .flags = &flags,
+    });
+    while (parser.next()) |arg| {
+        if (common.isFlag(arg, "-s --state")) {
+            state_filter = common.stateFilter(parser.value("-s") orelse return common.exit_error);
             state_given = true;
-        } else if (std.mem.eql(u8, arg, "-l") or std.mem.eql(u8, arg, "--label")) {
-            label_filter = args.value(ctx.err, "-l") orelse return common.exit_error;
-        } else if (std.mem.eql(u8, arg, "--assignee")) {
-            assignee_filter = args.value(ctx.err, "--assignee") orelse return common.exit_error;
-        } else if (std.mem.eql(u8, arg, "--priority")) {
-            const v = args.value(ctx.err, "--priority") orelse return common.exit_error;
-            const p = core.Priority.parse(v) orelse return common.fail(
-                ctx.err,
-                "error: priority must be low, medium, high, or critical\n",
-            );
-            priority_filter = p;
-        } else if (std.mem.eql(u8, arg, "-a") or std.mem.eql(u8, arg, "--all")) {
+        } else if (common.isFlag(arg, "--priority")) {
+            const v = parser.value("--priority") orelse return common.exit_error;
+            priority_filter = common.priorityOf(ctx.err, v) orelse return common.exit_error;
+        } else if (common.isFlag(arg, "-a --all")) {
             state_filter = null;
             state_given = true;
-        } else if (std.mem.eql(u8, arg, "-f") or std.mem.eql(u8, arg, "--format")) {
-            const v = args.value(ctx.err, "-f") orelse return common.exit_error;
-            format = std.meta.stringToEnum(Format, v) orelse return common.fail(
-                ctx.err,
-                "error: format must be short, full, or oneline\n",
-            );
-        } else if (std.mem.eql(u8, arg, "--sort")) {
-            const v = args.value(ctx.err, "--sort") orelse return common.exit_error;
+        } else if (common.isFlag(arg, "-f --format")) {
+            const v = parser.value("-f") orelse return common.exit_error;
+            format = std.meta.stringToEnum(Format, v) orelse
+                return common.fail(ctx.err, "error: format must be short, full, or oneline\n");
+        } else if (common.isFlag(arg, "--sort")) {
+            const v = parser.value("--sort") orelse return common.exit_error;
             sort = std.meta.stringToEnum(query.SortKey, v) orelse return common.fail(
                 ctx.err,
                 "error: sort must be created, updated, priority, or state\n",
             );
-        } else if (std.mem.eql(u8, arg, "--reverse")) {
-            reverse = true;
-        } else if (std.mem.eql(u8, arg, "--problems")) {
-            only_problems = true;
-        } else if (std.mem.eql(u8, arg, "--conflicts")) {
-            only_conflicts = true;
-        } else if (std.mem.eql(u8, arg, "--deleted")) {
-            only_deleted = true;
-        } else if (std.mem.eql(u8, arg, "--json")) {
-            as_json = true;
-        } else {
-            return common.unknownOption(ctx.err, "ls", arg);
-        }
+        } else return parser.unknown(arg);
     }
+    if (parser.exit) |exit| return exit;
 
     const repo = common.openRepo(B, ctx) orelse return common.exit_fatal;
     const all = repo.loadAll(arena) catch |e| return common.repoFailed(B, ctx, e);
@@ -117,7 +107,7 @@ pub fn main(comptime B: type, ctx: *context.Context(B), argv: []const []const u8
     const filter: query.Filter = .{
         .state = state_filter,
         .done = if (state_given or only_problems) null else false,
-        .done_states = repo.done_states,
+        .done_states = repo.doneStates(),
         .label = label_filter,
         .assignee = assignee_filter,
         .priority = priority_filter,
@@ -126,7 +116,7 @@ pub fn main(comptime B: type, ctx: *context.Context(B), argv: []const []const u8
     const sorted = query.list(arena, all, filter, .{
         .key = sort,
         .reverse = reverse,
-        .done_states = repo.done_states,
+        .done_states = repo.doneStates(),
     }) catch return common.exit_error;
     const proj = if (only_problems or as_json)
         ext_flags.projectIssues(B, ctx, repo, all) orelse return common.exit_error
@@ -145,7 +135,7 @@ pub fn main(comptime B: type, ctx: *context.Context(B), argv: []const []const u8
     if (as_json) {
         var s = json.begin(ctx.out);
         writeJson(&s, arena, listed, proj.?) catch |e| return json.failed(ctx.err, e);
-        json.end(&s);
+        json.end(&s) catch |e| return json.failed(ctx.err, e);
         return common.exit_ok;
     }
 
@@ -161,7 +151,10 @@ pub fn main(comptime B: type, ctx: *context.Context(B), argv: []const []const u8
                 .{ short, issue.state.text(), issue.title },
             ) catch {},
             .full => {
-                ctx.out.print("{s} [{s}] {s}\n", .{ short, issue.state.text(), issue.title }) catch {};
+                ctx.out.print(
+                    "{s} [{s}] {s}\n",
+                    .{ short, issue.state.text(), issue.title },
+                ) catch {};
                 var detail: std.Io.Writer.Allocating = .init(arena);
                 if (issue.labels.len > 0) detail.writer.print(
                     " labels:{s}",
@@ -175,7 +168,7 @@ pub fn main(comptime B: type, ctx: *context.Context(B), argv: []const []const u8
                     " priority:{s}",
                     .{v},
                 ) catch {};
-                if (issue.field("Milestone")) |v| detail.writer.print(
+                if (issue.milestone) |v| detail.writer.print(
                     " milestone:{s}",
                     .{v},
                 ) catch {};

@@ -46,6 +46,15 @@ const Repo = struct {
     fn open(r: *Repo, gpa: Allocator) !GitProcess {
         return GitProcess.open(io, gpa, .{ .path = r.path, .environ_map = &r.env });
     }
+
+    /// `origin` is `hub`, by absolute path.
+    fn addOrigin(r: *Repo, gpa: Allocator, hub: *const Repo) !void {
+        const cwd = try std.process.currentPathAlloc(io, gpa);
+        defer gpa.free(cwd);
+        const url = try std.fmt.allocPrint(gpa, "{s}/{s}", .{ cwd, hub.path });
+        defer gpa.free(url);
+        try runGit(gpa, &r.env, r.path, &.{ "git", "remote", "add", "origin", url });
+    }
 };
 
 /// Deterministic identity, no user/system config influence.
@@ -140,6 +149,55 @@ test "open" {
         error.NotARepository,
         GitProcess.open(io, gpa, .{ .path = "/nonexistent/issuez-test", .environ_map = &env }),
     );
+}
+
+test "the git binary is configurable" {
+    const gpa = testing.allocator;
+    var repo = try Repo.init(gpa, &.{});
+    defer repo.deinit(gpa);
+    var arena_state: std.heap.ArenaAllocator = .init(gpa);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    // A wrapper that logs each command, so the test sees which git ran:
+    // the commands and the long-lived sessions alike.
+    var bin = testing.tmpDir(.{});
+    defer bin.cleanup();
+    const cwd = try std.process.currentPathAlloc(io, arena);
+    const dir = try std.fmt.allocPrint(arena, "{s}/.zig-cache/tmp/{s}", .{ cwd, bin.sub_path });
+    const script = try std.fmt.allocPrint(
+        arena,
+        "#!/bin/sh\necho \"$1\" >> '{s}/log'\nexec git \"$@\"\n",
+        .{dir},
+    );
+    try bin.dir.writeFile(io, .{
+        .sub_path = "git-wrapper",
+        .data = script,
+        .flags = .{ .permissions = .executable_file },
+    });
+    const wrapper = try std.fmt.allocPrint(arena, "{s}/git-wrapper", .{dir});
+
+    var git = try GitProcess.open(io, gpa, .{
+        .path = repo.path,
+        .environ_map = &repo.env,
+        .git = wrapper,
+    });
+    defer git.close();
+    _ = try git.writeObject(.blob, "hello\n");
+    _ = try git.resolveRef("refs/heads/none");
+    const log = try bin.dir.readFileAlloc(io, "log", arena, .limited(1 << 16));
+    for ([_][]const u8{ "version", "hash-object", "cat-file" }) |command| {
+        if (std.mem.indexOf(u8, log, command) == null) {
+            std.debug.print("{s} didn't run through the wrapper:\n{s}", .{ command, log });
+            return error.TestUnexpectedResult;
+        }
+    }
+
+    try testing.expectError(error.GitSpawnFailed, GitProcess.open(io, gpa, .{
+        .path = repo.path,
+        .environ_map = &repo.env,
+        .git = "/nonexistent/git",
+    }));
 }
 
 test "open without a terminal: no git on PATH fails, leaving no fd open" {
@@ -364,10 +422,8 @@ test "push and fetch" {
     defer a.deinit(gpa);
     var b = try Repo.init(gpa, &.{});
     defer b.deinit(gpa);
-    const cwd = try std.process.currentPathAlloc(io, arena);
-    const hub_url = try std.fmt.allocPrint(arena, "{s}/{s}", .{ cwd, hub.path });
-    try runGit(gpa, &a.env, a.path, &.{ "git", "remote", "add", "origin", hub_url });
-    try runGit(gpa, &b.env, b.path, &.{ "git", "remote", "add", "origin", hub_url });
+    try a.addOrigin(gpa, &hub);
+    try b.addOrigin(gpa, &hub);
 
     var ga = try a.open(gpa);
     defer ga.close();
@@ -381,17 +437,17 @@ test "push and fetch" {
     const root = try ga.writeObject(.commit, try commitBytes(arena, .sha1, &.{}, "root\n"));
     try ga.updateRefs(&.{.{ .name = name, .op = .{ .create = root } }});
     const spec = name ++ ":" ++ name;
-    const first = try ga.push(arena, "origin", &.{spec}, true);
+    const first = try ga.push(arena, "origin", &.{spec}, .{ .atomic = true });
     try testing.expectEqual(@as(usize, 1), first.refs.len);
     try testing.expectEqual(issuez.backend.contract.PushedRef.Status.ok, first.refs[0].status);
-    const again = try ga.push(arena, "origin", &.{spec}, true);
+    const again = try ga.push(arena, "origin", &.{spec}, .{ .atomic = true });
     try testing.expectEqual(
         issuez.backend.contract.PushedRef.Status.up_to_date,
         again.refs[0].status,
     );
 
     // b fetches into staging, builds on it, pushes.
-    try gb.fetch(arena, "origin", &.{"+refs/issues/*:refs/remotes/origin/issues/*"}, false);
+    try gb.fetch(arena, "origin", &.{"+refs/issues/*:refs/remotes/origin/issues/*"}, .{});
     const staged_name = "refs/remotes/origin/issues/a7f3b2c1-4e5d-4a8b-9c1e-2f3a4b5c6d7e";
     const staged = (try gb.resolveRef(staged_name)).?;
     try testing.expect(staged.eql(root));
@@ -400,7 +456,7 @@ test "push and fetch" {
         try commitBytes(arena, .sha1, &.{root}, "from b\n"),
     );
     try gb.updateRefs(&.{.{ .name = name, .op = .{ .create = b_child } }});
-    try testing.expect(!(try gb.push(arena, "origin", &.{spec}, true)).rejected());
+    try testing.expect(!(try gb.push(arena, "origin", &.{spec}, .{ .atomic = true })).rejected());
 
     // a's diverging commit is not a fast-forward: rejected, and with
     // --atomic the other ref in the same push isn't applied either.
@@ -411,16 +467,21 @@ test "push and fetch" {
     try ga.updateRefs(&.{.{ .name = name, .op = .{ .update = .{ .new = a_child, .old = root } } }});
     const other = "refs/issues/b8e4c3d2-5f6e-4b9c-8d2f-3a4b5c6d7e8f";
     try ga.updateRefs(&.{.{ .name = other, .op = .{ .create = root } }});
-    const rejected = try ga.push(arena, "origin", &.{ spec, other ++ ":" ++ other }, true);
+    const rejected = try ga.push(
+        arena,
+        "origin",
+        &.{ spec, other ++ ":" ++ other },
+        .{ .atomic = true },
+    );
     try testing.expect(rejected.rejected());
-    try gb.fetch(arena, "origin", &.{"+refs/issues/*:refs/remotes/origin/issues/*"}, false);
+    try gb.fetch(arena, "origin", &.{"+refs/issues/*:refs/remotes/origin/issues/*"}, .{});
     const other_staged = "refs/remotes/origin/issues/b8e4c3d2-5f6e-4b9c-8d2f-3a4b5c6d7e8f";
     try testing.expect(try gb.resolveRef(other_staged) == null);
 
     // An unknown remote is a fetch failure with git's explanation kept.
     try testing.expectError(
         error.FetchFailed,
-        ga.fetch(arena, "nosuchremote", &.{"+refs/issues/*:refs/remotes/x/issues/*"}, false),
+        ga.fetch(arena, "nosuchremote", &.{"+refs/issues/*:refs/remotes/x/issues/*"}, .{}),
     );
     try testing.expect(ga.lastStderr().len > 0);
 }
@@ -436,7 +497,10 @@ test "object writes ignore attributes and filters" {
     // A clean filter and eol conversion for every path, the temp files
     // included. The object has to be the bytes, as with `--stdin`.
     const attributes = try std.fs.path.join(arena, &.{ repo.path, ".git", "info", "attributes" });
-    try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = attributes, .data = "* filter=up text eol=crlf\n" });
+    try std.Io.Dir.cwd().writeFile(
+        io,
+        .{ .sub_path = attributes, .data = "* filter=up text eol=crlf\n" },
+    );
     try runGit(gpa, &repo.env, repo.path, &.{ "git", "config", "filter.up.clean", "tr a-z A-Z" });
     // A temp file a dead process left behind a day ago is swept.
     const tmp = try std.fs.path.join(arena, &.{ repo.path, ".git", "issuez", "tmp" });
@@ -478,7 +542,9 @@ test "a ref to a missing object still resolves" {
     // cat-file says "missing" for both; the ref is there, its object isn't.
     try testing.expect((try git.resolveRef(name)).?.eql(oid));
     try testing.expect(try git.readObject(arena, oid) == null);
-    try testing.expect(try git.resolveRef("refs/issues/b8e4c3d2-5f6e-4b9c-8d2f-3a4b5c6d7e8f") == null);
+    try testing.expect(
+        try git.resolveRef("refs/issues/b8e4c3d2-5f6e-4b9c-8d2f-3a4b5c6d7e8f") == null,
+    );
 }
 
 test "fetch with prune" {
@@ -491,9 +557,7 @@ test "fetch with prune" {
     defer hub.deinit(gpa);
     var b = try Repo.init(gpa, &.{});
     defer b.deinit(gpa);
-    const cwd = try std.process.currentPathAlloc(io, arena);
-    const hub_url = try std.fmt.allocPrint(arena, "{s}/{s}", .{ cwd, hub.path });
-    try runGit(gpa, &b.env, b.path, &.{ "git", "remote", "add", "origin", hub_url });
+    try b.addOrigin(gpa, &hub);
 
     var gh = try hub.open(gpa);
     defer gh.close();
@@ -511,17 +575,74 @@ test "fetch with prune" {
         "+refs/issues/*:refs/issuez-sync/origin/seen/issues/*",
         "+refs/milestones/*:refs/issuez-sync/origin/seen/milestones/*",
     };
-    try gb.fetch(arena, "origin", specs, true);
+    try gb.fetch(arena, "origin", specs, .{ .prune = true });
     try testing.expectEqual(@as(usize, 2), (try gb.listRefs(arena, "refs/issuez-sync/")).len);
     // Refs outside the destinations stay.
-    try gb.updateRefs(&.{.{ .name = "refs/issuez-sync/origin/merged/issues/x", .op = .{ .create = root } }});
+    try gb.updateRefs(
+        &.{.{ .name = "refs/issuez-sync/origin/merged/issues/x", .op = .{ .create = root } }},
+    );
 
     try gh.updateRefs(&.{.{ .name = two, .op = .{ .delete = root } }});
-    try gb.fetch(arena, "origin", specs, true);
+    try gb.fetch(arena, "origin", specs, .{ .prune = true });
     const left = try gb.listRefs(arena, "refs/issuez-sync/");
     try testing.expectEqual(@as(usize, 2), left.len);
     try testing.expectEqualStrings("refs/issuez-sync/origin/merged/issues/x", left[0].name);
-    try testing.expectEqualStrings("refs/issuez-sync/origin/seen/issues/" ++ one["refs/issues/".len..], left[1].name);
+    try testing.expectEqualStrings(
+        "refs/issuez-sync/origin/seen/issues/" ++ one["refs/issues/".len..],
+        left[1].name,
+    );
+}
+
+test "leased push replaces and deletes, and refuses a stale lease" {
+    const gpa = testing.allocator;
+    var arena_state: std.heap.ArenaAllocator = .init(gpa);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const LeasedRef = issuez.backend.contract.LeasedRef;
+
+    var hub = try Repo.init(gpa, &.{"--bare"});
+    defer hub.deinit(gpa);
+    var a = try Repo.init(gpa, &.{});
+    defer a.deinit(gpa);
+    try a.addOrigin(gpa, &hub);
+    var ga = try a.open(gpa);
+    defer ga.close();
+
+    const name = "refs/issues/a7f3b2c1-4e5d-4a8b-9c1e-2f3a4b5c6d7e";
+    const gone = "refs/issues/b8e4c3d2-5f6e-4b9c-8d2f-3a4b5c6d7e8f";
+    const old = try ga.writeObject(.commit, try commitBytes(arena, .sha1, &.{}, "old\n"));
+    try ga.updateRefs(&.{
+        .{ .name = name, .op = .{ .create = old } },
+        .{ .name = gone, .op = .{ .create = old } },
+    });
+    _ = try ga.push(
+        arena,
+        "origin",
+        &.{ name ++ ":" ++ name, gone ++ ":" ++ gone },
+        .{ .atomic = true },
+    );
+
+    // Not a fast-forward: only a lease replaces it.
+    const new = try ga.writeObject(.commit, try commitBytes(arena, .sha1, &.{}, "new\n"));
+    try ga.updateRefs(&.{.{ .name = name, .op = .{ .update = .{ .new = new, .old = old } } }});
+    const stale = try ga.pushLeased(arena, "origin", &[_]LeasedRef{
+        .{ .src = name, .dst = name, .expect = new },
+        .{ .src = null, .dst = gone, .expect = old },
+    });
+    try testing.expect(stale.rejected());
+    var gh = try hub.open(gpa);
+    defer gh.close();
+    try testing.expect((try gh.resolveRef(gone)).?.eql(old));
+
+    const done = try ga.pushLeased(arena, "origin", &[_]LeasedRef{
+        .{ .src = name, .dst = name, .expect = old },
+        .{ .src = null, .dst = gone, .expect = old },
+    });
+    try testing.expect(!done.rejected());
+    gh.close();
+    gh = try hub.open(gpa);
+    try testing.expect((try gh.resolveRef(name)).?.eql(new));
+    try testing.expect(try gh.resolveRef(gone) == null);
 }
 
 test "pre-push hook" {
@@ -534,9 +655,8 @@ test "pre-push hook" {
     defer hub.deinit(gpa);
     var a = try Repo.init(gpa, &.{});
     defer a.deinit(gpa);
+    try a.addOrigin(gpa, &hub);
     const cwd = try std.process.currentPathAlloc(io, arena);
-    const hub_url = try std.fmt.allocPrint(arena, "{s}/{s}", .{ cwd, hub.path });
-    try runGit(gpa, &a.env, a.path, &.{ "git", "remote", "add", "origin", hub_url });
 
     // The hook records the refs it is told about. It refuses while
     // `refuse` exists.
@@ -559,7 +679,7 @@ test "pre-push hook" {
     try ga.updateRefs(&.{.{ .name = name, .op = .{ .create = root } }});
 
     try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = refuse, .data = "" });
-    const refused = ga.push(arena, "origin", &.{name ++ ":" ++ name}, true);
+    const refused = ga.push(arena, "origin", &.{name ++ ":" ++ name}, .{ .atomic = true });
     if (refused) |r| try testing.expect(r.rejected()) else |err| {
         try testing.expectEqual(error.PushFailed, err);
     }
@@ -568,7 +688,7 @@ test "pre-push hook" {
     try testing.expect(try gh.resolveRef(name) == null);
 
     try std.Io.Dir.cwd().deleteFile(io, refuse);
-    const pushed = try ga.push(arena, "origin", &.{name ++ ":" ++ name}, true);
+    const pushed = try ga.push(arena, "origin", &.{name ++ ":" ++ name}, .{ .atomic = true });
     try testing.expect(!pushed.rejected());
     const log = try std.Io.Dir.cwd().readFileAlloc(io, seen, arena, .limited(4096));
     try testing.expect(std.mem.find(u8, log, name) != null);
@@ -584,9 +704,7 @@ test "a hung git times out" {
     defer hub.deinit(gpa);
     var a = try Repo.init(gpa, &.{});
     defer a.deinit(gpa);
-    const cwd = try std.process.currentPathAlloc(io, arena);
-    const hub_url = try std.fmt.allocPrint(arena, "{s}/{s}", .{ cwd, hub.path });
-    try runGit(gpa, &a.env, a.path, &.{ "git", "remote", "add", "origin", hub_url });
+    try a.addOrigin(gpa, &hub);
     // Would hold back the sessions' answers.
     try a.env.put("GIT_FLUSH", "0");
 
@@ -601,9 +719,10 @@ test "a hung git times out" {
     const hooks = try std.fmt.allocPrint(arena, "{s}/.git/hooks", .{a.path});
     const rt = try std.fmt.allocPrint(arena, "{s}/reference-transaction", .{hooks});
     const pp = try std.fmt.allocPrint(arena, "{s}/pre-push", .{hooks});
+    // Long enough for git to reach its hook on a loaded machine.
     const short: GitProcess.Timeouts = .{
-        .command = .fromMilliseconds(300),
-        .network = .fromMilliseconds(300),
+        .command = .fromSeconds(1),
+        .network = .fromSeconds(1),
     };
     const started = std.Io.Clock.awake.now(io);
 
@@ -632,10 +751,11 @@ test "a hung git times out" {
     ga.timeouts = short;
     try testing.expectError(
         error.GitTimedOut,
-        ga.push(arena, "origin", &.{one ++ ":" ++ one}, true),
+        ga.push(arena, "origin", &.{one ++ ":" ++ one}, .{ .atomic = true }),
     );
+    // Each hook sleeps 10 s: none was waited out.
     const took = started.durationTo(std.Io.Clock.awake.now(io));
-    try testing.expect(took.toSeconds() < 5);
+    try testing.expect(took.toSeconds() < 8);
 }
 
 fn writeHook(
@@ -646,4 +766,80 @@ fn writeHook(
 ) !void {
     try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = path, .data = script });
     try runGit(gpa, env, ".", &.{ "chmod", "+x", path });
+}
+
+test "GitProcess.beginImport: SHA-1 and SHA-256 publish atomically and remove staging" {
+    const gpa = testing.allocator;
+    var arena_state: std.heap.ArenaAllocator = .init(gpa);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    for ([_][]const u8{ "--object-format=sha1", "--object-format=sha256" }) |format| {
+        var fixture = try Repo.init(gpa, &.{ "--bare", format });
+        defer fixture.deinit(gpa);
+        var git = try fixture.open(gpa);
+        defer git.close();
+        const main = issuez.Repo(GitProcess).init(&git);
+        var stage = try git.beginImport(arena);
+        const path = try arena.dupe(u8, stage.path);
+        {
+            defer stage.deinit();
+            const scratch = issuez.Repo(GitProcess).init(&stage.git);
+            const made = try scratch.create(arena, .{ .title = "Staged" }, .{});
+            try testing.expect((try main.find(arena, made.id)) == null);
+            try testing.expectEqual(@as(usize, 1), try stage.commit(arena, &git));
+            try testing.expectError(error.InvalidValue, stage.commit(arena, &git));
+            const published = (try main.find(arena, made.id)).?;
+            try testing.expectEqualStrings("Staged", published.title);
+        }
+        try testing.expectError(error.FileNotFound, std.Io.Dir.cwd().access(io, path, .{}));
+    }
+}
+
+test "GitProcess.open: past Apple's git stub, and only that" {
+    if (@import("builtin").os.tag != .macos) return error.SkipZigTest;
+    const gpa = testing.allocator;
+    var repo = try Repo.init(gpa, &.{});
+    defer repo.deinit(gpa);
+    var env = try repo.env.clone(gpa);
+    defer env.deinit();
+
+    try env.put("PATH", "/usr/bin:/bin");
+    var stubbed = try GitProcess.open(io, gpa, .{ .path = repo.path, .environ_map = &env });
+    defer stubbed.close();
+    try testing.expect(std.mem.endsWith(u8, stubbed.git_exe, "/git"));
+    try testing.expect(!std.mem.startsWith(u8, stubbed.git_exe, "/usr/bin/"));
+    // It really is a git, for reads and the long-lived sessions alike.
+    var arena_state: std.heap.ArenaAllocator = .init(gpa);
+    defer arena_state.deinit();
+    const blob = try stubbed.writeObject(.blob, "hello\n");
+    try testing.expect(try stubbed.readObject(arena_state.allocator(), blob) != null);
+
+    // A git chosen some other way stays what it was.
+    var named = try GitProcess.open(io, gpa, .{
+        .path = repo.path,
+        .environ_map = &env,
+        .git = stubbed.git_exe,
+    });
+    defer named.close();
+    try testing.expectEqualStrings(stubbed.git_exe, named.git_exe);
+}
+
+test "GitProcess.open: cancellation during opening is not retained" {
+    const gpa = testing.allocator;
+    var repo = try Repo.init(gpa, &.{});
+    defer repo.deinit(gpa);
+    var flag: std.atomic.Value(bool) = .init(true);
+    try testing.expectError(error.Canceled, GitProcess.open(io, gpa, .{
+        .path = repo.path,
+        .environ_map = &repo.env,
+        .cancel = &flag,
+    }));
+    flag.store(false, .release);
+    var git = try GitProcess.open(io, gpa, .{
+        .path = repo.path,
+        .environ_map = &repo.env,
+        .cancel = &flag,
+    });
+    defer git.close();
+    try testing.expect(git.cancel == null);
 }

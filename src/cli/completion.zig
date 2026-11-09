@@ -83,8 +83,12 @@ const command_helps = [_]struct { []const u8, []const u8 }{
     .{ "milestone", @import("cmd/milestone.zig").help },
     .{ "attach", @import("cmd/attach.zig").help },
     .{ "quarantine", @import("cmd/quarantine.zig").help },
+    .{ "react", @import("cmd/react.zig").help },
+    .{ "purge", @import("cmd/purge.zig").help },
+    .{ "push-check", @import("cmd/push_check.zig").help },
     .{ "completion", help },
-    .{ "tui", "usage: git issue tui\n\nInteractive terminal UI: a list, a kanban board, milestones, a timeline\nand a detail view.\n" ++
+    .{ "tui", "usage: git issue tui\n\nInteractive terminal UI: a list, a kanban board, " ++
+        "milestones, a timeline\nand a detail view.\n" ++
         "Press ? inside for the keys; the mouse works everywhere.\n\n" ++
         "Options:\n   -h, --help    Show this help\n" },
     .{ "mcp", @import("mcp_help").text },
@@ -164,7 +168,11 @@ fn commandLine(line: []const u8) ?struct { name: []const u8, desc: []const u8 } 
 
 /// The `<name>`s among the words of `line` from word `skip` on, up to a
 /// double space (where a description starts).
-fn placeholders(arena: Allocator, line: []const u8, skip: usize) Allocator.Error![]const Positional {
+fn placeholders(
+    arena: Allocator,
+    line: []const u8,
+    skip: usize,
+) Allocator.Error![]const Positional {
     var out: std.ArrayList(Positional) = .empty;
     const trimmed = std.mem.trimStart(u8, line, " ");
     const end = std.mem.find(u8, trimmed, "  ") orelse trimmed.len;
@@ -348,18 +356,28 @@ fn writeBash(arena: Allocator, w: *Writer, spec: Spec) Error!void {
             if (i > 0) try w.writeAll(" ");
             try writeJoined(w, o, " ");
         }
-        try w.print("\" ;;\n            *)\n                __git_issue_args \"$start\" \"{s}\"\n", .{
+        try w.print("\" ;;\n            *)\n" ++
+            "                __git_issue_args \"$start\" \"{s}\"\n", .{
             try c.takesValue(arena),
         });
         if (c.subcommands.len == 0) {
-            try bashPositionals(w, c.name, c.positionals, "${#__git_issue_words[@]}", "                ");
+            try bashPositionals(
+                w,
+                c.name,
+                c.positionals,
+                "${#__git_issue_words[@]}",
+                "                ",
+            );
         } else {
             try w.writeAll(
                 \\                local n=$((${#__git_issue_words[@]} - 1))
                 \\                if [ "$n" -lt 0 ]; then
                 \\                    __git_issue_reply "
             );
-            for (c.subcommands, 0..) |sub, i| try w.print("{s}{s}", .{ if (i > 0) " " else "", sub.name });
+            for (c.subcommands, 0..) |sub, i| try w.print(
+                "{s}{s}",
+                .{ if (i > 0) " " else "", sub.name },
+            );
             try w.writeAll(
                 \\"
                 \\                    return
@@ -505,9 +523,12 @@ fn writeZsh(w: *Writer, spec: Spec) Writer.Error!void {
         for (c.subcommands, 0..) |sub, i| {
             if (i > 0) try w.writeAll(" ");
             try w.print("{s}\\:", .{sub.name});
-            // In `((item\:desc ...))` a space or parenthesis ends a description.
+            // In `((item\:desc ...))` a space or parenthesis ends a
+            // description, and `_arguments` evaluates the list: a bare
+            // apostrophe would leave it unparsed, offering nothing.
             for (sub.desc) |ch| switch (ch) {
                 ' ', '(', ')' => try w.print("\\{c}", .{ch}),
+                '\'' => try w.writeAll("\\'\\''"),
                 else => try zshEscaped(w, &.{ch}),
             };
         }
@@ -614,13 +635,13 @@ fn writeFish(arena: Allocator, w: *Writer, spec: Spec) Error!void {
         \\
         \\# True when the next word is argument <index> (from 0, `1+`: or a
         \\# later one) of command <name>, or of its subcommand <sub> (`-`:
-        \\# none). Options and the values in $__git_issue_values_<name> aren't
+        \\# none). Options and the values in $__git_issue_values_<name> (`-` as `_`) aren't
         \\# arguments.
         \\function __git_issue_at -a name sub index
         \\    set -l tokens (commandline -opc)
         \\    test (count $tokens) -ge 2; and test "$tokens[2]" = $name; or return 1
         \\    set -e tokens[1..2]
-        \\    set -l values __git_issue_values_$name
+        \\    set -l values __git_issue_values_(string replace -a -- - _ $name)
         \\    set -l args
         \\    set -l skip 0
         \\    for t in $tokens
@@ -669,7 +690,12 @@ fn writeFish(arena: Allocator, w: *Writer, spec: Spec) Error!void {
             try w.writeAll("\n");
         }
         const values = try c.takesValue(arena);
-        if (values.len > 0) try w.print("set -g __git_issue_values_{s} {s}\n", .{ c.name, values });
+        // Fish variable names have no `-`: `push-check` is `push_check`.
+        if (values.len > 0) {
+            const var_name = try arena.dupe(u8, c.name);
+            std.mem.replaceScalar(u8, var_name, '-', '_');
+            try w.print("set -g __git_issue_values_{s} {s}\n", .{ var_name, values });
+        }
         if (c.subcommands.len == 0) {
             try fishPositionals(w, c.name, "-", c.positionals);
             continue;

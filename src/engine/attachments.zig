@@ -12,6 +12,7 @@
 //! up front with LfsUnavailable without it (see `ready`).
 
 const std = @import("std");
+const stableSort = @import("../sort.zig").stable;
 const Allocator = std.mem.Allocator;
 const contract = @import("../backend/contract.zig");
 const object = @import("../backend/object.zig");
@@ -25,6 +26,16 @@ const repo_mod = @import("repo.zig");
 const Oid = object.Oid;
 const Signature = object.Signature;
 pub const Attachment = issue_model.Attachment;
+
+/// Whether this repository has an attachment's bytes, and whole.
+pub const Availability = enum { local, missing, corrupt };
+
+/// An attachment as `Attachments(B).list` sees it.
+pub const Entry = struct {
+    attachment: Attachment,
+    availability: Availability,
+};
+
 pub const Media = fmt.Media;
 pub const Issue = issue_model.Issue;
 
@@ -42,6 +53,11 @@ pub const Upload = struct {
 pub const derived_identity_name = @import("sync.zig").merge_identity_name;
 pub const derived_identity_email = @import("sync.zig").merge_identity_email;
 pub const derived_subject = "Regenerate attachments";
+
+/// The derived ref of an issue's attachments, `refs/attachments/<id>`.
+pub fn refName(arena: Allocator, issue_id: []const u8) Allocator.Error![]const u8 {
+    return std.fmt.allocPrint(arena, "{s}{s}", .{ ref_prefix, issue_id });
+}
 
 pub fn Attachments(comptime B: type) type {
     return struct {
@@ -67,6 +83,9 @@ pub fn Attachments(comptime B: type) type {
             data: []const u8,
             /// Must match the bytes if given. Null takes it from the bytes.
             media: ?Media = null,
+            /// A v4 UUID the caller chose, e.g. the host's ID for the
+            /// upload. Null picks a random one.
+            id: ?[]const u8 = null,
         };
 
         pub const AddSpec = struct {
@@ -118,24 +137,23 @@ pub fn Attachments(comptime B: type) type {
 
         /// Stores the bytes, then writes one commit with an `X-Attachment`
         /// per file, and moves the derived ref with it.
-        pub fn add(self: Self, arena: Allocator, ref_name: []const u8, spec: AddSpec) Error!Added {
+        /// `options` as for `Repo.update`; a dry run stores no bytes.
+        pub fn add(
+            self_in: Self,
+            arena: Allocator,
+            ref_or_id: []const u8,
+            spec: AddSpec,
+            options: repo_mod.WriteOptions,
+        ) Error!Added {
+            const self = self_in.withOptions(options);
+            const ref_name = try repo_mod.refFor(arena, repo_mod.issue_ref_prefix, ref_or_id);
             try self.ready(arena);
             if (spec.files.len == 0) return error.NoAttachments;
             const specs = try arena.alloc(fmt.Spec, spec.files.len);
             const ids = try arena.alloc([]const u8, spec.files.len);
             for (spec.files, specs, ids) |f, *s, *id| {
-                const media = try self.validate(f);
-                var random: [16]u8 = undefined;
-                self.repo.backend.randomBytes(&random);
-                const uuid = uuid_fmt.Uuid.fromRandom(random);
-                id.* = try arena.dupe(u8, uuid.slice());
-                s.* = .{
-                    .id = id.*,
-                    .media = media,
-                    .size = @intCast(f.data.len),
-                    .sha256 = fmt.Sha256.of(f.data),
-                    .name = try fmt.sanitizeName(arena, f.name),
-                };
+                s.* = try self.prepare(arena, f);
+                id.* = s.id;
             }
             var tl: std.ArrayList(trailers.Trailer) = .empty;
             for (specs) |s| try tl.append(arena, .{
@@ -150,12 +168,13 @@ pub fn Attachments(comptime B: type) type {
             const message = try trailers.build(arena, split.subject, split.body, tl.items);
             // Bytes before the commit, so a failed commit leaves at most an
             // object nobody references (see `orphans`).
-            for (spec.files, specs) |f, s| try self.store(s.sha256, f.data);
-            const tip = try self.repo.appendWith(arena, ref_name, spec.author, spec.expect, Builder{
-                .self = self,
-                .text = message,
-                .added = specs,
-            });
+            if (!self.repo.call.dry_run) for (spec.files, specs) |f, s| try self.store(
+                s.sha256,
+                f.data,
+            );
+            const builder: Builder = .{ .self = self, .text = message, .added = specs };
+            const repo = self.repo;
+            const tip = try repo.appendIssue(arena, ref_name, spec.author, spec.expect, builder);
             return .{ .tip = tip, .ids = ids };
         }
 
@@ -167,14 +186,25 @@ pub fn Attachments(comptime B: type) type {
             if (t.len > self.repo.limits.max_body_bytes) return error.TooLong;
         }
 
-        /// The bytes stay, since history still references them.
+        /// The attachments with `options` for their next write.
+        fn withOptions(self: Self, options: repo_mod.WriteOptions) Self {
+            var me = self;
+            me.repo = self.repo.withOptions(options);
+            return me;
+        }
+
+        /// The bytes stay, since history still references them. `options`
+        /// as for `Repo.update`.
         pub fn remove(
-            self: Self,
+            self_in: Self,
             arena: Allocator,
-            ref_name: []const u8,
+            ref_or_id: []const u8,
             ids: []const []const u8,
             spec: ChangeSpec,
+            options: repo_mod.WriteOptions,
         ) Error!Oid {
+            const self = self_in.withOptions(options);
+            const ref_name = try repo_mod.refFor(arena, repo_mod.issue_ref_prefix, ref_or_id);
             try self.ready(arena);
             if (ids.len == 0) return error.NoAttachments;
             var tl: std.ArrayList(trailers.Trailer) = .empty;
@@ -186,27 +216,33 @@ pub fn Attachments(comptime B: type) type {
             const subject = repo_mod.givenMessage(spec.message) orelse
                 (if (ids.len == 1) "Remove attachment" else "Remove attachments");
             const split = repo_mod.splitMessage(subject);
-            return self.repo.appendWith(arena, ref_name, spec.author, spec.expect, Builder{
+            return self.repo.appendIssue(arena, ref_name, spec.author, spec.expect, Builder{
                 .self = self,
                 .text = try trailers.build(arena, split.subject, split.body, tl.items),
                 .removed = ids,
             });
         }
 
-        /// A new `X-Attachment` with the same object.
+        /// A new `X-Attachment` with the same object. `options` as for
+        /// `Repo.update`.
         pub fn rename(
-            self: Self,
+            self_in: Self,
             arena: Allocator,
-            ref_name: []const u8,
+            ref_or_id: []const u8,
             id: []const u8,
             name: []const u8,
             spec: ChangeSpec,
+            options: repo_mod.WriteOptions,
         ) Error!Oid {
+            const self = self_in.withOptions(options);
+            const ref_name = try repo_mod.refFor(arena, repo_mod.issue_ref_prefix, ref_or_id);
             try self.ready(arena);
             const clean = try fmt.sanitizeName(arena, name);
             try self.checkMessage(spec.message);
-            const split = repo_mod.splitMessage(repo_mod.givenMessage(spec.message) orelse "Rename attachment");
-            return self.repo.appendWith(arena, ref_name, spec.author, spec.expect, RenameBuilder{
+            const split = repo_mod.splitMessage(
+                repo_mod.givenMessage(spec.message) orelse "Rename attachment",
+            );
+            return self.repo.appendIssue(arena, ref_name, spec.author, spec.expect, RenameBuilder{
                 .id = id,
                 .name = clean,
                 .subject = split.subject,
@@ -222,14 +258,11 @@ pub fn Attachments(comptime B: type) type {
 
             pub fn message(b: Builder, arena: Allocator, current: Issue) Error![]const u8 {
                 _ = arena;
-                for (b.removed) |id| {
-                    if (findPresent(current, id) == null) return error.AttachmentNotFound;
-                }
-                // Removing must work on an issue over the limit, e.g. after
-                // concurrent adds.
-                const count = current.attachments.len + b.added.len;
-                if (b.added.len > 0 and count > b.self.repo.limits.max_attachments)
-                    return error.TooManyAttachments;
+                const changes: repo_mod.AttachmentChanges = .{
+                    .add = b.added,
+                    .remove = b.removed,
+                };
+                try changes.check(current, b.self.repo.limits);
                 return b.text;
             }
 
@@ -239,20 +272,78 @@ pub fn Attachments(comptime B: type) type {
                 current: Issue,
                 new_tip: Oid,
             ) Error![]const contract.RefUpdate {
-                var present: std.ArrayList(Pointer) = .empty;
-                for (current.attachments) |a| {
-                    if (labels_fmt.contains(b.removed, a.id)) continue;
-                    try present.append(arena, .fromAttachment(a));
-                }
-                for (b.added) |s| try present.append(arena, .{
-                    .id = s.id,
-                    .media = s.media,
-                    .size = s.size,
-                    .sha256 = s.sha256,
-                });
-                return b.self.derivedUpdate(arena, current.id, new_tip, present.items);
+                return b.self.derivedAfter(
+                    arena,
+                    current.id,
+                    current.attachments,
+                    new_tip,
+                    b.added,
+                    b.removed,
+                );
             }
         };
+
+        /// What a write that adds or removes attachments without storing
+        /// bytes needs: validated, hashed, named, with the given ID or a
+        /// random one. The bytes go to `storeBytes`, or the caller keeps
+        /// them (a host with its own LFS store).
+        pub fn prepare(self: Self, arena: Allocator, input: Input) Error!fmt.Spec {
+            const media = try self.validate(input);
+            const id = if (input.id) |given| blk: {
+                if (!uuid_fmt.isCanonical(given)) return error.InvalidValue;
+                break :blk try arena.dupe(u8, given);
+            } else blk: {
+                var random: [16]u8 = undefined;
+                self.repo.backend.randomBytes(&random);
+                const uuid = uuid_fmt.Uuid.fromRandom(random);
+                break :blk try arena.dupe(u8, uuid.slice());
+            };
+            return .{
+                .id = id,
+                .media = media,
+                .size = @intCast(input.data.len),
+                .sha256 = fmt.Sha256.of(input.data),
+                .name = try fmt.sanitizeName(arena, input.name),
+            };
+        }
+
+        /// The bytes of a prepared attachment, into this tool's store.
+        pub fn storeBytes(
+            self: Self,
+            arena: Allocator,
+            spec: fmt.Spec,
+            data: []const u8,
+        ) Error!void {
+            try self.ready(arena);
+            try self.store(spec.sha256, data);
+        }
+
+        /// Internal: the library's own plumbing, not API; it may change.
+        /// The derived ref's update for a write that adds and removes
+        /// attachments of issue `issue_id` (which had `before`) at
+        /// `new_tip`, in the same transaction.
+        pub fn derivedAfter(
+            self: Self,
+            arena: Allocator,
+            issue_id: []const u8,
+            before: []const Attachment,
+            new_tip: Oid,
+            added: []const fmt.Spec,
+            removed: []const []const u8,
+        ) Error![]const contract.RefUpdate {
+            var present: std.ArrayList(Pointer) = .empty;
+            for (before) |a| {
+                if (labels_fmt.contains(removed, a.id)) continue;
+                try present.append(arena, .fromAttachment(a));
+            }
+            for (added) |s| try present.append(arena, .{
+                .id = s.id,
+                .media = s.media,
+                .size = s.size,
+                .sha256 = s.sha256,
+            });
+            return self.derivedUpdate(arena, issue_id, new_tip, present.items);
+        }
 
         const RenameBuilder = struct {
             id: []const u8,
@@ -320,13 +411,6 @@ pub fn Attachments(comptime B: type) type {
             return if (matches(a, data)) .{ .bytes = data } else .corrupt;
         }
 
-        pub const Availability = enum { local, missing, corrupt };
-
-        pub const Entry = struct {
-            attachment: Attachment,
-            availability: Availability,
-        };
-
         pub const ListOptions = struct {
             /// Read and hash every object. Otherwise an object of the
             /// right size counts as `local` (when the backend can tell
@@ -355,10 +439,6 @@ pub fn Attachments(comptime B: type) type {
             return out;
         }
 
-        pub fn derivedRefName(arena: Allocator, issue_id: []const u8) Allocator.Error![]const u8 {
-            return std.fmt.allocPrint(arena, "{s}{s}", .{ ref_prefix, issue_id });
-        }
-
         pub const DerivedState = enum {
             /// Matches, or there are no attachments and no ref.
             ok,
@@ -370,7 +450,7 @@ pub fn Attachments(comptime B: type) type {
         };
 
         pub fn derivedState(self: Self, arena: Allocator, issue: Issue) Error!DerivedState {
-            const name = try derivedRefName(arena, issue.id);
+            const name = try refName(arena, issue.id);
             const tip = (try self.repo.backend.resolveRef(name)) orelse
                 return if (issue.attachments.len == 0) .ok else .absent;
             const pointers = try pointersOf(arena, issue.attachments);
@@ -465,15 +545,12 @@ pub fn Attachments(comptime B: type) type {
             issue_tip: Oid,
             pointers: []const Pointer,
         ) Error![]const contract.RefUpdate {
-            const name = try derivedRefName(arena, issue_id);
+            const name = try refName(arena, issue_id);
             const old = try self.repo.backend.resolveRef(name);
             const parents: []const Oid = if (old) |o| &.{o} else &.{};
             const oid = try self.derivedCommit(arena, issue_id, issue_tip, pointers, parents);
             const ops = try arena.alloc(contract.RefUpdate, 1);
-            ops[0] = .{ .name = name, .op = if (old) |o|
-                .{ .update = .{ .new = oid, .old = o } }
-            else
-                .{ .create = oid } };
+            ops[0] = .{ .name = name, .op = repo_mod.moveOp(old, oid) };
             return ops;
         }
 
@@ -490,34 +567,29 @@ pub fn Attachments(comptime B: type) type {
             const tree = try self.treeFor(arena, pointers, .write);
             const tip_commit = (try self.readCommit(arena, issue_tip)) orelse
                 return error.CorruptIssue;
-            const sig: Signature = .{
-                .name = derived_identity_name,
-                .email = derived_identity_email,
-                .time = tip_commit.committer.time,
-                .tz_offset_minutes = 0,
-            };
-            const hex = issue_tip.hex();
-            const message = try std.fmt.allocPrint(
+            const c = try derivedCommitOf(
                 arena,
-                "{s}\n\nX-Issue: {s}\nX-Issue-Tip: {s}\n",
-                .{ derived_subject, issue_id, hex.slice() },
+                issue_id,
+                issue_tip,
+                tip_commit.committer.time,
+                tree,
+                parents_in,
             );
-            const parents = try arena.dupe(Oid, parents_in);
-            std.mem.sort(Oid, parents, {}, struct {
-                fn lt(_: void, x: Oid, y: Oid) bool {
-                    return x.order(y) == .lt;
-                }
-            }.lt);
-            const c: object.Commit = .{
-                .tree = tree,
-                .parents = parents,
-                .author = sig,
-                .committer = sig,
-                .message = message,
-            };
             return self.repo.backend.writeObject(.commit, try c.serializeAlloc(arena));
         }
 
+        /// Internal: the library's own plumbing, not API; it may change.
+        /// The tree `attachments` derive, hashed only: checking must not
+        /// write objects.
+        pub fn derivedTree(
+            self: Self,
+            arena: Allocator,
+            attachments: []const Attachment,
+        ) Error!Oid {
+            return self.treeFor(arena, try pointersOf(arena, attachments), .hash_only);
+        }
+
+        /// Internal: the library's own plumbing, not API; it may change.
         /// Run by sync after merging the issue. Fast-forwards to the
         /// remote's derived ref when that one is right, so clones converge.
         /// Otherwise writes a commit on top of both tips, so the next push
@@ -529,21 +601,72 @@ pub fn Attachments(comptime B: type) type {
             issue: Issue,
             remote_tip_in: ?Oid,
         ) Error!bool {
+            return self.reconcileTo(arena, issue, remote_tip_in, false, false);
+        }
+
+        /// Internal: the library's own plumbing, not API; it may change.
+        /// When a derived ref has purged history (`hasOldTips`): the local
+        /// ref takes nothing from what has it and exists even with no
+        /// attachments left, so the next push replaces the remote's. Null
+        /// `remote_tip`: the remote's has it. `drop_local`: the local one has.
+        pub fn replacePurged(
+            self: Self,
+            arena: Allocator,
+            issue: Issue,
+            remote_tip: ?Oid,
+            drop_local: bool,
+        ) Error!bool {
+            return self.reconcileTo(arena, issue, remote_tip, true, drop_local);
+        }
+
+        /// Internal: the library's own plumbing, not API; it may change.
+        /// Whether a commit in `derived`'s history names an issue tip that
+        /// left `issue_tip`'s history: it predates a purge's rewrite, and
+        /// lists what the purge removed. Not a commit: false.
+        pub fn hasOldTips(self: Self, arena: Allocator, derived: Oid, issue_tip: Oid) Error!bool {
+            var seen: std.AutoHashMapUnmanaged([Oid.max_byte_len]u8, void) = .empty;
+            var stack: std.ArrayList(Oid) = .empty;
+            try stack.append(arena, derived);
+            while (stack.pop()) |oid| {
+                if ((try seen.getOrPut(arena, oid.bytes)).found_existing) continue;
+                // Anyone can push anything there: too long isn't ours.
+                if (seen.count() > self.repo.limits.max_commits_per_issue) return true;
+                const c = (try self.readCommit(arena, oid)) orelse continue;
+                if (!try self.namesTipIn(arena, oid, issue_tip)) return true;
+                try stack.appendSlice(arena, c.parents);
+            }
+            return false;
+        }
+
+        fn reconcileTo(
+            self: Self,
+            arena: Allocator,
+            issue: Issue,
+            remote_tip_in: ?Oid,
+            must_exist: bool,
+            drop_local: bool,
+        ) Error!bool {
             // Anyone can push anything there. What isn't a commit is
             // ignored, and the next push replaces it.
             const remote_tip = if (remote_tip_in) |r|
                 (if (try self.readCommit(arena, r) != null) r else null)
             else
                 null;
-            const name = try derivedRefName(arena, issue.id);
+            const name = try refName(arena, issue.id);
             const pointers = try pointersOf(arena, issue.attachments);
             const want = try self.treeFor(arena, pointers, .hash_only);
             var attempt: u8 = 0;
             while (attempt < self.repo.limits.cas_retries) : (attempt += 1) {
-                const local = try self.repo.backend.resolveRef(name);
-                if (local == null and remote_tip == null and issue.attachments.len == 0 and
-                    issue.removed_attachments.len == 0) return false;
-                const local_ok = if (local) |l| try self.treeIs(arena, l, want) else false;
+                const actual = try self.repo.backend.resolveRef(name);
+                const local = if (drop_local) null else actual;
+                if (!must_exist and local == null and remote_tip == null and
+                    issue.attachments.len == 0 and issue.removed_attachments.len == 0) return false;
+                // Also regenerated when the tip it names left the issue's
+                // history (a replaced history): a push check refuses it.
+                const local_ok = if (local) |l|
+                    try self.treeIs(arena, l, want) and try self.namesTipIn(arena, l, issue.tip)
+                else
+                    false;
                 const remote_in_local = if (remote_tip) |r| (if (local) |l|
                     r.eql(l) or try self.repo.backend.isAncestor(r, l)
                 else
@@ -574,10 +697,8 @@ pub fn Attachments(comptime B: type) type {
                         parents.items,
                     );
                 }
-                const op: contract.RefUpdate.Op = if (local) |l|
-                    .{ .update = .{ .new = target, .old = l } }
-                else
-                    .{ .create = target };
+                if (actual != null and actual.?.eql(target)) return false;
+                const op = repo_mod.moveOp(actual, target);
                 self.repo.backend.updateRefs(&.{.{ .name = name, .op = op }}) catch |e| switch (e) {
                     error.RefConflict => continue,
                     else => |x| return x,
@@ -585,6 +706,18 @@ pub fn Attachments(comptime B: type) type {
                 return true;
             }
             return error.ConcurrentModification;
+        }
+
+        /// Whether the derived commit's `X-Issue-Tip` is in the history of
+        /// `issue_tip`.
+        fn namesTipIn(self: Self, arena: Allocator, derived: Oid, issue_tip: Oid) Error!bool {
+            const c = (try self.readCommit(arena, derived)) orelse return false;
+            const block = try trailers.parse(arena, c.message, .{});
+            const hex = trailers.lastValue(block, "X-Issue-Tip") orelse return false;
+            const tip = Oid.parseHex(issue_tip.object_format, hex) catch return false;
+            if (tip.eql(issue_tip)) return true;
+            if (try self.readCommit(arena, tip) == null) return false;
+            return self.repo.backend.isAncestor(tip, issue_tip);
         }
 
         fn treeIs(self: Self, arena: Allocator, commit: Oid, tree: Oid) Error!bool {
@@ -626,7 +759,7 @@ pub fn Attachments(comptime B: type) type {
                     any = true;
                 };
                 if (!any) continue;
-                const name = try derivedRefName(arena, i.id);
+                const name = try refName(arena, i.id);
                 if (try self.derivedState(arena, i) == .ok) {
                     try refs.append(arena, name);
                     continue;
@@ -635,7 +768,7 @@ pub fn Attachments(comptime B: type) type {
                 const parents: []const Oid = if (old) |o| &.{o} else &.{};
                 const pointers = try pointersOf(arena, i.attachments);
                 const oid = try self.derivedCommit(arena, i.id, i.tip, pointers, parents);
-                try refs.append(arena, try arena.dupe(u8, oid.hex().slice()));
+                try refs.append(arena, try oid.hexAlloc(arena));
             }
             if (refs.items.len == 0) return .{ .fetched = 0, .missing = &.{} };
             var failed = false;
@@ -652,6 +785,7 @@ pub fn Attachments(comptime B: type) type {
             return .{ .fetched = fetched, .missing = missing.items, .transfer_failed = failed };
         }
 
+        /// Internal: the library's own plumbing, not API; it may change.
         /// IDs of the attachments a derived commit lists, e.g. what the
         /// remote's derived ref already has.
         pub fn derivedIds(self: Self, arena: Allocator, tip: Oid) Error![]const []const u8 {
@@ -668,6 +802,7 @@ pub fn Attachments(comptime B: type) type {
             return out.items;
         }
 
+        /// Internal: the library's own plumbing, not API; it may change.
         /// The bytes this clone has of `list`, deduplicated. Missing ones
         /// are skipped: whoever attached them uploaded them.
         pub fn uploads(
@@ -743,22 +878,58 @@ fn matches(a: Attachment, data: []const u8) bool {
 
 const testing = std.testing;
 const GitSim = @import("../backend/GitSim.zig");
+const TestRepo = @import("test_repo.zig").TestRepo;
 const samples = fmt.samples;
 
 fn latest(repo: repo_mod.Repo(GitSim), arena: Allocator, sim: *GitSim, name: []const u8) !Issue {
     return repo.load(arena, .{ .name = name, .tip = (try sim.resolveRef(name)).? });
 }
 
+/// Internal: the library's own plumbing, not API; it may change.
+/// The derived commit for an issue tip (§7): fixed identity, dated like
+/// the tip (`tip_time`), parents sorted by OID.
+pub fn derivedCommitOf(
+    arena: Allocator,
+    issue_id: []const u8,
+    issue_tip: Oid,
+    tip_time: i64,
+    tree: Oid,
+    parents_in: []const Oid,
+) Allocator.Error!object.Commit {
+    const sig: Signature = .{
+        .name = derived_identity_name,
+        .email = derived_identity_email,
+        .time = tip_time,
+        .tz_offset_minutes = 0,
+    };
+    const hex = issue_tip.hex();
+    const message = try std.fmt.allocPrint(
+        arena,
+        "{s}\n\nX-Issue: {s}\nX-Issue-Tip: {s}\n",
+        .{ derived_subject, issue_id, hex.slice() },
+    );
+    const parents = try arena.dupe(Oid, parents_in);
+    stableSort(Oid, parents, {}, struct {
+        fn lt(_: void, x: Oid, y: Oid) bool {
+            return x.order(y) == .lt;
+        }
+    }.lt);
+    return .{
+        .tree = tree,
+        .parents = parents,
+        .author = sig,
+        .committer = sig,
+        .message = message,
+    };
+}
+
 test "add, read, rename, remove" {
-    var arena_state: std.heap.ArenaAllocator = .init(testing.allocator);
-    defer arena_state.deinit();
-    const arena = arena_state.allocator();
-    var world: GitSim.World = .{ .seed = 61, .clones = &.{.{ .name = "a" }} };
-    var sim = try GitSim.init(arena, &world, 0);
-    const repo = repo_mod.Repo(GitSim).init(&sim);
+    var fx: TestRepo = .{};
+    defer fx.deinit();
+    const arena, const sim, const repo = try fx.open(61);
     const att = Attachments(GitSim).fromRepo(repo);
-    const created = try repo.create(arena, .{ .title = "Login broken" });
-    const ref = try std.fmt.allocPrint(arena, "refs/issues/{s}", .{created.id.slice()});
+    const created = try repo.create(arena, .{ .title = "Login broken" }, .{});
+    const ref = try std.fmt.allocPrint(arena, "refs/issues/{s}", .{created.id});
 
     const added = try att.add(arena, ref, .{
         .files = &.{
@@ -766,8 +937,8 @@ test "add, read, rename, remove" {
             .{ .name = "photo", .data = samples.jpeg, .media = .jpeg },
         },
         .comment = "The button is cut off.",
-    });
-    var issue = try latest(repo, arena, &sim, ref);
+    }, .{});
+    var issue = try latest(repo, arena, sim, ref);
     try testing.expect(issue.tip.eql(added.tip));
     try testing.expectEqual(@as(usize, 2), issue.attachments.len);
     try testing.expectEqualStrings("shot.png", issue.attachments[0].name);
@@ -781,7 +952,7 @@ test "add, read, rename, remove" {
     try testing.expectEqual(DerivedOk, try att.derivedState(arena, issue));
 
     // One LFS pointer per attachment.
-    const dname = try Attachments(GitSim).derivedRefName(arena, issue.id);
+    const dname = try refName(arena, issue.id);
     const dtip = (try sim.resolveRef(dname)).?;
     const dcommit = (try att.readCommit(arena, dtip)).?;
     const tree = (try sim.readObject(arena, dcommit.tree)).?;
@@ -791,9 +962,9 @@ test "add, read, rename, remove" {
     const header = "version https://git-lfs.github.com/spec/v1\n";
     try testing.expect(std.mem.startsWith(u8, blob.data, header));
 
-    _ = try att.rename(arena, ref, added.ids[0], "login.png", .{});
-    _ = try att.remove(arena, ref, &.{added.ids[1]}, .{});
-    issue = try latest(repo, arena, &sim, ref);
+    _ = try att.rename(arena, ref, added.ids[0], "login.png", .{}, .{});
+    _ = try att.remove(arena, ref, &.{added.ids[1]}, .{}, .{});
+    issue = try latest(repo, arena, sim, ref);
     try testing.expectEqual(@as(usize, 1), issue.attachments.len);
     try testing.expectEqualStrings("login.png", issue.attachments[0].name);
     try testing.expectEqual(@as(usize, 1), issue.removed_attachments.len);
@@ -801,11 +972,11 @@ test "add, read, rename, remove" {
     const dtip2 = (try sim.resolveRef(dname)).?;
     try testing.expect(try sim.isAncestor(dtip, dtip2)); // fast-forward
 
-    const gone = att.remove(arena, ref, &.{added.ids[1]}, .{});
+    const gone = att.remove(arena, ref, &.{added.ids[1]}, .{}, .{});
     try testing.expectError(error.AttachmentNotFound, gone);
     try testing.expectError(error.UnsupportedType, att.add(arena, ref, .{
         .files = &.{.{ .name = "x", .data = samples.text }},
-    }));
+    }, .{}));
     const animated = att.validate(.{ .name = "x", .data = samples.apng });
     try testing.expectError(error.AnimatedImage, animated);
     try testing.expectError(error.MediaMismatch, att.validate(.{
@@ -814,11 +985,11 @@ test "add, read, rename, remove" {
         .media = .webp,
     }));
     try testing.expectError(error.EmptyAttachment, att.validate(.{ .name = "x", .data = "" }));
-    try testing.expectError(error.NoAttachments, att.add(arena, ref, .{ .files = &.{} }));
+    try testing.expectError(error.NoAttachments, att.add(arena, ref, .{ .files = &.{} }, .{}));
     try testing.expectError(error.EmptyText, att.add(arena, ref, .{
         .files = &.{.{ .name = "a.png", .data = samples.png }},
         .comment = " \n ",
-    }));
+    }, .{}));
 
     const prefix = issue.attachments[0].id[0..6];
     try testing.expect(try Attachments(GitSim).find(arena, issue, prefix) == .one);
@@ -827,28 +998,29 @@ test "add, read, rename, remove" {
 const DerivedOk = Attachments(GitSim).DerivedState.ok;
 
 test "limits, missing bytes, repair, orphans" {
-    var arena_state: std.heap.ArenaAllocator = .init(testing.allocator);
-    defer arena_state.deinit();
-    const arena = arena_state.allocator();
-    var world: GitSim.World = .{ .seed = 62, .clones = &.{.{ .name = "a" }} };
-    var sim = try GitSim.init(arena, &world, 0);
-    var repo = repo_mod.Repo(GitSim).init(&sim);
+    var fx: TestRepo = .{};
+    defer fx.deinit();
+    const arena, const sim, _ = try fx.open(62);
+    var repo = repo_mod.Repo(GitSim).init(sim);
     repo.limits.max_attachments = 2;
     repo.limits.max_attachment_bytes = 64;
     const att = Attachments(GitSim).fromRepo(repo);
-    const created = try repo.create(arena, .{ .title = "Shots" });
-    const ref = try std.fmt.allocPrint(arena, "refs/issues/{s}", .{created.id.slice()});
+    const created = try repo.create(arena, .{ .title = "Shots" }, .{});
+    const ref = try std.fmt.allocPrint(arena, "refs/issues/{s}", .{created.id});
     try testing.expectError(error.AttachmentTooLarge, att.validate(.{
         .name = "big",
         .data = samples.png ++ "\x00" ** 64,
     }));
     const one: Attachments(GitSim).Input = .{ .name = "a.png", .data = samples.png };
-    _ = try att.add(arena, ref, .{ .files = &.{ one, one } });
-    try testing.expectError(error.TooManyAttachments, att.add(arena, ref, .{ .files = &.{one} }));
+    _ = try att.add(arena, ref, .{ .files = &.{ one, one } }, .{});
+    try testing.expectError(
+        error.TooManyAttachments,
+        att.add(arena, ref, .{ .files = &.{one} }, .{}),
+    );
 
     // Bytes only in git-lfs's store, as after a fresh clone and
     // `git lfs fetch`: read finds and adopts them.
-    var issue = try latest(repo, arena, &sim, ref);
+    var issue = try latest(repo, arena, sim, ref);
     const sha = issue.attachments[0].sha256.slice();
     for (sim.lfs.items) |*o| o.store = .git_lfs;
     switch (try att.read(arena, issue.attachments[0])) {
@@ -857,7 +1029,7 @@ test "limits, missing bytes, repair, orphans" {
     }
     try testing.expect(try sim.lfsSize(sha) != null);
     // Damaged at the same size: only a verifying list reads and sees it.
-    const Availability = Attachments(GitSim).Availability;
+
     for (sim.lfs.items) |*o| {
         const bad = try arena.dupe(u8, o.data);
         bad[bad.len - 1] ^= 1;
@@ -872,7 +1044,7 @@ test "limits, missing bytes, repair, orphans" {
     try testing.expectEqual(Availability.missing, entries[0].availability);
 
     // A deleted derived ref comes back with repair, once.
-    const dname = try Attachments(GitSim).derivedRefName(arena, issue.id);
+    const dname = try refName(arena, issue.id);
     const dtip = (try sim.resolveRef(dname)).?;
     try sim.updateRefs(&.{.{ .name = dname, .op = .{ .delete = dtip } }});
     const state = try att.derivedState(arena, issue);
@@ -882,7 +1054,140 @@ test "limits, missing bytes, repair, orphans" {
 
     // An object written by a failed add is an orphan.
     try sim.lfsWrite(fmt.Sha256.of(samples.webp).slice(), samples.webp);
-    issue = try latest(repo, arena, &sim, ref);
+    issue = try latest(repo, arena, sim, ref);
     const orphans = try att.orphans(arena, &.{issue});
     try testing.expectEqual(@as(usize, 1), orphans.len);
+}
+
+test "attachments in the commit of a write, bytes kept by the caller" {
+    var fx: TestRepo = .{};
+    defer fx.deinit();
+    const arena, const sim, const repo = try fx.open(63);
+    const att = Attachments(GitSim).fromRepo(repo);
+    const host_id = "5b0c4e0e-2b8a-4f5e-9d39-6c1c1f0f2a77";
+    try testing.expectError(error.InvalidValue, att.prepare(arena, .{
+        .name = "a.png",
+        .data = samples.png,
+        .id = "not-a-uuid",
+    }));
+
+    // On the root: the description's image, with the host's ID. Nothing
+    // is stored: the host keeps the bytes.
+    const shot = try att.prepare(
+        arena,
+        .{ .name = "shot.png", .data = samples.png, .id = host_id },
+    );
+    try testing.expectEqualStrings(host_id, shot.id);
+    try testing.expectError(error.AttachmentExists, repo.create(arena, .{
+        .title = "Twice",
+        .attachments = &.{ shot, shot },
+    }, .{}));
+    const created = try repo.create(
+        arena,
+        .{ .title = "Login broken", .attachments = &.{shot} },
+        .{},
+    );
+    const ref = try std.fmt.allocPrint(arena, "refs/issues/{s}", .{created.id});
+    var issue = try latest(repo, arena, sim, ref);
+    try testing.expectEqual(@as(usize, 1), issue.attachments.len);
+    try testing.expect(issue.attachments[0].added_in.eql(created.tip));
+    try testing.expectEqual(DerivedOk, try att.derivedState(arena, issue));
+    try testing.expectEqual(@as(usize, 0), sim.lfs.items.len);
+    try testing.expect(try att.read(arena, issue.attachments[0]) == .missing);
+
+    // A comment with an image, in one commit.
+    const photo = try att.prepare(arena, .{ .name = "photo.jpg", .data = samples.jpeg });
+    try att.storeBytes(arena, photo, samples.jpeg);
+    const commented = try repo.edit(arena, ref, .{
+        .comment = "Here it is.",
+        .attachments = .{ .add = &.{photo} },
+    }, .{});
+    issue = try latest(repo, arena, sim, ref);
+    const c = issue.comments[issue.comments.len - 1];
+    try testing.expect(c.oid.eql(commented.tip));
+    try testing.expectEqualStrings("Here it is.", c.subject);
+    try testing.expectEqual(@as(usize, 1), c.attachments.len);
+    try testing.expectEqual(DerivedOk, try att.derivedState(arena, issue));
+    try testing.expectError(error.AttachmentExists, repo.edit(arena, ref, .{
+        .attachments = .{ .add = &.{shot} },
+    }, .{}));
+
+    // A comment edit swaps its image; a description edit drops the root's.
+    const webp = try att.prepare(arena, .{ .name = "better.webp", .data = samples.webp });
+    _ = try repo.commentEvent(
+        arena,
+        ref,
+        .{
+            .target = commented.tip,
+            .event = .edit,
+            .text = "Here it is, sharper.",
+            .attachments = .{ .add = &.{webp}, .remove = &.{photo.id} },
+        },
+        .{},
+    );
+    try testing.expectError(
+        error.InvalidValue,
+        repo.commentEvent(
+            arena,
+            ref,
+            .{
+                .target = commented.tip,
+                .event = .delete,
+                .attachments = .{ .remove = &.{webp.id} },
+            },
+            .{},
+        ),
+    );
+    _ = try repo.edit(arena, ref, .{
+        .description = "No image any more.",
+        .attachments = .{ .remove = &.{host_id} },
+    }, .{});
+    issue = try latest(repo, arena, sim, ref);
+    try testing.expectEqual(@as(usize, 1), issue.attachments.len);
+    try testing.expectEqualStrings("better.webp", issue.attachments[0].name);
+    try testing.expectEqual(@as(usize, 2), issue.removed_attachments.len);
+    try testing.expectEqualStrings("Edit description", try trailers.subject(
+        arena,
+        (try att.readCommit(arena, issue.tip)).?.message,
+    ));
+    try testing.expectEqual(DerivedOk, try att.derivedState(arena, issue));
+    try testing.expectError(error.AttachmentNotFound, repo.edit(arena, ref, .{
+        .attachments = .{ .remove = &.{host_id} },
+    }, .{}));
+
+    // Alone: the subjects `add` and `remove` write.
+    const alone = try repo.edit(arena, ref, .{ .attachments = .{ .remove = &.{webp.id} } }, .{});
+    try testing.expectEqualStrings("Remove attachment", try trailers.subject(
+        arena,
+        (try att.readCommit(arena, alone.tip)).?.message,
+    ));
+    issue = try latest(repo, arena, sim, ref);
+    try testing.expectEqual(@as(usize, 0), issue.attachments.len);
+    try testing.expectEqual(DerivedOk, try att.derivedState(arena, issue));
+}
+
+test "add, remove, rename: a dry run stores no bytes and writes nothing" {
+    var fx: TestRepo = .{};
+    defer fx.deinit();
+    const arena, const sim, const repo = try fx.open(62);
+    const att = Attachments(GitSim).fromRepo(repo);
+    const created = try repo.create(arena, .{ .title = "Shots" }, .{});
+    const ref = try std.fmt.allocPrint(arena, "refs/issues/{s}", .{created.id});
+    const files = [_]Attachments(GitSim).Input{.{ .name = "shot.png", .data = samples.png }};
+
+    const dry = try att.add(arena, ref, .{ .files = &files }, .{ .dry_run = true });
+    try testing.expectEqual(@as(usize, 1), dry.ids.len);
+    try testing.expect(created.tip.eql((try sim.resolveRef(ref)).?));
+    const sha = fmt.Sha256.of(samples.png);
+    try testing.expect(try sim.lfsRead(arena, sha.slice()) == null);
+
+    const ada = "0c8d7a52-3f1e-4b6a-9d2c-5e4f3a2b1c0d";
+    const added = try att.add(arena, ref, .{ .files = &files }, .{ .author_id = ada });
+    const tip = try att.rename(arena, ref, added.ids[0], "s.png", .{}, .{ .dry_run = true });
+    try testing.expect(added.tip.eql((try sim.resolveRef(ref)).?));
+    try testing.expect(!tip.eql(added.tip));
+    _ = try att.remove(arena, ref, added.ids, .{}, .{ .dry_run = true });
+    try testing.expect(added.tip.eql((try sim.resolveRef(ref)).?));
+    const issue = try repo.load(arena, .{ .name = ref, .tip = added.tip });
+    try testing.expectEqualStrings(ada, issue_model.authorIdAt(issue.author_ids, added.tip).?);
 }

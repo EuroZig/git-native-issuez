@@ -1,5 +1,19 @@
 //! Git-native issue tracking, compatible with the git-native-issue format.
-//! See examples/ for complete programs.
+//! See examples/ for complete programs. `open` is the one entry: a
+//! repository with its settings and every part of the library over it.
+//!
+//! Zig has no package-private declarations, so the library's parts reach
+//! each other through `pub`. Those whose doc starts with "Internal:" are
+//! that plumbing: not API, they may change in any release.
+
+/// `build.zig.zon`'s version; built from a git checkout, with `git describe`'s
+/// distance and commit, and `-dirty` for uncommitted changes:
+/// `0.4.0-12-ga3e21cfa`. What `git issue version`, the MCP server,
+/// `issuez_version()` and the Go binding's `Version()` report.
+pub const version: []const u8 = @import("version").version;
+
+/// Internal: see sort.zig.
+pub const sort = @import("sort.zig");
 
 pub const backend = struct {
     pub const contract = @import("backend/contract.zig");
@@ -39,11 +53,52 @@ pub const Attachments = attachments.Attachments;
 pub const settings = @import("engine/settings.zig");
 pub const errors = @import("engine/errors.zig");
 pub const changes = @import("engine/changes.zig");
+pub const purge = @import("engine/purge.zig");
+pub const remote = @import("engine/remote.zig");
+pub const fsck = @import("engine/fsck.zig");
+pub const json = @import("engine/json.zig");
+pub const store = @import("engine/store.zig");
+pub const view = @import("engine/view.zig");
+pub const handle = @import("engine/handle.zig");
+pub const Handle = handle.Handle;
+/// A repository opened with its settings, every part of the library over
+/// it (`Handle`).
+pub const open = handle.open;
+pub const Store = store.Store;
+pub const push_check = @import("engine/push_check.zig");
+pub const PushCheck = push_check.PushCheck;
 pub const local_time = @import("engine/local_time.zig");
 pub const schedule = @import("engine/schedule.zig");
 pub const Settings = settings.Settings;
+/// The 7-character ID upstream prints, of an issue or milestone ID.
+pub const shortId = format.uuid.shortId;
+
+// The backends, and the types a caller names most, from where they live.
+pub const GitProcess = backend.GitProcess;
+pub const GitSim = backend.GitSim;
+pub const Oid = engine.Oid;
+pub const Signature = engine.Signature;
+pub const Issue = engine.Issue;
+pub const IssueRef = engine.IssueRef;
+pub const Resolution = engine.Resolution;
+pub const Limits = engine.Limits;
+pub const Created = engine.Created;
+pub const CreateSpec = engine.CreateSpec;
+pub const Update = engine.Update;
+pub const EditSpec = engine.EditSpec;
+pub const Edit = engine.Edit;
+pub const MilestoneEdit = engine.MilestoneEdit;
+pub const CommentSpec = engine.CommentSpec;
+pub const StateSpec = engine.StateSpec;
+pub const ReactSpec = engine.ReactSpec;
+pub const DeleteSpec = engine.DeleteSpec;
+pub const CommentEventSpec = engine.CommentEventSpec;
+pub const CommentEvent = engine.CommentEvent;
+pub const WriteOptions = engine.WriteOptions;
+pub const Receipt = engine.Receipt;
 
 test {
+    _ = sort;
     _ = backend.contract;
     _ = backend.object;
     _ = backend.GitProcess;
@@ -60,6 +115,14 @@ test {
     _ = model.issue;
     _ = engine;
     _ = sync;
+    _ = purge;
+    _ = remote;
+    _ = fsck;
+    _ = json;
+    _ = store;
+    _ = view;
+    _ = handle;
+    _ = push_check;
     _ = query;
     _ = projection;
     _ = milestone;

@@ -145,7 +145,12 @@ pub const Draft = struct {
     /// The issue's change, ops folded in order: dates and the rest as
     /// last set, blockers as added and removed. Not yet against the
     /// snapshot: see `issueChange`.
-    fn fold(d: *const Draft, arena: Allocator, id: []const u8, current_blockers: []const []const u8) Allocator.Error!?IssueChange {
+    fn fold(
+        d: *const Draft,
+        arena: Allocator,
+        id: []const u8,
+        current_blockers: []const []const u8,
+    ) Allocator.Error!?IssueChange {
         var out: IssueChange = .{ .id = .of(id) };
         var touched = false;
         var blockers: std.ArrayList([]const u8) = .empty;
@@ -163,7 +168,13 @@ pub const Draft = struct {
                 .milestone => |x| out.link = x.link,
                 .add_blocker => |x| {
                     blockers_touched = true;
-                    if (!labels_fmt.contains(blockers.items, x.blocker.slice())) try blockers.append(arena, try arena.dupe(u8, x.blocker.slice()));
+                    if (!labels_fmt.contains(
+                        blockers.items,
+                        x.blocker.slice(),
+                    )) try blockers.append(
+                        arena,
+                        try arena.dupe(u8, x.blocker.slice()),
+                    );
                 },
                 .remove_blocker => |x| {
                     blockers_touched = true;
@@ -179,8 +190,17 @@ pub const Draft = struct {
         if (blockers_touched) {
             var add: std.ArrayList(Id) = .empty;
             var remove: std.ArrayList(Id) = .empty;
-            for (blockers.items) |b| if (!labels_fmt.contains(current_blockers, b)) try add.append(arena, .of(b));
-            for (current_blockers) |b| if (!labels_fmt.contains(blockers.items, b)) try remove.append(arena, .of(b));
+            for (blockers.items) |b| if (!labels_fmt.contains(current_blockers, b)) try add.append(
+                arena,
+                .of(b),
+            );
+            for (current_blockers) |b| if (!labels_fmt.contains(
+                blockers.items,
+                b,
+            )) try remove.append(
+                arena,
+                .of(b),
+            );
             out.add = add.items;
             out.remove = remove.items;
         }
@@ -189,16 +209,21 @@ pub const Draft = struct {
 
     /// What the draft changes on issue `i`, against the snapshot; null
     /// when nothing.
-    pub fn issueChange(d: *const Draft, arena: Allocator, snap: *const Snapshot, i: u32) Allocator.Error!?IssueChange {
+    pub fn issueChange(
+        d: *const Draft,
+        arena: Allocator,
+        snap: *const Snapshot,
+        i: u32,
+    ) Allocator.Error!?IssueChange {
         const issue = snap.issues[i];
-        var c = (try d.fold(arena, issue.id, issue.ext.blocked_by)) orelse return null;
-        if (c.start) |v| if (optEql(v, issue.ext.start_date)) {
+        var c = (try d.fold(arena, issue.id, issue.blocked_by)) orelse return null;
+        if (c.start) |v| if (optEql(v, issue.start_date)) {
             c.start = null;
         };
-        if (c.due) |v| if (optEql(v, issue.ext.due_date)) {
+        if (c.due) |v| if (optEql(v, issue.due_date)) {
             c.due = null;
         };
-        if (c.estimate) |v| if (v == issue.ext.estimate_minutes) {
+        if (c.estimate) |v| if (v == issue.estimate_minutes) {
             c.estimate = null;
         };
         if (c.link) |l| if (l.eql(currentLink(snap, i))) {
@@ -256,10 +281,15 @@ pub const Draft = struct {
                 const c = (try d.issueChange(arena, snap, i)) orelse continue;
                 try issues.append(arena, c);
                 if (c.start != null or c.due != null) {
-                    const ext = snap.issues[i].ext;
+                    const ext = &snap.issues[i];
                     const start = if (c.start) |v| v else ext.start_date;
                     const due = if (c.due) |v| v else ext.due_date;
-                    if (start != null and due != null and start.?.order(due.?) == .gt) try inverted.append(arena, b.id);
+                    if (start != null and due != null and start.?.order(
+                        due.?,
+                    ) == .gt) try inverted.append(
+                        arena,
+                        b.id,
+                    );
                 }
                 if (!tipEql(b.tip, snap.issues[i].tip)) try stale.append(arena, b.id);
             } else if (snap.findMilestone(id)) |n| {
@@ -277,7 +307,9 @@ pub const Draft = struct {
                 if (snap.issues[i].deleted) break true;
             } else false;
             const milestone_gone = if (c.link) |l| switch (l) {
-                .id => |m| if (snap.findMilestone(m.slice())) |n| snap.milestones[n].status != .open else true,
+                .id => |m| if (snap.findMilestone(
+                    m.slice(),
+                )) |n| snap.milestones[n].status != .open else true,
                 else => false,
             } else false;
             if (blocker_gone or milestone_gone) try dangling.append(arena, c.id);
@@ -295,13 +327,17 @@ pub const Draft = struct {
 
     /// The changed issues that would wait on themselves: blockers as the
     /// snapshot has them, with the changes' added and removed.
-    fn loops(arena: Allocator, snap: *const Snapshot, changes: []const IssueChange) Allocator.Error![]const Id {
+    fn loops(
+        arena: Allocator,
+        snap: *const Snapshot,
+        changes: []const IssueChange,
+    ) Allocator.Error![]const Id {
         const Graph = struct {
             snap: *const Snapshot,
             changes: []const IssueChange,
 
             fn blockers(g: @This(), arena_: Allocator, i: u32) Allocator.Error![]const []const u8 {
-                const current = g.snap.issues[i].ext.blocked_by;
+                const current = g.snap.issues[i].blocked_by;
                 const c = for (g.changes) |*c| {
                     if (c.id.eql(g.snap.issues[i].id)) break c;
                 } else return current;
@@ -346,7 +382,11 @@ pub const Draft = struct {
     /// what is there.
     pub fn rebase(d: *Draft, snap: *const Snapshot, id: []const u8) void {
         const b = d.baseOf(id) orelse return;
-        if (snap.find(id)) |i| b.tip = snap.issues[i].tip else if (snap.findMilestone(id)) |n| b.tip = snap.milestones[n].tip;
+        if (snap.find(
+            id,
+        )) |i| b.tip = snap.issues[i].tip else if (snap.findMilestone(
+            id,
+        )) |n| b.tip = snap.milestones[n].tip;
     }
 };
 
@@ -362,8 +402,11 @@ fn tipEql(a: ?Oid, b: ?Oid) bool {
 
 /// How the issue gets its milestone now, as a draft link.
 pub fn currentLink(snap: *const Snapshot, i: u32) Link {
-    const ext = snap.issues[i].ext;
-    const mode = issuez.format.fields.MilestoneMode.of(ext.milestone_mode, ext.milestone_id != null, snap.proj.parent[i] != none);
+    const ext = &snap.issues[i];
+    const mode = issuez.format.fields.MilestoneMode.of(
+        ext.milestone_mode,
+        .{ .has_id = ext.milestone_id != null, .has_parent = snap.proj.parent[i] != none },
+    );
     return switch (mode) {
         .explicit => if (ext.milestone_id) |m| .{ .id = .of(m) } else .none,
         .inherit => .inherit,
@@ -373,7 +416,11 @@ pub fn currentLink(snap: *const Snapshot, i: u32) Link {
 
 /// Each issue's effective milestone with the draft's links: a link of its
 /// own, else its parent's, as the projection walks it.
-pub fn effectiveMilestones(arena: Allocator, d: *const Draft, snap: *const Snapshot) Allocator.Error![]const ?[]const u8 {
+pub fn effectiveMilestones(
+    arena: Allocator,
+    d: *const Draft,
+    snap: *const Snapshot,
+) Allocator.Error![]const ?[]const u8 {
     const n = snap.issues.len;
     const out = try arena.alloc(?[]const u8, n);
     const state = try arena.alloc(enum(u2) { todo, busy, done }, n);
@@ -407,7 +454,11 @@ pub fn effectiveMilestones(arena: Allocator, d: *const Draft, snap: *const Snaps
                 else => null,
             };
             if (own) |l| switch (l) {
-                .id => |id| break if (snap.findMilestone(id.slice())) |m| (if (snap.milestones[m].status == .retired) null else snap.milestones[m].id) else null,
+                .id => |id| {
+                    const m = snap.findMilestone(id.slice()) orelse break null;
+                    const ms = snap.milestones[m];
+                    break if (ms.status == .retired) null else ms.id;
+                },
                 .none => break null,
                 .inherit => {
                     const p = snap.proj.parent[cur];
@@ -443,17 +494,31 @@ test "a draft adds up its ops, undoes and redoes them" {
     try st.reload();
     const a = try st.create(.{ .title = "A" });
     const b = try st.create(.{ .title = "B" });
-    try st.edit(a.slice(), .{ .start_date = "2026-11-02", .due_date = "2026-11-06" });
-    const v1 = try st.createMilestone(.{ .name = "v1", .due = "2026-12-01" });
+    try st.edit(
+        a.slice(),
+        .{
+            .start_date = .{ .set = issuez.format.fields.Date.parse("2026-11-02").? },
+            .due_date = .{ .set = issuez.format.fields.Date.parse("2026-11-06").? },
+        },
+    );
+    const v1 = try st.createMilestone(.{ .name = "v1", .due = .parse("2026-12-01") });
     const snap = &st.snap;
     const ia = snap.find(a.slice()).?;
 
     var d: Draft = .{};
     defer d.deinit(testing.allocator);
     const D = Date.parse;
-    try d.push(testing.allocator, .{ .dates = .{ .id = a, .start = D("2026-11-03"), .due = D("2026-11-07") } }, snap.issues[ia].tip);
+    try d.push(
+        testing.allocator,
+        .{ .dates = .{ .id = a, .start = D("2026-11-03"), .due = D("2026-11-07") } },
+        snap.issues[ia].tip,
+    );
     try d.push(testing.allocator, .{ .add_blocker = .{ .id = a, .blocker = b } }, null);
-    try d.push(testing.allocator, .{ .milestone_due = .{ .id = v1, .due = D("2026-12-08") } }, snap.milestones[0].tip);
+    try d.push(
+        testing.allocator,
+        .{ .milestone_due = .{ .id = v1, .due = D("2026-12-08") } },
+        snap.milestones[0].tip,
+    );
     var p = try d.plan(arena, snap);
     try testing.expectEqual(@as(usize, 2), p.count());
     try testing.expect(p.issues[0].start.?.?.eql(D("2026-11-03").?));
@@ -461,7 +526,11 @@ test "a draft adds up its ops, undoes and redoes them" {
     try testing.expectEqual(@as(usize, 0), p.stale.len);
 
     // Moved back: no date change left, the blocker stays.
-    try d.push(testing.allocator, .{ .dates = .{ .id = a, .start = D("2026-11-02"), .due = D("2026-11-06") } }, null);
+    try d.push(
+        testing.allocator,
+        .{ .dates = .{ .id = a, .start = D("2026-11-02"), .due = D("2026-11-06") } },
+        null,
+    );
     p = try d.plan(arena, snap);
     try testing.expect(p.issues[0].start == null and p.issues[0].due == null);
     // Undo the move back, then the milestone: one change.
@@ -521,16 +590,29 @@ test "a date change keeps the other date as it is there now" {
     defer st.deinit();
     try st.reload();
     const a = try st.create(.{ .title = "A" });
-    try st.edit(a.slice(), .{ .start_date = "2026-11-02", .due_date = "2026-11-06" });
+    try st.edit(
+        a.slice(),
+        .{
+            .start_date = .{ .set = issuez.format.fields.Date.parse("2026-11-02").? },
+            .due_date = .{ .set = issuez.format.fields.Date.parse("2026-11-06").? },
+        },
+    );
     const D = Date.parse;
     const ia = st.snap.find(a.slice()).?;
 
     var d: Draft = .{};
     defer d.deinit(testing.allocator);
     // The user moves the start only.
-    try d.push(testing.allocator, .{ .dates = .{ .id = a, .start = D("2026-11-03") } }, st.snap.issues[ia].tip);
+    try d.push(
+        testing.allocator,
+        .{ .dates = .{ .id = a, .start = D("2026-11-03") } },
+        st.snap.issues[ia].tip,
+    );
     // Someone else moves the due date; the user keeps theirs.
-    try st.edit(a.slice(), .{ .due_date = "2026-11-20" });
+    try st.edit(
+        a.slice(),
+        .{ .due_date = .{ .set = issuez.format.fields.Date.parse("2026-11-20").? } },
+    );
     try testing.expectEqual(@as(usize, 1), (try d.plan(arena, &st.snap)).stale.len);
     d.rebase(&st.snap, a.slice());
     var p = try d.plan(arena, &st.snap);
@@ -541,7 +623,10 @@ test "a date change keeps the other date as it is there now" {
     try testing.expectEqual(@as(usize, 0), p.inverted.len);
 
     // Their due date moved before the user's start: refused when applied.
-    try st.edit(a.slice(), .{ .due_date = "2026-11-01" });
+    try st.edit(
+        a.slice(),
+        .{ .due_date = .{ .set = issuez.format.fields.Date.parse("2026-11-01").? } },
+    );
     d.rebase(&st.snap, a.slice());
     p = try d.plan(arena, &st.snap);
     try testing.expectEqual(@as(usize, 1), p.inverted.len);
@@ -560,10 +645,18 @@ test "staged again after undoing all, an issue expects what is there now" {
     const D = Date.parse;
     var d: Draft = .{};
     defer d.deinit(testing.allocator);
-    try d.push(testing.allocator, .{ .dates = .{ .id = a, .due = D("2026-11-03") } }, st.snap.issues[st.snap.find(a.slice()).?].tip);
+    try d.push(
+        testing.allocator,
+        .{ .dates = .{ .id = a, .due = D("2026-11-03") } },
+        st.snap.issues[st.snap.find(a.slice()).?].tip,
+    );
     try testing.expect(d.undo());
     try st.edit(a.slice(), .{ .title = "A, renamed" });
-    try d.push(testing.allocator, .{ .dates = .{ .id = a, .due = D("2026-11-04") } }, st.snap.issues[st.snap.find(a.slice()).?].tip);
+    try d.push(
+        testing.allocator,
+        .{ .dates = .{ .id = a, .due = D("2026-11-04") } },
+        st.snap.issues[st.snap.find(a.slice()).?].tip,
+    );
     try testing.expectEqual(@as(usize, 0), (try d.plan(arena, &st.snap)).stale.len);
 }
 
@@ -603,15 +696,27 @@ test "plan: what a draft points at gone or closed elsewhere, and blocker loops" 
     try testing.expectEqual(@as(usize, 0), p.loops.len);
     // So does removing the snapshot's B → A in the draft.
     try d.push(testing.allocator, .{ .add_blocker = .{ .id = c, .blocker = b } }, tip(&st.snap, c));
-    try d.push(testing.allocator, .{ .remove_blocker = .{ .id = b, .blocker = a } }, tip(&st.snap, b));
+    try d.push(
+        testing.allocator,
+        .{ .remove_blocker = .{ .id = b, .blocker = a } },
+        tip(&st.snap, b),
+    );
     p = try d.plan(arena, &st.snap);
     try testing.expectEqual(@as(usize, 0), p.loops.len);
 
     // A blocker that is gone, and a milestone retired since.
     d.clear();
     const gone: Id = .of("ffffffff-ffff-4fff-bfff-ffffffffffff");
-    try d.push(testing.allocator, .{ .add_blocker = .{ .id = a, .blocker = gone } }, tip(&st.snap, a));
-    try d.push(testing.allocator, .{ .milestone = .{ .id = b, .link = .{ .id = v1 } } }, tip(&st.snap, b));
+    try d.push(
+        testing.allocator,
+        .{ .add_blocker = .{ .id = a, .blocker = gone } },
+        tip(&st.snap, a),
+    );
+    try d.push(
+        testing.allocator,
+        .{ .milestone = .{ .id = b, .link = .{ .id = v1 } } },
+        tip(&st.snap, b),
+    );
     p = try d.plan(arena, &st.snap);
     try testing.expectEqual(@as(usize, 1), p.dangling.len);
     try testing.expect(p.dangling[0].eql(a.slice()));

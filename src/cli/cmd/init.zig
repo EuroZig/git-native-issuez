@@ -25,54 +25,26 @@ pub const help =
     \\
 ;
 
-/// Upstream's refspec. Forced and direct, so fetching can drop unpushed
-/// issue commits.
-pub const unsafe_refspec = "+refs/issues/*:refs/issues/*";
-
-pub fn milestoneRefspec(arena: std.mem.Allocator, remote: []const u8) ![]const u8 {
-    return std.fmt.allocPrint(arena, "+refs/milestones/*:refs/remotes/{s}/milestones/*", .{remote});
-}
-
-pub fn attachmentRefspec(arena: std.mem.Allocator, remote: []const u8) ![]const u8 {
-    const spec = "+refs/attachments/*:refs/remotes/{s}/attachments/*";
-    return std.fmt.allocPrint(arena, spec, .{remote});
-}
-
-pub fn stagingRefspec(arena: std.mem.Allocator, remote: []const u8) ![]const u8 {
-    return std.fmt.allocPrint(arena, "+refs/issues/*:refs/remotes/{s}/issues/*", .{remote});
-}
+const remote_mod = @import("issuez").remote;
 
 pub fn main(comptime B: type, ctx: *context.Context(B), argv: []const []const u8) u8 {
     const arena = ctx.arena;
     var remote_arg: ?[]const u8 = null;
     var fix = false;
-    var args: common.Args = .{ .list = argv };
-    while (args.next()) |arg| {
-        if (!args.isOption(arg)) {
-            if (args.was_separator) continue;
-            // Upstream silently takes the last one.
-            if (remote_arg != null) return common.missing(
-                ctx.err,
-                "init",
-                "only one remote can be given",
-            );
-            remote_arg = arg;
-        } else if (common.isHelp(arg)) {
-            ctx.out.writeAll(help) catch {};
-            return common.exit_ok;
-        } else if (std.mem.eql(u8, arg, "--fix-refspec")) {
-            fix = true;
-        } else {
-            return common.unknownOption(ctx.err, "init", arg);
-        }
-    }
+    if (common.parseArgs(ctx, argv, .{
+        .command = "init",
+        .help = help,
+        // Upstream silently takes the last one.
+        .positionals = .{ .only = .{ &remote_arg, "only one remote can be given" } },
+        .flags = &.{.{ "--fix-refspec", .{ .on = &fix } }},
+    })) |exit| return exit;
 
     const repo = common.openRepoQuiet(B, ctx) orelse return common.exit_fatal;
     const backend = repo.backend;
-    const remotes = backend.remoteNames(arena) catch return gitError(ctx);
+    const found = remote_mod.default(B, arena, backend) catch return gitError(ctx);
 
-    const remote = remote_arg orelse switch (remotes.len) {
-        0 => {
+    const remote = remote_arg orelse switch (found) {
+        .none => {
             ctx.err.writeAll(
                 \\git-issue: No remotes configured.
                 \\
@@ -88,15 +60,11 @@ pub fn main(comptime B: type, ctx: *context.Context(B), argv: []const []const u8
             ) catch {};
             return common.exit_ok;
         },
-        1 => blk: {
-            ctx.out.print("git-issue: Auto-detected remote '{s}'\n", .{remotes[0]}) catch {};
-            break :blk remotes[0];
+        .one => |r| blk: {
+            ctx.out.print("git-issue: Auto-detected remote '{s}'\n", .{r}) catch {};
+            break :blk r;
         },
-        else => blk: {
-            for (remotes) |r| if (std.mem.eql(u8, r, "origin")) {
-                ctx.out.writeAll("git-issue: Auto-detected remote 'origin'\n") catch {};
-                break :blk "origin";
-            };
+        .many => |remotes| {
             ctx.err.writeAll(
                 "git-issue: Multiple remotes found. Please specify which one to use:\n",
             ) catch {};
@@ -109,54 +77,23 @@ pub fn main(comptime B: type, ctx: *context.Context(B), argv: []const []const u8
         },
     };
 
-    var exists = false;
-    for (remotes) |r| if (std.mem.eql(u8, r, remote)) {
-        exists = true;
+    const options: remote_mod.Options = .{ .fix_unsafe = fix };
+    const setup = remote_mod.configure(B, arena, backend, remote, options) catch |e| {
+        if (e == error.NoSuchRemote or e == error.InvalidRemoteName) {
+            ctx.err.print("error: remote '{s}' does not exist\n", .{remote}) catch {};
+            const remotes = backend.remoteNames(arena) catch &.{};
+            const list = std.mem.join(arena, ", ", remotes) catch "";
+            ctx.err.print("       available remotes: {s}\n", .{list}) catch {};
+            return common.exit_error;
+        }
+        if (e == error.OutOfMemory) return common.oom(ctx.err);
+        return gitError(ctx);
     };
-    if (!exists) {
-        ctx.err.print("error: remote '{s}' does not exist\n", .{remote}) catch {};
-        const list = std.mem.join(arena, ", ", remotes) catch "";
-        ctx.err.print("       available remotes: {s}\n", .{list}) catch {};
-        return common.exit_error;
-    }
-
-    const key = std.fmt.allocPrint(
-        arena,
-        "remote.{s}.fetch",
-        .{remote},
-    ) catch return common.oom(ctx.err);
-    const staging = stagingRefspec(arena, remote) catch return common.oom(ctx.err);
-    const fetch = backend.configGetAll(arena, key) catch return gitError(ctx);
-    var has_staging = false;
-    var has_unsafe = false;
-    const milestones = milestoneRefspec(arena, remote) catch return common.oom(ctx.err);
-    var has_milestones = false;
-    const attachments = attachmentRefspec(arena, remote) catch return common.oom(ctx.err);
-    var has_attachments = false;
-    for (fetch) |spec| {
-        if (std.mem.eql(u8, spec, staging)) has_staging = true;
-        if (std.mem.eql(u8, spec, milestones)) has_milestones = true;
-        if (std.mem.eql(u8, spec, attachments)) has_attachments = true;
-        if (std.mem.eql(
-            u8,
-            std.mem.trimStart(u8, spec, "+"),
-            unsafe_refspec[1..],
-        )) has_unsafe = true;
-    }
-
-    if (has_unsafe and fix) {
-        backend.configUnsetValue(key, unsafe_refspec) catch return gitError(ctx);
-        backend.configUnsetValue(key, unsafe_refspec[1..]) catch return gitError(ctx);
-        has_unsafe = false;
-        ctx.out.print(
-            "git-issue: removed the unsafe refspec '{s}' from {s}.\n",
-            .{ unsafe_refspec, remote },
-        ) catch {};
-    }
-    if (!has_milestones) backend.configAdd(key, milestones) catch return gitError(ctx);
-    if (!has_attachments) backend.configAdd(key, attachments) catch return gitError(ctx);
-    if (!has_staging) {
-        backend.configAdd(key, staging) catch return gitError(ctx);
+    if (setup.removed_unsafe) ctx.out.print(
+        "git-issue: removed the unsafe refspec '{s}' from {s}.\n",
+        .{ remote_mod.unsafe_refspec, remote },
+    ) catch {};
+    if (setup.configured) {
         ctx.out.print(
             "git-issue: configured. Issues will be fetched from {s} into " ++
                 "refs/remotes/{s}/issues/.\n",
@@ -166,13 +103,13 @@ pub fn main(comptime B: type, ctx: *context.Context(B), argv: []const []const u8
     } else if (!fix) {
         ctx.out.print("git-issue: already configured for remote '{s}'.\n", .{remote}) catch {};
     }
-    if (has_unsafe) {
+    if (setup.unsafe) {
         ctx.err.print(
             "warning: remote '{s}' also has '{s}' (set by upstream git-issue init).\n" ++
                 "         A plain 'git fetch' then overwrites local issue refs and can drop\n" ++
                 "         unpushed issue changes. Run 'git issue init {s} --fix-refspec'\n" ++
                 "         to remove it.\n",
-            .{ remote, unsafe_refspec, remote },
+            .{ remote, remote_mod.unsafe_refspec, remote },
         ) catch {};
     }
     return common.exit_ok;

@@ -81,7 +81,7 @@ pub const Summary = struct {
             .quarantined => if (!e.kept_local) {
                 s.quarantined += 1;
             },
-            .up_to_date, .local_ahead => {},
+            .up_to_date, .local_ahead, .purged => {},
         };
         for (r.entries) |e| {
             if (e.conflicts.len > 0) s.conflicts += 1;
@@ -92,7 +92,8 @@ pub const Summary = struct {
 /// How long one ssh connection is kept for the next sync to reuse.
 pub const ssh_persist_s = 300;
 
-const ssh_base = "ssh -o BatchMode=yes -o ConnectTimeout=15 -o ServerAliveInterval=15 -o ServerAliveCountMax=2";
+const ssh_base =
+    "ssh -o BatchMode=yes -o ConnectTimeout=15 -o ServerAliveInterval=15 -o ServerAliveCountMax=2";
 
 /// The ssh the sync's git runs, unless the user set their own: it never
 /// prompts (the terminal is the TUI's), and gives up on a host that
@@ -121,7 +122,12 @@ const socket_suffix = 1 + 40 + 1 + 16;
 /// and closed to everyone else. Short enough for the sockets too.
 pub fn controlDir(io: std.Io, buf: []u8, runtime_dir: ?[]const u8, uid: u32) ?[:0]const u8 {
     const dir = if (runtime_dir) |r|
-        std.fmt.bufPrintSentinel(buf, "{s}/issuez", .{std.mem.trimEnd(u8, r, "/")}, 0) catch return null
+        std.fmt.bufPrintSentinel(
+            buf,
+            "{s}/issuez",
+            .{std.mem.trimEnd(u8, r, "/")},
+            0,
+        ) catch return null
     else
         std.fmt.bufPrintSentinel(buf, "/tmp/issuez-{d}", .{uid}, 0) catch return null;
     if (dir.len + socket_suffix + 1 > max_socket_path or !std.fs.path.isAbsolute(dir)) return null;
@@ -144,7 +150,13 @@ fn isPrivateDir(path: [*:0]const u8, uid: u32) bool {
     if (builtin.os.tag == .linux) {
         const linux = std.os.linux;
         var stx: linux.Statx = undefined;
-        const rc = linux.statx(linux.AT.FDCWD, path, linux.AT.SYMLINK_NOFOLLOW, .{ .TYPE = true, .MODE = true, .UID = true }, &stx);
+        const rc = linux.statx(
+            linux.AT.FDCWD,
+            path,
+            linux.AT.SYMLINK_NOFOLLOW,
+            .{ .TYPE = true, .MODE = true, .UID = true },
+            &stx,
+        );
         if (linux.errno(rc) != .SUCCESS) return false;
         return linux.S.ISDIR(stx.mode) and stx.uid == uid and stx.mode & 0o077 == 0;
     } else {
@@ -195,10 +207,18 @@ pub fn run(
     const err: anyerror = blk: {
         switch (kind) {
             .sync => {
-                const merged = s.merge(arena, remote, .{ .progress = progress }) catch |e| break :blk e;
+                const merged = s.merge(
+                    arena,
+                    remote,
+                    .{ .progress = progress },
+                ) catch |e| break :blk e;
                 out.add(merged);
                 out.fetched = true;
-                const pushed = s.pushFetched(arena, remote, .{ .progress = progress }) catch |e| break :blk e;
+                const pushed = s.push(
+                    arena,
+                    remote,
+                    .{ .progress = progress, .fetch = false },
+                ) catch |e| break :blk e;
                 out.outgoing = @intCast(pushed.pushed);
                 for (pushed.merges) |m| out.add(m);
             },
@@ -207,8 +227,8 @@ pub fn run(
                 out.fetched = true;
             },
             .push => {
-                const options: sync.PushOptions = .{ .progress = progress };
-                const pushed = (if (fetched) s.pushFetched(arena, remote, options) else s.pushWith(arena, remote, options)) catch |e| break :blk e;
+                const options: sync.PushOptions = .{ .progress = progress, .fetch = !fetched };
+                const pushed = s.push(arena, remote, options) catch |e| break :blk e;
                 out.outgoing = @intCast(pushed.pushed);
                 for (pushed.merges) |m| out.add(m);
             },
@@ -227,10 +247,16 @@ fn describe(comptime B: type, backend: *B, out: *Summary, err: anyerror, remote:
         break :blk it.first();
     } else null;
     const hint: []const u8 = if (last) |l|
-        if (std.ascii.findIgnoreCase(l, "passphrase") != null or std.mem.find(u8, l, "Permission denied (") != null or
+        if (std.ascii.findIgnoreCase(
+            l,
+            "passphrase",
+        ) != null or std.mem.find(u8, l, "Permission denied (") != null or
             std.ascii.findIgnoreCase(l, "Host key verification") != null)
             " (ssh can't ask here: ssh-add the key, or run git issue sync in a terminal once)"
-        else if (std.ascii.findIgnoreCase(l, "terminal prompts disabled") != null or std.ascii.findIgnoreCase(l, "could not read Username") != null)
+        else if (std.ascii.findIgnoreCase(
+            l,
+            "terminal prompts disabled",
+        ) != null or std.ascii.findIgnoreCase(l, "could not read Username") != null)
             " (the remote wants credentials: set up a credential helper)"
         else
             ""
@@ -241,14 +267,23 @@ fn describe(comptime B: type, backend: *B, out: *Summary, err: anyerror, remote:
         else => if (last) |l|
             out.fail("{s} with {s} failed: {s}{s}", .{ out.kind.label(), remote, l, hint })
         else
-            out.fail("{s} with {s} failed: {f}", .{ out.kind.label(), remote, issuez.errors.Description{ .err = err, .limits = .{} } }),
+            out.fail(
+                "{s} with {s} failed: {f}",
+                .{
+                    out.kind.label(),
+                    remote,
+                    issuez.errors.Description{ .err = err, .limits = .{} },
+                },
+            ),
     }
 }
 
 test sshCommand {
     var buf: [256]u8 = undefined;
     try std.testing.expectEqualStrings(
-        "ssh -o BatchMode=yes -o ConnectTimeout=15 -o ServerAliveInterval=15 -o ServerAliveCountMax=2 -o ControlMaster=auto -o ControlPath=/run/user/501/issuez/%C -o ControlPersist=300",
+        "ssh -o BatchMode=yes -o ConnectTimeout=15 -o ServerAliveInterval=15 " ++
+            "-o ServerAliveCountMax=2 -o ControlMaster=auto " ++
+            "-o ControlPath=/run/user/501/issuez/%C -o ControlPersist=300",
         sshCommand(&buf, "/run/user/501/issuez"),
     );
     try std.testing.expectEqualStrings(ssh_base, sshCommand(&buf, null));
@@ -260,7 +295,11 @@ test controlDir {
     // Short, unlike the test's temporary directory: socket paths are.
     var root_buf: [64]u8 = undefined;
     const t = std.Io.Timestamp.now(io, .real);
-    const root = try std.fmt.bufPrint(&root_buf, "/tmp/issuez-test-{x}", .{@as(u64, @intCast(t.nanoseconds))});
+    const root = try std.fmt.bufPrint(
+        &root_buf,
+        "/tmp/issuez-test-{x}",
+        .{@as(u64, @intCast(t.nanoseconds))},
+    );
     const cwd = std.Io.Dir.cwd();
     try cwd.createDir(io, root, @enumFromInt(0o700));
     defer cwd.deleteTree(io, root) catch {};
@@ -294,8 +333,12 @@ test controlDir {
 
 test sshSharesSafely {
     try std.testing.expect(sshSharesSafely("OpenSSH_9.9p1, LibreSSL 3.3.6"));
-    try std.testing.expect(sshSharesSafely("OpenSSH_8.4p1 Debian-5+deb11u3, OpenSSL 1.1.1w  11 Sep 2023"));
-    try std.testing.expect(!sshSharesSafely("OpenSSH_8.2p1 Ubuntu-4ubuntu0.11, OpenSSL 1.1.1f  31 Mar 2020"));
+    try std.testing.expect(
+        sshSharesSafely("OpenSSH_8.4p1 Debian-5+deb11u3, OpenSSL 1.1.1w  11 Sep 2023"),
+    );
+    try std.testing.expect(
+        !sshSharesSafely("OpenSSH_8.2p1 Ubuntu-4ubuntu0.11, OpenSSL 1.1.1f  31 Mar 2020"),
+    );
     try std.testing.expect(!sshSharesSafely("OpenSSH_7.4p1, OpenSSL 1.0.2k-fips"));
     try std.testing.expect(!sshSharesSafely("ssh: command not found"));
 }

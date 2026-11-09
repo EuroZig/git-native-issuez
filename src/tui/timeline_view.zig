@@ -3,6 +3,7 @@
 //! scrolled with the keys or the wheel.
 
 const std = @import("std");
+const stableSort = @import("issuez").sort.stable;
 const Allocator = std.mem.Allocator;
 const vaxis = @import("vaxis");
 const issuez = @import("issuez");
@@ -71,11 +72,7 @@ pub const Deps = enum {
     off,
 
     pub fn label(d: Deps) []const u8 {
-        return switch (d) {
-            .selected => "selected",
-            .all => "all",
-            .off => "off",
-        };
+        return @tagName(d);
     }
 };
 
@@ -84,10 +81,7 @@ pub const Grouping = enum {
     none,
 
     pub fn label(g: Grouping) []const u8 {
-        return switch (g) {
-            .milestone => "milestone",
-            .none => "none",
-        };
+        return @tagName(g);
     }
 };
 
@@ -230,7 +224,9 @@ pub const State = struct {
         return switch (r.kind) {
             .group => .{ .group = g },
             .unscheduled => .{ .unscheduled = g },
-            .issue, .unscheduled_issue => .{ .issue = .{ .id = .of(snap.issues[r.issue].id), .group = g } },
+            .issue, .unscheduled_issue => .{
+                .issue = .{ .id = .of(snap.issues[r.issue].id), .group = g },
+            },
         };
     }
 
@@ -307,7 +303,7 @@ pub const State = struct {
 pub fn datesOf(s: *const AppState, i: u32) schedule.Dates {
     const t = &s.timeline;
     if (i < t.overlay.len) if (t.overlay[i]) |d| return d;
-    return schedule.Dates.of(s.snap.issues[i]);
+    return schedule.Dates.of(&s.snap.issues[i]);
 }
 
 /// A milestone's due date, or the draft's.
@@ -315,7 +311,9 @@ pub fn milestoneDue(s: *const AppState, n: u32) ?Date {
     const m = s.snap.milestones[n];
     const t = &s.timeline;
     if (t.editing) {
-        if (t.preview) |p| if (p == .milestone_due and p.milestone_due.id.eql(m.id)) return p.milestone_due.due;
+        if (t.preview) |p| if (p == .milestone_due and p.milestone_due.id.eql(
+            m.id,
+        )) return p.milestone_due.due;
         if (t.draft.milestoneDue(m.id)) |d| return d;
     }
     return m.due;
@@ -335,7 +333,10 @@ fn buildOverlay(s: *AppState, arena: Allocator) Allocator.Error!?[]const ?[]cons
     const deleted = t.plan.?.gone;
     if (deleted.len > 0) {
         for (deleted) |g| t.draft.drop(g.slice());
-        s.info("{d} edited issues were deleted elsewhere: their changes are dropped", .{deleted.len});
+        s.info(
+            "{d} edited issues were deleted elsewhere: their changes are dropped",
+            .{deleted.len},
+        );
         t.plan = try t.draft.plan(arena, snap);
     }
     const ov = try arena.alloc(?schedule.Dates, snap.issues.len);
@@ -347,13 +348,13 @@ fn buildOverlay(s: *AppState, arena: Allocator) Allocator.Error!?[]const ?[]cons
         const i = snap.find(op.target().slice()) orelse continue;
         switch (op) {
             .dates => |x| {
-                var d = ov[i] orelse schedule.Dates.of(snap.issues[i]);
+                var d = ov[i] orelse schedule.Dates.of(&snap.issues[i]);
                 if (x.start) |v| d.start = v;
                 if (x.due) |v| d.due = v;
                 ov[i] = d;
             },
             .estimate => |x| {
-                var d = ov[i] orelse schedule.Dates.of(snap.issues[i]);
+                var d = ov[i] orelse schedule.Dates.of(&snap.issues[i]);
                 d.estimate_minutes = x.minutes;
                 ov[i] = d;
             },
@@ -391,7 +392,10 @@ fn buildOverlay(s: *AppState, arena: Allocator) Allocator.Error!?[]const ?[]cons
 }
 
 pub fn calendar(s: *const AppState) schedule.Calendar {
-    return .{ .work_days = s.snap.settings.work_days, .hours_per_day = s.snap.settings.hours_per_day };
+    return .{
+        .work_days = s.snap.settings.work_days,
+        .hours_per_day = s.snap.settings.hours_per_day,
+    };
 }
 
 /// Opens the timeline on a milestone's group, or on the issues in none.
@@ -450,14 +454,25 @@ fn treeSpans(arena: Allocator, snap: *const Snapshot, own: []const ?Span) Alloca
         if (merged[p]) |*m| {
             if (sp.start.order(m.start) == .lt) m.start = sp.start;
             if (sp.end.order(m.end) == .gt) m.end = sp.end;
-        } else merged[p] = .{ .start = sp.start, .end = sp.end, .shape = .bar, .derived_start = true, .derived_end = true };
+        } else merged[p] = .{
+            .start = sp.start,
+            .end = sp.end,
+            .shape = .bar,
+            .derived_start = true,
+            .derived_end = true,
+        };
     }
     return out;
 }
 
 // Rows.
 
-fn buildRows(s: *AppState, arena: Allocator, tree: []const ?Span, effective: ?[]const ?[]const u8) Allocator.Error!void {
+fn buildRows(
+    s: *AppState,
+    arena: Allocator,
+    tree: []const ?Span,
+    effective: ?[]const ?[]const u8,
+) Allocator.Error!void {
     const t = &s.timeline;
     const snap = s.snap;
     var groups: std.ArrayList(Group) = .empty;
@@ -490,7 +505,9 @@ fn buildRows(s: *AppState, arena: Allocator, tree: []const ?Span, effective: ?[]
         const in_none: u32 = @intCast(scopes.items.len);
         try scopes.append(arena, .none);
         for (all) |r| {
-            group_of[r.issue] = if (proj.milestone[r.issue]) |m| index.get(m) orelse none else in_none;
+            group_of[r.issue] = if (proj.milestone[r.issue]) |m| index.get(
+                m,
+            ) orelse none else in_none;
         }
     }
     const pos = try arena.alloc(u32, n);
@@ -517,7 +534,7 @@ fn buildRows(s: *AppState, arena: Allocator, tree: []const ?Span, effective: ?[]
                     x = snap.proj.parent[x];
                 }
             }
-            std.mem.sort(u32, picked.items, {}, std.sort.asc(u32));
+            stableSort(u32, picked.items, {}, std.sort.asc(u32));
         }
         const m: ?u32 = if (scope) |sc| switch (sc) {
             .none => null,
@@ -526,7 +543,12 @@ fn buildRows(s: *AppState, arena: Allocator, tree: []const ?Span, effective: ?[]
         var g: Group = .{
             .scope = scope orelse .none,
             .milestone = m,
-            .span = if (m) |x| schedule.milestoneSpan(proj, tree, snap.milestones[x].id, milestoneDue(s, x)) else null,
+            .span = if (m) |x| schedule.milestoneSpan(
+                &proj,
+                tree,
+                snap.milestones[x].id,
+                milestoneDue(s, x),
+            ) else null,
         };
         // The issues in none: shown when there are some.
         if (scope != null and scope.? == .none and picked.items.len == 0) continue;
@@ -538,11 +560,20 @@ fn buildRows(s: *AppState, arena: Allocator, tree: []const ?Span, effective: ?[]
             const r = all[k];
             const context = r.context or (scope != null and group_of[r.issue] != gi);
             if (!context) g.issues += 1;
-            const row: Row = .{ .kind = .issue, .group = g_index, .issue = r.issue, .depth = r.depth, .context = context };
+            const row: Row = .{
+                .kind = .issue,
+                .group = g_index,
+                .issue = r.issue,
+                .depth = r.depth,
+                .context = context,
+            };
             if (tree[r.issue] == null) {
                 if (!context) {
                     g.unscheduled += 1;
-                    try unscheduled.append(arena, .{ .kind = .unscheduled_issue, .group = g_index, .issue = r.issue });
+                    try unscheduled.append(
+                        arena,
+                        .{ .kind = .unscheduled_issue, .group = g_index, .issue = r.issue },
+                    );
                 }
                 continue;
             }
@@ -561,7 +592,11 @@ fn buildRows(s: *AppState, arena: Allocator, tree: []const ?Span, effective: ?[]
 // Drawing.
 
 /// Cells a bar covers, clipped to the chart.
-fn cells(t: *const State, sp: Span, width: u16) ?struct { from: u16, to: u16, cut_left: bool, cut_right: bool } {
+fn cells(
+    t: *const State,
+    sp: Span,
+    width: u16,
+) ?struct { from: u16, to: u16, cut_left: bool, cut_right: bool } {
     const a = t.x(sp.start.toDays());
     const b = @max(t.x(sp.end.toDays() + 1) - 1, a);
     if (b < 0 or a >= width) return null;
@@ -632,22 +667,27 @@ pub fn draw(s: *AppState, f: ui.Frame, win: ui.Window) Allocator.Error!void {
         t.origin = c - @divFloor(t.visibleDays(), 2);
         t.center_on = null;
     }
-    if (t.follow) {
-        if (t.selected < t.scroll) t.scroll = t.selected;
-        if (t.selected >= t.scroll + t.visible) t.scroll = t.selected - t.visible + 1;
-        t.follow = false;
-    }
-    t.scroll = @min(t.scroll, @as(u32, @intCast(t.rows.len -| t.visible)));
+    ui.settleScroll(&t.scroll, &t.follow, t.selected, t.rows.len, t.visible);
 
     try drawHeader(s, f, head, today);
     if (t.rows.len == 0) {
-        const msg = if (snap.issues.len == 0) "No issues yet." else "Nothing to show: no issues match.";
-        _ = ui.text(body, (body.width -| body.gwidth(msg)) / 2, body.height / 2, msg, .{ .fg = palette.muted });
+        const msg =
+            if (snap.issues.len == 0) "No issues yet." else "Nothing to show: no issues match.";
+        _ = ui.text(
+            body,
+            (body.width -| body.gwidth(msg)) / 2,
+            body.height / 2,
+            msg,
+            .{ .fg = palette.muted },
+        );
         return;
     }
 
     const grid_w: u16 = @max(chart_w, 1);
-    const grid: Grid = .{ .taken = try f.arena.alloc(bool, @as(usize, body.height) * grid_w), .width = grid_w };
+    const grid: Grid = .{
+        .taken = try f.arena.alloc(bool, @as(usize, body.height) * grid_w),
+        .width = grid_w,
+    };
     @memset(grid.taken, false);
     const chart = body.child(.{ .x_off = chart_x, .width = chart_w });
 
@@ -657,7 +697,9 @@ pub fn draw(s: *AppState, f: ui.Frame, win: ui.Window) Allocator.Error!void {
     while (cx < chart_w) : (cx += 1) {
         const d = Date.fromDays(t.dayAt(cx));
         const off = t.zoom == .day and !cal.work_days.isWorkDay(d);
-        if (off) chart.child(.{ .x_off = cx, .width = 1 }).fill(.{ .style = .{ .bg = palette.panel_bg } });
+        if (off) chart.child(
+            .{ .x_off = cx, .width = 1 },
+        ).fill(.{ .style = .{ .bg = palette.panel_bg } });
     }
 
     const sel_issue = t.selectedIssue();
@@ -669,18 +711,37 @@ pub fn draw(s: *AppState, f: ui.Frame, win: ui.Window) Allocator.Error!void {
         const row_win = body.child(.{ .y_off = y, .height = 1 });
         if (selected) row_win.fill(.{ .style = .{ .bg = palette.select_bg } });
         // The group a held row would go to.
-        if (t.row_drag) |rd| if (rd.over) |o| if (r.kind == .group and !o.eql(rd.from) and o.eql(t.groups[r.group].scope)) {
+        if (t.row_drag) |rd| if (rd.over) |o| if (r.kind == .group and !o.eql(
+            rd.from,
+        ) and o.eql(t.groups[r.group].scope)) {
             row_win.fill(.{ .style = .{ .bg = palette.hover_bg } });
         };
         if (today_x >= 0 and today_x < chart_w) {
-            _ = ui.text(chart, @intCast(today_x), y, "┊", .{ .fg = palette.accent_bg, .bg = if (selected) palette.select_bg else .default });
+            _ = ui.text(
+                chart,
+                @intCast(today_x),
+                y,
+                "┊",
+                .{ .fg = palette.accent_bg, .bg = if (selected) palette.select_bg else .default },
+            );
         }
         try drawLabel(s, f, row_win.child(.{ .width = left_w }), r, selected);
-        try drawChartRow(s, f, chart.child(.{ .y_off = y, .height = 1 }), grid, y, r, selected, own);
+        try drawChartRow(
+            s,
+            f,
+            chart.child(.{ .y_off = y, .height = 1 }),
+            grid,
+            y,
+            r,
+            selected,
+            own,
+        );
         try f.hit(row_win, .{ .tl_row = index });
         // The gutter: blockers of the selected issue, what it blocks,
         // and what doesn't fit.
-        if (r.issue != none and (r.kind == .issue or (t.editing and r.kind == .unscheduled_issue))) {
+        if (r.issue != none and
+            (r.kind == .issue or (t.editing and r.kind == .unscheduled_issue)))
+        {
             const gutter = row_win.child(.{ .x_off = left_w, .width = 1 });
             const proj = t.projection(snap);
             const mark: ?struct { []const u8, vaxis.Color } = blk: {
@@ -697,12 +758,22 @@ pub fn draw(s: *AppState, f: ui.Frame, win: ui.Window) Allocator.Error!void {
                 if (warningsOf(s, r.issue, &wbuf).len > 0) break :blk .{ "⚠", palette.medium };
                 break :blk null;
             };
-            if (mark) |m| _ = ui.text(gutter, 0, 0, m[0], .{ .fg = m[1], .bg = if (selected) palette.select_bg else .default });
+            if (mark) |m| _ = ui.text(
+                gutter,
+                0,
+                0,
+                m[0],
+                .{ .fg = m[1], .bg = if (selected) palette.select_bg else .default },
+            );
         }
     }
     if (t.deps != .off) try drawDeps(s, f.arena, chart, grid);
 
-    if (panel_h > 0) try drawPanel(s, f, win.child(.{ .y_off = win.height - panel_h, .height = panel_h }));
+    if (panel_h > 0) try drawPanel(
+        s,
+        f,
+        win.child(.{ .y_off = win.height - panel_h, .height = panel_h }),
+    );
 }
 
 pub fn warningsOf(s: *const AppState, i: u32, buf: []schedule.Warning) []const schedule.Warning {
@@ -710,8 +781,11 @@ pub fn warningsOf(s: *const AppState, i: u32, buf: []schedule.Warning) []const s
     const snap = s.snap;
     // Its milestone with the draft's moves.
     const milestone = if (t.effective) |e| e[i] else snap.proj.milestone[i];
-    const due: ?Date = if (milestone) |mid| if (snap.findMilestone(mid)) |n| milestoneDue(s, n) else null else null;
-    return schedule.warnings(t.projection(snap).*, t.spans, datesOf(s, i), due, i, buf);
+    const due: ?Date = if (milestone) |mid| if (snap.findMilestone(mid)) |n| milestoneDue(
+        s,
+        n,
+    ) else null else null;
+    return schedule.warnings(t.projection(snap), t.spans, datesOf(s, i), due, i, buf);
 }
 
 fn isChanged(t: *const State, id: []const u8) bool {
@@ -729,39 +803,39 @@ fn isStale(t: *const State, id: []const u8) bool {
 
 fn drawBar(s: *AppState, f: ui.Frame, bar: ui.Window) Allocator.Error!void {
     const t = &s.timeline;
-    const bg: ui.Style = .{ .bg = palette.panel_bg };
-    bar.fill(.{ .style = bg });
-    var col: u16 = 1;
-    col += ui.text(bar, col, 0, "/ ", .{ .fg = if (s.search_focused) palette.accent else palette.muted, .bg = palette.panel_bg });
     const box_w: u16 = @min(@max(bar.width / 4, 16), 40);
-    const box = bar.child(.{ .x_off = col, .width = box_w, .height = 1 });
-    try s.tl_search.draw(f.arena, box, .{ .bg = palette.input_bg }, s.search_focused, "filter: words, label:x, @who, is:blocked");
-    try f.hit(box, .search);
-    col += box_w + 2;
-    const q = s.tl_query;
+    const hint = "filter: words, label:x, @who, is:blocked";
+    const x = try ui.filterBox(f, bar, &s.tl_search, s.search_focused, box_w, hint);
+    var l: ui.Line = .{ .f = f, .win = bar, .x = x };
+    const off = ui.buttonStyle(false);
     for ([_]filter.Scope{ .open, .done, .all }) |sc| {
-        col += try ui.button(f, bar, col, 0, sc.label(), .{ .scope = sc }, ui.buttonStyle(q.scope == sc));
+        try l.button(sc.label(), .{ .scope = sc }, ui.buttonStyle(s.tl_query.scope == sc));
     }
-    col += 2;
+    l.x += 2;
     for (std.enums.values(Zoom)) |z| {
-        col += try ui.button(f, bar, col, 0, z.label(), .{ .tl_zoom = z }, ui.buttonStyle(t.zoom == z));
+        try l.button(z.label(), .{ .tl_zoom = z }, ui.buttonStyle(t.zoom == z));
     }
-    col += 1;
-    col += try ui.button(f, bar, col, 0, "◀", .{ .tl_command = .earlier }, ui.buttonStyle(false));
-    col += try ui.button(f, bar, col, 0, "Today", .{ .tl_command = .today }, ui.buttonStyle(false));
-    col += try ui.button(f, bar, col, 0, "▶", .{ .tl_command = .later }, ui.buttonStyle(false));
-    col += 2;
-    col += try ui.button(f, bar, col, 0, f.fmt("Deps: {s}", .{t.deps.label()}), .{ .tl_command = .deps }, ui.buttonStyle(false));
-    col += 1;
-    col += try ui.button(f, bar, col, 0, f.fmt("Group: {s}", .{t.grouping.label()}), .{ .tl_command = .grouping }, ui.buttonStyle(false));
+    l.x += 1;
+    try l.button("◀", .{ .tl_command = .earlier }, off);
+    try l.button("Today", .{ .tl_command = .today }, off);
+    try l.button("▶", .{ .tl_command = .later }, off);
+    l.x += 2;
+    try l.button(f.fmt("Deps: {s}", .{t.deps.label()}), .{ .tl_command = .deps }, off);
+    l.x += 1;
+    try l.button(f.fmt("Group: {s}", .{t.grouping.label()}), .{ .tl_command = .grouping }, off);
     if (!t.editing) {
         const label = "✎ E edit";
         const w = bar.gwidth(label) + 2;
-        if (bar.width > col +| w +| 2) _ = try ui.button(f, bar, bar.width - w - 1, 0, label, .{ .tl_command = .edit }, ui.buttonStyle(true));
+        if (bar.width > l.x +| w +| 2) {
+            l.x = bar.width - w - 1;
+            try l.button(label, .{ .tl_command = .edit }, ui.buttonStyle(true));
+        }
     }
 }
 
-const months = [_][]const u8{ "Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec" };
+const months = [_][]const u8{
+    "Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec",
+};
 
 fn drawHeader(s: *AppState, f: ui.Frame, head: ui.Window, today: Date) Allocator.Error!void {
     const t = &s.timeline;
@@ -803,7 +877,17 @@ fn drawHeader(s: *AppState, f: ui.Frame, head: ui.Window, today: Date) Allocator
         const is_today = d.eql(today);
         // At day zoom today is its number; otherwise a mark goes there.
         if (t.zoom != .day and today_x >= cx and today_x < @as(i32, cx) + w) continue;
-        _ = ui.text(head, cx, 1, text, if (is_today) .{ .fg = .{ .index = 231 }, .bg = palette.accent_bg, .bold = true } else .{ .fg = palette.muted });
+        _ = ui.text(
+            head,
+            cx,
+            1,
+            text,
+            if (is_today) .{
+                .fg = .{ .index = 231 },
+                .bg = palette.accent_bg,
+                .bold = true,
+            } else .{ .fg = palette.muted },
+        );
         day_free = cx +| @as(u16, @intCast(w)) +| 1;
     }
     if (t.zoom != .day and today_x >= 0 and today_x < head.width) {
@@ -811,7 +895,13 @@ fn drawHeader(s: *AppState, f: ui.Frame, head: ui.Window, today: Date) Allocator
     }
 }
 
-fn drawLabel(s: *AppState, f: ui.Frame, win: ui.Window, r: Row, selected: bool) Allocator.Error!void {
+fn drawLabel(
+    s: *AppState,
+    f: ui.Frame,
+    win: ui.Window,
+    r: Row,
+    selected: bool,
+) Allocator.Error!void {
     const t = &s.timeline;
     const snap = s.snap;
     const bg: vaxis.Color = if (selected) palette.select_bg else .default;
@@ -820,25 +910,29 @@ fn drawLabel(s: *AppState, f: ui.Frame, win: ui.Window, r: Row, selected: bool) 
         .group => {
             const g = t.groups[r.group];
             const folded = t.isFolded(g.scope);
-            var x: u16 = 1;
-            x += ui.text(win, x, 0, if (folded) "▸ " else "▾ ", .{ .fg = palette.muted, .bg = bg });
+            var l: ui.Line = .{ .f = f, .win = win, .x = 1 };
+            l.text(if (folded) "▸ " else "▾ ", .{ .fg = palette.muted, .bg = bg });
             if (g.milestone) |n| {
-                const m = snap.milestones[n];
-                x += ui.text(win, x, 0, "◆ ", .{ .fg = palette.accent, .bg = bg });
-                x += ui.text(win, x, 0, m.name, .{ .fg = palette.accent, .bg = bg, .bold = true });
-            } else x += ui.text(win, x, 0, "(no milestone)", .{ .fg = palette.muted, .bg = bg, .italic = true });
-            _ = ui.text(win, x + 1, 0, f.fmt("{d}", .{g.issues}), .{ .fg = palette.faint, .bg = bg });
+                l.text("◆ ", .{ .fg = palette.accent, .bg = bg });
+                l.text(snap.milestones[n].name, .{ .fg = palette.accent, .bg = bg, .bold = true });
+            } else l.text("(no milestone)", .{ .fg = palette.muted, .bg = bg, .italic = true });
+            l.x += 1;
+            l.text(f.fmt("{d}", .{g.issues}), .{ .fg = palette.faint, .bg = bg });
         },
         .issue, .unscheduled_issue => {
             const i = r.issue;
             const issue = snap.issues[i];
             const done = snap.isDone(i);
-            var x: u16 = 1 + @as(u16, @min(r.depth, 6)) * 2;
-            if (t.grouping == .milestone) x += 2;
-            if (r.kind == .unscheduled_issue) x += 2;
+            var l: ui.Line = .{ .f = f, .win = win, .x = 1 + @as(u16, @min(r.depth, 6)) * 2 };
+            if (t.grouping == .milestone) l.x += 2;
+            if (r.kind == .unscheduled_issue) l.x += 2;
             const blocked = t.projection(snap).activelyBlocked(i);
-            x += ui.text(win, x, 0, if (done) "✓ " else if (blocked) "⊘ " else "● ", .{ .fg = if (done) palette.done else if (blocked) palette.err else palette.open, .bg = bg, .dim = r.context });
-            _ = ui.text(win, x, 0, issue.title, .{
+            l.text(if (done) "✓ " else if (blocked) "⊘ " else "● ", .{
+                .fg = if (done) palette.done else if (blocked) palette.err else palette.open,
+                .bg = bg,
+                .dim = r.context,
+            });
+            l.text(issue.title, .{
                 .fg = if (done or r.context) palette.muted else .default,
                 .bg = bg,
                 .bold = selected,
@@ -849,12 +943,27 @@ fn drawLabel(s: *AppState, f: ui.Frame, win: ui.Window, r: Row, selected: bool) 
             const g = t.groups[r.group];
             const open = t.showsUnscheduled(g.scope);
             const x: u16 = if (t.grouping == .milestone) 3 else 1;
-            _ = ui.text(win, x, 0, f.fmt("{s} {d} without dates", .{ if (open) "▾" else "▸", g.unscheduled }), .{ .fg = palette.muted, .bg = bg, .italic = true });
+            _ = ui.text(
+                win,
+                x,
+                0,
+                f.fmt("{s} {d} without dates", .{ if (open) "▾" else "▸", g.unscheduled }),
+                .{ .fg = palette.muted, .bg = bg, .italic = true },
+            );
         },
     }
 }
 
-fn drawChartRow(s: *AppState, f: ui.Frame, win: ui.Window, grid: Grid, y: u16, r: Row, selected: bool, own: []const ?Span) Allocator.Error!void {
+fn drawChartRow(
+    s: *AppState,
+    f: ui.Frame,
+    win: ui.Window,
+    grid: Grid,
+    y: u16,
+    r: Row,
+    selected: bool,
+    own: []const ?Span,
+) Allocator.Error!void {
     _ = f;
     const t = &s.timeline;
     const snap = s.snap;
@@ -875,13 +984,25 @@ fn drawChartRow(s: *AppState, f: ui.Frame, win: ui.Window, grid: Grid, y: u16, r
             if (t.editing and m.due != null) if (milestoneDue(s, n)) |due| if (!due.eql(m.due.?)) {
                 // Where it was.
                 const ox = t.x(m.due.?.toDays());
-                if (ox >= 0 and ox < win.width) _ = ui.text(win, @intCast(ox), 0, "◇", .{ .fg = palette.faint, .bg = bg });
+                if (ox >= 0 and ox < win.width) _ = ui.text(
+                    win,
+                    @intCast(ox),
+                    0,
+                    "◇",
+                    .{ .fg = palette.faint, .bg = bg },
+                );
             };
             if (milestoneDue(s, n)) |due| {
                 const dx = t.x(due.toDays());
                 if (dx >= 0 and dx < win.width) {
                     const moved = t.editing and isChanged(t, m.id);
-                    _ = ui.text(win, @intCast(dx), 0, "◆", .{ .fg = if (moved) palette.medium else if (m.status == .completed) palette.done else palette.accent, .bg = bg, .bold = true });
+                    const fg = if (moved)
+                        palette.medium
+                    else if (m.status == .completed)
+                        palette.done
+                    else
+                        palette.accent;
+                    _ = ui.text(win, @intCast(dx), 0, "◆", .{ .fg = fg, .bg = bg, .bold = true });
                     grid.set(y, @intCast(dx));
                 }
             }
@@ -893,18 +1014,37 @@ fn drawChartRow(s: *AppState, f: ui.Frame, win: ui.Window, grid: Grid, y: u16, r
             const blocked = t.projection(snap).activelyBlocked(i);
             const late = !done and sp.end.order(s.today) == .lt;
             const changed = t.editing and isChanged(t, snap.issues[i].id);
-            const color: vaxis.Color = if (changed) palette.medium else if (done) palette.done else if (blocked) palette.err else if (selected) palette.accent else palette.open;
+            const color: vaxis.Color = if (changed)
+                palette.medium
+            else if (done)
+                palette.done
+            else if (blocked)
+                palette.err
+            else if (selected)
+                palette.accent
+            else
+                palette.open;
             // Where a changed bar was.
-            if (changed) if (schedule.span(schedule.Dates.of(snap.issues[i]), calendar(s))) |old| if (cells(t, old, win.width)) |oc| {
+            if (changed) if (schedule.span(
+                schedule.Dates.of(&snap.issues[i]),
+                calendar(s),
+            )) |old| if (cells(t, old, win.width)) |oc| {
                 var cx = oc.from;
-                while (cx <= oc.to) : (cx += 1) _ = ui.text(win, cx, 0, "┄", .{ .fg = palette.faint, .bg = bg });
+                while (cx <= oc.to) : (cx += 1) _ = ui.text(
+                    win,
+                    cx,
+                    0,
+                    "┄",
+                    .{ .fg = palette.faint, .bg = bg },
+                );
             };
             const c = cells(t, sp, win.width) orelse return;
             // A parent with no dates of its own spans its work.
             if (own[i] == null) {
                 var cx = c.from;
                 while (cx <= c.to) : (cx += 1) {
-                    const glyph: []const u8 = if (cx == c.from and !c.cut_left) "▕" else if (cx == c.to and !c.cut_right) "▏" else "━";
+                    const glyph: []const u8 = if (cx == c.from and
+                        !c.cut_left) "▕" else if (cx == c.to and !c.cut_right) "▏" else "━";
                     _ = ui.text(win, cx, 0, glyph, .{ .fg = palette.muted, .bg = bg });
                     grid.set(y, cx);
                 }
@@ -912,7 +1052,13 @@ fn drawChartRow(s: *AppState, f: ui.Frame, win: ui.Window, grid: Grid, y: u16, r
             }
             switch (sp.shape) {
                 .due => {
-                    _ = ui.text(win, c.from, 0, "◇", .{ .fg = if (late) palette.err else color, .bg = bg, .bold = true });
+                    _ = ui.text(
+                        win,
+                        c.from,
+                        0,
+                        "◇",
+                        .{ .fg = if (late) palette.err else color, .bg = bg, .bold = true },
+                    );
                     grid.set(y, c.from);
                 },
                 .start => {
@@ -926,14 +1072,21 @@ fn drawChartRow(s: *AppState, f: ui.Frame, win: ui.Window, grid: Grid, y: u16, r
                 },
                 .bar => {
                     // The done share of its leaves fills from the left.
-                    const share: f32 = if (snap.proj.progress(i)) |p| @as(f32, @floatFromInt(p.closed)) / @as(f32, @floatFromInt(@max(p.total, 1))) else if (done) 1 else 0;
-                    const full_to = t.x(sp.start.toDays()) + @as(i32, @intFromFloat(@round(share * @as(f32, @floatFromInt(@max(t.x(sp.end.toDays() + 1) - t.x(sp.start.toDays()), 1))))));
+                    const share: f32 = if (snap.proj.progress(i)) |p| blk: {
+                        const closed: f32 = @floatFromInt(p.closed);
+                        break :blk closed / @as(f32, @floatFromInt(@max(p.total, 1)));
+                    } else if (done) 1 else 0;
+                    const from = t.x(sp.start.toDays());
+                    const cover: f32 = @floatFromInt(@max(t.x(sp.end.toDays() + 1) - from, 1));
+                    const full_to = from + @as(i32, @intFromFloat(@round(share * cover)));
                     var cx = c.from;
                     while (cx <= c.to) : (cx += 1) {
-                        const derived = (sp.derived_start and cx == c.from) or (sp.derived_end and cx == c.to);
+                        const derived =
+                            (sp.derived_start and cx == c.from) or (sp.derived_end and cx == c.to);
                         const filled = done or cx < full_to;
                         const parent = snap.proj.progress(i) != null;
-                        const glyph: []const u8 = if (derived) "▒" else if (parent and !filled) "▒" else "█";
+                        const glyph: []const u8 =
+                            if (derived) "▒" else if (parent and !filled) "▒" else "█";
                         const fg = if (late and cx == c.to) palette.err else color;
                         _ = ui.text(win, cx, 0, glyph, .{ .fg = fg, .bg = bg });
                         grid.set(y, cx);
@@ -1017,67 +1170,91 @@ fn line(chart: ui.Window, grid: Grid, r1: u16, r2: u16, x1: i32, x2: i32, fg: va
 fn drawPanel(s: *AppState, f: ui.Frame, win: ui.Window) Allocator.Error!void {
     const t = &s.timeline;
     const snap = s.snap;
-    win.fill(.{ .style = .{ .bg = palette.bar_bg } });
-    const st: ui.Style = .{ .bg = palette.bar_bg };
+    const bg = palette.bar_bg;
+    win.fill(.{ .style = .{ .bg = bg } });
+    const st: ui.Style = .{ .bg = bg };
+    const muted: ui.Style = .{ .fg = palette.muted, .bg = bg };
+    const medium: ui.Style = .{ .fg = palette.medium, .bg = bg };
     if (t.selected >= t.rows.len) return;
     const r = t.rows[t.selected];
+    var l: ui.Line = .{ .f = f, .win = win, .x = 1 };
     switch (r.kind) {
         .group => {
             const g = t.groups[r.group];
-            const n = g.milestone orelse {
-                _ = ui.text(win, 1, 0, f.fmt("Issues in no milestone: {d}, {d} without dates", .{ g.issues, g.unscheduled }), st);
-                return;
-            };
+            const n = g.milestone orelse return l.text(f.fmt(
+                "Issues in no milestone: {d}, {d} without dates",
+                .{ g.issues, g.unscheduled },
+            ), st);
             const m = snap.milestones[n];
             const due = milestoneDue(s, n);
-            var x: u16 = 1;
-            x += ui.text(win, x, 0, m.name, .{ .fg = palette.accent, .bg = palette.bar_bg, .bold = true });
-            if (due) |d| x += ui.text(win, x, 0, f.fmt(" · due {f}", .{d}), st) else x += ui.text(win, x, 0, " · no due date", st);
-            if (g.span) |sp| x += ui.text(win, x, 0, f.fmt(" · work from {f} to {f}", .{ sp.start, sp.end }), st);
+            l.text(m.name, .{ .fg = palette.accent, .bg = bg, .bold = true });
+            l.text(if (due) |d| f.fmt(" · due {f}", .{d}) else " · no due date", st);
+            if (g.span) |sp| l.text(f.fmt(" · work from {f} to {f}", .{ sp.start, sp.end }), st);
             if (g.span != null and due != null and g.span.?.end.order(due.?) == .gt) {
-                _ = ui.text(win, x, 0, " · ⚠ work ends after the due date", .{ .fg = palette.medium, .bg = palette.bar_bg });
+                l.text(" · ⚠ work ends after the due date", medium);
             }
-            _ = ui.text(win, 1, 1, f.fmt("{d} issues, {d} without dates · ⏎ its issues · space fold", .{ g.issues, g.unscheduled }), .{ .fg = palette.muted, .bg = palette.bar_bg });
+            _ = ui.text(win, 1, 1, f.fmt(
+                "{d} issues, {d} without dates · ⏎ its issues · space fold",
+                .{ g.issues, g.unscheduled },
+            ), muted);
         },
-        .unscheduled => _ = ui.text(win, 1, 0, "Issues without a start or due date · space shows them", .{ .fg = palette.muted, .bg = palette.bar_bg }),
+        .unscheduled => l.text("Issues without a start or due date · space shows them", muted),
         .issue, .unscheduled_issue => {
             const i = r.issue;
             const issue = snap.issues[i];
-            var x: u16 = 1;
-            x += ui.text(win, x, 0, f.fmt("#{s} ", .{shortId(issue.id)}), .{ .fg = palette.id, .bg = palette.bar_bg });
-            x += ui.text(win, x, 0, issue.title, .{ .bg = palette.bar_bg, .bold = true });
+            l.text(f.fmt("#{s} ", .{shortId(issue.id)}), .{ .fg = palette.id, .bg = bg });
+            l.text(issue.title, .{ .bg = bg, .bold = true });
             const d = datesOf(s, i);
             if (t.spans[i]) |sp| {
-                x += ui.text(win, x, 0, f.fmt(" · {f} → {f}", .{ sp.start, sp.end }), st);
-                if (sp.derived_start or sp.derived_end) x += ui.text(win, x, 0, if (d.start == null and d.due == null) " (its work)" else " (from the estimate)", .{ .fg = palette.muted, .bg = palette.bar_bg, .italic = true });
-            } else x += ui.text(win, x, 0, " · no dates", .{ .fg = palette.muted, .bg = palette.bar_bg });
-            if (d.estimate_minutes) |m| x += ui.text(win, x, 0, f.fmt(" · est {s}", .{ui.duration(f, m)}), st);
-            if (snap.milestoneName(i)) |name| x += ui.text(win, x, 0, f.fmt(" · {s}", .{name}), .{ .fg = palette.accent, .bg = palette.bar_bg });
+                l.text(f.fmt(" · {f} → {f}", .{ sp.start, sp.end }), st);
+                if (sp.derived_start or sp.derived_end) l.text(
+                    if (d.start == null and d.due == null)
+                        " (its work)"
+                    else
+                        " (from the estimate)",
+                    .{ .fg = palette.muted, .bg = bg, .italic = true },
+                );
+            } else l.text(" · no dates", muted);
+            if (d.estimate_minutes) |m| l.text(f.fmt(" · est {s}", .{ui.duration(f, m)}), st);
+            if (snap.milestoneName(i)) |name| {
+                l.text(f.fmt(" · {s}", .{name}), .{ .fg = palette.accent, .bg = bg });
+            }
             // Line two: blockers and warnings.
-            var x2: u16 = 1;
+            l = .{ .f = f, .win = win, .x = 1, .y = 1 };
             const proj = t.projection(snap);
             if (t.editing and isStale(t, issue.id)) {
-                x2 += ui.text(win, x2, 1, "! changed elsewhere since you edited it: r keeps your change, X drops it", .{ .fg = palette.err, .bg = palette.bar_bg, .bold = true });
-                x2 += 2;
+                l.text(
+                    "! changed elsewhere since you edited it: r keeps your change, X drops it",
+                    .{ .fg = palette.err, .bg = bg, .bold = true },
+                );
+                l.x += 2;
             }
             if (proj.blockers[i].len > 0) {
-                x2 += ui.text(win, x2, 1, "blocked by", .{ .fg = palette.muted, .bg = palette.bar_bg });
-                for (proj.blockers[i]) |b| x2 += ui.text(win, x2, 1, f.fmt(" #{s}", .{shortId(snap.issues[b].id)}), .{ .fg = if (proj.isActive(b)) palette.err else palette.done, .bg = palette.bar_bg });
-                x2 += 2;
+                l.text("blocked by", muted);
+                for (proj.blockers[i]) |b| l.text(
+                    f.fmt(" #{s}", .{shortId(snap.issues[b].id)}),
+                    .{ .fg = if (proj.isActive(b)) palette.err else palette.done, .bg = bg },
+                );
+                l.x += 2;
             }
             if (proj.blocks[i].len > 0) {
-                x2 += ui.text(win, x2, 1, "blocks", .{ .fg = palette.muted, .bg = palette.bar_bg });
-                for (proj.blocks[i]) |b| x2 += ui.text(win, x2, 1, f.fmt(" #{s}", .{shortId(snap.issues[b].id)}), .{ .fg = palette.medium, .bg = palette.bar_bg });
-                x2 += 2;
+                l.text("blocks", muted);
+                for (proj.blocks[i]) |b| {
+                    l.text(f.fmt(" #{s}", .{shortId(snap.issues[b].id)}), medium);
+                }
+                l.x += 2;
             }
             var wbuf: [4]schedule.Warning = undefined;
             for (warningsOf(s, i, &wbuf)) |w| {
                 const text = switch (w) {
-                    .before_blocker => |b| f.fmt("⚠ starts before #{s} is done", .{shortId(snap.issues[b].id)}),
+                    .before_blocker => |b| f.fmt(
+                        "⚠ starts before #{s} is done",
+                        .{shortId(snap.issues[b].id)},
+                    ),
                     else => f.fmt("⚠ {s}", .{w.describe()}),
                 };
-                x2 += ui.text(win, x2, 1, text, .{ .fg = palette.medium, .bg = palette.bar_bg });
-                x2 += 2;
+                l.text(text, medium);
+                l.x += 2;
             }
         },
     }
@@ -1093,43 +1270,27 @@ pub fn key(s: *AppState, k: vaxis.Key) Allocator.Error!AppState.Action {
         edit.enter(s);
         return .none;
     }
-    const sel: i64 = t.selected;
-    const page: i64 = @max(t.visible, 2) - 1;
-    if (k.matches(K.down, .{}) or k.matches('j', .{})) {
-        t.moveTo(snap, sel + 1);
-    } else if (k.matches(K.up, .{}) or k.matches('k', .{})) {
-        t.moveTo(snap, sel - 1);
-    } else if (k.matches(K.page_down, .{}) or k.matches('d', .{ .ctrl = true })) {
-        t.moveTo(snap, sel + page);
-    } else if (k.matches(K.page_up, .{}) or k.matches('u', .{ .ctrl = true })) {
-        t.moveTo(snap, sel - page);
-    } else if (k.matches(K.home, .{}) or k.matches('g', .{})) {
-        t.moveTo(snap, 0);
-    } else if (k.matches(K.end, .{}) or k.matches('G', .{})) {
-        t.moveTo(snap, @as(i64, @intCast(t.rows.len)) - 1);
+    if (ui.rowKey(k, t.selected, t.rows.len, t.visible)) |row| {
+        t.moveTo(snap, row);
     } else if (k.matches(K.left, .{}) or k.matches('h', .{}) or k.matches('(', .{})) {
         t.scrollDays(-t.zoom.unit());
     } else if (k.matches(K.right, .{}) or k.matches('l', .{}) or k.matches(')', .{})) {
         t.scrollDays(t.zoom.unit());
     } else if (k.matches(K.left, .{ .shift = true }) or k.matches('H', .{})) {
-        t.scrollDays(-@as(i32, @max(t.visibleDays() - t.zoom.unit(), 1)));
+        command(s, .earlier);
     } else if (k.matches(K.right, .{ .shift = true }) or k.matches('L', .{})) {
-        t.scrollDays(@max(t.visibleDays() - t.zoom.unit(), 1));
+        command(s, .later);
     } else if (k.matches('.', .{})) {
-        t.center_on = s.today.toDays();
+        command(s, .today);
     } else if (k.matches('z', .{})) {
         zoom(s, -1);
     } else if (k.matches('Z', .{})) {
         zoom(s, 1);
     } else if (k.matches('D', .{})) {
-        t.deps = switch (t.deps) {
-            .selected => .all,
-            .all => .off,
-            .off => .selected,
-        };
+        command(s, .deps);
         s.info("blocker lines: {s}", .{t.deps.label()});
     } else if (k.matches('v', .{})) {
-        t.grouping = if (t.grouping == .milestone) .none else .milestone;
+        command(s, .grouping);
         t.follow = true;
     } else if (k.matches(']', .{})) {
         jumpGroup(s, 1);
@@ -1139,7 +1300,9 @@ pub fn key(s: *AppState, k: vaxis.Key) Allocator.Error!AppState.Action {
         try fold(s);
     } else if (k.matches(K.enter, .{})) {
         // In edit mode only the "without dates" row's: it folds.
-        if (t.editing and (t.selected >= t.rows.len or t.rows[t.selected].kind != .unscheduled)) return .none;
+        const on_unscheduled = t.selected < t.rows.len and
+            t.rows[t.selected].kind == .unscheduled;
+        if (t.editing and !on_unscheduled) return .none;
         return activate(s);
     } else if (t.editing) {
         // Writes at once: refused in edit mode before this.
@@ -1240,7 +1403,9 @@ pub fn wheel(s: *AppState, m: vaxis.Mouse, delta: i32) void {
     switch (m.button) {
         .wheel_left => t.scrollDays(-t.zoom.unit()),
         .wheel_right => t.scrollDays(t.zoom.unit()),
-        else => if (m.mods.shift) t.scrollDays(std.math.sign(delta) * t.zoom.unit()) else t.scrollBy(delta),
+        else => if (m.mods.shift) t.scrollDays(
+            std.math.sign(delta) * t.zoom.unit(),
+        ) else t.scrollBy(delta),
     }
 }
 

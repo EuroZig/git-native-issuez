@@ -205,7 +205,8 @@ fn watchesDir(rel: []const u8) bool {
 /// A lock file counts as the file it locks: some backends only see the
 /// lock come and go.
 pub fn classify(rel_in: []const u8) Change {
-    const rel = if (std.mem.endsWith(u8, rel_in, ".lock")) rel_in[0 .. rel_in.len - ".lock".len] else rel_in;
+    const lock = std.mem.endsWith(u8, rel_in, ".lock");
+    const rel = if (lock) rel_in[0 .. rel_in.len - ".lock".len] else rel_in;
     if (std.mem.eql(u8, rel, "config")) return .{ .config = true };
     if (std.mem.eql(u8, rel, "packed-refs") or under(rel, "reftable")) return .{ .refs = true };
     for (watched_refs) |prefix| if (under(rel, prefix)) return .{ .refs = true };
@@ -245,13 +246,22 @@ fn run(self: *RepoWatcher) void {
 const testing = std.testing;
 
 test classify {
-    try testing.expectEqual(Change{ .refs = true }, classify("refs/issues/0b8c7a52-3f1e-4d2a-9b6c-5e4f3a2b1c0d"));
+    try testing.expectEqual(
+        Change{ .refs = true },
+        classify("refs/issues/0b8c7a52-3f1e-4d2a-9b6c-5e4f3a2b1c0d"),
+    );
     try testing.expectEqual(Change{ .refs = true }, classify("refs/issues/0b8c7a52.lock"));
     try testing.expectEqual(Change{ .refs = true }, classify("refs/issues"));
     try testing.expectEqual(Change{ .refs = true }, classify("refs/milestones/x"));
     try testing.expectEqual(Change{ .refs = true }, classify("refs/attachments/x/y"));
-    try testing.expectEqual(Change{ .refs = true }, classify("refs/issuez-sync/origin/pushed/issues/x"));
-    try testing.expectEqual(Change{ .refs = true }, classify("refs/issuez-sync/origin/quarantined/issues/x.lock"));
+    try testing.expectEqual(
+        Change{ .refs = true },
+        classify("refs/issuez-sync/origin/pushed/issues/x"),
+    );
+    try testing.expectEqual(
+        Change{ .refs = true },
+        classify("refs/issuez-sync/origin/quarantined/issues/x.lock"),
+    );
     try testing.expectEqual(Change{ .refs = true }, classify("packed-refs"));
     try testing.expectEqual(Change{ .refs = true }, classify("packed-refs.lock"));
     try testing.expectEqual(Change{ .refs = true }, classify("reftable/tables.list"));
@@ -280,7 +290,16 @@ test watchesDir {
         "reftable",
     }) |rel|
         try testing.expect(watchesDir(rel));
-    for ([_][]const u8{ "", "objects", "refs/heads", "refs/tags", "refs/remotes/origin", "logs", "hooks", "issuez" }) |rel|
+    for ([_][]const u8{
+        "",
+        "objects",
+        "refs/heads",
+        "refs/tags",
+        "refs/remotes/origin",
+        "logs",
+        "hooks",
+        "issuez",
+    }) |rel|
         try testing.expect(!watchesDir(rel));
 }
 
@@ -326,7 +345,13 @@ test "reports ref and config writes, not other files" {
 
     var recorder: Recorder = .{};
     var w: RepoWatcher = undefined;
-    try w.init(io, testing.allocator, git_dir, .{ .context = &recorder, .changed = Recorder.changed }, .{});
+    try w.init(
+        io,
+        testing.allocator,
+        git_dir,
+        .{ .context = &recorder, .changed = Recorder.changed },
+        .{},
+    );
     defer w.deinit();
 
     // The first issue makes refs/issues, which nothing watched yet.

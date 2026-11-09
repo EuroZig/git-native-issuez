@@ -5,7 +5,7 @@
 //!   zig build test                 unit, backend, simulator/oracle and fuzz smoke tests
 //!   zig build simulator            git-issue-sim
 //!   zig build -Dfuzz               also install git-issue-fuzz
-//!   zig build release              both flavors for every release target, in zig-out/release/
+//!   zig build release              both flavors and libissuez, every target, in zig-out/release/
 //!   zig build test-interop         tests against upstream (fetched lazily)
 //!   zig build test-upstream-suite  upstream's t/*.sh against our binary
 //!   zig build test-perf            `ls` over 10 000 issues
@@ -16,6 +16,15 @@
 //!   zig build examples             library examples (examples/*.zig)
 //!   zig build example-<name>       run one (quickstart, sync, attachments, real-repo -- <path> ls)
 //!   zig build update-snapshots     rewrite examples/*.out
+//!   zig build capi                 libissuez.a, include/issuez.h, share/issuez/issuez-api.json
+//!   zig build capi-header          rewrite the committed header and API description
+//!   zig build go-libs [-Dgo-libs-all]  lib/go/<platform>/libissuez.a (host, or every target)
+//!   zig build test-capi            the C smoke test under ASan (needs a C compiler)
+//!   zig build test-go              the Go binding's tests (needs Go)
+//!   zig build test-go-e2e          the Go binding against the CLI (needs Go)
+//!   zig build test-bindings        test-capi-zig, test-capi, test-go and test-go-e2e
+//!   zig build test-bindings-linux  the same in a Linux container (needs docker)
+//!   zig build fuzz-go [-Dfuzz-time=60s]  fuzz the Go binding, with the leak check
 
 const std = @import("std");
 const entry_points = @import("src/cli/entry_points.zig");
@@ -23,7 +32,10 @@ const entry_points = @import("src/cli/entry_points.zig");
 const zon_version: []const u8 = @import("build.zig.zon").version;
 
 pub fn build(b: *std.Build) void {
-    if (isRootPackage(b)) forgetOuterRepository(b);
+    if (isRootPackage(b)) {
+        forgetOuterRepository(b);
+        skipGitStub(b);
+    }
     const target = b.standardTargetOptions(.{});
     const optimize = b.standardOptimizeOption(.{});
     // Projects depending on the library need neither the TUI nor the MCP
@@ -46,15 +58,25 @@ pub fn build(b: *std.Build) void {
     ) orelse full;
     const fuzz = b.option(bool, "fuzz", "Install the fuzzer") orelse false;
 
+    // Dependents and the tests get build.zig.zon's version, so a commit alone
+    // doesn't throw away test results. What gets installed gets git's.
     const issuez = b.addModule("issuez", .{
         .root_source_file = b.path("src/root.zig"),
         .target = target,
         .optimize = optimize,
+        .imports = &.{versionImport(b, zon_version)},
     });
     const version = describeVersion(b);
-    const cli: Cli = .init(b, target, optimize, issuez, version);
-    const oracle = cli.oracle;
+    const cli: Cli = .init(b, target, optimize, b.createModule(.{
+        .root_source_file = b.path("src/root.zig"),
+        .target = target,
+        .optimize = optimize,
+        .imports = &.{versionImport(b, version)},
+    }));
     const extras = cli.parts(.{ .tui = tui, .mcp = mcp });
+    const test_cli: Cli = .init(b, target, optimize, issuez);
+    const oracle = test_cli.oracle;
+    const test_extras = test_cli.parts(.{ .tui = tui, .mcp = mcp });
 
     const exe = cli.exe("git-issue", "src/cli/main.zig", optimize, extras);
     b.installArtifact(exe);
@@ -81,35 +103,52 @@ pub fn build(b: *std.Build) void {
     run_step.dependOn(&run_exe.step);
 
     // These never include the TUI or the MCP server.
-    const sim = cli.exe("git-issue-sim", "src/cli/main_sim.zig", optimize, .{});
+    const sim = test_cli.exe("git-issue-sim", "src/cli/main_sim.zig", optimize, .{});
     const sim_step = b.step("simulator", "Build git-issue-sim");
     sim_step.dependOn(&b.addInstallArtifact(sim, .{}).step);
 
-    const fuzz_exe = cli.exe("git-issue-fuzz", "src/cli/main_fuzz.zig", optimize, .{});
+    const fuzz_exe = test_cli.exe("git-issue-fuzz", "src/cli/main_fuzz.zig", optimize, .{});
     if (fuzz) b.installArtifact(fuzz_exe);
 
     const test_step = b.step("test", "Run unit, backend, simulator/oracle and fuzz smoke tests");
+    // Lines stay within 100 columns (CONTRIBUTING.md).
+    if (isRootPackage(b) and hasPath(b, "tools")) {
+        const line_length = b.addExecutable(.{
+            .name = "line-length",
+            .root_module = b.createModule(.{
+                .root_source_file = b.path("tools/line_length.zig"),
+                .target = b.graph.host,
+                .optimize = .Debug,
+            }),
+        });
+        const run = b.addRunArtifact(line_length);
+        for ([_][]const u8{ "build.zig", "src", "test", "examples", "tools" }) |p|
+            run.addArg(b.pathFromRoot(p));
+        run.expectExitCode(0);
+        run.has_side_effects = true;
+        test_step.dependOn(&run.step);
+    }
 
     const unit_roots = [_]struct { name: []const u8, module: *std.Build.Module }{
         .{ .name = "issuez", .module = issuez },
         .{ .name = "oracle", .module = oracle },
-        .{ .name = "cli", .module = cli.module("src/cli/main.zig", optimize, extras) },
+        .{ .name = "cli", .module = test_cli.module("src/cli/main.zig", optimize, test_extras) },
     };
     for (unit_roots) |u| {
         const t = b.addTest(.{ .name = u.name, .root_module = u.module });
         test_step.dependOn(&b.addRunArtifact(t).step);
     }
-    if (extras.tui) |m| {
+    if (test_extras.tui) |m| {
         const t = b.addTest(.{ .name = "tui", .root_module = m });
         const run_t = b.addRunArtifact(t);
         test_step.dependOn(&run_t.step);
         b.step("test-tui", "Run the TUI's tests").dependOn(&run_t.step);
     }
-    if (extras.mcp) |m| {
+    if (test_extras.mcp) |m| {
         const t = b.addTest(.{ .name = "mcp", .root_module = m });
         test_step.dependOn(&b.addRunArtifact(t).step);
     }
-    if (extras.watch) |m| {
+    if (test_extras.watch) |m| {
         const t = b.addTest(.{ .name = "watch", .root_module = m });
         test_step.dependOn(&b.addRunArtifact(t).step);
     }
@@ -187,6 +226,7 @@ pub fn build(b: *std.Build) void {
             const opts = b.addOptions();
             opts.addOptionPath("git_issue_exe", exe.getEmittedBin());
             opts.addOptionPath("tty_exec", tty_exec.getEmittedBin());
+            opts.addOptionPath("lazygit_doc", b.path("docs/lazygit.md"));
             const t = b.addTest(.{
                 .name = "live_tui",
                 .root_module = b.createModule(.{
@@ -212,11 +252,24 @@ pub fn build(b: *std.Build) void {
         tui_e2e_step.dependOn(&fail.step);
     }
 
-    for ([_][]const u8{ "test/backend_git.zig", "test/trailers_git.zig" }) |root| {
+    {
         const t = b.addTest(.{
-            .name = std.fs.path.stem(root),
+            .name = "backend_git",
             .root_module = b.createModule(.{
-                .root_source_file = b.path(root),
+                .root_source_file = b.path("test/backend_git.zig"),
+                .target = target,
+                .optimize = optimize,
+                .imports = &.{.{ .name = "issuez", .module = issuez }},
+            }),
+            .test_runner = shardRunner(b),
+        });
+        addShards(b, t, 4, test_step);
+    }
+    {
+        const t = b.addTest(.{
+            .name = "trailers_git",
+            .root_module = b.createModule(.{
+                .root_source_file = b.path("test/trailers_git.zig"),
                 .target = target,
                 .optimize = optimize,
                 .imports = &.{.{ .name = "issuez", .module = issuez }},
@@ -236,10 +289,9 @@ pub fn build(b: *std.Build) void {
                 .optimize = optimize,
                 .imports = &.{.{ .name = "paths", .module = opts.createModule() }},
             }),
+            .test_runner = shardRunner(b),
         });
-        const run_t = b.addRunArtifact(t);
-        run_t.has_side_effects = true;
-        test_step.dependOn(&run_t.step);
+        addShards(b, t, 8, test_step);
     }
 
     // A smoke run: the same cases every time, so it catches regressions.
@@ -250,9 +302,26 @@ pub fn build(b: *std.Build) void {
     fuzz_run.expectStdErrMatch("300 cases passed");
     test_step.dependOn(&fuzz_run.step);
 
-    // Budget 2 s, on a ReleaseSafe build whatever -Doptimize says: that is
-    // what users run. Most of the time is spent in git.
-    const perf_exe = cli.exe("git-issue", "src/cli/main.zig", .ReleaseSafe, .{});
+    const bindings_step = addCapi(b, target, optimize, test_step, exe, version);
+    const go_e2e = bindings_step.go_e2e;
+
+    // Budget 2 s, on ReleaseSafe builds whatever -Doptimize says: that is
+    // what users run, in both flavors. The whole of it has to be ReleaseSafe,
+    // the library too. Most of the time is spent in git.
+    const release_issuez = b.createModule(.{
+        .root_source_file = b.path("src/root.zig"),
+        .target = target,
+        .optimize = .ReleaseSafe,
+        .imports = &.{versionImport(b, zon_version)},
+    });
+    const release_cli: Cli = .init(b, target, .ReleaseSafe, release_issuez);
+    const release_extras = release_cli.parts(.{ .tui = tui, .mcp = mcp });
+    const all_perf_exes = [_]*std.Build.Step.Compile{
+        release_cli.exe("git-issue", "src/cli/main.zig", .ReleaseSafe, .{}),
+        release_cli.exe("git-issue", "src/cli/main.zig", .ReleaseSafe, release_extras),
+    };
+    // -Dminimal has only the one flavor.
+    const perf_exes = all_perf_exes[0..if (tui or mcp) 2 else 1];
     const perf_runner = b.addExecutable(.{
         .name = "perf-smoke",
         .root_module = b.createModule(.{
@@ -261,12 +330,36 @@ pub fn build(b: *std.Build) void {
             .optimize = .Debug,
         }),
     });
-    const run_perf = b.addRunArtifact(perf_runner);
-    run_perf.addArtifactArg(perf_exe);
-    if (b.args) |args| run_perf.addArgs(args);
-    run_perf.stdio = .inherit;
-    b.step("test-perf", "Time `ls -a` over 10 000 issues against the 2 s budget")
-        .dependOn(&run_perf.step);
+    // One after the other, so the two do not share the CPU.
+    const addPerfRuns = struct {
+        fn add(
+            builder: *std.Build,
+            runner: *std.Build.Step.Compile,
+            exes: []const *std.Build.Step.Compile,
+            args: ?[]const []const u8,
+            after: ?*std.Build.Step,
+            step: *std.Build.Step,
+        ) void {
+            var previous = after;
+            for (exes) |perf_exe| {
+                const run = builder.addRunArtifact(runner);
+                run.addArtifactArg(perf_exe);
+                if (args) |a| run.addArgs(a);
+                run.stdio = .inherit;
+                if (previous) |p| run.step.dependOn(p);
+                step.dependOn(&run.step);
+                previous = &run.step;
+            }
+        }
+    }.add;
+    addPerfRuns(
+        b,
+        perf_runner,
+        perf_exes,
+        b.args,
+        null,
+        b.step("test-perf", "Time `ls -a` over 10 000 issues against the 2 s budget"),
+    );
 
     // What CI runs, so `zig build ci -Dseed=<run id>` reproduces a CI run:
     // `test`, long fuzz and trailer runs on the seed, interop, upstream's
@@ -275,6 +368,7 @@ pub fn build(b: *std.Build) void {
     {
         const seed = b.fmt("{d}", .{b.option(u64, "seed", "Seed of the ci runs") orelse 20261018});
         ci_step.dependOn(test_step);
+        ci_step.dependOn(bindings_step.step);
         if (extras.mcp != null) ci_step.dependOn(e2e_step);
 
         const long_fuzz = b.addRunArtifact(fuzz_exe);
@@ -297,12 +391,8 @@ pub fn build(b: *std.Build) void {
         long_trailers.setEnvironmentVariable("ISSUEZ_TRAILER_SEED", seed);
         ci_step.dependOn(&long_trailers.step);
 
-        const ci_perf = b.addRunArtifact(perf_runner);
-        ci_perf.addArtifactArg(perf_exe);
-        ci_perf.stdio = .inherit;
         // After the long fuzz run, so the two do not share the CPU.
-        ci_perf.step.dependOn(&long_fuzz.step);
-        ci_step.dependOn(&ci_perf.step);
+        addPerfRuns(b, perf_runner, perf_exes, null, &long_fuzz.step, ci_step);
     }
 
     // The simulator examples need no git and must print exactly their
@@ -386,9 +476,7 @@ pub fn build(b: *std.Build) void {
                         },
                     }),
                 });
-                const run_test = b.addRunArtifact(t);
-                run_test.has_side_effects = true;
-                test_step.dependOn(&run_test.step);
+                test_step.dependOn(&b.addRunArtifact(t).step);
             }
         }
     }
@@ -403,6 +491,7 @@ pub fn build(b: *std.Build) void {
         if (b.lazyDependency("git_native_issue", .{})) |upstream| {
             const opts = b.addOptions();
             opts.addOptionPath("upstream_bin", upstream.path("bin"));
+            go_e2e.addDirectoryArg(upstream.path("bin"));
             opts.addOptionPath("git_issue_exe", exe.getEmittedBin());
             const interop = b.addTest(.{
                 .name = "interop",
@@ -416,11 +505,10 @@ pub fn build(b: *std.Build) void {
                         .{ .name = "paths", .module = opts.createModule() },
                     },
                 }),
+                .test_runner = shardRunner(b),
             });
-            const run_interop = b.addRunArtifact(interop);
-            run_interop.has_side_effects = true;
-            interop_step.dependOn(&run_interop.step);
-            ci_step.dependOn(&run_interop.step);
+            addShards(b, interop, 8, interop_step);
+            ci_step.dependOn(interop_step);
 
             const suite = b.addExecutable(.{
                 .name = "upstream-suite",
@@ -430,16 +518,21 @@ pub fn build(b: *std.Build) void {
                     .optimize = .Debug,
                 }),
             });
+            // Alone, the report is what you ran it for. In `ci` it only shows
+            // on a failure, so the suite runs alongside everything else.
             const run_suite = b.addRunArtifact(suite);
-            run_suite.addDirectoryArg(upstream.path(""));
-            run_suite.addArtifactArg(exe);
-            run_suite.addFileArg(b.path("test/upstream-expected.txt"));
-            run_suite.addFileArg(b.path("test/upstream-allowlist.txt"));
-            // The runner reports on stderr, which a checked step would treat
-            // as a failure.
             run_suite.stdio = .inherit;
+            const quiet_suite = addQuietCommand(b, &.{});
+            quiet_suite.setName("run upstream-suite");
+            quiet_suite.addArtifactArg(suite);
+            for ([_]*std.Build.Step.Run{ run_suite, quiet_suite }) |r| {
+                r.addDirectoryArg(upstream.path(""));
+                r.addArtifactArg(exe);
+                r.addFileArg(b.path("test/upstream-expected.txt"));
+                r.addFileArg(b.path("test/upstream-allowlist.txt"));
+            }
             suite_step.dependOn(&run_suite.step);
-            ci_step.dependOn(&run_suite.step);
+            ci_step.dependOn(&quiet_suite.step);
         }
     }
 }
@@ -463,11 +556,12 @@ const release_flavors = [_]Flavor{
 /// `git-native-issuez-<version>-<flavor>-<arch>-<os>`, one per flavor and
 /// target, cross-compiled (ReleaseSafe, stripped): `bin/` with the
 /// `git-issue-<command>` entry points (not on Windows), the shell completions and man pages
-/// (from a build that runs here), and LICENSE, README.md and CHANGELOG.md
-/// in `share/doc/git-native-issuez/` (at the top on Windows). A `.zip` for
+/// (from a build that runs here), and LICENSE, THIRD_PARTY_LICENSES, README.md
+/// and CHANGELOG.md in `share/doc/git-native-issuez/` (at the top on Windows). A `.zip` for
 /// Windows, `.tar.gz` otherwise, all in `zig-out/release/` with their
 /// `SHA256SUMS`. GitHub lists release assets by name, so the full flavor
-/// comes first. Needs `sh`, `tar` and `zip`.
+/// comes first, and the C library's `libissuez-*` come after the programs.
+/// Needs `sh`, `tar` and `zip`.
 fn addRelease(b: *std.Build, step: *std.Build.Step) void {
     const version = zon_version;
     const sums = b.addSystemCommand(&.{ "sh", "-c", sums_script, "sh" });
@@ -511,7 +605,13 @@ fn addRelease(b: *std.Build, step: *std.Build.Step) void {
             // Under share/ like the rest, so unpacking into a prefix
             // doesn't put them at its top. Windows has no share/.
             const doc_dir = if (windows) "" else "share/doc/git-native-issuez/";
-            for ([_][]const u8{ "LICENSE", "README.md", "CHANGELOG.md" }) |doc| {
+            const docs = [_][]const u8{
+                "LICENSE",
+                "THIRD_PARTY_LICENSES",
+                "README.md",
+                "CHANGELOG.md",
+            };
+            for (docs) |doc| {
                 pack.addArgs(&.{ "f", b.fmt("{s}{s}", .{ doc_dir, doc }) });
                 pack.addFileArg(b.path(doc));
             }
@@ -528,6 +628,40 @@ fn addRelease(b: *std.Build, step: *std.Build.Step) void {
             step.dependOn(&b.addInstallFileWithDir(archive, release_dir, archive_name).step);
         }
     }
+
+    // `libissuez-<version>-<arch>-<os>[-<abi>]`: the C library, its header and
+    // its API description.
+    for (lib_targets) |lib_target| {
+        const resolved = b.resolveTargetQuery(lib_target.query);
+        const t = resolved.result;
+        const name = if (t.os.tag == .linux)
+            b.fmt("libissuez-{s}-{t}-{t}-{t}", .{ version, t.cpu.arch, t.os.tag, t.abi })
+        else
+            b.fmt("libissuez-{s}-{t}-{t}", .{ version, t.cpu.arch, t.os.tag });
+        const archive_name = b.fmt("{s}.tar.gz", .{name});
+
+        const pack = b.addSystemCommand(&.{ "sh", "-c", pack_script, "sh" });
+        pack.setEnvironmentVariable("COPYFILE_DISABLE", "1");
+        const archive = pack.addOutputFileArg(archive_name);
+        _ = pack.addOutputDirectoryArg("stage");
+        pack.addArg(name);
+        pack.addArgs(&.{ "f", "lib/libissuez.a" });
+        pack.addFileArg(hostArchive(b, capiLib(b, resolved, .ReleaseSafe, false, version)));
+        for ([_]struct { []const u8, []const u8 }{
+            // The tests check that these two are what the generator writes.
+            .{ "include/issuez.h", committed_header },
+            .{ "share/issuez/issuez-api.json", committed_api_json },
+            .{ "share/doc/libissuez/LICENSE", "LICENSE" },
+            .{ "share/doc/libissuez/THIRD_PARTY_LICENSES", "THIRD_PARTY_LICENSES" },
+            .{ "share/doc/libissuez/CHANGELOG.md", "CHANGELOG.md" },
+        }) |file| {
+            pack.addArgs(&.{ "f", file[0] });
+            pack.addFileArg(b.path(file[1]));
+        }
+
+        sums.addFileArg(archive);
+        step.dependOn(&b.addInstallFileWithDir(archive, release_dir, archive_name).step);
+    }
 }
 
 const release_dir: std.Build.InstallDir = .{ .custom = "release" };
@@ -541,9 +675,10 @@ fn releaseExe(
         .root_source_file = b.path("src/root.zig"),
         .target = target,
         .optimize = .ReleaseSafe,
+        // The tag's version: release.yml checks it is build.zig.zon's.
+        .imports = &.{versionImport(b, zon_version)},
     });
-    // The tag's version: release.yml checks it is build.zig.zon's.
-    const cli: Cli = .init(b, target, .ReleaseSafe, issuez, zon_version);
+    const cli: Cli = .init(b, target, .ReleaseSafe, issuez);
     const exe = cli.exe("git-issue", "src/cli/main.zig", .ReleaseSafe, cli.parts(.{
         .tui = flavor.full,
         .mcp = flavor.full,
@@ -651,6 +786,13 @@ fn installManPages(b: *std.Build, exe: *std.Build.Step.Compile) void {
     }).step);
 }
 
+/// The `version` import of `src/root.zig`, which is `issuez.version`.
+fn versionImport(b: *std.Build, version: []const u8) std.Build.Module.Import {
+    const options = b.addOptions();
+    options.addOption([]const u8, "version", version);
+    return .{ .name = "version", .module = options.createModule() };
+}
+
 /// `build.zig.zon`'s version, from git when building a checkout: just it
 /// on the `v<version>` tag, `0.3.0-12-ga3e21cfa` twelve commits after the
 /// tag, `0.3.0-ga3e21cfa` before there is one, each with `-dirty` for
@@ -688,7 +830,10 @@ fn addLinkSteps(b: *std.Build, exe: *std.Build.Step.Compile) void {
         "link-prefix",
         "Where `zig build link` puts its symlinks (default: ~/.local)",
     ) orelse if (b.graph.environ_map.get("HOME")) |home| b.pathJoin(&.{ home, ".local" }) else null;
-    const link_step = b.step("link", "Install, then symlink it into -Dlink-prefix (default: ~/.local)");
+    const link_step = b.step(
+        "link",
+        "Install, then symlink it into -Dlink-prefix (default: ~/.local)",
+    );
     const unlink_step = b.step("unlink", "Remove the symlinks `zig build link` made");
     const problem: ?[]const u8 = if (exe.rootModuleTarget().os.tag == .windows)
         "zig build link has no Windows support: use zig build -p <prefix>"
@@ -859,6 +1004,57 @@ fn forgetOuterRepository(b: *std.Build) void {
     }) |name| _ = b.graph.environ_map.swapRemove(name);
 }
 
+/// Every git the tests start, thousands of them, otherwise goes through
+/// Apple's /usr/bin/git, which spends 5 ms finding the real one: a third of
+/// the time of the suites that use git the most.
+fn skipGitStub(b: *std.Build) void {
+    if (b.graph.host.result.os.tag != .macos) return;
+    var code: u8 = undefined;
+    const out = b.runAllowFail(&.{ "git", "--exec-path" }, &code, .ignore) catch return;
+    const dir = std.mem.trimEnd(u8, out, "\n");
+    const path = b.graph.environ_map.get("PATH") orelse return;
+    b.graph.environ_map.put("PATH", b.fmt("{s}:{s}", .{ dir, path })) catch @panic("OOM");
+}
+
+/// A test binary's tests run one after the other, and these suites spend
+/// their time in git, so `shards` runs of it take a slice of the tests each.
+fn shardRunner(b: *std.Build) std.Build.Step.Compile.TestRunner {
+    return .{ .path = b.path("tools/shard_test_runner.zig"), .mode = .server };
+}
+
+fn addShards(
+    b: *std.Build,
+    t: *std.Build.Step.Compile,
+    shards: u32,
+    step: *std.Build.Step,
+) void {
+    for (0..shards) |i| {
+        const run = b.addRunArtifact(t);
+        run.setName(b.fmt("run test {s} {d}/{d}", .{ t.name, i + 1, shards }));
+        run.addArg(b.fmt("--shard={d}/{d}", .{ i, shards }));
+        step.dependOn(&run.step);
+    }
+}
+
+/// `argv` with its output kept back unless it fails. A step that inherits
+/// stdio holds the build's stderr lock from start to exit, so those steps
+/// run one at a time, whatever else there is to do.
+fn addQuietCommand(b: *std.Build, argv: []const []const u8) *std.Build.Step.Run {
+    const quiet =
+        \\log=$(mktemp)
+        \\"$@" >"$log" 2>&1
+        \\rc=$?
+        \\[ "$rc" -eq 0 ] || cat "$log" >&2
+        \\rm -f "$log"
+        \\exit "$rc"
+    ;
+    const run = b.addSystemCommand(&.{ "sh", "-c", quiet, "sh" });
+    run.addArgs(argv);
+    run.has_side_effects = true;
+    run.expectExitCode(0);
+    return run;
+}
+
 fn isRootPackage(b: *std.Build) bool {
     return b.pkg_hash.len == 0;
 }
@@ -878,8 +1074,6 @@ const Cli = struct {
     optimize: std.builtin.OptimizeMode,
     issuez: *std.Build.Module,
     oracle: *std.Build.Module,
-    /// `version`, what `git issue version` and the MCP server report.
-    version: *std.Build.Module,
     mcp_help: *std.Build.Module,
 
     fn init(
@@ -887,10 +1081,7 @@ const Cli = struct {
         target: std.Build.ResolvedTarget,
         optimize: std.builtin.OptimizeMode,
         issuez: *std.Build.Module,
-        version: []const u8,
     ) Cli {
-        const version_options = b.addOptions();
-        version_options.addOption([]const u8, "version", version);
         return .{
             .b = b,
             .target = target,
@@ -902,7 +1093,6 @@ const Cli = struct {
                 .optimize = optimize,
                 .imports = &.{.{ .name = "issuez", .module = issuez }},
             }),
-            .version = version_options.createModule(),
             .mcp_help = b.createModule(.{ .root_source_file = b.path("src/mcp/help.zig") }),
         };
     }
@@ -952,7 +1142,6 @@ const Cli = struct {
                 .imports = &.{
                     .{ .name = "issuez", .module = cli.issuez },
                     .{ .name = "blitzmcp", .module = blitzmcp.module("blitzmcp") },
-                    .{ .name = "version", .module = cli.version },
                     .{ .name = "mcp_help", .module = cli.mcp_help },
                     .{ .name = "RepoWatcher", .module = watch_module orelse break :blk null },
                 },
@@ -978,7 +1167,6 @@ const Cli = struct {
             .imports = &.{
                 .{ .name = "issuez", .module = cli.issuez },
                 .{ .name = "oracle", .module = cli.oracle },
-                .{ .name = "version", .module = cli.version },
                 .{ .name = "build_options", .module = options.createModule() },
                 .{ .name = "mcp_help", .module = cli.mcp_help },
             },
@@ -1001,3 +1189,456 @@ const Cli = struct {
         });
     }
 };
+
+// ─── The C API and the Go binding ──────────────────────────────────────
+
+/// Where the Go binding lives and what it commits: the header and the API
+/// description. Its archives are build outputs; releases have them as
+/// `libissuez-*`.
+const go_pkg = "bindings/go/issuez";
+const committed_header = go_pkg ++ "/include/issuez.h";
+const committed_api_json = "docs/issuez-api.json";
+
+/// The C library's platforms, in the Go binding's terms: GOOS_GOARCH[_musl]
+/// and the Zig target.
+const lib_targets = [_]struct { dir: []const u8, query: std.Target.Query }{
+    .{
+        .dir = "darwin_arm64",
+        .query = .{
+            .cpu_arch = .aarch64,
+            .os_tag = .macos,
+            .os_version_min = .{ .semver = .{ .major = 13, .minor = 0, .patch = 0 } },
+        },
+    },
+    .{
+        .dir = "darwin_amd64",
+        .query = .{
+            .cpu_arch = .x86_64,
+            .os_tag = .macos,
+            .os_version_min = .{ .semver = .{ .major = 13, .minor = 0, .patch = 0 } },
+        },
+    },
+    .{
+        .dir = "linux_amd64",
+        .query = .{
+            .cpu_arch = .x86_64,
+            .os_tag = .linux,
+            .abi = .gnu,
+            .glibc_version = .{ .major = 2, .minor = 28, .patch = 0 },
+        },
+    },
+    .{
+        .dir = "linux_amd64_musl",
+        .query = .{ .cpu_arch = .x86_64, .os_tag = .linux, .abi = .musl },
+    },
+    .{
+        .dir = "linux_arm64",
+        .query = .{
+            .cpu_arch = .aarch64,
+            .os_tag = .linux,
+            .abi = .gnu,
+            .glibc_version = .{ .major = 2, .minor = 28, .patch = 0 },
+        },
+    },
+    .{
+        .dir = "linux_arm64_musl",
+        .query = .{ .cpu_arch = .aarch64, .os_tag = .linux, .abi = .musl },
+    },
+    // ARMv6 code runs on v7 too, so one archive serves GOARM=6 and 7.
+    .{
+        .dir = "linux_arm",
+        .query = .{
+            .cpu_arch = .arm,
+            .os_tag = .linux,
+            .abi = .gnueabihf,
+            .cpu_model = .{ .explicit = &std.Target.arm.cpu.arm1176jzf_s },
+            .glibc_version = .{ .major = 2, .minor = 28, .patch = 0 },
+        },
+    },
+    .{
+        .dir = "linux_arm_musl",
+        .query = .{
+            .cpu_arch = .arm,
+            .os_tag = .linux,
+            .abi = .musleabihf,
+            .cpu_model = .{ .explicit = &std.Target.arm.cpu.arm1176jzf_s },
+        },
+    },
+};
+
+fn capiLib(
+    b: *std.Build,
+    target: std.Build.ResolvedTarget,
+    optimize: std.builtin.OptimizeMode,
+    /// Counts live allocations and exports `issuez__debug_live_allocations`.
+    debug: bool,
+    /// `issuez_version()`.
+    version: []const u8,
+) *std.Build.Step.Compile {
+    const options = b.addOptions();
+    options.addOption(bool, "debug", debug);
+    const issuez = b.createModule(.{
+        .root_source_file = b.path("src/root.zig"),
+        .target = target,
+        .optimize = optimize,
+        .link_libc = true,
+        .pic = true,
+        .imports = &.{versionImport(b, version)},
+    });
+    const lib = b.addLibrary(.{
+        .linkage = .static,
+        .name = "issuez",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/capi/lib.zig"),
+            .target = target,
+            .optimize = optimize,
+            .link_libc = true,
+            .pic = true,
+            .imports = &.{
+                .{ .name = "issuez", .module = issuez },
+                .{ .name = "capi_options", .module = options.createModule() },
+            },
+        }),
+    });
+    // The host links it with its own toolchain, which has no Zig runtime.
+    lib.bundle_compiler_rt = true;
+    return lib;
+}
+
+/// The archive repacked by `zig ar` (llvm-ar) in the target's format:
+/// Apple's linker refuses the archives Zig writes itself (members not
+/// 8-byte aligned).
+fn hostArchive(b: *std.Build, lib: *std.Build.Step.Compile) std.Build.LazyPath {
+    const format = if (lib.rootModuleTarget().os.tag.isDarwin()) "darwin" else "gnu";
+    const run = b.addSystemCommand(&.{ "sh", "-c", repack_script, "sh", b.graph.zig_exe, format });
+    run.addFileArg(lib.getEmittedBin());
+    const out = run.addOutputFileArg("libissuez.a");
+    run.setName(b.fmt("repack libissuez.a ({s})", .{format}));
+    return out;
+}
+
+const repack_script =
+    \\set -e
+    \\zig="$1"; format="$2"
+    \\abs() { (cd "$(dirname "$1")" && printf '%s/%s' "$(pwd)" "$(basename "$1")"); }
+    \\lib=$(abs "$3"); out=$(abs "$4")
+    \\work=$(mktemp -d)
+    \\trap 'rm -rf "$work"' EXIT
+    \\cd "$work"
+    \\"$zig" ar x "$lib"
+    \\chmod u+rw ./*.o
+    \\rm -f "$out"
+    \\"$zig" ar rcs --format="$format" "$out" ./*.o
+;
+
+/// A C file compiled with the system compiler and linked with the archive.
+fn compileC(
+    b: *std.Build,
+    source: []const u8,
+    header: std.Build.LazyPath,
+    archive: std.Build.LazyPath,
+    flags: []const []const u8,
+) std.Build.LazyPath {
+    const cc = b.addSystemCommand(&.{ "cc", "-std=c11", "-Wall", "-Wextra", "-Werror" });
+    cc.addArgs(flags);
+    // The archive is built for the exact host version; linking for an
+    // older one makes ld warn, and a step that writes to stderr fails.
+    if (b.graph.host.result.os.tag == .macos) {
+        const v = b.graph.host.result.os.version_range.semver.min;
+        cc.addArg(b.fmt("-mmacosx-version-min={d}.{d}.{d}", .{ v.major, v.minor, v.patch }));
+    }
+    cc.addPrefixedDirectoryArg("-I", header.dirname());
+    cc.addFileArg(b.path(source));
+    cc.addFileArg(archive);
+    cc.addArgs(&.{ "-lpthread", "-o" });
+    return cc.addOutputFileArg(std.fs.path.stem(source));
+}
+
+/// Sets up a command that runs the Go toolchain on the binding.
+fn goCommand(b: *std.Build, run: *std.Build.Step.Run, committed: *std.Build.Step) void {
+    run.setCwd(b.path("bindings/go"));
+    run.setEnvironmentVariable("CGO_ENABLED", "1");
+    // A go.work above this checkout (an embedder's) isn't ours.
+    run.setEnvironmentVariable("GOWORK", "off");
+    run.step.dependOn(committed);
+}
+
+fn addCapi(
+    b: *std.Build,
+    target: std.Build.ResolvedTarget,
+    optimize: std.builtin.OptimizeMode,
+    test_step: *std.Build.Step,
+    /// The CLI the Go end-to-end tests drive.
+    exe: *std.Build.Step.Compile,
+    /// What the archives that get installed report.
+    version: []const u8,
+) struct { go_e2e: *std.Build.Step.Run, step: *std.Build.Step } {
+    const gen = b.addExecutable(.{
+        .name = "issuez-gen",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/capi/gen.zig"),
+            .target = b.graph.host,
+            .optimize = .Debug,
+            // The header is committed, so it can't have git's version.
+            .imports = &.{.{
+                .name = "issuez",
+                .module = b.createModule(.{
+                    .root_source_file = b.path("src/root.zig"),
+                    .imports = &.{versionImport(b, zon_version)},
+                }),
+            }},
+        }),
+    });
+    const run_gen = b.addRunArtifact(gen);
+    const header = run_gen.addOutputFileArg("issuez.h");
+    const api_json = run_gen.addOutputFileArg("issuez-api.json");
+
+    const lib = capiLib(b, target, optimize, false, zon_version);
+    const archive = hostArchive(b, lib);
+    const capi_step = b.step("capi", "Build libissuez.a with its header and API description");
+    capi_step.dependOn(&b.addInstallFileWithDir(
+        hostArchive(b, capiLib(b, target, optimize, false, version)),
+        .lib,
+        "libissuez.a",
+    ).step);
+    capi_step.dependOn(&b.addInstallFileWithDir(header, .header, "issuez.h").step);
+    capi_step.dependOn(&b.addInstallFileWithDir(
+        api_json,
+        .{ .custom = "share/issuez" },
+        "issuez-api.json",
+    ).step);
+
+    const update = b.addUpdateSourceFiles();
+    update.addCopyFileToSource(header, committed_header);
+    update.addCopyFileToSource(api_json, committed_api_json);
+    b.step("capi-header", "Rewrite the committed issuez.h and issuez-api.json")
+        .dependOn(&update.step);
+
+    // The committed copies must be what the generator writes now.
+    for ([_]struct { std.Build.LazyPath, []const u8 }{
+        .{ header, committed_header },
+        .{ api_json, committed_api_json },
+    }) |pair| {
+        const cmp = b.addSystemCommand(&.{ "cmp", "-s" });
+        cmp.addFileArg(pair[0]);
+        cmp.addFileArg(b.path(pair[1]));
+        cmp.setName(b.fmt("{s} is current (zig build capi-header)", .{pair[1]}));
+        cmp.expectExitCode(0);
+        test_step.dependOn(&cmp.step);
+    }
+
+    const unit = b.addTest(.{ .name = "capi", .root_module = lib.root_module });
+    test_step.dependOn(&b.addRunArtifact(unit).step);
+
+    // The C API through its header, called from Zig like an embedder would.
+    // The library counts its live allocations.
+    const debug_lib = capiLib(b, target, .Debug, true, zon_version);
+    const translated = b.addTranslateC(.{
+        .root_source_file = header,
+        .target = target,
+        .optimize = .Debug,
+    });
+    const zig_suite = b.addTest(.{
+        .name = "capi-zig",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("test/capi_zig/root.zig"),
+            .target = target,
+            .optimize = .Debug,
+            .link_libc = true,
+            .imports = &.{.{ .name = "c", .module = translated.createModule() }},
+        }),
+        .test_runner = shardRunner(b),
+    });
+    zig_suite.root_module.linkLibrary(debug_lib);
+    zig_suite.root_module.addAnonymousImport("issuez-api.json", .{ .root_source_file = api_json });
+    // Every function and helper needs a test.
+    const coverage = b.addExecutable(.{
+        .name = "capi-coverage",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("tools/capi_coverage.zig"),
+            .target = b.graph.host,
+            .optimize = .Debug,
+        }),
+    });
+    const run_coverage = b.addRunArtifact(coverage);
+    run_coverage.addFileArg(api_json);
+    run_coverage.addDirectoryArg(b.path("test/capi_zig"));
+    run_coverage.expectExitCode(0);
+    // The cache doesn't see the test files change inside the directory.
+    run_coverage.has_side_effects = true;
+    const zig_suite_step = b.step(
+        "test-capi-zig",
+        "Test every C API function from Zig, through the header",
+    );
+    zig_suite_step.dependOn(&run_coverage.step);
+    addShards(b, zig_suite, 8, zig_suite_step);
+    test_step.dependOn(zig_suite_step);
+
+    // Archives for the Go binding. `go-libs` installs them; its tests link
+    // this platform's, with build.zig.zon's version so a commit alone keeps
+    // them, through CGO_LDFLAGS.
+    const all = b.option(
+        bool,
+        "go-libs-all",
+        "go-libs: every Go platform, not only the host",
+    ) orelse false;
+    const go_libs_step = b.step(
+        "go-libs",
+        "Install the Go binding's archives in lib/go/ (host, or -Dgo-libs-all)",
+    );
+    var go_test_lib: ?std.Build.LazyPath = null;
+    var go_debug_lib: ?std.Build.LazyPath = null;
+    for (lib_targets) |t| {
+        const resolved = b.resolveTargetQuery(t.query);
+        const host = b.graph.host.result;
+        const on_host = resolved.result.os.tag == host.os.tag and
+            resolved.result.cpu.arch == host.cpu.arch and
+            (host.os.tag != .linux or resolved.result.abi.isMusl() == host.abi.isMusl());
+        if (on_host) {
+            go_test_lib = hostArchive(b, capiLib(b, resolved, .ReleaseSafe, false, zon_version));
+            // The archive that counts its allocations, for the Go fuzz tests'
+            // leak check (-tags issuez_debug).
+            go_debug_lib = hostArchive(b, capiLib(b, resolved, .ReleaseSafe, true, zon_version));
+        }
+        if (!all and !on_host) continue;
+        go_libs_step.dependOn(&b.addInstallFileWithDir(
+            hostArchive(b, capiLib(b, resolved, .ReleaseSafe, false, version)),
+            .{ .custom = b.fmt("lib/go/{s}", .{t.dir}) },
+            "libissuez.a",
+        ).step);
+    }
+    // No such platform (Windows): the target's, for the failure to say so.
+    const go_test_archive = go_test_lib orelse archive;
+    const go_debug_archive = go_debug_lib orelse archive;
+
+    // The C smoke test, with the system compiler so ASan is available.
+    const run_smoke = std.Build.Step.Run.create(b, "run C smoke test");
+    run_smoke.addFileArg(compileC(b, "test/capi/smoke.c", header, archive, &.{
+        "-g",
+        "-fsanitize=address,undefined",
+        "-fno-omit-frame-pointer",
+    }));
+    _ = run_smoke.addOutputDirectoryArg("work");
+    // LeakSanitizer only exists on Linux; Apple's ASan aborts if asked.
+    if (b.graph.host.result.os.tag == .linux) run_smoke.setEnvironmentVariable(
+        "ASAN_OPTIONS",
+        "detect_leaks=1",
+    );
+    run_smoke.expectExitCode(0);
+    const test_capi = b.step("test-capi", "Run the C smoke test under ASan (needs cc)");
+    test_capi.dependOn(&run_smoke.step);
+
+    // The C quickstart, on a fresh repository; test-capi runs it too.
+    const quickstart_c = compileC(b, "examples/c/quickstart.c", header, archive, &.{});
+    const run_quickstart_c = b.addSystemCommand(&.{
+        "sh",
+        "-c",
+        "git init -q \"$2\" && exec \"$1\" \"$2\"",
+        "sh",
+    });
+    run_quickstart_c.addFileArg(quickstart_c);
+    _ = run_quickstart_c.addOutputDirectoryArg("repo");
+    run_quickstart_c.expectExitCode(0);
+    b.step("example-c-quickstart", "Run examples/c/quickstart.c (needs cc)")
+        .dependOn(&run_quickstart_c.step);
+    test_capi.dependOn(&run_quickstart_c.step);
+
+    // gofmt prints nothing, vet passes, then the tests under the race
+    // detector in a random order, with a statement coverage floor on the
+    // hand-written code, and the fuzz seeds with the leak check.
+    const go_test = addQuietCommand(b, &.{
+        "sh",
+        "-c",
+        \\set -e
+        \\dir() { (cd "$(dirname "$1")" && pwd); }
+        \\export CGO_LDFLAGS="-L$(dir "$2")"
+        \\out=$(gofmt -l .)
+        \\if [ -n "$out" ]; then echo "gofmt: $out" >&2; exit 1; fi
+        \\go vet ./...
+        \\cover=$(mktemp)
+        \\hand=$(mktemp)
+        \\trap 'rm -f "$cover" "$hand"' EXIT
+        \\go test -race -count=1 -shuffle=on -coverprofile="$cover" ./...
+        \\grep -v '/enums_gen\.go:' "$cover" >"$hand"
+        \\total=$(go tool cover -func="$hand" | awk '/^total:/ { sub("%", "", $3); print $3 }')
+        \\if ! awk -v t="$total" -v min="$1" 'BEGIN { exit !(t >= min) }'; then
+        \\  echo "Go statement coverage $total% is under $1%" >&2; exit 1
+        \\fi
+        \\CGO_LDFLAGS="-L$(dir "$3")" go test -tags issuez_debug -count=1 -run '^Fuzz' ./issuez
+        ,
+        "sh",
+        "95",
+    });
+    goCommand(b, go_test, &update.step);
+    go_test.addFileArg(go_test_archive);
+    go_test.addFileArg(go_debug_archive);
+    b.step("test-go", "Run the Go binding's tests (needs Go)").dependOn(&go_test.step);
+
+    // Each fuzz test in turn, with the leak check.
+    const fuzz_time = b.option(
+        []const u8,
+        "fuzz-time",
+        "fuzz-go: how long each Go fuzz test runs (go test -fuzztime)",
+    ) orelse "30s";
+    const go_fuzz = b.addSystemCommand(&.{
+        "sh",
+        "-c",
+        \\set -e
+        \\CGO_LDFLAGS="-L$(cd "$(dirname "$2")" && pwd)"
+        \\export CGO_LDFLAGS
+        \\for f in FuzzParseOID FuzzSnapshotUnmarshal FuzzEditValidate; do
+        \\  go test -tags issuez_debug -run '^$' -fuzz "^$f\$" -fuzztime "$1" ./issuez
+        \\done
+        ,
+        "sh",
+        fuzz_time,
+    });
+    goCommand(b, go_fuzz, &update.step);
+    go_fuzz.addFileArg(go_debug_archive);
+    go_fuzz.stdio = .inherit;
+    b.step(
+        "fuzz-go",
+        "Fuzz the Go binding (-Dfuzz-time=60s each; needs Go)",
+    ).dependOn(&go_fuzz.step);
+
+    // The binding against the real CLI. The root package adds
+    // upstream's bin directory as the second argument.
+    const go_e2e = addQuietCommand(b, &.{
+        "sh",
+        "-c",
+        \\set -e
+        \\# go test runs in the package's directory: absolute paths only.
+        \\abs() { (cd "$(dirname "$1")" && printf '%s/%s' "$(pwd)" "$(basename "$1")"); }
+        \\CGO_LDFLAGS="-L$(dirname "$(abs "$1")")"
+        \\ISSUEZ_GIT_ISSUE=$(abs "$2")
+        \\ISSUEZ_UPSTREAM=${3:+$(abs "$3")}
+        \\export CGO_LDFLAGS ISSUEZ_GIT_ISSUE ISSUEZ_UPSTREAM
+        \\go vet -tags e2e ./issuez/e2e/...
+        \\go test -tags e2e -count=1 ./issuez/e2e/...
+        ,
+        "sh",
+    });
+    goCommand(b, go_e2e, &update.step);
+    go_e2e.addFileArg(go_test_archive);
+    go_e2e.addArtifactArg(exe);
+    b.step("test-go-e2e", "Run the Go binding's end-to-end tests against the CLI (needs Go)")
+        .dependOn(&go_e2e.step);
+
+    const bindings = b.step(
+        "test-bindings",
+        "Run every C API and Go binding test (needs cc and Go)",
+    );
+    bindings.dependOn(zig_suite_step);
+    bindings.dependOn(&run_smoke.step);
+    bindings.dependOn(&go_test.step);
+    bindings.dependOn(&go_e2e.step);
+
+    // The same on Linux, in a container (test/linux/), for a macOS host.
+    const linux = b.addSystemCommand(&.{ "sh", "test/linux/test-bindings.sh" });
+    linux.setCwd(b.path("."));
+    linux.has_side_effects = true;
+    linux.stdio = .inherit;
+    b.step("test-bindings-linux", "Run test-bindings in a Linux container (needs docker)")
+        .dependOn(&linux.step);
+    return .{ .go_e2e = go_e2e, .step = bindings };
+}

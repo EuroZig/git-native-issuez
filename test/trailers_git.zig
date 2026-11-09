@@ -106,10 +106,6 @@ test "parser matches git log on random messages" {
     // ISSUEZ_TRAILER_CASES=<n> and a fresh ISSUEZ_TRAILER_SEED.
     const count = envInt(&env, "ISSUEZ_TRAILER_CASES") orelse 600;
     const seed = envInt(&env, "ISSUEZ_TRAILER_SEED") orelse 20261018;
-    if (count != 600 or seed != 20261018) std.debug.print(
-        "trailers_git: {d} cases, seed {d}\n",
-        .{ count, seed },
-    );
     var prng: std.Random.DefaultPrng = .init(seed);
     const rand = prng.random();
     const messages = try arena.alloc([]const u8, count);
@@ -187,5 +183,10 @@ test "parser matches git log on random messages" {
             );
         }
     }
+    // Said only on failure: a test that writes to stderr fails its step.
+    if (mismatches > 0) std.debug.print(
+        "trailers_git: {d} of {d} cases differ, seed {d}\n",
+        .{ mismatches, count, seed },
+    );
     try testing.expectEqual(@as(usize, 0), mismatches);
 }

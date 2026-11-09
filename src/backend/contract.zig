@@ -16,10 +16,12 @@
 //! fn configAdd(self, key, value) Error!void
 //! fn configUnsetValue(self, key, value) Error!void
 //! fn remoteNames(self, arena) Error![]const []const u8
-//! fn identity(self, arena) Error!Identity
+//! fn identity(self, arena) (Error || error{IdentityUnknown})!Identity
 //! fn randomBytes(self, buf: []u8) void
-//! fn fetch(self, arena, remote, refspecs, prune) (Error || error{FetchFailed})!void
-//! fn push(self, arena, remote, refspecs, atomic) (Error || error{PushFailed})!PushResult
+//! fn configList(self, arena) Error![]const ConfigEntry  // optional: every
+//!     entry in git's order, keys lowercased; settings read it in one call
+//! fn fetch(self, arena, remote, refspecs, FetchOptions) (Error || error{FetchFailed})!void
+//! fn push(self, arena, remote, refspecs, PushOptions) (Error || error{PushFailed})!PushResult
 //! ```
 //!
 //! Attachments also need an LFS store. Without it every other operation
@@ -51,6 +53,14 @@
 //! fn lfsAvailable(self, arena) Error!bool         // git-lfs installed
 //! fn lfsPush(self, arena, remote, sha256_hexes) (Error || LfsTransportError)!void
 //! fn lfsFetch(self, arena, remote, refs_or_oids) (Error || LfsTransportError)!void
+//! ```
+//!
+//! Optional, the one push that isn't a fast-forward, for purges (format.md
+//! §10). Atomic: every ref must still be what its lease expects, else all
+//! are rejected.
+//!
+//! ```
+//! fn pushLeased(self, arena, remote, []const LeasedRef) (Error || error{PushFailed})!PushResult
 //! ```
 //!
 //! `lfsPush` uploads objects from the store. `lfsFetch` downloads the
@@ -118,6 +128,36 @@ pub const RefUpdate = struct {
     };
 };
 
+pub fn hasLeasedPush(comptime B: type) bool {
+    return @hasDecl(B, "pushLeased");
+}
+
+/// Sets the remote's `dst` to the local ref `src` (or an object ID in
+/// hex), or deletes it when `src` is null, if the remote's is still
+/// `expect` (null: absent).
+pub const LeasedRef = struct {
+    src: ?[]const u8,
+    dst: []const u8,
+    expect: ?Oid,
+};
+
+/// A config entry, as `configList` gives them.
+pub const ConfigEntry = struct { key: []const u8, value: []const u8 };
+
+/// What a backend's `fetch` takes.
+pub const FetchOptions = struct {
+    /// Delete refs under the refspecs' destinations that the remote no
+    /// longer has, as `git fetch --prune`.
+    prune: bool = false,
+};
+
+/// What a backend's `push` takes.
+pub const PushOptions = struct {
+    /// All refs or none, as `git push --atomic`; a remote that can't falls
+    /// back to a plain push.
+    atomic: bool = false,
+};
+
 /// With `atomic`, either every ref was updated or none.
 pub const PushResult = struct {
     refs: []const PushedRef,
@@ -135,12 +175,27 @@ pub const PushedRef = struct {
     pub const Status = enum {
         ok,
         up_to_date,
-        /// Not a fast-forward, or the atomic push failed because of another
-        /// ref. When the remote refused a ref for any other reason (a hook,
+        /// Not a fast-forward, the atomic push failed because of another
+        /// ref, or the remote's ref moved while it received the push. When
+        /// the remote refused a ref for any other reason (a hook,
         /// permissions), `push` fails with PushFailed instead.
         rejected,
     };
 };
+
+/// A URL or path given instead of a remote's name (`git fetch` takes
+/// either): has a `/` or `:`, and nothing that would break a command
+/// line or a ref name read back.
+pub fn isRemoteUrl(target: []const u8) bool {
+    if (target.len == 0 or target.len > 4096 or target[0] == '-') return false;
+    for (target) |c| if (c < 0x20 or c == 0x7f) return false;
+    return std.mem.findAny(u8, target, "/:") != null;
+}
+
+/// What fetch and push take: a remote's name, or a URL or path.
+pub fn isValidRemoteTarget(target: []const u8) bool {
+    return isValidRemoteName(target) or isRemoteUrl(target);
+}
 
 /// Remote names end up in refs and refspecs, so they must be one safe path
 /// component.

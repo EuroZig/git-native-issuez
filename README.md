@@ -15,6 +15,8 @@ command. It reads and writes the format of
 - **For coding agents:** `git issue mcp`, a Model Context Protocol server.
 - **For scripts:** `--json` on every read command, man pages and shell
   completions.
+- **For other languages:** a C API and a
+  [Go binding](bindings/go/README.md).
 
 ![The board: a column per workflow state, cards with priority, progress, labels and assignee](docs/issuez-board.png)
 
@@ -106,7 +108,8 @@ See [docs/attachments.md](docs/attachments.md).
 
 `git issue tui`, or plain `git issue` at a terminal: a list (optionally a
 tree of sub-issues), a kanban board by workflow state and a detail view
-where every field is edited in place. `?` shows the keys; the mouse works
+where every field is edited in place. `M` lists the open milestones with
+their progress to filter by, `?` shows the keys; the mouse works
 everywhere. The list is sortable and filterable
 (`label:ui @ada p:high is:blocked -label:wontfix`). It updates live when
 the CLI, another TUI or an agent writes.
@@ -178,13 +181,14 @@ exe.root_module.addImport("issuez", issuez_dep.module("issuez"));
 
 ```zig
 const issuez = @import("issuez");
-const Repo = issuez.Repo(issuez.backend.GitProcess);
+const GitProcess = issuez.GitProcess; // or GitSim, or your own backend
 
-var git = try issuez.backend.GitProcess.open(io, gpa, .{ .path = ".", .environ_map = env });
+var git = try GitProcess.open(io, gpa, .{ .path = ".", .environ_map = env });
 defer git.close();
-const repo = Repo.init(&git);
-const created = try repo.create(arena, .{ .title = "Login page crashes", .labels = &.{"bug"} });
-const open = try issuez.query.list(arena, try repo.loadAll(arena), .{ .state = .open }, .{});
+const h = try issuez.open(GitProcess, arena, &git); // the repository's settings
+const created = try h.repo.create(arena, .{ .title = "Login page crashes", .labels = &.{"bug"} }, .{});
+_ = try h.repo.comment(arena, created.id, .{ .text = "Seen on 1.4.2." }, .{});
+const open = try issuez.query.list(arena, try h.repo.loadAll(arena), .{ .state = .open }, .{});
 for (open) |issue| std.debug.print("{s} {s}\n", .{ issue.state.text(), issue.title });
 ```
 
@@ -202,6 +206,14 @@ for (open) |issue| std.debug.print("{s} {s}\n", .{ issue.state.text(), issue.tit
 | [attachments.zig](examples/attachments.zig)       | validate, attach with a comment, read bytes back, rename and remove (in memory)        | `zig build example-attachments`            |
 | [real_repo.zig](examples/real_repo.zig)           | the same API on a real repository through `GitProcess`                                 | `zig build example-real-repo -- <repo> ls` |
 | [custom_backend.zig](examples/custom_backend.zig) | your own backend (audit log, write policy) and ETag-style `.expect` versions           | `zig build example-custom-backend`         |
+| [c/quickstart.c](examples/c/quickstart.c)         | the C API: create, comment, edit, close, list, show                                    | `zig build example-c-quickstart`           |
+
+From C (and any language with a C FFI), each release has the library as
+`libissuez-*` archives, and `zig build capi` writes
+`zig-out/lib/libissuez.a` and `zig-out/include/issuez.h`; the header's
+preamble covers errors, ownership and threads. Go has a binding of its
+own, with `go get github.com/EuroZig/git-native-issuez-go/issuez`:
+[bindings/go](bindings/go/README.md).
 
 ## Docs
 
@@ -212,6 +224,8 @@ for (open) |issue| std.debug.print("{s} {s}\n", .{ issue.state.text(), issue.tit
 - [docs/lazygit.md](docs/lazygit.md): an issues menu for lazygit.
 - [docs/mcp.md](docs/mcp.md): the MCP server for coding agents.
 - [docs/design.md](docs/design.md): how the library is put together.
+- [docs/embedding.md](docs/embedding.md): embedding the library in a host,
+  from Zig, C or Go.
 - [docs/compatibility.md](docs/compatibility.md): where the CLI differs from
   upstream on purpose.
 - [CHANGELOG.md](CHANGELOG.md): what changed.
@@ -232,8 +246,8 @@ docs under `share/`. The Windows archive has `git-issue.exe` only: run
 one by hand, unpack it into a prefix with `bin/` on your `PATH`:
 
 ```sh
-gh release download v0.3.0 --repo EuroZig/git-native-issuez --pattern '*-full-aarch64-macos.tar.gz'
-tar -xzf git-native-issuez-0.3.0-full-aarch64-macos.tar.gz --strip-components=1 -C ~/.local
+gh release download v0.4.0 --repo EuroZig/git-native-issuez --pattern '*-full-aarch64-macos.tar.gz'
+tar -xzf git-native-issuez-0.4.0-full-aarch64-macos.tar.gz --strip-components=1 -C ~/.local
 ```
 
 On macOS, an archive downloaded with a browser is quarantined and
@@ -245,7 +259,7 @@ On macOS, an archive downloaded with a browser is quarantined and
 It downloads the latest release for your machine, checks it against
 `SHA256SUMS` and unpacks it into `~/.local`.
 
-- Options go after `sh -s --`: `--flavor minimal`, `--version 0.3.0`,
+- Options go after `sh -s --`: `--flavor minimal`, `--version 0.4.0`,
   `--prefix /usr/local`. For a prefix you can't write to, pipe it into
   `sudo sh -s -- --prefix /usr/local`.
 - It doesn't touch your shell configuration: if `~/.local/bin` isn't on
