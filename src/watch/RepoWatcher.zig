@@ -323,6 +323,15 @@ const Recorder = struct {
         r.calls.store(0, .release);
         return @bitCast(r.seen.swap(0, .acq_rel));
     }
+
+    /// Lets a write's late events arrive, then forgets them: on a busy
+    /// machine a lock and its rename can come more than `quiet` apart,
+    /// so one write may make two calls.
+    fn settle(r: *Recorder, io: Io) !void {
+        try io.sleep(.fromMilliseconds(300), .awake);
+        r.calls.store(0, .release);
+        r.seen.store(0, .release);
+    }
 };
 
 /// What git does to write a file: a lock, renamed over it.
@@ -366,6 +375,7 @@ test "reports ref and config writes, not other files" {
 
     try gitWrite(io, tmp.dir, "config", "[issue]\n\tdoneStates = done\n");
     try testing.expectEqual(Change{ .config = true }, try recorder.take(io));
+    try recorder.settle(io);
 
     // Branches and objects aren't issues.
     try gitWrite(io, tmp.dir, "refs/heads/main", "3333\n");
