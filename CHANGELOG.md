@@ -31,7 +31,10 @@ format are as in 0.4.0, but a C host needs the 0.5.0 `issuez.h`: before
   then rewrote the issue differently from the remote's copy, merged the two
   with a conflict, and pushed a history the push check refuses
   (`invalid_history`, `purged`). Purging now rewrites until nothing changes
-  ([docs/format.md](docs/format.md) §10).
+  ([docs/format.md](docs/format.md) §10). A push check on 0.4.0 still
+  refuses such a history: update the hosts that run one.
+- In that state, purging the comment's rewrite recorded the rewrite in the
+  tombstone instead of the comment, which the tombstone already had.
 
 ## [0.4.0] - 2026-11-08
 

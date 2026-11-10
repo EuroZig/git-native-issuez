@@ -70,6 +70,21 @@ pub fn firstId(
     return if (c.isFullHex(was) and !history.contains(was)) was else hex;
 }
 
+/// `firstId` of a comment to purge: a rewrite whose original is still in
+/// the history is the original once `t` purged that.
+pub fn targetId(
+    c: commands.Clone,
+    history: *const std.StringHashMapUnmanaged(void),
+    hex: []const u8,
+    t: Tomb,
+) Allocator.Error![]const u8 {
+    const first = try firstId(c, history, hex);
+    const cm = c.commit(hex) orelse return first;
+    const block = try commands.trailersOf(c.arena, cm.message);
+    const was = trailers.lastValue(block, "X-Rewritten-From") orelse return first;
+    return if (c.isFullHex(was) and t.covers(was)) was else first;
+}
+
 /// Whether the history of `tip` still has text a purge took: a commit
 /// whose first ID is purged and that isn't marked `X-Purged: true`.
 pub fn leaks(c: commands.Clone, tip: []const u8, t: Tomb) Allocator.Error!?[]const u8 {
@@ -99,19 +114,24 @@ const comment_keeps = [_][]const u8{
 };
 
 /// The tip `tip` rewrites to with `purged` (first IDs) purged. Null when
-/// the history isn't all there. Rewritten again until nothing changes: a
-/// pass drops purged commits, and an `X-Rewritten-From` naming one of
-/// them counts once it is gone (format.md §10).
+/// the history isn't all there, or doesn't settle within as many passes
+/// as it has commits (the library's CorruptIssue). Rewritten again until
+/// nothing changes: a pass drops purged commits, and an
+/// `X-Rewritten-From` naming one of them counts once it is gone
+/// (format.md §10).
 pub fn rewrite(
     c: commands.Clone,
     tip: []const u8,
     purged: []const []const u8,
 ) Allocator.Error!?[]const u8 {
+    const bound = (try c.reach(tip)).count();
     // The new commits too: the next pass reads them like any others.
     var over = c;
     over.objects = try c.objects.clone(c.arena);
-    var at = tip;
-    while (true) {
+    var at = (try rewriteOnce(c, &over, tip, purged)) orelse return null;
+    if (std.mem.eql(u8, at, tip)) return at;
+    // One more than the library, which needs no pass to see it settled.
+    for (0..bound + 1) |_| {
         // What the pass reads stays as it was while the pass writes.
         var pass = over;
         pass.objects = try over.objects.clone(c.arena);
@@ -119,6 +139,7 @@ pub fn rewrite(
         if (std.mem.eql(u8, next, at)) return at;
         at = next;
     }
+    return null;
 }
 
 fn rewriteOnce(
