@@ -1317,12 +1317,12 @@ pub fn key(s: *AppState, k: vaxis.Key) Allocator.Error!AppState.Action {
 /// In (-1) or out (+1), keeping the selected bar, or today, in place.
 pub fn zoom(s: *AppState, by: i32) void {
     const t = &s.timeline;
-    const z: i32 = @intFromEnum(t.zoom);
+    const z: i32 = @backingInt(t.zoom);
     const next = std.math.clamp(z + by, 0, 2);
     if (next == z) return;
     const keep = t.anchor(s.today);
     const at = t.x(keep);
-    t.zoom = @enumFromInt(next);
+    t.zoom = @fromBackingInt(@intCast(next));
     // The same day under the same column, if it was on screen.
     const col = if (at >= 0 and at < t.chart_width) at else @divFloor(@as(i32, t.chart_width), 2);
     t.origin = keep - @divFloor(col * t.zoom.den(), t.zoom.num());
@@ -1432,8 +1432,8 @@ pub fn command(s: *AppState, c: ui.TimelineCommand) void {
 pub const edit = @import("timeline_edit.zig");
 
 pub fn setZoom(s: *AppState, z: Zoom) void {
-    const want: i32 = @intFromEnum(z);
-    const have: i32 = @intFromEnum(s.timeline.zoom);
+    const want: i32 = @backingInt(z);
+    const have: i32 = @backingInt(s.timeline.zoom);
     if (want != have) zoom(s, want - have);
 }
 

@@ -675,7 +675,7 @@ pub fn Sync(comptime B: type) type {
 
         /// A purged issue whose remote tip, purged, isn't in the local one.
         fn leaseWouldLose(self: Self, arena: Allocator, view: *const PushView) Error!bool {
-            const seen = view.seen[@intFromEnum(Namespace.issues)];
+            const seen = view.seen[@backingInt(Namespace.issues)];
             var it = view.tombs.iterator();
             while (it.next()) |e| {
                 if (e.value_ptr.issue or e.value_ptr.comments.len == 0) continue;
@@ -693,7 +693,7 @@ pub fn Sync(comptime B: type) type {
         /// The remote has a tombstone this clone doesn't: merge it first,
         /// or the push brings back what it purged.
         fn tombstonesBehind(self: Self, view: *const PushView) Error!bool {
-            var it = view.seen[@intFromEnum(Namespace.purged)].iterator();
+            var it = view.seen[@backingInt(Namespace.purged)].iterator();
             while (it.next()) |e| {
                 const local = view.tombs.get(e.key_ptr.*) orelse return true;
                 if (local.tip.eql(e.value_ptr.*)) continue;
@@ -1153,7 +1153,7 @@ pub fn Sync(comptime B: type) type {
                     view.records,
                     try recordRef(arena, remote, .kept, ns, ""),
                 );
-                var it = view.quarantined[@intFromEnum(ns)].iterator();
+                var it = view.quarantined[@backingInt(ns)].iterator();
                 while (it.next()) |e| {
                     if (kept.get(e.key_ptr.*)) |k| if (k.eql(e.value_ptr.*)) continue;
                     quarantined += 1;
@@ -1427,7 +1427,7 @@ pub fn Sync(comptime B: type) type {
                     issue.attachments.len == 0 and issue.removed_attachments.len == 0) continue;
                 if (try att.reconcile(arena, issue, null)) moved = true;
             }
-            if (moved) view.locals[@intFromEnum(Namespace.attachments)] =
+            if (moved) view.locals[@backingInt(Namespace.attachments)] =
                 try self.b().listRefs(arena, Namespace.attachments.refPrefix());
             var report: PushReport = .{
                 .pushed = 0,
@@ -1536,7 +1536,7 @@ pub fn Sync(comptime B: type) type {
             records: []const contract.RefEntry,
 
             fn local(v: *const PushView, ns: Namespace) []const contract.RefEntry {
-                return v.locals[@intFromEnum(ns)];
+                return v.locals[@backingInt(ns)];
             }
         };
 
@@ -1551,7 +1551,7 @@ pub fn Sync(comptime B: type) type {
                 .records = records,
             };
             for (fetched_namespaces) |ns| {
-                const i = @intFromEnum(ns);
+                const i = @backingInt(ns);
                 v.locals[i] = try self.b().listRefs(arena, ns.refPrefix());
                 v.seen[i] = try mapUnder(
                     arena,
@@ -1600,7 +1600,7 @@ pub fn Sync(comptime B: type) type {
                     try recordRef(arena, remote, .seen, ns, ""),
                 );
                 const pushed_prefix = try recordRef(arena, remote, .pushed, ns, "");
-                const pushed = &view.pushed[@intFromEnum(ns)];
+                const pushed = &view.pushed[@backingInt(ns)];
                 for (view.local(ns)) |r| {
                     const id = r.name[ns.refPrefix().len..];
                     const name = try std.mem.concat(arena, u8, &.{ pushed_prefix, id });
@@ -1623,7 +1623,7 @@ pub fn Sync(comptime B: type) type {
                 else => |e| return e,
             };
             for (changes.items) |c| {
-                const pushed = &view.pushed[@intFromEnum(c.ns)];
+                const pushed = &view.pushed[@backingInt(c.ns)];
                 if (c.new) |n| try pushed.put(arena, c.id, n) else _ = pushed.remove(c.id);
             }
             return view;
@@ -1687,7 +1687,7 @@ pub fn Sync(comptime B: type) type {
             for (chunk) |p| if (p.leased) try updates.append(arena, .{
                 .src = if (p.tip != null) p.src orelse p.name else null,
                 .dst = p.name,
-                .expect = view.seen[@intFromEnum(p.ns)].get(p.id),
+                .expect = view.seen[@backingInt(p.ns)].get(p.id),
             }) else try specs.append(
                 arena,
                 try std.fmt.allocPrint(arena, "{s}:{s}", .{ p.name, p.name }),
@@ -1770,12 +1770,12 @@ pub fn Sync(comptime B: type) type {
             var out: std.ArrayList(Pending) = .fromOwnedSlice(todo);
             var group: usize = 0;
             for (todo) |p| group = @max(group, p.group);
-            var it = view.quarantined[@intFromEnum(Namespace.issues)].keyIterator();
+            var it = view.quarantined[@backingInt(Namespace.issues)].keyIterator();
             while (it.next()) |key| {
                 const id = key.*;
                 const t = view.tombs.get(id) orelse continue;
                 if (t.issue or t.comments.len == 0) continue;
-                const remote_tip = view.seen[@intFromEnum(Namespace.issues)].get(id) orelse
+                const remote_tip = view.seen[@backingInt(Namespace.issues)].get(id) orelse
                     continue;
                 const purged = try self.purgedTip(arena, remote_tip, t.comments);
                 if (purged.eql(remote_tip)) continue;
@@ -1793,7 +1793,7 @@ pub fn Sync(comptime B: type) type {
                     .tip = purged,
                     .ns = .issues,
                     .id = id,
-                    .record = view.pushed[@intFromEnum(Namespace.issues)].get(id),
+                    .record = view.pushed[@backingInt(Namespace.issues)].get(id),
                     .group = g,
                     .leased = true,
                     .src = try arena.dupe(u8, hex.slice()),
@@ -1812,12 +1812,12 @@ pub fn Sync(comptime B: type) type {
             view: *const PushView,
         ) Error![]Pending {
             _ = self;
-            const Extra = std.StringArrayHashMapUnmanaged(Pending);
+            const Extra = std.array_hash_map.String(Pending);
             // Derived refs and tombstones that differ from the records.
             var extras: [2]Extra = .{ .empty, .empty };
-            const issue_markers = view.quarantined[@intFromEnum(Namespace.issues)];
+            const issue_markers = view.quarantined[@backingInt(Namespace.issues)];
             for ([_]Namespace{ .attachments, .purged }, &extras) |ns, *extra| {
-                const records = view.pushed[@intFromEnum(ns)];
+                const records = view.pushed[@backingInt(ns)];
                 for (view.local(ns)) |r| {
                     const id = r.name[ns.refPrefix().len..];
                     if (ns == .attachments and issue_markers.contains(id)) continue;
@@ -1836,8 +1836,8 @@ pub fn Sync(comptime B: type) type {
             var out: std.ArrayList(Pending) = .empty;
             var group: usize = 0;
             for (namespaces) |ns| {
-                const markers = view.quarantined[@intFromEnum(ns)];
-                const records = view.pushed[@intFromEnum(ns)];
+                const markers = view.quarantined[@backingInt(ns)];
+                const records = view.pushed[@backingInt(ns)];
                 for (view.local(ns)) |r| {
                     const id = r.name[ns.refPrefix().len..];
                     if (markers.contains(id)) {
@@ -1874,14 +1874,14 @@ pub fn Sync(comptime B: type) type {
                 const id = e.key_ptr.*;
                 const before = out.items.len;
                 for ([_]Namespace{ .issues, .attachments }) |ns| {
-                    if (view.seen[@intFromEnum(ns)].get(id) == null) continue;
+                    if (view.seen[@backingInt(ns)].get(id) == null) continue;
                     if (before == out.items.len) group += 1;
                     try out.append(arena, .{
                         .name = try localRef(arena, ns, id),
                         .tip = null,
                         .ns = ns,
                         .id = id,
-                        .record = view.pushed[@intFromEnum(ns)].get(id),
+                        .record = view.pushed[@backingInt(ns)].get(id),
                         .group = group,
                         .leased = true,
                     });

@@ -99,16 +99,35 @@ const comment_keeps = [_][]const u8{
 };
 
 /// The tip `tip` rewrites to with `purged` (first IDs) purged. Null when
-/// the history isn't all there.
+/// the history isn't all there. Rewritten again until nothing changes: a
+/// pass drops purged commits, and an `X-Rewritten-From` naming one of
+/// them counts once it is gone (format.md §10).
 pub fn rewrite(
     c: commands.Clone,
     tip: []const u8,
     purged: []const []const u8,
 ) Allocator.Error!?[]const u8 {
-    var memo: std.StringHashMapUnmanaged([]const u8) = .empty;
-    // The new commits too: a merge's new parents are read like any others.
+    // The new commits too: the next pass reads them like any others.
     var over = c;
     over.objects = try c.objects.clone(c.arena);
+    var at = tip;
+    while (true) {
+        // What the pass reads stays as it was while the pass writes.
+        var pass = over;
+        pass.objects = try over.objects.clone(c.arena);
+        const next = (try rewriteOnce(pass, &over, at, purged)) orelse return null;
+        if (std.mem.eql(u8, next, at)) return at;
+        at = next;
+    }
+}
+
+fn rewriteOnce(
+    c: commands.Clone,
+    over: *commands.Clone,
+    tip: []const u8,
+    purged: []const []const u8,
+) Allocator.Error!?[]const u8 {
+    var memo: std.StringHashMapUnmanaged([]const u8) = .empty;
     var walk = try c.walk(tip);
     while (try walk.next()) |_| {}
     if (walk.missing) return null;
@@ -116,7 +135,7 @@ pub fn rewrite(
         .c = c,
         .purged = purged,
         .memo = &memo,
-        .over = &over,
+        .over = over,
         .history = &walk.seen,
     };
     return try r.new(tip);

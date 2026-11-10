@@ -57,10 +57,10 @@ pub fn main(init: std.process.Init) u8 {
         0,
     ) catch |err| fatal.msg("reading world from stdin: {t}", .{err});
 
-    var diag: std.zon.parse.Diagnostics = .{};
+    var diag: std.zon.parse.Diagnostics = undefined;
     var world = World.parse(arena, source, &diag) catch |err| switch (err) {
         error.OutOfMemory => |e| fatal.oom(e),
-        error.ParseZon => fatal.msg("invalid world document:\n{f}", .{diag}),
+        error.ParseZon => fatal.msg("invalid world document:\n{f}", .{diag.fmt("<stdin>")}),
     };
     if (world.clones.len == 0) fatal.msg("world has no clones", .{});
     const clone_index = if (clone_name) |name|

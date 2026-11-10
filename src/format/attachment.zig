@@ -249,7 +249,7 @@ test "spec: round trip and rejects" {
     try testing.expectEqualStrings(spec.name, back.name);
 
     const id = "1b4e28ba-2fa1-4d3b-a3f5-ef19b5a7633b";
-    const h = "sha256:" ++ "a" ** 64;
+    const h = "sha256:" ++ @as([64]u8, @splat('a'));
     for ([_][]const u8{
         "",
         id,
@@ -275,18 +275,19 @@ test "sanitizeName" {
     try testing.expectEqualStrings("a b", try sanitizeName(arena, "a\nb"));
     try testing.expectEqualStrings("attachment", try sanitizeName(arena, " \t "));
     try testing.expectEqualStrings("ok", try sanitizeName(arena, "\xffok"));
-    const long = try sanitizeName(arena, "é" ** 200);
+    const long = try sanitizeName(arena, @ptrCast(&@as([200][2]u8, @splat("é".*))));
     try testing.expect(long.len <= max_name_bytes and isCleanName(long));
-    const latin1 = try sanitizeName(arena, "a" ** 300 ++ "\xe9");
+    const latin1 = try sanitizeName(arena, @as([300]u8, @splat('a')) ++ "\xe9");
     try testing.expect(latin1.len == max_name_bytes and isCleanName(latin1));
 }
 
 test "lfsPointer" {
     var arena_state: std.heap.ArenaAllocator = .init(testing.allocator);
     defer arena_state.deinit();
-    const p = try lfsPointer(arena_state.allocator(), Sha256.parse("ab" ** 32).?, 12);
+    const ab: [64]u8 = @bitCast(@as([32][2]u8, @splat("ab".*)));
+    const p = try lfsPointer(arena_state.allocator(), Sha256.parse(&ab).?, 12);
     try testing.expectEqualStrings(
-        "version https://git-lfs.github.com/spec/v1\noid sha256:" ++ "ab" ** 32 ++ "\nsize 12\n",
+        "version https://git-lfs.github.com/spec/v1\noid sha256:" ++ ab ++ "\nsize 12\n",
         p,
     );
 }

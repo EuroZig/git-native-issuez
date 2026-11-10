@@ -393,7 +393,7 @@ fn writeObjectSession(gp: *GitProcess, kind: ObjectKind, data: []const u8) Error
     // git reads one path per line and unquotes a line starting with '"';
     // the one-off fallback takes such a repository path.
     if (std.mem.findScalar(u8, path, '\n') != null or path[0] == '"') return error.GitFailed;
-    const slot = &gp.hash_objects[@intFromEnum(kind)];
+    const slot = &gp.hash_objects[@backingInt(kind)];
     if (slot.* == null) slot.* = try HashObject.start(gp, kind);
     const ho = slot.*.?;
 
@@ -1278,13 +1278,13 @@ fn spawnDetached(gp: *GitProcess, argv: []const []const u8, stdin: bool) Error!s
     defer arena_state.deinit();
     const a = arena_state.allocator();
     const argv_z = try a.allocSentinel(?[*:0]const u8, argv.len, null);
-    for (argv, argv_z) |arg, *z| z.* = (try a.dupeZ(u8, arg)).ptr;
+    for (argv, argv_z) |arg, *z| z.* = (try a.dupeSentinel(u8, arg, 0)).ptr;
     const env = try gp.env.createPosixBlock(a, .{});
-    const cwd = try a.dupeZ(u8, gp.repo_path);
+    const cwd = try a.dupeSentinel(u8, gp.repo_path, 0);
     // Where `git` may be: the configured path itself, else in PATH order.
     var programs: std.ArrayList([*:0]const u8) = .empty;
     if (std.mem.indexOfScalar(u8, argv[0], '/') != null) {
-        try programs.append(a, try a.dupeZ(u8, argv[0]));
+        try programs.append(a, try a.dupeSentinel(u8, argv[0], 0));
     } else {
         const path = gp.env.get("PATH") orelse "/usr/bin:/bin";
         var dirs = std.mem.tokenizeScalar(u8, path, ':');

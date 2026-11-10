@@ -36,18 +36,18 @@ fn untranslatable(name: []const u8) bool {
 const layouts = blk: {
     @setEvalBranchQuota(200_000);
     var out: []const Layout = &.{};
-    for (@typeInfo(c).@"struct".decls) |d| {
-        if (!std.mem.startsWith(u8, d.name, "issuez_")) continue;
-        const v = @field(c, d.name);
+    for (@typeInfo(c).@"struct".decl_names) |name| {
+        if (!std.mem.startsWith(u8, name, "issuez_")) continue;
+        const v = @field(c, name);
         if (@TypeOf(v) != type) continue;
         const info = @typeInfo(v);
         if (info != .@"struct" or info.@"struct".layout != .@"extern") continue;
         var fields: []const FieldLayout = &.{};
-        for (info.@"struct".fields) |f| fields = fields ++ [_]FieldLayout{.{
-            .name = f.name,
-            .offset = @offsetOf(v, f.name),
+        for (info.@"struct".field_names) |f| fields = fields ++ [_]FieldLayout{.{
+            .name = f,
+            .offset = @offsetOf(v, f),
         }};
-        out = out ++ [_]Layout{.{ .name = d.name, .size = @sizeOf(v), .fields = fields }};
+        out = out ++ [_]Layout{.{ .name = name, .size = @sizeOf(v), .fields = fields }};
     }
     break :blk out;
 };
@@ -58,11 +58,11 @@ const Constant = struct { name: []const u8, value: i64 };
 const constants = blk: {
     @setEvalBranchQuota(200_000);
     var out: []const Constant = &.{};
-    for (@typeInfo(c).@"struct".decls) |d| {
-        if (!std.mem.startsWith(u8, d.name, "ISSUEZ_") or untranslatable(d.name)) continue;
-        const v = @field(c, d.name);
+    for (@typeInfo(c).@"struct".decl_names) |name| {
+        if (!std.mem.startsWith(u8, name, "ISSUEZ_") or untranslatable(name)) continue;
+        const v = @field(c, name);
         switch (@typeInfo(@TypeOf(v))) {
-            .int, .comptime_int => out = out ++ [_]Constant{.{ .name = d.name, .value = v }},
+            .int, .comptime_int => out = out ++ [_]Constant{.{ .name = name, .value = v }},
             else => {},
         }
     }

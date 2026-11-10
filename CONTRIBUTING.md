@@ -6,8 +6,8 @@ approach before you put in the work.
 
 ## Setup
 
-- Zig **0.16.0** (`minimum_zig_version` in `build.zig.zon`; 0.17 isn't
-  supported yet).
+- Zig **0.17.1** (`minimum_zig_version` in `build.zig.zon` is 0.17.0; 0.16
+  is no longer supported).
 - git ≥ 2.30.
 - For the upstream suite: bash, and on Debian-like systems gawk (upstream's
   `fsck` fails on mawk) and uuid-runtime.

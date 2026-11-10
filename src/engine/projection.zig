@@ -773,7 +773,7 @@ test "random graphs" {
         const a = try build(arena, issues, .{ .max_depth = 3 });
         const b = try build(arena, issues, .{ .max_depth = 3 });
         // Every issue reachable exactly once.
-        var seen = try std.DynamicBitSetUnmanaged.initEmpty(arena, n);
+        var seen = try std.bit_set.Dynamic.initEmpty(arena, n);
         var stack: std.ArrayList(u32) = .empty;
         try stack.appendSlice(arena, a.roots);
         while (stack.pop()) |i| {

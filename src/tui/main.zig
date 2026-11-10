@@ -168,7 +168,7 @@ const SyncWorker = struct {
 
     fn onPhase(context: *anyopaque, phase: issuez.sync.Phase) void {
         const w: *SyncWorker = @ptrCast(@alignCast(context));
-        w.phase.store(@intFromEnum(phase), .release);
+        w.phase.store(@backingInt(phase), .release);
         w.post(.sync_phase);
     }
 
@@ -400,7 +400,7 @@ fn run(
             },
             .repo_changed => null,
             .sync_phase => blk: {
-                app.syncPhase(@enumFromInt(worker.phase.load(.acquire)));
+                app.syncPhase(@fromBackingInt(@intCast(worker.phase.load(.acquire))));
                 break :blk null;
             },
             .sync_done => blk: {

@@ -488,8 +488,8 @@ fn applyOptions(r: *RepoObj, arena: Allocator, ops: []const api.Op, problems: *r
     for (ops, 0..) |op, i| {
         const check: rt.OpCheck = .at(arena, problems, i);
         if (try check.reserved(op)) continue;
-        const verb: api.Verb = @enumFromInt(op.verb);
-        const target: Opt = @enumFromInt(op.target);
+        const verb: api.Verb = @fromBackingInt(@intCast(op.verb));
+        const target: Opt = @fromBackingInt(@intCast(op.target));
         const s = op.str.slice();
         switch (target) {
             .git_path => r.git_path = try arena.dupe(u8, s),
@@ -638,9 +638,10 @@ fn dupeList(arena: Allocator, list: []const []const u8) ![]const []const u8 {
 }
 
 fn setLimit(limits: *issuez.engine.Limits, name: []const u8, value: i64) bool {
-    inline for (std.meta.fields(issuez.engine.Limits)) |f| {
-        if (std.mem.eql(u8, f.name, name)) {
-            @field(limits, f.name) = std.math.cast(f.type, value) orelse return false;
+    const L = issuez.engine.Limits;
+    inline for (comptime std.meta.fieldNames(L), comptime std.meta.fieldTypes(L)) |f, T| {
+        if (std.mem.eql(u8, f, name)) {
+            @field(limits, f) = std.math.cast(T, value) orelse return false;
             return true;
         }
     }
@@ -667,9 +668,9 @@ pub const issuez_repo_git_dir = RepoReads.field("git_dir");
 
 pub fn issuez_repo_limit(repo: ?*const api.Repo, name: Str, out: ?*u64) callconv(.c) bool {
     const r = rt.obj(RepoObj, repo) orelse return false;
-    inline for (std.meta.fields(issuez.engine.Limits)) |f| {
-        if (std.mem.eql(u8, f.name, name.slice())) {
-            if (out) |o| o.* = @field(r.limits, f.name);
+    inline for (comptime std.meta.fieldNames(issuez.engine.Limits)) |f| {
+        if (std.mem.eql(u8, f, name.slice())) {
+            if (out) |o| o.* = @field(r.limits, f);
             return true;
         }
     }
@@ -691,10 +692,10 @@ fn importOptions(a: Allocator, r: *RepoObj, env: *const std.process.Environ.Map)
     for (r.settings.workflow_states) |v| try ops.add(.add, .workflow_state, .{ .str = Str.of(v) });
     for (r.exclusive_scopes) |v| try ops.add(.add, .exclusive_scope, .{ .str = Str.of(v) });
     for (r.extra_prefixes) |v| try ops.add(.add, .extra_prefix, .{ .str = Str.of(v) });
-    inline for (@typeInfo(issuez.engine.Limits).@"struct".fields) |field| {
+    inline for (@typeInfo(issuez.engine.Limits).@"struct".field_names) |name| {
         try ops.add(.set, .limit, .{
-            .name = Str.of(field.name),
-            .num = @intCast(@field(r.limits, field.name)),
+            .name = Str.of(name),
+            .num = @intCast(@field(r.limits, name)),
         });
     }
     try ops.add(.set, .attachment_store, .{ .num = @intFromBool(r.store_attachments) });
@@ -711,8 +712,8 @@ const OpBuilder = struct {
     /// `value` with the verb and the target set.
     fn add(b: *OpBuilder, verb: api.Verb, target: Opt, value: api.Op) !void {
         var op = value;
-        op.verb = @intFromEnum(verb);
-        op.target = @intFromEnum(target);
+        op.verb = @backingInt(verb);
+        op.target = @backingInt(target);
         try b.list.append(b.a, op);
     }
 };

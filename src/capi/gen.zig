@@ -46,7 +46,7 @@ fn cTypeOf(comptime T: type) []const u8 {
         .optional => |o| cType(o.child),
         .pointer => |p| ptr: {
             const base = if (p.child == u8) "char" else cType(p.child);
-            const qualifier = if (p.is_const) "const " else "";
+            const qualifier = if (p.attrs.@"const") "const " else "";
             break :ptr qualifier ++ base ++ (if (base[base.len - 1] == '*') "*" else " *");
         },
         .@"struct", .@"enum", .@"opaque" => T.c_name,
@@ -216,12 +216,12 @@ fn writeType(w: *Writer, comptime T: type) !void {
     switch (@typeInfo(T)) {
         .@"enum" => |e| {
             try w.print("typedef enum {s} {{\n", .{T.c_name});
-            inline for (e.fields) |field| {
+            inline for (e.field_names, e.field_values) |name, value| {
                 const line = comptime std.fmt.comptimePrint("    {s} = {d},", .{
-                    enumConst(T, field.name),
-                    field.value,
+                    enumConst(T, name),
+                    value,
                 });
-                const doc = try docOf(T, field.name);
+                const doc = try docOf(T, name);
                 if (doc.len == 0) {
                     try w.print("{s}\n", .{line});
                 } else if (line.len + doc.len + 7 <= width) {
@@ -234,9 +234,9 @@ fn writeType(w: *Writer, comptime T: type) !void {
         },
         .@"struct" => |s| {
             try w.print("typedef struct {s} {{\n", .{T.c_name});
-            inline for (s.fields) |field| {
-                const line = comptime "    " ++ cDecl(field.type, field.name) ++ ";";
-                const doc = try docOf(T, field.name);
+            inline for (s.field_names, s.field_types) |name, FieldT| {
+                const line = comptime "    " ++ cDecl(FieldT, name) ++ ";";
+                const doc = try docOf(T, name);
                 if (doc.len == 0) {
                     try w.print("{s}\n", .{line});
                 } else if (line.len + doc.len + 7 <= width) {
@@ -251,9 +251,9 @@ fn writeType(w: *Writer, comptime T: type) !void {
     }
 }
 
-fn funcInfo(comptime func: api.Func) std.builtin.Type.Fn {
+fn funcInfo(comptime func: api.Func) std.lang.Type.Fn {
     const info = @typeInfo(func.T).@"fn";
-    if (info.params.len != func.params.len)
+    if (info.param_types.len != func.params.len)
         @compileError(func.name ++ ": parameter names don't match the type");
     return info;
 }
@@ -264,7 +264,7 @@ fn writeFunc(w: *Writer, comptime func: api.Func) !void {
     const head = comptime cDecl(info.return_type.?, func.name) ++ "(";
     const params = comptime ps: {
         var list: []const []const u8 = &.{};
-        for (info.params, func.params) |p, name| list = list ++ .{cDecl(p.type.?, name)};
+        for (info.param_types, func.params) |p, name| list = list ++ .{cDecl(p.?, name)};
         break :ps list;
     };
     var total: usize = head.len + 2;
@@ -416,12 +416,12 @@ fn writeJson(w: *Writer) !void {
                 try w.writeAll(", \"returns\": ");
                 try str(w, comptime cType(info.return_type.?));
                 try w.writeAll(", \"params\": [");
-                inline for (info.params, func.params, 0..) |p, name, i| {
+                inline for (info.param_types, func.params, 0..) |p, name, i| {
                     if (i > 0) try w.writeAll(", ");
                     try w.writeAll("{\"name\": ");
                     try str(w, name);
                     try w.writeAll(", \"type\": ");
-                    try str(w, comptime cDecl(p.type.?, ""));
+                    try str(w, comptime cDecl(p.?, ""));
                     try w.writeAll("}");
                 }
                 try w.writeAll("], \"doc\": ");
@@ -459,12 +459,12 @@ fn jsonType(w: *Writer, comptime T: type) !void {
     switch (@typeInfo(T)) {
         .@"enum" => |e| {
             try w.writeAll(", \"kind\": \"enum\", \"values\": [");
-            inline for (e.fields, 0..) |field, i| {
+            inline for (e.field_names, e.field_values, 0..) |name, value, i| {
                 if (i > 0) try w.writeAll(", ");
                 try w.writeAll("{\"name\": ");
-                try str(w, comptime enumConst(T, field.name));
-                try w.print(", \"value\": {d}, \"doc\": ", .{field.value});
-                try str(w, try docOf(T, field.name));
+                try str(w, comptime enumConst(T, name));
+                try w.print(", \"value\": {d}, \"doc\": ", .{value});
+                try str(w, try docOf(T, name));
                 try w.writeAll("}");
             }
         },
@@ -472,14 +472,14 @@ fn jsonType(w: *Writer, comptime T: type) !void {
             try w.writeAll(", \"kind\": ");
             try str(w, @tagName(T.type_kind));
             try w.print(", \"size\": {d}, \"fields\": [", .{@sizeOf(T)});
-            inline for (s.fields, 0..) |field, i| {
+            inline for (s.field_names, s.field_types, 0..) |name, FieldT, i| {
                 if (i > 0) try w.writeAll(", ");
                 try w.writeAll("{\"name\": ");
-                try str(w, field.name);
+                try str(w, name);
                 try w.writeAll(", \"type\": ");
-                try str(w, comptime cDecl(field.type, ""));
-                try w.print(", \"offset\": {d}, \"doc\": ", .{@offsetOf(T, field.name)});
-                try str(w, try docOf(T, field.name));
+                try str(w, comptime cDecl(FieldT, ""));
+                try w.print(", \"offset\": {d}, \"doc\": ", .{@offsetOf(T, name)});
+                try str(w, try docOf(T, name));
                 try w.writeAll("}");
             }
         },

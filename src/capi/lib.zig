@@ -37,9 +37,9 @@ comptime {
         else => {},
     };
     // The other way round: nothing exported that the API doesn't declare.
-    for (impls) |m| for (@typeInfo(m).@"struct".decls) |d| {
-        if (std.mem.startsWith(u8, d.name, "issuez_") and !declared(d.name))
-            @compileError(d.name ++ " is implemented but not declared in api.zig");
+    for (impls) |m| for (@typeInfo(m).@"struct".decl_names) |d| {
+        if (std.mem.startsWith(u8, d, "issuez_") and !declared(d))
+            @compileError(d ++ " is implemented but not declared in api.zig");
     };
 }
 

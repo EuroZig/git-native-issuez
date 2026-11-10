@@ -47,7 +47,7 @@ pub const Flags = struct {
     milestone_id: ?[]const u8 = null,
     milestone_mode: ?[]const u8 = null,
     // edit only
-    no: std.EnumSet(Clear) = .initEmpty(),
+    no: std.EnumSet(Clear) = .empty,
 
     pub const Clear = enum {
         parent,

@@ -197,10 +197,10 @@ test "the hook's input: one update per line, three fields each" {
 
 test "the zero ID has as many digits as the repo's IDs" {
     const sha1: issuez.backend.object.ObjectFormat = .sha1;
-    try std.testing.expect(parseOid(sha1, "0" ** 40).? == null);
-    for ([_][]const u8{ "0", "00", "0" ** 39, "0" ** 64, "" }) |s|
+    try std.testing.expect(parseOid(sha1, &@as([40]u8, @splat('0'))).? == null);
+    for ([_][]const u8{ "0", "00", &@as([39]u8, @splat('0')), &@as([64]u8, @splat('0')), "" }) |s|
         try std.testing.expect(parseOid(sha1, s) == null);
     const sha256: issuez.backend.object.ObjectFormat = .sha256;
-    try std.testing.expect(parseOid(sha256, "0" ** 64).? == null);
-    try std.testing.expect(parseOid(sha256, "0" ** 40) == null);
+    try std.testing.expect(parseOid(sha256, &@as([64]u8, @splat('0'))).? == null);
+    try std.testing.expect(parseOid(sha256, &@as([40]u8, @splat('0'))) == null);
 }

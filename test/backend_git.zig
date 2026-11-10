@@ -239,7 +239,8 @@ test "cat-file session" {
     var datas: [n][]u8 = undefined;
     var parent: ?Oid = null;
     for (0..n) |i| {
-        const msg = try std.fmt.allocPrint(arena, "Commit {d}\n\n{s}\n", .{ i, "x" ** 100 });
+        const body: [100]u8 = @splat('x');
+        const msg = try std.fmt.allocPrint(arena, "Commit {d}\n\n{s}\n", .{ i, &body });
         const parents: []const Oid = if (parent) |p| &.{p} else &.{};
         datas[i] = try commitBytes(arena, .sha1, parents, msg);
         oids[i] = try git.writeObject(.commit, datas[i]);
@@ -247,7 +248,7 @@ test "cat-file session" {
         parent = oids[i];
     }
     // Written through one `hash-object` session.
-    try testing.expect(git.hash_objects[@intFromEnum(object.ObjectKind.commit)] != null);
+    try testing.expect(git.hash_objects[@backingInt(object.ObjectKind.commit)] != null);
     // Interleave reads in reverse order through the same session.
     var i: usize = n;
     while (i > 0) {
@@ -516,7 +517,7 @@ test "object writes ignore attributes and filters" {
     try testing.expect(oid.eql(object.hashObject(.sha1, .blob, data)));
     try testing.expectEqualStrings(data, (try git.readObject(arena, oid)).?.data);
     // Through the session, not the one-off fallback (which drops it).
-    try testing.expect(git.hash_objects[@intFromEnum(object.ObjectKind.blob)] != null);
+    try testing.expect(git.hash_objects[@backingInt(object.ObjectKind.blob)] != null);
     try testing.expectError(error.FileNotFound, std.Io.Dir.cwd().statFile(io, stale, .{}));
 }
 
@@ -714,7 +715,7 @@ test "a hung git times out" {
     const one = "refs/issues/a7f3b2c1-4e5d-4a8b-9c1e-2f3a4b5c6d7e";
     const two = "refs/issues/b8e4c3d2-5f6e-4b9c-8d2f-3a4b5c6d7e8f";
     const root = try ga.writeObject(.commit, try commitBytes(arena, .sha1, &.{}, "root\n"));
-    try testing.expect(ga.hash_objects[@intFromEnum(object.ObjectKind.commit)] != null);
+    try testing.expect(ga.hash_objects[@backingInt(object.ObjectKind.commit)] != null);
 
     const hooks = try std.fmt.allocPrint(arena, "{s}/.git/hooks", .{a.path});
     const rt = try std.fmt.allocPrint(arena, "{s}/reference-transaction", .{hooks});

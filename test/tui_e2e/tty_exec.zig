@@ -32,7 +32,7 @@ pub fn main(init: std.process.Init) !u8 {
 
     // Spawned, so not a process group leader: setsid works.
     if (c.setsid() < 0) return fail("setsid");
-    const tty_path = try arena.dupeZ(u8, args[1]);
+    const tty_path = try arena.dupeSentinel(u8, args[1], 0);
     const tty = c.open(tty_path, .{ .ACCMODE = .RDWR });
     if (tty < 0) return fail("open the tty");
     if (ioctl(tty, TIOCSCTTY, @as(c_int, 0)) != 0) return fail("TIOCSCTTY");
@@ -42,13 +42,13 @@ pub fn main(init: std.process.Init) !u8 {
     if (tty > 2) _ = c.close(tty);
 
     const argv = try arena.allocSentinel(?[*:0]const u8, args.len - 4, null);
-    for (args[4..], argv) |arg, *out| out.* = (try arena.dupeZ(u8, arg)).ptr;
+    for (args[4..], argv) |arg, *out| out.* = (try arena.dupeSentinel(u8, arg, 0)).ptr;
     const envp = try init.environ_map.createPosixBlock(arena, .{});
     _ = c.execve(argv[0].?, argv.ptr, envp.slice.ptr);
     return fail("execve");
 }
 
 fn fail(what: []const u8) u8 {
-    std.debug.print("tty-exec: {s} failed (errno {d})\n", .{ what, @intFromEnum(c.errno(-1)) });
+    std.debug.print("tty-exec: {s} failed (errno {d})\n", .{ what, @backingInt(c.errno(-1)) });
     return 127;
 }

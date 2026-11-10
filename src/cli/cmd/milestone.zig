@@ -151,7 +151,7 @@ pub fn main(comptime B: type, ctx: *context.Context(B), argv: []const []const u8
                     json.end(&s) catch |e| return json.failed(ctx.err, e);
                 } else {
                     w.print("Milestone {s} [{t}]\n", .{ short, m.status }) catch {};
-                    w.writeAll("=" ** 60 ++ "\n") catch {};
+                    w.writeAll(@as([60]u8, @splat('=')) ++ "\n") catch {};
                     w.print("Name:    {s}\n", .{m.name}) catch {};
                     if (m.due) |d| w.print("Due:     {f}\n", .{d}) catch {};
                     for (m.conflicts) |c| w.print(

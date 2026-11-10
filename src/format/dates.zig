@@ -33,7 +33,7 @@ pub fn parse(text_in: []const u8, today: Date, work_days: WorkDays) ?Date {
     if (eq(text, "eow")) {
         // The week's last working day, today if it is that; once it is
         // past, the next week's.
-        const sunday = today.addDays(6 - @as(i32, @intFromEnum(today.weekday())));
+        const sunday = today.addDays(6 - @as(i32, @backingInt(today.weekday())));
         const this_week = lastWorkDay(sunday, work_days);
         if (this_week.order(today) != .lt) return this_week;
         return after(today, lastWorkDay(sunday.addDays(7), work_days));
@@ -58,8 +58,8 @@ pub fn parse(text_in: []const u8, today: Date, work_days: WorkDays) ?Date {
     }
     // A weekday: the next one, never today.
     if (Weekday.parse(text)) |w| {
-        const from: i32 = @intFromEnum(today.weekday());
-        const to: i32 = @intFromEnum(w);
+        const from: i32 = @backingInt(today.weekday());
+        const to: i32 = @backingInt(w);
         const ahead = @mod(to - from + 6, 7) + 1;
         return after(today, today.addDays(ahead));
     }

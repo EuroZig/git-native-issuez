@@ -199,14 +199,14 @@ pub const Rule = struct {
                 .month_week_day => |x| blk: {
                     const first: Date = .{ .year = year, .month = x.month, .day = 1 };
                     // Weekday 0 is Monday for `Date`, Sunday here.
-                    const first_wd: i32 = @mod(@as(i32, @intFromEnum(first.weekday())) + 1, 7);
+                    const first_wd: i32 = @mod(@as(i32, @backingInt(first.weekday())) + 1, 7);
                     var day: i32 = 1 + @mod(
                         @as(i32, x.weekday) - first_wd,
                         7,
                     ) + (@as(i32, x.week) - 1) * 7;
                     const in_month: i32 = std.time.epoch.getDaysInMonth(
                         year,
-                        @enumFromInt(x.month),
+                        @fromBackingInt(@intCast(x.month)),
                     );
                     while (day > in_month) day -= 7;
                     break :blk first.toDays() + day - 1;

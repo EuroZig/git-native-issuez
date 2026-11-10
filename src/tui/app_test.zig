@@ -465,7 +465,7 @@ test "list: filter, scope and sort" {
     try testing.expectEqual(filter.SortKey.title, h.app.state.query.key);
     try testing.expect(h.app.state.modal == null);
     try h.click(.{ .command = .sort });
-    try h.click(.{ .modal = .{ .choice = @intFromEnum(filter.SortKey.priority) } });
+    try h.click(.{ .modal = .{ .choice = @backingInt(filter.SortKey.priority) } });
     try testing.expectEqual(filter.SortKey.priority, h.app.state.query.key);
     try testing.expect(!h.app.state.query.reverse);
 }
@@ -831,7 +831,7 @@ test "a paste into the form's description keeps its tabs and newlines" {
 test "a long status is cut at a character, with an ellipsis" {
     const h = try Harness.create();
     defer h.destroy();
-    const long = "é" ** 600;
+    const long: []const u8 = @ptrCast(&@as([600][2]u8, @splat("é".*)));
     h.app.state.fail("no issue '{s}'", .{long});
     const st = h.app.state.status();
     try testing.expect(std.unicode.utf8ValidateSlice(st));
@@ -2942,9 +2942,8 @@ test "sync panel: ←→ pick another remote, not while a sync runs" {
     try h.press(K.left, .{});
     try testing.expectEqualStrings("other", h.snap().remote.name.?);
     try testing.expect(h.shows("the sync with other is running"));
-    try testing.expect(
-        h.app.perform(.{ .resolve = .{ .id = .of("0" ** 40), .how = .keep_local } }),
-    );
+    const zeros: [40]u8 = @splat('0');
+    try testing.expect(h.app.perform(.{ .resolve = .{ .id = .of(&zeros), .how = .keep_local } }));
     try h.draw();
     try testing.expect(h.shows("the sync with other is running"));
     // The badge names the running one's remote.

@@ -463,7 +463,7 @@ test "quitting while a sync runs stops it; the user's own ssh runs without the t
     try testing.expectEqual(@as(u8, 0), try tui.quit(&all));
     // The ssh is gone with the git that ran it.
     const gone_by = now() + timeout_ms;
-    while (c.kill(pid, @enumFromInt(0)) == 0) {
+    while (c.kill(pid, @fromBackingInt(@intCast(0))) == 0) {
         if (now() > gone_by) return error.SshStillRunning;
         try io.sleep(.fromMilliseconds(25), .awake);
     }

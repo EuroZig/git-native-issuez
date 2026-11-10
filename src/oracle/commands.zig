@@ -388,7 +388,7 @@ const Dag = struct {
         commit: object.Commit,
         block: trailers.Block,
         parents: []const usize,
-        ancestors: std.DynamicBitSetUnmanaged,
+        ancestors: std.bit_set.Dynamic,
     };
 
     fn load(c: Clone, tip_hexes: []const []const u8) RuleError!Dag {
@@ -413,7 +413,7 @@ const Dag = struct {
                 .commit = cm,
                 .block = try trailers.parse(c.arena, cm.message, .{}),
                 .parents = parents,
-                .ancestors = try std.DynamicBitSetUnmanaged.initEmpty(c.arena, order.items.len),
+                .ancestors = try std.bit_set.Dynamic.initEmpty(c.arena, order.items.len),
             };
         }
         // Naive fixpoint. Histories are small and this is easy to trust.
@@ -1021,7 +1021,7 @@ fn isDate(s: []const u8) bool {
     const m = std.fmt.parseInt(u4, s[5..7], 10) catch return false;
     const d = std.fmt.parseInt(u8, s[8..10], 10) catch return false;
     if (y == 0 or m < 1 or m > 12 or d < 1) return false;
-    return d <= std.time.epoch.getDaysInMonth(y, @enumFromInt(m));
+    return d <= std.time.epoch.getDaysInMonth(y, @fromBackingInt(@intCast(m)));
 }
 
 /// `90`, `90m`, `2h`, `1h30m`, bounded like the CLI.

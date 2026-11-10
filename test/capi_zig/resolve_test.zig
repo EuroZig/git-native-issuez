@@ -134,7 +134,7 @@ test "issuez_resolve_one: a ref that is no UUID is no candidate" {
     const long = try std.fmt.allocPrint(
         r.arena(),
         "refs/issues/{s}{s}",
-        .{ one.idSlice()[0..4], "x" ** 200 },
+        .{ one.idSlice()[0..4], &@as([200]u8, @splat('x')) },
     );
     const ref = try std.fmt.allocPrint(r.arena(), "refs/issues/{s}", .{one.idSlice()});
     _ = try r.git(&.{ "update-ref", long, ref });
@@ -152,7 +152,7 @@ test "issuez_resolve_one: a ref that is no UUID is no candidate" {
         null,
     );
     try testing.expectEqualStrings(one.idSlice(), std.mem.sliceTo(&buf, 0));
-    try testing.expectEqualStrings("x" ** 8, buf[37..]);
+    try testing.expectEqualStrings(&@as([8]u8, @splat('x')), buf[37..]);
     // Matched alone, it isn't written into the buffer either.
     try expect.code(
         c.ISSUEZ_E_NOT_FOUND,
@@ -166,7 +166,7 @@ test "issuez_resolve_one: a ref that is no UUID is no candidate" {
         ),
         null,
     );
-    try testing.expectEqualStrings("x" ** 8, buf[37..]);
+    try testing.expectEqualStrings(&@as([8]u8, @splat('x')), buf[37..]);
 }
 
 fn take(repo: *c.issuez_repo) !*c.issuez_snapshot {
@@ -246,7 +246,7 @@ test "issuez_snapshot_decode: the encoding, sorted; empty; garbage" {
     const issue = "0b6c4f63-6f5a-4a3e-9c2b-1d2e3f4a5b6c";
     const other = "1b6c4f63-6f5a-4a3e-9c2b-1d2e3f4a5b6c";
     const sha1 = "5186cff79af42ee5c6a80d822eec95a842832b34";
-    const sha256 = "a7f3" ++ "0" ** 56 ++ "beef";
+    const sha256 = "a7f3" ++ @as([56]u8, @splat('0')) ++ "beef";
     const line = "i " ++ issue ++ " " ++ sha1 ++ "\n";
     const bytes = "issuez-snapshot 1\n" ++
         "m " ++ other ++ " " ++ sha256 ++ "\n" ++

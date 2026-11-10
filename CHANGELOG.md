@@ -8,6 +8,31 @@ versions may change the library API; the on-disk format only ever grows (see
 
 ## [Unreleased]
 
+## [0.5.0] - 2026-11-10
+
+Zig 0.17, and a purge fix. The library API, the C ABI and the on-disk
+format are as in 0.4.0, but a C host needs the 0.5.0 `issuez.h`: before
+1.0, the header and the library must have the same minor version.
+
+### Changed
+
+- Building needs Zig 0.17 (0.17.1 recommended); Zig 0.16 is no longer
+  supported. The TUI, MCP server and watcher dependencies (libvaxis,
+  blitzmcp, nightwatch) moved to their Zig 0.17 versions. Projects that
+  depend on the library need Zig 0.17 too.
+
+### Fixed
+
+- A Zig call to the header's `issuez_add_attachment`, translated with
+  translate-c (`b.addTranslateC`), builds on x86_64 macOS again: the LLVM
+  error listed under 0.4.0's known limitations was Zig 0.16's.
+- A comment purge that upstream's merge undid, the comment back beside its
+  rewrite, could leave an edit of the comment with its text. The next sync
+  then rewrote the issue differently from the remote's copy, merged the two
+  with a conflict, and pushed a history the push check refuses
+  (`invalid_history`, `purged`). Purging now rewrites until nothing changes
+  ([docs/format.md](docs/format.md) §10).
+
 ## [0.4.0] - 2026-11-08
 
 The library can now be embedded from other languages, through a C API and a Go

@@ -76,7 +76,13 @@ pub const World = struct {
         source: [:0]const u8,
         diag: ?*std.zon.parse.Diagnostics,
     ) ParseError!World {
-        return std.zon.parse.fromSliceAlloc(World, arena, source, diag, .{});
+        var ignored: std.zon.parse.Diagnostics = undefined;
+        return std.zon.parse.fromSlice(World, .{
+            .gpa = arena,
+            .arena = arena,
+            .source = source,
+            .diagnostics = diag orelse &ignored,
+        });
     }
 
     pub fn write(world: World, w: *std.Io.Writer) std.Io.Writer.Error!void {
@@ -569,7 +575,7 @@ fn checkSha(sha256: []const u8) void {
 }
 
 fn lfsLessThan(_: void, a: World.LfsObject, b: World.LfsObject) bool {
-    if (a.store != b.store) return @intFromEnum(a.store) < @intFromEnum(b.store);
+    if (a.store != b.store) return @backingInt(a.store) < @backingInt(b.store);
     return std.mem.lessThan(u8, a.sha256, b.sha256);
 }
 
@@ -1032,7 +1038,7 @@ test "world round trip through ZON is lossless" {
 
     var aw: std.Io.Writer.Allocating = .init(arena);
     try world.write(&aw.writer);
-    const text = try arena.dupeZ(u8, aw.written());
+    const text = try arena.dupeSentinel(u8, aw.written(), 0);
     var back = try World.parse(arena, text, null);
 
     var aw2: std.Io.Writer.Allocating = .init(arena);

@@ -99,7 +99,7 @@ pub fn build(b: *std.Build) void {
 
     const run_step = b.step("run", "Run git-issue");
     const run_exe = b.addRunArtifact(exe);
-    if (b.args) |args| run_exe.addArgs(args);
+    run_exe.addPassthruArgs();
     run_step.dependOn(&run_exe.step);
 
     // These never include the TUI or the MCP server.
@@ -118,12 +118,13 @@ pub fn build(b: *std.Build) void {
             .root_module = b.createModule(.{
                 .root_source_file = b.path("tools/line_length.zig"),
                 .target = b.graph.host,
-                .optimize = .Debug,
+                .optimize = .debug,
             }),
         });
         const run = b.addRunArtifact(line_length);
-        for ([_][]const u8{ "build.zig", "src", "test", "examples", "tools" }) |p|
-            run.addArg(b.pathFromRoot(p));
+        run.addFileArg(b.path("build.zig"));
+        for ([_][]const u8{ "src", "test", "examples", "tools" }) |p|
+            run.addDirectoryArg(b.path(p));
         run.expectExitCode(0);
         run.has_side_effects = true;
         test_step.dependOn(&run.step);
@@ -213,13 +214,13 @@ pub fn build(b: *std.Build) void {
         "Run the TUI's end-to-end tests on pseudo-terminals",
     );
     if (extras.tui != null and extras.mcp != null and b.graph.host.result.os.tag != .windows) {
-        if (b.lazyDependency("vaxis", .{ .target = b.graph.host, .optimize = .Debug })) |vaxis| {
+        if (b.lazyDependency("vaxis", .{ .target = b.graph.host, .optimize = .debug })) |vaxis| {
             const tty_exec = b.addExecutable(.{
                 .name = "tty-exec",
                 .root_module = b.createModule(.{
                     .root_source_file = b.path("test/tui_e2e/tty_exec.zig"),
                     .target = b.graph.host,
-                    .optimize = .Debug,
+                    .optimize = .debug,
                     .link_libc = true,
                 }),
             });
@@ -232,7 +233,7 @@ pub fn build(b: *std.Build) void {
                 .root_module = b.createModule(.{
                     .root_source_file = b.path("test/live_tui.zig"),
                     .target = b.graph.host,
-                    .optimize = .Debug,
+                    .optimize = .debug,
                     .link_libc = true,
                     .imports = &.{
                         .{ .name = "paths", .module = opts.createModule() },
@@ -311,14 +312,14 @@ pub fn build(b: *std.Build) void {
     const release_issuez = b.createModule(.{
         .root_source_file = b.path("src/root.zig"),
         .target = target,
-        .optimize = .ReleaseSafe,
+        .optimize = .safe,
         .imports = &.{versionImport(b, zon_version)},
     });
-    const release_cli: Cli = .init(b, target, .ReleaseSafe, release_issuez);
+    const release_cli: Cli = .init(b, target, .safe, release_issuez);
     const release_extras = release_cli.parts(.{ .tui = tui, .mcp = mcp });
     const all_perf_exes = [_]*std.Build.Step.Compile{
-        release_cli.exe("git-issue", "src/cli/main.zig", .ReleaseSafe, .{}),
-        release_cli.exe("git-issue", "src/cli/main.zig", .ReleaseSafe, release_extras),
+        release_cli.exe("git-issue", "src/cli/main.zig", .safe, .{}),
+        release_cli.exe("git-issue", "src/cli/main.zig", .safe, release_extras),
     };
     // -Dminimal has only the one flavor.
     const perf_exes = all_perf_exes[0..if (tui or mcp) 2 else 1];
@@ -327,7 +328,7 @@ pub fn build(b: *std.Build) void {
         .root_module = b.createModule(.{
             .root_source_file = b.path("test/perf_smoke.zig"),
             .target = b.graph.host,
-            .optimize = .Debug,
+            .optimize = .debug,
         }),
     });
     // One after the other, so the two do not share the CPU.
@@ -336,7 +337,7 @@ pub fn build(b: *std.Build) void {
             builder: *std.Build,
             runner: *std.Build.Step.Compile,
             exes: []const *std.Build.Step.Compile,
-            args: ?[]const []const u8,
+            passthru: bool,
             after: ?*std.Build.Step,
             step: *std.Build.Step,
         ) void {
@@ -344,7 +345,7 @@ pub fn build(b: *std.Build) void {
             for (exes) |perf_exe| {
                 const run = builder.addRunArtifact(runner);
                 run.addArtifactArg(perf_exe);
-                if (args) |a| run.addArgs(a);
+                if (passthru) run.addPassthruArgs();
                 run.stdio = .inherit;
                 if (previous) |p| run.step.dependOn(p);
                 step.dependOn(&run.step);
@@ -356,7 +357,7 @@ pub fn build(b: *std.Build) void {
         b,
         perf_runner,
         perf_exes,
-        b.args,
+        true,
         null,
         b.step("test-perf", "Time `ls -a` over 10 000 issues against the 2 s budget"),
     );
@@ -392,7 +393,7 @@ pub fn build(b: *std.Build) void {
         ci_step.dependOn(&long_trailers.step);
 
         // After the long fuzz run, so the two do not share the CPU.
-        addPerfRuns(b, perf_runner, perf_exes, null, &long_fuzz.step, ci_step);
+        addPerfRuns(b, perf_runner, perf_exes, false, &long_fuzz.step, ci_step);
     }
 
     // The simulator examples need no git and must print exactly their
@@ -446,7 +447,7 @@ pub fn build(b: *std.Build) void {
             examples_step.dependOn(&b.addInstallArtifact(example, .{}).step);
 
             const run_example = b.addRunArtifact(example);
-            if (b.args) |args| run_example.addArgs(args);
+            run_example.addPassthruArgs();
             b.step("example-" ++ e.name, "Run " ++ e.root).dependOn(&run_example.step);
 
             if (e.snapshot) |snapshot| {
@@ -490,7 +491,7 @@ pub fn build(b: *std.Build) void {
     if (isRootPackage(b)) {
         if (b.lazyDependency("git_native_issue", .{})) |upstream| {
             const opts = b.addOptions();
-            opts.addOptionPath("upstream_bin", upstream.path("bin"));
+            opts.addOptionPathDirectory("upstream_bin", upstream.path("bin"));
             go_e2e.addDirectoryArg(upstream.path("bin"));
             opts.addOptionPath("git_issue_exe", exe.getEmittedBin());
             const interop = b.addTest(.{
@@ -515,7 +516,7 @@ pub fn build(b: *std.Build) void {
                 .root_module = b.createModule(.{
                     .root_source_file = b.path("test/upstream_suite.zig"),
                     .target = b.graph.host,
-                    .optimize = .Debug,
+                    .optimize = .debug,
                 }),
             });
             // Alone, the report is what you ran it for. In `ci` it only shows
@@ -646,7 +647,7 @@ fn addRelease(b: *std.Build, step: *std.Build.Step) void {
         _ = pack.addOutputDirectoryArg("stage");
         pack.addArg(name);
         pack.addArgs(&.{ "f", "lib/libissuez.a" });
-        pack.addFileArg(hostArchive(b, capiLib(b, resolved, .ReleaseSafe, false, version)));
+        pack.addFileArg(hostArchive(b, capiLib(b, resolved, .safe, false, version)));
         for ([_]struct { []const u8, []const u8 }{
             // The tests check that these two are what the generator writes.
             .{ "include/issuez.h", committed_header },
@@ -674,12 +675,12 @@ fn releaseExe(
     const issuez = b.createModule(.{
         .root_source_file = b.path("src/root.zig"),
         .target = target,
-        .optimize = .ReleaseSafe,
+        .optimize = .safe,
         // The tag's version: release.yml checks it is build.zig.zon's.
         .imports = &.{versionImport(b, zon_version)},
     });
-    const cli: Cli = .init(b, target, .ReleaseSafe, issuez);
-    const exe = cli.exe("git-issue", "src/cli/main.zig", .ReleaseSafe, cli.parts(.{
+    const cli: Cli = .init(b, target, .safe, issuez);
+    const exe = cli.exe("git-issue", "src/cli/main.zig", .safe, cli.parts(.{
         .tui = flavor.full,
         .mcp = flavor.full,
     }));
@@ -742,27 +743,23 @@ fn installEntryPoints(b: *std.Build, exe: *std.Build.Step.Compile) void {
         }
         return;
     }
-    const links = b.allocator.create(std.Build.Step) catch @panic("OOM");
-    links.* = .init(.{
-        .id = .custom,
-        .name = "install git-issue-<sub> links",
-        .owner = b,
-        .makeFn = makeEntryPointLinks,
+    const links = b.addSystemCommand(&.{
+        "sh",
+        "-c",
+        \\set -e
+        \\bin=$1
+        \\shift
+        \\for name; do ln -sfn git-issue "$bin/git-issue-$name"; done
+        ,
+        "sh",
     });
-    links.dependOn(&b.addInstallArtifact(exe, .{}).step);
-    b.getInstallStep().dependOn(links);
-}
-
-fn makeEntryPointLinks(step: *std.Build.Step, options: std.Build.Step.MakeOptions) !void {
-    _ = options;
-    const b = step.owner;
-    const io = b.graph.io;
-    const bin = b.getInstallPath(.bin, "");
-    for (entry_points.names) |name| {
-        const link = b.pathJoin(&.{ bin, b.fmt("git-issue-{s}", .{name}) });
-        std.Io.Dir.cwd().symLinkAtomic(io, "git-issue", link, .{}) catch |err|
-            return step.fail("unable to symlink {s} -> git-issue: {t}", .{ link, err });
-    }
+    links.setName("install git-issue-<sub> links");
+    links.addDirectoryArg(.{ .relative = .{ .base = .install_bin } });
+    links.addArgs(&entry_points.names);
+    links.has_side_effects = true;
+    links.expectExitCode(0);
+    links.step.dependOn(&b.addInstallArtifact(exe, .{}).step);
+    b.getInstallStep().dependOn(&links.step);
 }
 
 /// Skipped for cross builds, where the binary can't run to print them.
@@ -800,7 +797,9 @@ fn versionImport(b: *std.Build, version: []const u8) std.Build.Module.Import {
 /// source archive, a dependency).
 fn describeVersion(b: *std.Build) []const u8 {
     if (!isRootPackage(b) or !hasPath(b, ".git")) return zon_version;
-    const root = b.build_root.path orelse ".";
+    // The configure cache can't see a commit: git runs every time.
+    b.graph.poisonCache();
+    const root = b.root.toString(b.allocator) catch @panic("OOM");
     const tag = "v" ++ zon_version;
     var code: u8 = undefined;
     if (b.runAllowFail(&.{
@@ -848,74 +847,62 @@ fn addLinkSteps(b: *std.Build, exe: *std.Build.Step.Compile) void {
         unlink_step.dependOn(&b.addFail(p).step);
         return;
     }
+    // What `zig build` installs, relative to the prefix. The man pages are
+    // whatever is there when the step runs.
+    var paths: std.ArrayList([]const u8) = .empty;
+    paths.append(b.allocator, "bin/git-issue") catch @panic("OOM");
+    for (entry_points.names) |name|
+        paths.append(b.allocator, b.fmt("bin/git-issue-{s}", .{name})) catch @panic("OOM");
+    for (completionFiles(b)) |f| paths.append(b.allocator, f.path) catch @panic("OOM");
     for ([_]struct { step: *std.Build.Step, remove: bool }{
         .{ .step = link_step, .remove = false },
         .{ .step = unlink_step, .remove = true },
     }) |s| {
-        const links = b.allocator.create(Links) catch @panic("OOM");
-        links.* = .{
-            .step = .init(.{
-                .id = .custom,
-                .name = if (s.remove) "unlink from link prefix" else "link into link prefix",
-                .owner = b,
-                .makeFn = Links.make,
-            }),
-            .prefix = b.pathResolve(&.{ b.graph.cache.cwd, prefix.? }),
-            .remove = s.remove,
-        };
+        const links = b.addSystemCommand(&.{ "sh", "-c", links_script, "sh" });
+        links.setName(if (s.remove) "unlink from link prefix" else "link into link prefix");
+        links.addDirectoryArg(.{ .relative = .{ .base = .install_prefix } });
+        links.addDirectoryArg(b.graph.cwdRelativePath(prefix.?));
+        links.addArgs(&.{ if (s.remove) "unlink" else "link", man_dir });
+        links.addArgs(paths.items);
+        links.has_side_effects = true;
+        links.expectExitCode(0);
         if (!s.remove) links.step.dependOn(b.getInstallStep());
         s.step.dependOn(&links.step);
     }
 }
 
-const Links = struct {
-    step: std.Build.Step,
-    prefix: []const u8,
-    remove: bool,
-
-    fn make(step: *std.Build.Step, options: std.Build.Step.MakeOptions) !void {
-        _ = options;
-        const links: *Links = @fieldParentPtr("step", step);
-        const b = step.owner;
-        const io = b.graph.io;
-        const cwd = std.Io.Dir.cwd();
-        const installed = b.pathResolve(&.{ b.graph.cache.cwd, b.install_path });
-        if (std.mem.eql(u8, installed, links.prefix))
-            return step.fail("-Dlink-prefix is the install prefix ({s})", .{installed});
-
-        var paths: std.ArrayList([]const u8) = .empty;
-        try paths.append(b.allocator, "bin/git-issue");
-        for (entry_points.names) |name|
-            try paths.append(b.allocator, b.fmt("bin/git-issue-{s}", .{name}));
-        for (completionFiles(b)) |f| try paths.append(b.allocator, f.path);
-        // The pages the install made, or for unlink those in the link prefix.
-        const pages_root = if (links.remove) links.prefix else installed;
-        if (cwd.openDir(io, b.pathJoin(&.{ pages_root, man_dir }), .{ .iterate = true })) |dir| {
-            var d = dir;
-            defer d.close(io);
-            var it = d.iterate();
-            while (try it.next(io)) |entry| if (std.mem.startsWith(u8, entry.name, "git-issue"))
-                try paths.append(b.allocator, b.fmt("{s}/{s}", .{ man_dir, entry.name }));
-        } else |_| {}
-
-        for (paths.items) |rel| {
-            const target = b.pathJoin(&.{ installed, rel });
-            const link = b.pathJoin(&.{ links.prefix, rel });
-            if (links.remove) {
-                var buf: [std.fs.max_path_bytes]u8 = undefined;
-                const n = cwd.readLink(io, link, &buf) catch continue;
-                if (!std.mem.eql(u8, buf[0..n], target)) continue;
-                cwd.deleteFile(io, link) catch |err|
-                    return step.fail("unable to remove {s}: {t}", .{ link, err });
-                continue;
-            }
-            cwd.createDirPath(io, std.fs.path.dirname(link).?) catch |err|
-                return step.fail("unable to create the directory for {s}: {t}", .{ link, err });
-            cwd.symLinkAtomic(io, target, link, .{}) catch |err|
-                return step.fail("unable to symlink {s} -> {s}: {t}", .{ link, target, err });
-        }
-    }
-};
+/// `sh -c links_script sh <install prefix> <link prefix> link|unlink <man dir> <path>...`
+/// symlinks each `<link prefix>/<path>` to `<install prefix>/<path>`, and
+/// the `git-issue*` man pages the same way. `unlink` removes those
+/// symlinks, and only those.
+const links_script =
+    \\set -eu
+    \\installed=$(cd "$1" && pwd)
+    \\prefix=$2 mode=$3 man=$4
+    \\shift 4
+    \\case $prefix in /*) ;; *) prefix="$(pwd)/$prefix" ;; esac
+    \\if [ -d "$prefix" ]; then prefix=$(cd "$prefix" && pwd); fi
+    \\if [ "$installed" = "$prefix" ]; then
+    \\  echo "-Dlink-prefix is the install prefix ($installed)" >&2; exit 1
+    \\fi
+    \\# The pages the install made, or for unlink those in the link prefix.
+    \\if [ "$mode" = unlink ]; then pages=$prefix/$man; else pages=$installed/$man; fi
+    \\for page in "$pages"/git-issue*; do
+    \\  [ -e "$page" ] || [ -L "$page" ] || continue
+    \\  set -- "$@" "$man/$(basename "$page")"
+    \\done
+    \\for rel; do
+    \\  target=$installed/$rel link=$prefix/$rel
+    \\  if [ "$mode" = unlink ]; then
+    \\    [ -L "$link" ] && [ "$(readlink "$link")" = "$target" ] || continue
+    \\    rm -f "$link" || { echo "unable to remove $link" >&2; exit 1; }
+    \\    continue
+    \\  fi
+    \\  mkdir -p "$(dirname "$link")" ||
+    \\    { echo "unable to create the directory for $link" >&2; exit 1; }
+    \\  ln -sfn "$target" "$link" || { echo "unable to symlink $link -> $target" >&2; exit 1; }
+    \\done
+;
 
 const Shell = enum { bash, zsh, fish };
 
@@ -944,7 +931,7 @@ const CompletionScripts = struct {
     scripts: [3]std.Build.LazyPath,
 
     fn of(c: CompletionScripts, shell: Shell) std.Build.LazyPath {
-        return c.scripts[@intFromEnum(shell)];
+        return c.scripts[@backingInt(shell)];
     }
 };
 
@@ -977,14 +964,22 @@ fn runsOnHost(b: *std.Build, exe: *std.Build.Step.Compile) bool {
     return target.os.tag == host.os.tag and target.cpu.arch == host.cpu.arch;
 }
 
+/// The configure cache sees `path` appear or go away: a missing path can't
+/// be a dependency itself, so its directory's entries are.
 fn hasPath(b: *std.Build, path: []const u8) bool {
-    b.build_root.handle.access(b.graph.io, path, .{}) catch return false;
+    b.root.access(b.graph.io, path, .{}) catch {
+        b.dependOnDirectoryContents(b.path(std.fs.path.dirname(path) orelse ""));
+        return false;
+    };
+    b.dependOnFileMetadata(b.path(path));
     return true;
 }
 
 fn readSnapshot(b: *std.Build, path: []const u8) []const u8 {
+    b.dependOnFileContents(b.path(path));
     const limit: std.Io.Limit = .limited(1 << 20);
-    return b.build_root.handle.readFileAlloc(b.graph.io, path, b.allocator, limit) catch |e|
+    const full = b.root.joinString(b.allocator, path) catch @panic("OOM");
+    return std.Io.Dir.cwd().readFileAlloc(b.graph.io, full, b.allocator, limit) catch |e|
         std.debug.panic("cannot read snapshot {s}: {t}", .{ path, e });
 }
 
@@ -1071,7 +1066,7 @@ const Extras = struct {
 const Cli = struct {
     b: *std.Build,
     target: std.Build.ResolvedTarget,
-    optimize: std.builtin.OptimizeMode,
+    optimize: std.lang.OptimizeMode,
     issuez: *std.Build.Module,
     oracle: *std.Build.Module,
     mcp_help: *std.Build.Module,
@@ -1079,7 +1074,7 @@ const Cli = struct {
     fn init(
         b: *std.Build,
         target: std.Build.ResolvedTarget,
-        optimize: std.builtin.OptimizeMode,
+        optimize: std.lang.OptimizeMode,
         issuez: *std.Build.Module,
     ) Cli {
         return .{
@@ -1099,7 +1094,7 @@ const Cli = struct {
 
     fn dependencyArgs(cli: Cli) struct {
         target: std.Build.ResolvedTarget,
-        optimize: std.builtin.OptimizeMode,
+        optimize: std.lang.OptimizeMode,
     } {
         return .{ .target = cli.target, .optimize = cli.optimize };
     }
@@ -1153,7 +1148,7 @@ const Cli = struct {
     fn module(
         cli: Cli,
         root: []const u8,
-        optimize: std.builtin.OptimizeMode,
+        optimize: std.lang.OptimizeMode,
         extras: Extras,
     ) *std.Build.Module {
         const b = cli.b;
@@ -1180,7 +1175,7 @@ const Cli = struct {
         cli: Cli,
         name: []const u8,
         root: []const u8,
-        optimize: std.builtin.OptimizeMode,
+        optimize: std.lang.OptimizeMode,
         extras: Extras,
     ) *std.Build.Step.Compile {
         return cli.b.addExecutable(.{
@@ -1269,7 +1264,7 @@ const lib_targets = [_]struct { dir: []const u8, query: std.Target.Query }{
 fn capiLib(
     b: *std.Build,
     target: std.Build.ResolvedTarget,
-    optimize: std.builtin.OptimizeMode,
+    optimize: std.lang.OptimizeMode,
     /// Counts live allocations and exports `issuez__debug_live_allocations`.
     debug: bool,
     /// `issuez_version()`.
@@ -1366,7 +1361,7 @@ fn goCommand(b: *std.Build, run: *std.Build.Step.Run, committed: *std.Build.Step
 fn addCapi(
     b: *std.Build,
     target: std.Build.ResolvedTarget,
-    optimize: std.builtin.OptimizeMode,
+    optimize: std.lang.OptimizeMode,
     test_step: *std.Build.Step,
     /// The CLI the Go end-to-end tests drive.
     exe: *std.Build.Step.Compile,
@@ -1378,7 +1373,7 @@ fn addCapi(
         .root_module = b.createModule(.{
             .root_source_file = b.path("src/capi/gen.zig"),
             .target = b.graph.host,
-            .optimize = .Debug,
+            .optimize = .debug,
             // The header is committed, so it can't have git's version.
             .imports = &.{.{
                 .name = "issuez",
@@ -1432,18 +1427,18 @@ fn addCapi(
 
     // The C API through its header, called from Zig like an embedder would.
     // The library counts its live allocations.
-    const debug_lib = capiLib(b, target, .Debug, true, zon_version);
+    const debug_lib = capiLib(b, target, .debug, true, zon_version);
     const translated = b.addTranslateC(.{
         .root_source_file = header,
         .target = target,
-        .optimize = .Debug,
+        .optimize = .debug,
     });
     const zig_suite = b.addTest(.{
         .name = "capi-zig",
         .root_module = b.createModule(.{
             .root_source_file = b.path("test/capi_zig/root.zig"),
             .target = target,
-            .optimize = .Debug,
+            .optimize = .debug,
             .link_libc = true,
             .imports = &.{.{ .name = "c", .module = translated.createModule() }},
         }),
@@ -1457,7 +1452,7 @@ fn addCapi(
         .root_module = b.createModule(.{
             .root_source_file = b.path("tools/capi_coverage.zig"),
             .target = b.graph.host,
-            .optimize = .Debug,
+            .optimize = .debug,
         }),
     });
     const run_coverage = b.addRunArtifact(coverage);
@@ -1495,14 +1490,14 @@ fn addCapi(
             resolved.result.cpu.arch == host.cpu.arch and
             (host.os.tag != .linux or resolved.result.abi.isMusl() == host.abi.isMusl());
         if (on_host) {
-            go_test_lib = hostArchive(b, capiLib(b, resolved, .ReleaseSafe, false, zon_version));
+            go_test_lib = hostArchive(b, capiLib(b, resolved, .safe, false, zon_version));
             // The archive that counts its allocations, for the Go fuzz tests'
             // leak check (-tags issuez_debug).
-            go_debug_lib = hostArchive(b, capiLib(b, resolved, .ReleaseSafe, true, zon_version));
+            go_debug_lib = hostArchive(b, capiLib(b, resolved, .safe, true, zon_version));
         }
         if (!all and !on_host) continue;
         go_libs_step.dependOn(&b.addInstallFileWithDir(
-            hostArchive(b, capiLib(b, resolved, .ReleaseSafe, false, version)),
+            hostArchive(b, capiLib(b, resolved, .safe, false, version)),
             .{ .custom = b.fmt("lib/go/{s}", .{t.dir}) },
             "libissuez.a",
         ).step);

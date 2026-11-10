@@ -55,7 +55,7 @@ pub const Date = struct {
     /// A day of the calendar, year 1 to 9999.
     pub fn isValid(d: Date) bool {
         if (d.year == 0 or d.year > 9999 or d.month < 1 or d.month > 12 or d.day < 1) return false;
-        return d.day <= std.time.epoch.getDaysInMonth(d.year, @enumFromInt(d.month));
+        return d.day <= std.time.epoch.getDaysInMonth(d.year, @fromBackingInt(@intCast(d.month)));
     }
 
     pub fn order(a: Date, b: Date) std.math.Order {
@@ -113,7 +113,7 @@ pub const Date = struct {
     }
 
     pub fn daysInMonth(d: Date) u8 {
-        return std.time.epoch.getDaysInMonth(d.year, @enumFromInt(d.month));
+        return std.time.epoch.getDaysInMonth(d.year, @fromBackingInt(@intCast(d.month)));
     }
 
     /// The month's last day.
@@ -158,7 +158,7 @@ pub const Date = struct {
 
     pub fn weekday(d: Date) Weekday {
         // 1970-01-01 was a Thursday.
-        return @enumFromInt(@as(u3, @intCast(@mod(d.toDays() + 3, 7))));
+        return @fromBackingInt(@intCast(@as(u3, @intCast(@mod(d.toDays() + 3, 7)))));
     }
 };
 
@@ -174,8 +174,8 @@ pub const Weekday = enum(u3) {
 
     pub fn parse(s: []const u8) ?Weekday {
         if (s.len < 3) return null;
-        inline for (std.meta.fields(Weekday)) |f| {
-            if (std.ascii.eqlIgnoreCase(s[0..3], f.name)) {
+        for (std.meta.tags(Weekday)) |d| {
+            if (std.ascii.eqlIgnoreCase(s[0..3], @tagName(d))) {
                 const full = [_][]const u8{
                     "monday",
                     "tuesday",
@@ -185,13 +185,11 @@ pub const Weekday = enum(u3) {
                     "saturday",
                     "sunday",
                 };
-                const long = full[f.value];
+                const long = full[@backingInt(d)];
                 if (s.len == 3 or (s.len <= long.len and std.ascii.eqlIgnoreCase(
                     s,
                     long[0..s.len],
-                ))) return @enumFromInt(
-                    f.value,
-                );
+                ))) return d;
             }
         }
         return null;
@@ -218,11 +216,11 @@ pub const WorkDays = struct {
     pub const weekdays: WorkDays = .{ .bits = 0x1f };
 
     pub fn has(w: WorkDays, d: Weekday) bool {
-        return w.bits & (@as(u7, 1) << @intFromEnum(d)) != 0;
+        return w.bits & (@as(u7, 1) << @backingInt(d)) != 0;
     }
 
     pub fn with(w: WorkDays, d: Weekday) WorkDays {
-        return .{ .bits = w.bits | (@as(u7, 1) << @intFromEnum(d)) };
+        return .{ .bits = w.bits | (@as(u7, 1) << @backingInt(d)) };
     }
 
     pub fn isWorkDay(w: WorkDays, d: Date) bool {
@@ -513,10 +511,10 @@ pub const Event = enum {
 
     /// The tag names with `-` for `_`, so the two can't drift apart.
     const names = blk: {
-        const tags = @typeInfo(Event).@"enum".fields;
+        const tags = @typeInfo(Event).@"enum".field_names;
         var out: [tags.len][]const u8 = undefined;
         for (tags, &out) |t, *o| {
-            var name: [t.name.len]u8 = t.name[0..t.name.len].*;
+            var name: [t.len]u8 = t[0..t.len].*;
             std.mem.replaceScalar(u8, &name, '_', '-');
             const final = name;
             o.* = &final;
@@ -525,12 +523,12 @@ pub const Event = enum {
     };
 
     pub fn parse(s: []const u8) ?Event {
-        for (names, 0..) |n, i| if (std.mem.eql(u8, n, s)) return @enumFromInt(i);
+        for (names, 0..) |n, i| if (std.mem.eql(u8, n, s)) return @fromBackingInt(@intCast(i));
         return null;
     }
 
     pub fn text(e: Event) []const u8 {
-        return names[@intFromEnum(e)];
+        return names[@backingInt(e)];
     }
 
     /// Needs `X-Comment`. A reaction may have one.

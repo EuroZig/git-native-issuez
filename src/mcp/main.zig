@@ -29,7 +29,7 @@ const ProcessRepos = struct {
     path: []const u8,
     git: ?GitProcess = null,
     /// By the `repo` path as given, oldest first. Owns keys and values.
-    others: std.StringArrayHashMapUnmanaged(*GitProcess) = .empty,
+    others: std.array_hash_map.String(*GitProcess) = .empty,
     /// Where notifications go; null leaves subscriptions unwatched.
     /// Written from the watcher's thread too, so thread-safe for writes.
     transport: ?*mcp.Transport = null,

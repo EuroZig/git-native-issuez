@@ -2242,7 +2242,7 @@ fn sameRef(a: ?Oid, b: ?Oid) bool {
 fn checkRoundTrip(arena: Allocator, world: World) CaseError!void {
     var first: std.Io.Writer.Allocating = .init(arena);
     try world.write(&first.writer);
-    const text = try arena.dupeZ(u8, first.written());
+    const text = try arena.dupeSentinel(u8, first.written(), 0);
     const back = World.parse(arena, text, null) catch |err| switch (err) {
         error.OutOfMemory => |e| return e,
         error.ParseZon => return error.RoundTripMismatch,
@@ -2320,7 +2320,7 @@ const PushChecker = struct {
         return .{
             .pusher_emails = emails.items,
             .pusher_ids = ids.items,
-            .author_policy = @enumFromInt(r.uintLessThan(u8, 3)),
+            .author_policy = @fromBackingInt(@intCast(r.uintLessThan(u8, 3))),
             .allow_numbers = r.boolean(),
             .allow_purge = r.boolean(),
             // Now and then a budget for merges that runs out.
@@ -2362,7 +2362,7 @@ const PushChecker = struct {
         const want = oracle.push_check.expect(view, oups, .{
             .pusher_emails = engine_policy.pusher_emails,
             .pusher_ids = engine_policy.pusher_ids,
-            .authors = @enumFromInt(@intFromEnum(engine_policy.author_policy)),
+            .authors = @fromBackingInt(@intCast(@backingInt(engine_policy.author_policy))),
             .allow_numbers = engine_policy.allow_numbers,
             .allow_purge = engine_policy.allow_purge,
             .max_merge_work = engine_policy.max_merge_work,
@@ -2462,9 +2462,9 @@ const PushChecker = struct {
         if (g.gives_number) countOutcome("(push check: gives a number)", true);
         if (g.kind == .tombstone and g.accept) countOutcome("(push check: tombstone in)", true);
         // The stats keep their keys: static names only.
-        inline for (std.meta.fields(issuez.push_check.ProblemKind)) |f| {
-            if (commands.containsText(kinds.items, f.name))
-                countOutcome("(push check: " ++ f.name ++ ")", true);
+        inline for (comptime std.meta.fieldNames(issuez.push_check.ProblemKind)) |f| {
+            if (commands.containsText(kinds.items, f))
+                countOutcome("(push check: " ++ f ++ ")", true);
         }
         if (must_pass and !g.accept) {
             const only_numbers = for (g.problems) |p| {

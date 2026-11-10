@@ -162,7 +162,10 @@ fn indexOf(arena: Allocator, commits: []const issue_model.CommitInput) Allocator
 /// the same purges changes nothing. A merge whose moved parents ended up
 /// one behind the other is dropped: it merges nothing now. Our own merges
 /// that stay restate what their new parents resolve to: what they restated
-/// before can override newer values once the history changes.
+/// before can override newer values once the history changes. Rewritten
+/// again until nothing changes: a pass drops purged commits, and an
+/// `X-Rewritten-From` naming one of them counts once it is gone. Upstream's
+/// merge can bring back a purged comment beside its rewrite.
 pub fn rewrite(
     arena: Allocator,
     backend: anytype,
@@ -170,6 +173,45 @@ pub fn rewrite(
     tip: Oid,
     purged: []const Oid,
 ) !Rewritten {
+    var r = try rewriteOnce(arena, backend, commits, tip, purged);
+    // Each pass after the first only follows trailers the one before made
+    // count, so the history's length bounds the passes.
+    for (0..commits.len) |_| {
+        if (r.result.tip.eql(tip) or r.result.map.len == 0) return r.result;
+        const again = try rewriteOnce(arena, backend, r.history, r.result.tip, purged);
+        if (again.result.tip.eql(r.result.tip)) return r.result;
+        // Old commit to its last new one.
+        var map: std.ArrayList(Moved) = .empty;
+        for (commits) |c| {
+            var to = c.oid;
+            for (r.result.map) |m| if (m.old.eql(to)) {
+                to = m.new;
+                break;
+            };
+            for (again.result.map) |m| if (m.old.eql(to)) {
+                to = m.new;
+                break;
+            };
+            if (!to.eql(c.oid)) try map.append(arena, .{ .old = c.oid, .new = to });
+        }
+        r = .{ .result = .{ .tip = again.result.tip, .map = map.items }, .history = again.history };
+    }
+    return error.CorruptIssue;
+}
+
+const Pass = struct {
+    result: Rewritten,
+    /// The new tip's history.
+    history: []const issue_model.CommitInput,
+};
+
+fn rewriteOnce(
+    arena: Allocator,
+    backend: anytype,
+    commits: []const issue_model.CommitInput,
+    tip: Oid,
+    purged: []const Oid,
+) !Pass {
     const format = backend.objectFormat();
     const n = commits.len;
     const index = try indexOf(arena, commits);
@@ -280,7 +322,9 @@ pub fn rewrite(
         if (!c.oid.eql(x.?)) try map.append(arena, .{ .old = c.oid, .new = x.? });
     }
     const tip_index = index.get(tip.bytes) orelse return error.CorruptIssue;
-    return .{ .tip = new[tip_index].?, .map = map.items };
+    const new_tip = new[tip_index].?;
+    const history = try historyOf(arena, &lineage, &.{new_tip});
+    return .{ .result = .{ .tip = new_tip, .map = map.items }, .history = history.values() };
 }
 
 const Lineage = std.AutoHashMapUnmanaged([Oid.max_byte_len]u8, issue_model.CommitInput);
@@ -290,8 +334,8 @@ fn historyOf(
     arena: Allocator,
     lineage: *const Lineage,
     tips: []const Oid,
-) Allocator.Error!std.AutoArrayHashMapUnmanaged([Oid.max_byte_len]u8, issue_model.CommitInput) {
-    var seen: std.AutoArrayHashMapUnmanaged([Oid.max_byte_len]u8, issue_model.CommitInput) = .empty;
+) Allocator.Error!std.array_hash_map.Auto([Oid.max_byte_len]u8, issue_model.CommitInput) {
+    var seen: std.array_hash_map.Auto([Oid.max_byte_len]u8, issue_model.CommitInput) = .empty;
     var stack: std.ArrayList(Oid) = .empty;
     try stack.appendSlice(arena, tips);
     while (stack.pop()) |x| {
@@ -968,6 +1012,49 @@ test "a merge a purge leaves nothing to merge is dropped" {
     const kept_object = (try sim.readObject(arena, kept.tip)).?;
     const kept_commit = try object.Commit.parse(arena, .sha1, kept_object.data);
     try std.testing.expectEqual(@as(usize, 2), kept_commit.parents.len);
+}
+
+test "a purged comment that came back beside its rewrite: twice changes nothing" {
+    var fx: TestRepo = .{};
+    defer fx.deinit();
+    const arena, const sim, const repo = try fx.open(3);
+    _, const ref = try fx.issue(.{ .title = "T" });
+    const bad = try repo.comment(arena, ref, .{ .text = "Abuse" }, .{});
+    const purged: []const Oid = &.{bad.tip};
+    const line = try rewrite(arena, sim, try repo.loadCommits(arena, bad.tip), bad.tip, purged);
+    const sig: object.Signature = .{
+        .name = "x",
+        .email = "x@invalid",
+        .time = 9,
+        .tz_offset_minutes = 0,
+    };
+    const who: contract.Identity = .{ .author = sig, .committer = sig };
+    const fields = try repo.writeCommit(arena, &.{line.tip}, who, "Edit fields\n");
+    // Upstream's merge brings the comment back as it was, beside its rewrite.
+    const merge = try repo.writeCommit(
+        arena,
+        &.{ fields, bad.tip },
+        who,
+        "Merge issue from origin\n\nState: open\n",
+    );
+    const edit = try repo.writeCommit(arena, &.{merge}, who, try std.fmt.allocPrint(
+        arena,
+        "Edit comment\n\nWorse abuse\n\nX-Event: comment-edit\nX-Comment: {f}\n",
+        .{line.tip},
+    ));
+
+    // The edit targets the rewrite, which only counts as the purged
+    // comment once the original is gone: one rewrite purges it all the same.
+    const r = try rewrite(arena, sim, try repo.loadCommits(arena, edit), edit, purged);
+    const commits = try repo.loadCommits(arena, r.tip);
+    for (commits) |c| {
+        try std.testing.expect(!c.oid.eql(bad.tip));
+        try std.testing.expect(std.mem.find(u8, c.message, "buse") == null);
+    }
+    for (r.map) |m| if (m.old.eql(bad.tip)) try std.testing.expect(m.new.eql(line.tip));
+    const again = try rewrite(arena, sim, commits, r.tip, purged);
+    try std.testing.expect(again.tip.eql(r.tip));
+    try std.testing.expectEqual(@as(usize, 0), again.map.len);
 }
 
 test "an own merge that stays restates what its new parents resolve to" {

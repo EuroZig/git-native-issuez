@@ -203,7 +203,7 @@ pub fn build(a: Allocator, issue: Issue, ctx: Context) Allocator.Error!IssueObj 
     const created_changes = try changesOf(a, issue.created_changes, &cx);
     try timeline.append(a, .{
         .public = .{
-            .kind = @intFromEnum(api.EntryKind.created),
+            .kind = @backingInt(api.EntryKind.created),
             .commit = rt.oidOf(issue.root),
             .author = author,
             .at = created,
@@ -232,11 +232,11 @@ pub fn build(a: Allocator, issue: Issue, ctx: Context) Allocator.Error!IssueObj 
                 const kind: api.EntryKind = if (c.is_merge)
                     .merge
                 else if (c.kind == .comment) .comment else .update;
-                entry.kind = @intFromEnum(kind);
+                entry.kind = @backingInt(kind);
                 if (comment_of.items[k]) |ci| entry.comment = &comments.items[ci].public;
             },
             .event => |e| {
-                entry.kind = @intFromEnum(rt.mirrored(api.EntryKind, e.kind));
+                entry.kind = @backingInt(rt.mirrored(api.EntryKind, e.kind));
                 if (e.target) |t| for (comments.items) |*c| {
                     const oid = rt.oidOf(t);
                     if (rt.oidEql(&c.public.id, &oid)) entry.comment = &c.public;
@@ -304,7 +304,7 @@ pub fn build(a: Allocator, issue: Issue, ctx: Context) Allocator.Error!IssueObj 
                 .unix_seconds = issue.updated,
                 .tz_offset_minutes = issue.updated_tz_offset_minutes,
             },
-            .state = @intFromEnum(state),
+            .state = @backingInt(state),
             .state_name = try rt.dupeZ(a, issue.state.text()),
             .is_done = issue.state.isDone(ctx.done_states),
             .workflow_state = try rt.optZ(a, workflowOf(issue, ctx)),
@@ -316,7 +316,7 @@ pub fn build(a: Allocator, issue: Issue, ctx: Context) Allocator.Error!IssueObj 
             .is_deleted = issue.deleted,
             .is_locked = issue.locked,
             .lock_reason = try rt.optZ(a, issue.lock_reason),
-            .priority = @intFromEnum(priorityOf(issue)),
+            .priority = @backingInt(priorityOf(issue)),
             .milestone_id = try rt.optZ(a, issue.milestone_id),
             .parent_id = try rt.optZ(a, issue.parent),
             .start_date = if (issue.start_date) |d| rt.dateOf(d) else .{},
@@ -344,8 +344,8 @@ pub fn build(a: Allocator, issue: Issue, ctx: Context) Allocator.Error!IssueObj 
 
 /// The API field a trailer key stands for.
 pub fn fieldOfKey(key: []const u8) api.Field {
-    inline for (@typeInfo(api.Field).@"enum".fields) |f| {
-        const field: api.Field = @enumFromInt(f.value);
+    inline for (@typeInfo(api.Field).@"enum".field_values) |v| {
+        const field: api.Field = @fromBackingInt(@intCast(v));
         const k = field.key();
         if (k.len > 0 and std.ascii.eqlIgnoreCase(k, key)) return field;
     }
@@ -369,9 +369,9 @@ pub fn changesOf(
     const typed = try view.changes(a, list, cx);
     const out = try a.alloc(api.Change, typed.len);
     for (typed, out) |c, *o| o.* = .{
-        .field = @intFromEnum(rt.mirrored(api.Field, c.field)),
+        .field = @backingInt(rt.mirrored(api.Field, c.field)),
         .key = try rt.dupeZ(a, c.key),
-        .op = @intFromEnum(rt.mirrored(api.Verb, c.op)),
+        .op = @backingInt(rt.mirrored(api.Verb, c.op)),
         .old_value = try rt.optZ(a, c.old),
         .new_value = try rt.optZ(a, c.new),
         .old_person = try personOfAssignee(a, c.old_person),
@@ -406,7 +406,7 @@ fn revisionsOf(
             .commit = rt.oidOf(r.oid),
             .author = try rt.newPerson(a, r.author, authorIdAt(author_ids, r.oid)),
             .at = rt.timeOf(r.author),
-            .kind = @intFromEnum(rt.mirrored(api.RevisionKind, r.kind)),
+            .kind = @backingInt(rt.mirrored(api.RevisionKind, r.kind)),
             .text = try rt.dupeZ(a, r.text),
         };
     }
@@ -733,7 +733,7 @@ pub fn parseQuery(a: Allocator, ops: []const api.Op, problems: *rt.Problems) !Qu
         const check: rt.OpCheck = .at(a, problems, i);
         if (try check.reserved(op)) continue;
         const s = op.str.slice();
-        switch (@as(api.Opt, @enumFromInt(op.target))) {
+        switch (@as(api.Opt, @fromBackingInt(@intCast(op.target)))) {
             .q_done => q.done = tri(op.num),
             .q_deleted => q.deleted = tri(op.num),
             .q_state => try q.states.append(a, s),
@@ -744,7 +744,7 @@ pub fn parseQuery(a: Allocator, ops: []const api.Op, problems: *rt.Problems) !Qu
             .q_assignee => try q.assignees.append(a, s),
             .q_author => try q.authors.append(a, s),
             .q_priority => if (std.math.cast(u32, op.num)) |n| {
-                try q.priorities.append(a, @enumFromInt(n));
+                try q.priorities.append(a, @fromBackingInt(@intCast(n)));
             } else {
                 try check.add(.bad_format, "unknown priority");
             },
@@ -760,7 +760,7 @@ pub fn parseQuery(a: Allocator, ops: []const api.Op, problems: *rt.Problems) !Qu
                 q.ignore_case = op.num != 0;
             },
             .q_order => {
-                q.order = @enumFromInt(std.math.cast(u32, op.num) orelse 0);
+                q.order = @fromBackingInt(@intCast(std.math.cast(u32, op.num) orelse 0));
                 q.ascending = op.num2 != 0;
                 switch (q.order) {
                     .created, .updated, .number, .priority, .due_date, .comments, .state => {},
