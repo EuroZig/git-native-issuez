@@ -563,7 +563,9 @@ The rewrite is repeated on its result until it changes nothing. A purged
 comment can come back beside its rewrite (upstream's merge brings the old
 history in again): while both are there the rewrite's `X-Rewritten-From` is
 ignored, and once a pass has dropped the comment it counts, so an edit of
-the rewrite is purged too. Rewriting a rewritten history changes nothing.
+the rewrite is purged too. Purging the rewrite while both are there names
+the comment the tombstone already has, not the rewrite. Rewriting a
+rewritten history changes nothing.
 
 The tombstone `refs/issuez-purged/<uuid>` is a chain of empty-tree commits,
 one per purge, by the purger:

@@ -295,8 +295,9 @@ fn checkPurge(
             .{},
         );
         const history = try b.reach(tip);
-        first = try purge.firstId(b, &history, hex);
-        if (old_tomb) |ot| if ((try purge.read(b, ot)).covers(first.?)) {
+        const recorded: purge.Tomb = if (old_tomb) |ot| try purge.read(b, ot) else .{};
+        first = try purge.targetId(b, &history, hex, recorded);
+        if (recorded.covers(first.?)) {
             // Purged and recorded already: nothing to write.
             const block = try commands.trailersOf(arena, b.commit(hex).?.message);
             if (std.mem.eql(u8, trailers.lastValue(block, "X-Purged") orelse "", "true")) {
@@ -304,7 +305,7 @@ fn checkPurge(
                     try report.fail("purge of a purged comment changed refs", .{});
                 return;
             }
-        };
+        }
     };
     const new_tomb = a.ref(tomb_name) orelse return report.fail("purge wrote no tombstone", .{});
     const tc = a.commit(new_tomb) orelse return report.fail("tombstone is not a commit", .{});

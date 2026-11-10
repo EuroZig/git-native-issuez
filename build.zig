@@ -730,12 +730,17 @@ const sums_script =
     \\for f; do (cd "$(dirname "$f")" && $sum "$(basename "$f")") >> "$out"; done
 ;
 
-/// Relative symlinks to `git-issue`, copies on Windows.
+/// Relative symlinks to `git-issue`, made by sh; copies for Windows, and
+/// on a Windows host, which may have no sh.
 fn installEntryPoints(b: *std.Build, exe: *std.Build.Step.Compile) void {
-    if (exe.rootModuleTarget().os.tag == .windows) {
+    const for_windows = exe.rootModuleTarget().os.tag == .windows;
+    if (for_windows or b.graph.host.result.os.tag == .windows) {
         for (entry_points.names) |name| {
             const copy = b.addInstallArtifact(exe, .{
-                .dest_sub_path = b.fmt("git-issue-{s}.exe", .{name}),
+                .dest_sub_path = b.fmt(
+                    "git-issue-{s}{s}",
+                    .{ name, if (for_windows) ".exe" else "" },
+                ),
                 .pdb_dir = .disabled,
                 .implib_dir = .disabled,
             });
@@ -797,7 +802,9 @@ fn versionImport(b: *std.Build, version: []const u8) std.Build.Module.Import {
 /// source archive, a dependency).
 fn describeVersion(b: *std.Build) []const u8 {
     if (!isRootPackage(b) or !hasPath(b, ".git")) return zon_version;
-    // The configure cache can't see a commit: git runs every time.
+    // The configure cache can't see a commit or an edit (`-dirty`), so git
+    // runs every time: a few milliseconds, for a version that is always
+    // the checkout's.
     b.graph.poisonCache();
     const root = b.root.toString(b.allocator) catch @panic("OOM");
     const tag = "v" ++ zon_version;
@@ -964,14 +971,12 @@ fn runsOnHost(b: *std.Build, exe: *std.Build.Step.Compile) bool {
     return target.os.tag == host.os.tag and target.cpu.arch == host.cpu.arch;
 }
 
-/// The configure cache sees `path` appear or go away: a missing path can't
-/// be a dependency itself, so its directory's entries are.
+/// The configure cache sees `path` appear or go away: its directory's
+/// entries are the dependency, so a missing path and `.git` as a file (a
+/// worktree) work too.
 fn hasPath(b: *std.Build, path: []const u8) bool {
-    b.root.access(b.graph.io, path, .{}) catch {
-        b.dependOnDirectoryContents(b.path(std.fs.path.dirname(path) orelse ""));
-        return false;
-    };
-    b.dependOnFileMetadata(b.path(path));
+    b.dependOnDirectoryContents(b.path(std.fs.path.dirname(path) orelse ""));
+    b.root.access(b.graph.io, path, .{}) catch return false;
     return true;
 }
 

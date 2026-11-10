@@ -148,6 +148,22 @@ fn firstId(
     return if (history.contains(first.bytes)) oid else first;
 }
 
+/// `firstId` of a comment to purge. A rewrite whose original is still in
+/// the history (upstream's merge brought it back) is the original once a
+/// tombstone purged that: purging it again records nothing new.
+fn targetId(
+    format: object.ObjectFormat,
+    oid: Oid,
+    block: trailers.Block,
+    history: *const Index,
+    recorded: []const Oid,
+) Oid {
+    const first = firstId(format, oid, block, history);
+    const was = trailers.lastValue(block, rewritten_from_key) orelse return first;
+    const named = Oid.parseHex(format, was) catch return first;
+    return if (containsOid(recorded, named)) named else first;
+}
+
 fn indexOf(arena: Allocator, commits: []const issue_model.CommitInput) Allocator.Error!Index {
     var index: Index = .empty;
     for (commits, 0..) |c, i| try index.put(arena, c.oid.bytes, i);
@@ -176,33 +192,49 @@ pub fn rewrite(
     var r = try rewriteOnce(arena, backend, commits, tip, purged);
     // Each pass after the first only follows trailers the one before made
     // count, so the history's length bounds the passes.
-    for (0..commits.len) |_| {
-        if (r.result.tip.eql(tip) or r.result.map.len == 0) return r.result;
-        const again = try rewriteOnce(arena, backend, r.history, r.result.tip, purged);
-        if (again.result.tip.eql(r.result.tip)) return r.result;
-        // Old commit to its last new one.
-        var map: std.ArrayList(Moved) = .empty;
-        for (commits) |c| {
-            var to = c.oid;
-            for (r.result.map) |m| if (m.old.eql(to)) {
-                to = m.new;
-                break;
-            };
-            for (again.result.map) |m| if (m.old.eql(to)) {
-                to = m.new;
-                break;
-            };
-            if (!to.eql(c.oid)) try map.append(arena, .{ .old = c.oid, .new = to });
-        }
-        r = .{ .result = .{ .tip = again.result.tip, .map = map.items }, .history = again.history };
+    var passes: usize = 1;
+    while (r.again) : (passes += 1) {
+        if (passes > commits.len) return error.CorruptIssue;
+        const next = try rewriteOnce(arena, backend, r.history, r.result.tip, purged);
+        r = .{
+            .result = .{
+                .tip = next.result.tip,
+                .map = try compose(arena, commits, r.result.map, next.result.map),
+            },
+            .history = next.history,
+            .again = next.again,
+        };
     }
-    return error.CorruptIssue;
+    return r.result;
+}
+
+/// Each commit of `commits` to where `first`, then `second`, moved it.
+fn compose(
+    arena: Allocator,
+    commits: []const issue_model.CommitInput,
+    first: []const Moved,
+    second: []const Moved,
+) Allocator.Error![]const Moved {
+    var to: std.AutoHashMapUnmanaged([Oid.max_byte_len]u8, Oid) = .empty;
+    for (first) |m| try to.put(arena, m.old.bytes, m.new);
+    var then: std.AutoHashMapUnmanaged([Oid.max_byte_len]u8, Oid) = .empty;
+    for (second) |m| try then.put(arena, m.old.bytes, m.new);
+    var map: std.ArrayList(Moved) = .empty;
+    for (commits) |c| {
+        const mid = to.get(c.oid.bytes) orelse c.oid;
+        const new = then.get(mid.bytes) orelse mid;
+        if (!new.eql(c.oid)) try map.append(arena, .{ .old = c.oid, .new = new });
+    }
+    return map.items;
 }
 
 const Pass = struct {
     result: Rewritten,
     /// The new tip's history.
     history: []const issue_model.CommitInput,
+    /// Whether another pass would change it: a commit it kept names, in
+    /// `X-Rewritten-From`, a purged comment it dropped.
+    again: bool,
 };
 
 fn rewriteOnce(
@@ -324,7 +356,20 @@ fn rewriteOnce(
     const tip_index = index.get(tip.bytes) orelse return error.CorruptIssue;
     const new_tip = new[tip_index].?;
     const history = try historyOf(arena, &lineage, &.{new_tip});
-    return .{ .result = .{ .tip = new_tip, .map = map.items }, .history = history.values() };
+    // A trailer naming a commit still here didn't count: it counts next
+    // pass if this one dropped that commit, and purges if it was purged.
+    const again = for (commits, blocks, is_purged) |c, block, x| {
+        if (x) continue;
+        const was = trailers.lastValue(block, rewritten_from_key) orelse continue;
+        const first = Oid.parseHex(format, was) catch continue;
+        if (first.eql(c.oid) or !index.contains(first.bytes)) continue;
+        if (containsOid(purged, first) and !history.contains(first.bytes)) break true;
+    } else false;
+    return .{
+        .result = .{ .tip = new_tip, .map = map.items },
+        .history = history.values(),
+        .again = again,
+    };
 }
 
 const Lineage = std.AutoHashMapUnmanaged([Oid.max_byte_len]u8, issue_model.CommitInput);
@@ -612,15 +657,18 @@ pub fn Purge(comptime B: type) type {
                     } else return error.CommentNotFound;
                     const commits = try self.repo.loadCommits(arena, tip);
                     const index = try indexOf(arena, commits);
+                    const recorded: []const Oid = if (old_tomb) |ot|
+                        (try readAt(arena, backend, ot)).comments
+                    else
+                        &.{};
                     for (commits) |ci| if (ci.oid.eql(t)) {
                         const block = try trailers.parse(arena, ci.message, .{});
-                        first = firstId(backend.objectFormat(), ci.oid, block, &index);
+                        first = targetId(backend.objectFormat(), ci.oid, block, &index, recorded);
                     };
                     if (c.purged) if (old_tomb) |ot| {
                         // Already purged here: only a tombstone that lacks
                         // it (another tool's rewrite) needs the record.
-                        const known = try readAt(arena, backend, ot);
-                        if (containsOid(known.comments, first.?)) return .{
+                        if (containsOid(recorded, first.?)) return .{
                             .tombstone = ot,
                             .tip = tip,
                             .moved = &.{},
@@ -628,10 +676,7 @@ pub fn Purge(comptime B: type) type {
                     };
                     const purged_set = blk: {
                         var list: std.ArrayList(Oid) = .empty;
-                        if (old_tomb) |ot| try list.appendSlice(
-                            arena,
-                            (try readAt(arena, backend, ot)).comments,
-                        );
+                        try list.appendSlice(arena, recorded);
                         if (!containsOid(list.items, first.?)) try list.append(arena, first.?);
                         break :blk list.items;
                     };
@@ -1055,6 +1100,33 @@ test "a purged comment that came back beside its rewrite: twice changes nothing"
     const again = try rewrite(arena, sim, commits, r.tip, purged);
     try std.testing.expect(again.tip.eql(r.tip));
     try std.testing.expectEqual(@as(usize, 0), again.map.len);
+}
+
+test "purging the rewrite of a purged comment that came back records the comment" {
+    var fx: TestRepo = .{};
+    defer fx.deinit();
+    const arena, const sim, const repo = try fx.open(3);
+    const created, const ref = try fx.issue(.{ .title = "T" });
+    const bad = try repo.comment(arena, ref, .{ .text = "Abuse" }, .{});
+    const purge = Purge(GitSim).fromRepo(repo);
+    const r = try purge.comment(arena, ref, bad.tip, .{ .reason = "abuse" }, .{});
+    const placeholder = r.tip.?;
+    const who = try repo.identity(arena, null);
+    // Upstream's merge brings the comment back as it was, beside its rewrite.
+    const merge = try repo.writeCommit(
+        arena,
+        &.{ placeholder, bad.tip },
+        who,
+        "Merge issue from origin\n\nState: open\n",
+    );
+    try sim.updateRefs(&.{.{
+        .name = ref,
+        .op = .{ .update = .{ .new = merge, .old = placeholder } },
+    }});
+
+    _ = try purge.comment(arena, ref, placeholder, .{ .reason = "again" }, .{});
+    const t = (try purge.tombstone(arena, created.id)).?;
+    for (t.comments) |first| try std.testing.expect(first.eql(bad.tip));
 }
 
 test "an own merge that stays restates what its new parents resolve to" {
