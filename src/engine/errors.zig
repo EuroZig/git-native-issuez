@@ -234,10 +234,10 @@ test "every library error has a description" {
         const Sync = @import("sync.zig").Sync(B);
         const Settings = @import("settings.zig").Settings;
         inline for (.{ Sync.Error, Settings.Error }) |E| {
-            inline for (@typeInfo(E).error_set.?) |e| {
-                const err = @field(anyerror, e.name);
+            inline for (@typeInfo(E).error_set.error_names.?) |e| {
+                const err = @field(anyerror, e);
                 std.testing.expect(describe(err) != null) catch |x| {
-                    std.debug.print("no description for error.{s}\n", .{e.name});
+                    std.debug.print("no description for error.{s}\n", .{e});
                     return x;
                 };
             }

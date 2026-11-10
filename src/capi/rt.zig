@@ -146,7 +146,7 @@ fn environSnapshot() std.process.Environ {
     const from = std.mem.sliceTo(std.c.environ, null);
     const entries = a.allocSentinel(?[*:0]const u8, from.len, null) catch return .empty;
     for (from, entries) |entry, *to| {
-        const copy = a.dupeZ(u8, std.mem.span(entry.?)) catch return .empty;
+        const copy = a.dupeSentinel(u8, std.mem.span(entry.?), 0) catch return .empty;
         to.* = copy.ptr;
     }
     return .{ .block = .{ .slice = entries } };
@@ -198,7 +198,7 @@ fn upperZ(comptime s: []const u8) [*:0]const u8 {
 
 /// A copy with a NUL after it, as every returned string has.
 pub fn dupeZ(arena: Allocator, s: []const u8) Allocator.Error!Str {
-    const z = try arena.dupeZ(u8, s);
+    const z = try arena.dupeSentinel(u8, s, 0);
     return .{ .ptr = z.ptr, .len = s.len };
 }
 
@@ -476,8 +476,8 @@ pub const OpCheck = struct {
 
 pub fn problem(arena: Allocator, p: ProblemSpec) Allocator.Error!api.Problem {
     return .{
-        .kind = @intFromEnum(p.kind),
-        .field = @intFromEnum(p.field),
+        .kind = @backingInt(p.kind),
+        .field = @backingInt(p.field),
         .key = try dupeZ(arena, if (p.key.len > 0) p.key else p.field.key()),
         .value = try dupeZ(arena, p.value),
         .subject = try dupeZ(arena, p.subject),
@@ -858,13 +858,13 @@ pub fn issuez_set_logger(
     lockLogger();
     defer unlockLogger();
     logger = .{ .cb = cb, .userdata = userdata };
-    log_level.store(if (cb == null) 0 else @intFromEnum(min_level), .release);
+    log_level.store(if (cb == null) 0 else @backingInt(min_level), .release);
 }
 
 pub fn logging(level: api.LogLevel) bool {
-    if (scoped.level != 0) return @intFromEnum(level) <= scoped.level;
+    if (scoped.level != 0) return @backingInt(level) <= scoped.level;
     const min = log_level.load(.acquire);
-    return min != 0 and @intFromEnum(level) <= min;
+    return min != 0 and @backingInt(level) <= min;
 }
 
 /// Sets a repo's logger; `target` is the repo's field.
@@ -878,7 +878,7 @@ pub fn setScoped(
     defer unlockLogger();
     target.* = .{
         .logger = .{ .cb = cb, .userdata = userdata },
-        .level = if (cb == null) 0 else @intFromEnum(min_level),
+        .level = if (cb == null) 0 else @backingInt(min_level),
     };
 }
 
@@ -911,7 +911,7 @@ pub fn log(level: api.LogLevel, spec: LogSpec) void {
     var buf: [log_buf_bytes]u8 = undefined;
     var used: usize = 0;
     const event: api.LogEvent = .{
-        .level = @intFromEnum(level),
+        .level = @backingInt(level),
         .operation = terminated(&buf, &used, spec.operation),
         .message = terminated(&buf, &used, spec.message),
         .repo_path = terminated(&buf, &used, spec.repo_path),
@@ -944,7 +944,7 @@ test "log strings are NUL-terminated" {
     try std.testing.expectEqualStrings("git.read-object", a.slice());
     try std.testing.expectEqual(@as(u8, 0), a.ptr.?[a.len]);
     try std.testing.expectEqual(@as(u8, 0), b.ptr.?[0]);
-    const long = [_]u8{'x'} ** (2 * log_buf_bytes);
+    const long: [2 * log_buf_bytes]u8 = @splat('x');
     const c = terminated(&buf, &used, &long);
     try std.testing.expectEqual(@as(u8, 0), c.ptr.?[c.len]);
     try std.testing.expectEqual(@as(usize, log_buf_bytes), used);

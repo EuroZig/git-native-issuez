@@ -36,7 +36,7 @@ fn makeSnapshot(a: Allocator, entries: []const SnapEntry) !SnapshotObj {
 }
 
 fn lessEntry(_: void, x: SnapEntry, y: SnapEntry) bool {
-    if (x.kind != y.kind) return @intFromEnum(x.kind) < @intFromEnum(y.kind);
+    if (x.kind != y.kind) return @backingInt(x.kind) < @backingInt(y.kind);
     return std.mem.lessThan(u8, x.id.slice(), y.id.slice());
 }
 
@@ -155,7 +155,7 @@ fn buildMilestone(a: Allocator, m: Milestone) !MilestoneObj {
             .tip = rt.oidOf(m.tip),
             .name = try rt.dupeZ(a, m.name),
             .description = try rt.dupeZ(a, m.description),
-            .status = @intFromEnum(rt.mirrored(api.MilestoneStatus, m.status)),
+            .status = @backingInt(rt.mirrored(api.MilestoneStatus, m.status)),
             .due_date = if (m.due) |d| rt.dateOf(d) else .{},
             .created = .{ .unix_seconds = m.created },
             .updated = .{ .unix_seconds = m.updated },
@@ -496,9 +496,9 @@ fn fsckReportObj(a: Allocator, report: Fsck.Report) !FsckReportObj {
         };
         const kind, const subject_kind, const subject = head;
         try findings.append(a, .{
-            .kind = @intFromEnum(kind),
+            .kind = @backingInt(kind),
             .is_error = e.isError(),
-            .subject_kind = @intFromEnum(subject_kind),
+            .subject_kind = @backingInt(subject_kind),
             .subject = try rt.optZ(a, if (subject.len > 0) subject else null),
             .message = try rt.dupeZ(a, try std.fmt.allocPrint(a, "{f}", .{e})),
         });
@@ -553,7 +553,7 @@ pub fn parsePushOps(a: Allocator, ops: []const api.Op, problems: *rt.Problems) !
             continue;
         }
         const s = op.str.slice();
-        switch (@as(api.Opt, @enumFromInt(op.target))) {
+        switch (@as(api.Opt, @fromBackingInt(@intCast(op.target)))) {
             .pusher => {
                 const user_id = op.person.user_id.slice();
                 if (op.person.email.len == 0) {
@@ -579,7 +579,7 @@ pub fn parsePushOps(a: Allocator, ops: []const api.Op, problems: *rt.Problems) !
             },
             .author_policy => switch (@as(
                 api.AuthorPolicy,
-                @enumFromInt(std.math.cast(u32, op.num) orelse 0),
+                @fromBackingInt(@intCast(std.math.cast(u32, op.num) orelse 0)),
             )) {
                 .any => policy.author_policy = .any,
                 .warn => policy.author_policy = .warn,
@@ -725,9 +725,9 @@ fn makeVerdicts(
         x.* = .{
             .public = .{
                 .ref = try rt.dupeZ(a, v.update.ref),
-                .kind = @intFromEnum(verdictKind(v.kind)),
+                .kind = @backingInt(verdictKind(v.kind)),
                 .id = try rt.dupeZ(a, v.id),
-                .action = @intFromEnum(rt.mirrored(api.PushAction, v.action)),
+                .action = @backingInt(rt.mirrored(api.PushAction, v.action)),
                 .accept = v.accept,
                 .problems = @ptrCast(try rt.borrowedProblems(a, specs.items)),
                 .needs_number = v.needs_number,

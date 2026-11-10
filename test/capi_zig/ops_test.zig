@@ -51,7 +51,7 @@ test "issuez_ops_validate: each kind of mistake, at its op" {
     fixture.ensureInit();
     const leaks = fixture.Leaks.start();
     defer leaks.check();
-    const long = "x" ** 1100;
+    const long = &@as([1100]u8, @splat('x'));
     const Case = struct { c.issuez_op_list, c.issuez_op, c_uint };
     const cases = [_]Case{
         .{

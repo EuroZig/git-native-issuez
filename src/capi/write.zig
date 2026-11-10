@@ -44,7 +44,7 @@ const add_remove: []const Verb = &.{ .add, .remove };
 fn verbsOf(list: api.OpList, target: u32) ?[]const Verb {
     const update = list == .issue_update;
     const milestone = list == .milestone_create or list == .milestone_update;
-    if (target >= 0x100) return switch (@as(Opt, @enumFromInt(target))) {
+    if (target >= 0x100) return switch (@as(Opt, @fromBackingInt(@intCast(target)))) {
         // A new commit has no tip to expect, and its subject is the title.
         .expect, .subject => if (list == .issue_create or list == .milestone_create)
             null
@@ -60,7 +60,7 @@ fn verbsOf(list: api.OpList, target: u32) ?[]const Verb {
         => if (update) set_only else null,
         else => null,
     };
-    const f: Field = @enumFromInt(target);
+    const f: Field = @fromBackingInt(@intCast(target));
     if (milestone) return switch (f) {
         .name, .description, .milestone_status => set_only,
         .due_date => set_clear,
@@ -79,7 +79,7 @@ fn verbsOf(list: api.OpList, target: u32) ?[]const Verb {
 }
 
 fn targetField(target: u32) Field {
-    return if (target < 0x100) @enumFromInt(target) else .unknown;
+    return if (target < 0x100) @fromBackingInt(@intCast(target)) else .unknown;
 }
 
 /// Problems with the ops themselves and their values' format: everything
@@ -94,7 +94,7 @@ fn checkOps(a: Allocator, list: api.OpList, ops: []const api.Op, problems: *Prob
             try check.add(.unknown_target, "not a target of this call");
             continue;
         };
-        const verb: Verb = @enumFromInt(op.verb);
+        const verb: Verb = @fromBackingInt(@intCast(op.verb));
         if (std.mem.indexOfScalar(Verb, verbs, verb) == null) {
             try check.add(.bad_verb, "this verb doesn't apply to this target");
             continue;
@@ -178,11 +178,11 @@ fn checkOps(a: Allocator, list: api.OpList, ops: []const api.Op, problems: *Prob
             },
             else => {},
         }
-        const oid_opt = op.target == @intFromEnum(Opt.expect) or
-            op.target == @intFromEnum(Opt.edit_comment) or
-            op.target == @intFromEnum(Opt.delete_comment) or
-            op.target == @intFromEnum(Opt.restore_comment) or
-            op.target == @intFromEnum(Opt.reaction_target);
+        const oid_opt = op.target == @backingInt(Opt.expect) or
+            op.target == @backingInt(Opt.edit_comment) or
+            op.target == @backingInt(Opt.delete_comment) or
+            op.target == @backingInt(Opt.restore_comment) or
+            op.target == @backingInt(Opt.reaction_target);
         if (oid_opt and rt.oidFrom(op.oid) == null) try check.add(.bad_format, "not an object ID");
     }
 }
@@ -292,7 +292,7 @@ const Plan = struct {
     op_of: [32]i64 = @splat(-1),
 
     fn opOf(p: *const Plan, f: Field) i64 {
-        const i = @intFromEnum(f);
+        const i = @backingInt(f);
         return if (i < 32) p.op_of[i] else -1;
     }
 };
@@ -324,10 +324,10 @@ fn plan(a: Allocator, list: api.OpList, ops: []const api.Op, problems: *Problems
     const whole: rt.OpCheck = .{ .a = a, .problems = problems, .index = -1 };
     for (ops, 0..) |op, i| {
         const index: i64 = @intCast(i);
-        const verb: Verb = @enumFromInt(op.verb);
+        const verb: Verb = @fromBackingInt(@intCast(op.verb));
         const s = op.str.slice();
         if (op.target >= 0x100) {
-            switch (@as(Opt, @enumFromInt(op.target))) {
+            switch (@as(Opt, @fromBackingInt(@intCast(op.target)))) {
                 .expect => p.expect = rt.oidFrom(op.oid),
                 .subject => p.subject = s,
                 .original_author => both(&p.edit.original.author, &p.create.original.author, s),
@@ -346,7 +346,7 @@ fn plan(a: Allocator, list: api.OpList, ops: []const api.Op, problems: *Problems
                 .delete_comment, .restore_comment => if (rt.oidFrom(op.oid)) |t| {
                     p.comment_event = .{
                         .target = t,
-                        .delete = op.target == @intFromEnum(Opt.delete_comment),
+                        .delete = op.target == @backingInt(Opt.delete_comment),
                     };
                 },
                 .reaction_target => p.reaction_target = rt.oidFrom(op.oid),
@@ -354,8 +354,8 @@ fn plan(a: Allocator, list: api.OpList, ops: []const api.Op, problems: *Problems
             }
             continue;
         }
-        const field: Field = @enumFromInt(op.target);
-        if (@intFromEnum(field) < 32) p.op_of[@intFromEnum(field)] = index;
+        const field: Field = @fromBackingInt(@intCast(op.target));
+        if (@backingInt(field) < 32) p.op_of[@backingInt(field)] = index;
         if (list == .milestone_create or list == .milestone_update) {
             switch (field) {
                 .name => p.milestone.name = s,
@@ -488,9 +488,9 @@ fn plan(a: Allocator, list: api.OpList, ops: []const api.Op, problems: *Problems
             // reaction's target) go with it.
             for (ops, 0..) |op, i| {
                 const own = (op.target >= 0x100 and
-                    op.target != @intFromEnum(Opt.prepared_attachment) and
-                    op.target != @intFromEnum(Opt.expect_edits)) or
-                    op.target == @intFromEnum(Field.reactions);
+                    op.target != @backingInt(Opt.prepared_attachment) and
+                    op.target != @backingInt(Opt.expect_edits)) or
+                    op.target == @backingInt(Field.reactions);
                 if (!own or (p.comment_event != null and p.reaction != null) or
                     (p.edit_comment != null)) try whole.on(targetField(op.target), @intCast(i)).add(
                     .incompatible,
@@ -503,8 +503,8 @@ fn plan(a: Allocator, list: api.OpList, ops: []const api.Op, problems: *Problems
                 .add(.missing_value, "a comment edit needs the comment's new text");
             // Only the comment's text and images, as its edit event takes.
             for (ops, 0..) |op, i| {
-                const alone = op.target == @intFromEnum(Field.comment) or
-                    op.target == @intFromEnum(Field.attachments) or op.target >= 0x100;
+                const alone = op.target == @backingInt(Field.comment) or
+                    op.target == @backingInt(Field.attachments) or op.target >= 0x100;
                 if (!alone) try whole.on(targetField(op.target), @intCast(i))
                     .add(.incompatible, "a comment edit carries only COMMENT and ATTACHMENTS");
             }
@@ -631,7 +631,7 @@ fn makeWrite(
     w.new_tip = if (new_tip) |t| rt.oidOf(t) else if (old_tip) |t| rt.oidOf(t) else .{};
     w.entry = .{
         .public = .{
-            .kind = @intFromEnum(entry_kind),
+            .kind = @backingInt(entry_kind),
             .commit = w.commit,
             .author = rt.newPerson(a, author, c.author_id) catch null,
             .at = rt.timeOf(author),
@@ -663,7 +663,7 @@ fn copyChanges(a: Allocator, changes: []const api.Change) Allocator.Error![]cons
             .reason = try rt.dupeZ(a, ch.reason.slice()),
         };
         // Milestone writes spell their dates out only.
-        const field: Field = @enumFromInt(ch.field);
+        const field: Field = @fromBackingInt(@intCast(ch.field));
         if (field == .due_date or field == .start_date) {
             if (fields_fmt.Date.parse(ch.old_value.slice())) |d| o.old_date = rt.dateOf(d);
             if (fields_fmt.Date.parse(ch.new_value.slice())) |d| o.new_date = rt.dateOf(d);
@@ -750,7 +750,7 @@ fn checked(
     out.* = try plan(a, list, slice, &problems);
     // Host fields only under the prefixes the repo was opened with.
     for (slice, 0..) |op, i| {
-        if (op.target != @intFromEnum(Field.extra)) continue;
+        if (op.target != @backingInt(Field.extra)) continue;
         const key = op.name.slice();
         const allowed = for (prefixes) |pre| {
             if (std.ascii.startsWithIgnoreCase(key, pre)) break true;
@@ -924,7 +924,7 @@ fn scopeConflicts(
     if (scopes.len == 0) return;
     var seen: std.StringHashMapUnmanaged(void) = .empty;
     for (slice, 0..) |op, i| {
-        if (op.target != @intFromEnum(Field.labels) or op.verb != @intFromEnum(Verb.add)) continue;
+        if (op.target != @backingInt(Field.labels) or op.verb != @backingInt(Verb.add)) continue;
         const scope = exclusiveScopeOf(scopes, op.str.slice()) orelse continue;
         if (!(try seen.getOrPut(a, scope)).found_existing) continue;
         try problems.append(a, .{
@@ -1170,9 +1170,9 @@ pub fn issuez_milestone_create(
     }, .{}) catch |e| return writeFailed(&c, err, e, p, "");
     var changes: std.ArrayList(api.Change) = .empty;
     changes.append(a, .{
-        .field = @intFromEnum(Field.name),
+        .field = @backingInt(Field.name),
         .key = Str.of("Name"),
-        .op = @intFromEnum(Verb.set),
+        .op = @backingInt(Verb.set),
         .old_value = .{},
         .new_value = Str.of(p.milestone.name.?),
     }) catch {};
@@ -1252,9 +1252,9 @@ pub fn issuez_milestone_update(
         const value = new orelse continue;
         if (std.mem.eql(u8, old, value)) continue;
         changes.append(a, .{
-            .field = @intFromEnum(field),
+            .field = @backingInt(field),
             .key = Str.of(field.key()),
-            .op = @intFromEnum(if (value.len == 0) Verb.clear else Verb.set),
+            .op = @backingInt(if (value.len == 0) Verb.clear else Verb.set),
             .old_value = Str.of(old),
             .new_value = Str.of(value),
         }) catch {};

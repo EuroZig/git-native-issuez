@@ -135,7 +135,7 @@ extern "C" {
 /* ---------------------------------------- Version and init --------------------------------- */
 
 #define ISSUEZ_VERSION_MAJOR 0
-#define ISSUEZ_VERSION_MINOR 4
+#define ISSUEZ_VERSION_MINOR 5
 #define ISSUEZ_VERSION_PATCH 0
 /* Major in the high 16 bits, minor in the low 16. The library accepts a
  * header with the same major and a minor <= its own; before 1.0 the minor

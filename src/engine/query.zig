@@ -163,7 +163,7 @@ pub fn labelCounts(
     issues: []const Issue,
     done_states: []const []const u8,
 ) Allocator.Error![]LabelCount {
-    var by: std.StringArrayHashMapUnmanaged(LabelCount) = .empty;
+    var by: std.array_hash_map.String(LabelCount) = .empty;
     for (issues) |issue| {
         if (issue.deleted) continue;
         const done = issue.state.isDone(done_states);
@@ -197,11 +197,11 @@ pub const Person = struct {
 /// Everyone who opened or is assigned an issue, by email (compared
 /// ignoring case): candidates for assignee and author pickers.
 pub fn people(arena: Allocator, issues: []const Issue) Allocator.Error![]Person {
-    var by: std.StringArrayHashMapUnmanaged(Person) = .empty;
+    var by: std.array_hash_map.String(Person) = .empty;
     const add = struct {
         fn f(
             al: Allocator,
-            map: *std.StringArrayHashMapUnmanaged(Person),
+            map: *std.array_hash_map.String(Person),
             email: []const u8,
         ) Allocator.Error!*Person {
             const key = try std.ascii.allocLowerString(al, email);

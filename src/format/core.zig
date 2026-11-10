@@ -21,7 +21,7 @@ pub const Priority = enum {
 
     /// 1 (low) to 4 (critical).
     pub fn rank(p: Priority) u8 {
-        return @as(u8, @intFromEnum(p)) + 1;
+        return @as(u8, @backingInt(p)) + 1;
     }
 };
 

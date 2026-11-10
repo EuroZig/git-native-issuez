@@ -137,7 +137,7 @@ pub fn controlDir(io: std.Io, buf: []u8, runtime_dir: ?[]const u8, uid: u32) ?[:
         'a'...'z', 'A'...'Z', '0'...'9', '/', '.', '_', '-' => {},
         else => return null,
     };
-    std.Io.Dir.cwd().createDir(io, dir, @enumFromInt(0o700)) catch |e| switch (e) {
+    std.Io.Dir.cwd().createDir(io, dir, @fromBackingInt(@intCast(0o700))) catch |e| switch (e) {
         error.PathAlreadyExists => {},
         else => return null,
     };
@@ -301,7 +301,7 @@ test controlDir {
         .{@as(u64, @intCast(t.nanoseconds))},
     );
     const cwd = std.Io.Dir.cwd();
-    try cwd.createDir(io, root, @enumFromInt(0o700));
+    try cwd.createDir(io, root, @fromBackingInt(@intCast(0o700)));
     defer cwd.deleteTree(io, root) catch {};
     var tmp = try cwd.openDir(io, root, .{});
     defer tmp.close(io);
@@ -313,18 +313,18 @@ test controlDir {
     try std.testing.expect(controlDir(io, &buf, root, uid) != null);
     // Someone else's, or open to others: not used.
     try std.testing.expect(controlDir(io, &buf, root, uid +% 1) == null);
-    try tmp.setFilePermissions(io, "issuez", @enumFromInt(0o755), .{});
+    try tmp.setFilePermissions(io, "issuez", @fromBackingInt(@intCast(0o755)), .{});
     try std.testing.expect(controlDir(io, &buf, root, uid) == null);
     // A link to a private directory isn't one.
     try tmp.deleteDir(io, "issuez");
-    try tmp.createDir(io, "real", @enumFromInt(0o700));
+    try tmp.createDir(io, "real", @fromBackingInt(@intCast(0o700)));
     try tmp.symLink(io, "real", "issuez", .{});
     try std.testing.expect(controlDir(io, &buf, root, uid) == null);
     // Too long for a socket.
-    try std.testing.expect(controlDir(io, &buf, "/" ++ "x" ** 60, uid) == null);
+    try std.testing.expect(controlDir(io, &buf, "/" ++ @as([60]u8, @splat('x')), uid) == null);
     // What a shell or ssh would read as more than a path, though private.
     for ([_][]const u8{ "a b", "a;id", "$(id)", "a%h", "'q" }) |name| {
-        try tmp.createDir(io, name, @enumFromInt(0o700));
+        try tmp.createDir(io, name, @fromBackingInt(@intCast(0o700)));
         var bad_buf: [128]u8 = undefined;
         const bad = try std.fmt.bufPrint(&bad_buf, "{s}/{s}", .{ root, name });
         try std.testing.expect(controlDir(io, &buf, bad, uid) == null);
@@ -345,7 +345,7 @@ test sshSharesSafely {
 
 test "failures say what failed, cut at a character" {
     var s: Summary = .{ .kind = .push };
-    s.fail("{s}", .{"x" ** 396 ++ "é and more"});
+    s.fail("{s}", .{@as([396]u8, @splat('x')) ++ "é and more"});
     try std.testing.expect(std.unicode.utf8ValidateSlice(s.message()));
     try std.testing.expect(std.mem.endsWith(u8, s.message(), "x\u{2026}"));
     try std.testing.expect(s.message().len <= s.message_buf.len);

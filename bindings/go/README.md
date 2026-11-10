@@ -31,10 +31,10 @@ macOS (`aarch64`, `x86_64`) and Linux (`aarch64`, `x86_64` and `arm`, which
 is ARMv6 and runs on ARMv7 too, with glibc or musl).
 
 ```sh
-go get github.com/EuroZig/git-native-issuez/bindings/go@v0.4.0
-gh release download v0.4.0 --repo EuroZig/git-native-issuez --pattern 'libissuez-*-x86_64-linux-gnu.tar.gz'
-tar -xzf libissuez-0.4.0-x86_64-linux-gnu.tar.gz
-export CGO_LDFLAGS="-L$PWD/libissuez-0.4.0-x86_64-linux-gnu/lib"
+go get github.com/EuroZig/git-native-issuez/bindings/go@v0.5.0
+gh release download v0.5.0 --repo EuroZig/git-native-issuez --pattern 'libissuez-*-x86_64-linux-gnu.tar.gz'
+tar -xzf libissuez-0.5.0-x86_64-linux-gnu.tar.gz
+export CGO_LDFLAGS="-L$PWD/libissuez-0.5.0-x86_64-linux-gnu/lib"
 go build ./...
 ```
 

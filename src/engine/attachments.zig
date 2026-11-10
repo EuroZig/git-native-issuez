@@ -1009,7 +1009,7 @@ test "limits, missing bytes, repair, orphans" {
     const ref = try std.fmt.allocPrint(arena, "refs/issues/{s}", .{created.id});
     try testing.expectError(error.AttachmentTooLarge, att.validate(.{
         .name = "big",
-        .data = samples.png ++ "\x00" ** 64,
+        .data = samples.png ++ @as([64]u8, @splat('\x00')),
     }));
     const one: Attachments(GitSim).Input = .{ .name = "a.png", .data = samples.png };
     _ = try att.add(arena, ref, .{ .files = &.{ one, one } }, .{});

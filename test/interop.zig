@@ -33,6 +33,8 @@ const Sandbox = struct {
     root: []const u8,
     /// Holds our binary as `git-issue`, to put first on PATH.
     ours_bin: []const u8,
+    /// Upstream's `bin/`, absolute.
+    upstream_bin: []const u8,
     env: std.process.Environ.Map,
     arena_state: std.heap.ArenaAllocator,
 
@@ -41,6 +43,7 @@ const Sandbox = struct {
             .tmp = testing.tmpDir(.{}),
             .root = undefined,
             .ours_bin = undefined,
+            .upstream_bin = undefined,
             .env = try testing.environ.createMap(testing.allocator),
             .arena_state = .init(testing.allocator),
         };
@@ -58,12 +61,11 @@ const Sandbox = struct {
 
         sb.ours_bin = try std.fmt.allocPrint(arena, "{s}/ours-bin", .{sb.root});
         try std.Io.Dir.cwd().createDirPath(io, sb.ours_bin);
-        // The build may hand us a cache-relative path. A relative symlink
-        // target would resolve against the link's directory instead.
-        const target = if (std.fs.path.isAbsolute(paths.git_issue_exe))
-            paths.git_issue_exe
-        else
-            try std.fmt.allocPrint(arena, "{s}/{s}", .{ cwd, paths.git_issue_exe });
+        // The build hands us paths relative to the build root, the tests'
+        // working directory. A relative symlink target would resolve
+        // against the link's directory instead.
+        const target = try std.fs.path.resolve(arena, &.{ cwd, paths.git_issue_exe });
+        sb.upstream_bin = try std.fs.path.resolve(arena, &.{ cwd, paths.upstream_bin });
         const link = try std.fmt.allocPrint(arena, "{s}/git-issue", .{sb.ours_bin});
         try std.Io.Dir.cwd().symLink(io, target, link, .{});
         return sb;
@@ -170,7 +172,7 @@ const Clone = struct {
         defer env.deinit();
         const bin = switch (tool) {
             .ours => c.sb.ours_bin,
-            .upstream => paths.upstream_bin,
+            .upstream => c.sb.upstream_bin,
         };
         const path = env.get("PATH") orelse "/usr/bin:/bin";
         try env.put("PATH", try std.fmt.allocPrint(arena, "{s}:{s}", .{ bin, path }));
@@ -448,7 +450,7 @@ test "top-level dispatcher parity with upstream" {
         const args = try split(arena, case.args);
         const ours_exe = try std.fmt.allocPrint(arena, "{s}/git-issue", .{sb.ours_bin});
         const ours = try repo.exec(try std.mem.concat(arena, []const u8, &.{ &.{ours_exe}, args }));
-        const upstream_exe = try std.fmt.allocPrint(arena, "{s}/git-issue", .{paths.upstream_bin});
+        const upstream_exe = try std.fmt.allocPrint(arena, "{s}/git-issue", .{sb.upstream_bin});
         const theirs = try repo.exec(
             try std.mem.concat(arena, []const u8, &.{ &.{upstream_exe}, args }),
         );
@@ -821,7 +823,7 @@ test "email validation" {
     // Upstream: the real validate_email from its git-issue-lib, every case
     // in one shell, in a subshell because a refusal ends it. Each record is
     // the exit code, then stderr.
-    const lib = try std.fmt.allocPrint(arena, "{s}/git-issue-lib", .{paths.upstream_bin});
+    const lib = try std.fmt.allocPrint(arena, "{s}/git-issue-lib", .{sb.upstream_bin});
     const script =
         \\. "$0"
         \\for email; do

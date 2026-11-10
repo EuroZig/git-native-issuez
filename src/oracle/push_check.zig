@@ -130,8 +130,8 @@ fn isUuid(s: []const u8) bool {
 fn history(
     c: commands.Clone,
     tip: []const u8,
-) Allocator.Error!?std.StringArrayHashMapUnmanaged(object.Commit) {
-    var out: std.StringArrayHashMapUnmanaged(object.Commit) = .empty;
+) Allocator.Error!?std.array_hash_map.String(object.Commit) {
+    var out: std.array_hash_map.String(object.Commit) = .empty;
     var walk = try c.walk(tip);
     while (try walk.next()) |x| try out.put(c.arena, x.hex, x.commit);
     return if (walk.missing) null else out;
@@ -251,7 +251,7 @@ fn unionText(
 /// purged, whichever issue the tombstone names.
 fn purgedIn(
     r: *Run,
-    h: std.StringArrayHashMapUnmanaged(object.Commit),
+    h: std.array_hash_map.String(object.Commit),
     k: *Kinds,
 ) Allocator.Error!void {
     for (h.keys()) |hex| if (r.purged.contains(hex)) return k.add("purged");
@@ -262,7 +262,7 @@ fn purgedIn(
 fn rewrittenFrom(
     c: commands.Clone,
     fresh: []const Fresh,
-    h: std.StringArrayHashMapUnmanaged(object.Commit),
+    h: std.array_hash_map.String(object.Commit),
     k: *Kinds,
 ) Allocator.Error!void {
     for (fresh) |f| {
@@ -420,7 +420,7 @@ const Fresh = struct { hex: []const u8, commit: object.Commit };
 /// The commits of `h` that `base`'s history doesn't have.
 fn freshOf(
     r: *Run,
-    h: std.StringArrayHashMapUnmanaged(object.Commit),
+    h: std.array_hash_map.String(object.Commit),
     base: ?std.StringHashMapUnmanaged(void),
 ) Allocator.Error![]const Fresh {
     var out: std.ArrayList(Fresh) = .empty;
@@ -434,7 +434,7 @@ fn freshOf(
 
 fn keysOf(
     arena: Allocator,
-    h: std.StringArrayHashMapUnmanaged(object.Commit),
+    h: std.array_hash_map.String(object.Commit),
 ) Allocator.Error!std.StringHashMapUnmanaged(void) {
     var out: std.StringHashMapUnmanaged(void) = .empty;
     for (h.keys()) |key| try out.put(arena, key, {});
@@ -489,7 +489,7 @@ fn isPurge(c: commands.Clone, cm: object.Commit) Allocator.Error!bool {
     return false;
 }
 
-fn rootOf(h: std.StringArrayHashMapUnmanaged(object.Commit)) struct { usize, ?object.Commit } {
+fn rootOf(h: std.array_hash_map.String(object.Commit)) struct { usize, ?object.Commit } {
     var n: usize = 0;
     var root: ?object.Commit = null;
     for (h.values()) |cm| if (cm.parents.len == 0) {
@@ -548,7 +548,7 @@ fn issueOrMilestone(
         if (!std.mem.eql(u8, v, "1")) try k.add("format_version");
     }
 
-    const old_h: ?std.StringArrayHashMapUnmanaged(object.Commit) = if (u.old) |o|
+    const old_h: ?std.array_hash_map.String(object.Commit) = if (u.old) |o|
         (try history(c, o)) orelse {
             try k.add("invalid_history");
             return k.done(action);
@@ -722,7 +722,7 @@ fn isDerived(
     c: commands.Clone,
     id: []const u8,
     f: Fresh,
-    issue_h: ?std.StringArrayHashMapUnmanaged(object.Commit),
+    issue_h: ?std.array_hash_map.String(object.Commit),
 ) (Allocator.Error || error{NoRule})!bool {
     const a = c.arena;
     const cm = f.commit;

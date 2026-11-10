@@ -69,11 +69,8 @@ fn serve(init: std.process.Init.Minimal, shard: Shard) !void {
     const io = std.Io.Threaded.global_single_threaded.io();
     var stdin_reader: std.Io.File.Reader = .initStreaming(.stdin(), io, &stdin_buffer);
     var stdout_writer: std.Io.File.Writer = .initStreaming(.stdout(), io, &stdout_buffer);
-    var server = try Server.init(.{
-        .in = &stdin_reader.interface,
-        .out = &stdout_writer.interface,
-        .zig_version = builtin.zig_version_string,
-    });
+    var server: Server = .{ .in = &stdin_reader.interface, .out = &stdout_writer.interface };
+    try server.serveStringMessage(.zig_version, builtin.zig_version_string);
     while (true) {
         const header = try server.receiveMessage();
         switch (header.tag) {
@@ -86,9 +83,9 @@ fn serve(init: std.process.Init.Minimal, shard: Shard) !void {
 }
 
 fn serveMetadata(server: *Server, shard: Shard) !void {
-    testing.allocator_instance = .{};
-    defer if (testing.allocator_instance.deinit() == .leak) @panic("test runner memory leak");
-    const gpa = testing.allocator;
+    var sa: std.heap.SafeAllocator = .init(std.heap.page_allocator, .{});
+    defer if (sa.deinit() != 0) @panic("test runner memory leak");
+    const gpa = sa.allocator();
 
     var string_bytes: std.ArrayList(u8) = .empty;
     defer string_bytes.deinit(gpa);
@@ -114,7 +111,10 @@ fn serveMetadata(server: *Server, shard: Shard) !void {
 
 fn runTest(server: *Server, init: std.process.Init.Minimal, shard: Shard) !void {
     testing.environ = init.environ;
-    testing.allocator_instance = .{};
+    testing.allocator_instance = .init(std.heap.page_allocator, .{
+        .canary = 0xc3a701ba,
+        .check_write_after_free = true,
+    });
     testing.io_instance = .init(testing.allocator, .{
         .argv0 = .init(init.args),
         .environ = init.environ,
@@ -133,8 +133,7 @@ fn runTest(server: *Server, init: std.process.Init.Minimal, shard: Shard) !void 
         },
     };
     testing.io_instance.deinit();
-    const leak_count = testing.allocator_instance.detectLeaks();
-    testing.allocator_instance.deinitWithoutLeakChecks();
+    const leak_count = testing.allocator_instance.deinit();
     try server.serveTestResults(.{
         .index = n,
         .flags = .{
@@ -158,8 +157,8 @@ pub fn log(
     comptime format: []const u8,
     args: anytype,
 ) void {
-    if (@intFromEnum(level) <= @intFromEnum(std.log.Level.err)) log_err_count +|= 1;
-    if (@intFromEnum(level) <= @intFromEnum(testing.log_level)) std.debug.print(
+    if (@backingInt(level) <= @backingInt(std.log.Level.err)) log_err_count +|= 1;
+    if (@backingInt(level) <= @backingInt(testing.log_level)) std.debug.print(
         "[" ++ @tagName(scope) ++ "] (" ++ @tagName(level) ++ "): " ++ format ++ "\n",
         args,
     );

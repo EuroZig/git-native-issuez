@@ -8,7 +8,7 @@
 
 /// `build.zig.zon`'s version; built from a git checkout, with `git describe`'s
 /// distance and commit, and `-dirty` for uncommitted changes:
-/// `0.4.0-12-ga3e21cfa`. What `git issue version`, the MCP server,
+/// `0.5.0-12-ga3e21cfa`. What `git issue version`, the MCP server,
 /// `issuez_version()` and the Go binding's `Version()` report.
 pub const version: []const u8 = @import("version").version;
 

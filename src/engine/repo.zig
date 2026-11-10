@@ -145,9 +145,9 @@ pub const Limits = struct {
     };
 
     pub fn valid(l: Limits) bool {
-        inline for (std.meta.fields(Limits)) |f| {
-            const v = @field(l, f.name);
-            if (v == 0 or v > @field(maximum, f.name)) return false;
+        inline for (comptime std.meta.fieldNames(Limits)) |f| {
+            const v = @field(l, f);
+            if (v == 0 or v > @field(maximum, f)) return false;
         }
         return true;
     }

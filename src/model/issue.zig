@@ -344,13 +344,13 @@ pub const Issue = struct {
     /// The extension fields as one value, as the parser has them.
     pub fn extensions(issue: *const Issue) Extensions {
         var x: Extensions = .{};
-        inline for (std.meta.fields(Extensions)) |f| @field(x, f.name) = @field(issue, f.name);
+        inline for (comptime std.meta.fieldNames(Extensions)) |f| @field(x, f) = @field(issue, f);
         return x;
     }
 
     /// Sets the extension fields from `x`.
     pub fn setExtensions(issue: *Issue, x: Extensions) void {
-        inline for (std.meta.fields(Extensions)) |f| @field(issue, f.name) = @field(x, f.name);
+        inline for (comptime std.meta.fieldNames(Extensions)) |f| @field(issue, f) = @field(x, f);
     }
 
     pub fn field(issue: *const Issue, key: []const u8) ?[]const u8 {
@@ -825,7 +825,7 @@ fn authorIds(arena: Allocator, nodes: []const Node) Allocator.Error![]const Auth
 
 const Ctx = struct {
     nodes: []const Node,
-    ancestors: []const std.DynamicBitSetUnmanaged,
+    ancestors: []const std.bit_set.Dynamic,
     attachment_problems: *std.ArrayList(AttachmentProblem),
 
     fn isAncestor(ctx: Ctx, a: u32, b: u32) bool {
@@ -1597,10 +1597,10 @@ fn ancestorSets(
     arena: Allocator,
     nodes: []const Node,
     order: []const u32,
-) Allocator.Error![]std.DynamicBitSetUnmanaged {
-    const sets = try arena.alloc(std.DynamicBitSetUnmanaged, nodes.len);
+) Allocator.Error![]std.bit_set.Dynamic {
+    const sets = try arena.alloc(std.bit_set.Dynamic, nodes.len);
     for (order) |i| {
-        var set = try std.DynamicBitSetUnmanaged.initEmpty(arena, nodes.len);
+        var set = try std.bit_set.Dynamic.initEmpty(arena, nodes.len);
         for (nodes[i].parents) |p| {
             set.set(p);
             set.setUnion(sets[p]);
@@ -2569,7 +2569,7 @@ test "concurrent and bad events" {
     try testing.expect(i.conflicts[0].target == .comment);
 
     // Dangling target, the root, an event, and two events in one commit.
-    const missing = "0f" ** 20;
+    const missing: [40]u8 = @bitCast(@as([20][2]u8, @splat("0f".*)));
     const dangling_msg = "Edit\n\nX\n\nX-Event: comment-edit\nX-Comment: " ++ missing ++ "\n";
     const bad1 = try d.add(&.{merge}, 600, dangling_msg);
     const bad2 = try d.add(&.{bad1}, 700, try eventMsg(&d, "Delete", "comment-delete", root));
@@ -2593,8 +2593,8 @@ test "attachments" {
     defer d.deinit();
     const id1 = "1b4e28ba-2fa1-4d3b-a3f5-ef19b5a7633b";
     const id2 = "2c5f39cb-3ab2-4e4c-b4a6-f02ac6b8744c";
-    const h1 = " image/png 10 sha256:" ++ "a" ** 64 ++ " ";
-    const h2 = " image/jpeg 20 sha256:" ++ "b" ** 64 ++ " ";
+    const h1 = " image/png 10 sha256:" ++ @as([64]u8, @splat('a')) ++ " ";
+    const h2 = " image/jpeg 20 sha256:" ++ @as([64]u8, @splat('b')) ++ " ";
     const root = try d.add(&.{}, 100, "Crash\n\nState: open\nFormat-Version: 1\n");
     const c1 = try d.add(&.{root}, 200, "Here's a screenshot\n\n" ++
         "X-Attachment: " ++ id1 ++ h1 ++ "shot.png\n" ++
@@ -2630,7 +2630,7 @@ test "attachment merges" {
     var d: TestDag = .{};
     defer d.deinit();
     const id = "1b4e28ba-2fa1-4d3b-a3f5-ef19b5a7633b";
-    const h = " image/png 10 sha256:" ++ "a" ** 64 ++ " ";
+    const h = " image/png 10 sha256:" ++ @as([64]u8, @splat('a')) ++ " ";
     const root = try d.add(&.{}, 100, "Crash\n\nState: open\nX-Attachment: " ++ id ++ h ++
         "a.png\nFormat-Version: 1\n");
     const removed = try d.add(&.{root}, 300, "Remove\n\nX-Attachment-Removed: " ++ id ++ "\n");
@@ -2646,7 +2646,7 @@ test "attachment merges" {
     i = try d.issue(m2);
     try testing.expectEqualStrings("d.png", i.attachments[0].name);
 
-    const h2 = " image/jpeg 20 sha256:" ++ "b" ** 64 ++ " ";
+    const h2 = " image/jpeg 20 sha256:" ++ @as([64]u8, @splat('b')) ++ " ";
     const other = "3d6a4adc-4bc3-4f5d-85b7-013bd7c9855d";
     const x1 = try d.add(&.{m2}, 800, "X\n\nX-Attachment: " ++ other ++ h ++ "first.png\n");
     const x2 = try d.add(&.{m2}, 900, "Y\n\nX-Attachment: " ++ other ++ h2 ++ "second.jpg\n");
@@ -2678,7 +2678,7 @@ test "an attachment renamed on two branches survives a removal on one" {
     var d: TestDag = .{};
     defer d.deinit();
     const id = "1b4e28ba-2fa1-4d3b-a3f5-ef19b5a7633b";
-    const h = " image/png 10 sha256:" ++ "a" ** 64 ++ " ";
+    const h = " image/png 10 sha256:" ++ @as([64]u8, @splat('a')) ++ " ";
     const root = try d.add(&.{}, 100, "Crash\n\nState: open\nX-Attachment: " ++ id ++ h ++
         "a.png\nFormat-Version: 1\n");
     const left = try d.add(&.{root}, 300, "Rename\n\nX-Attachment: " ++ id ++ h ++ "l.png\n");
