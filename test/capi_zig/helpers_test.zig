@@ -3,6 +3,7 @@
 //! table follows issuez-api.json's helpers.
 
 const std = @import("std");
+const builtin = @import("builtin");
 const testing = std.testing;
 const fixture = @import("fixture.zig");
 const expect = @import("expect.zig");
@@ -88,6 +89,22 @@ var sample_oid: c.issuez_oid = blk: {
     o.bytes[0] = 0xab;
     break :blk o;
 };
+
+/// `issuez_add_attachment`, except on x86_64 macOS: Zig 0.16 can't compile
+/// the translated helper there (LLVM: "Intrinsic has incorrect argument
+/// type!" for its third issuez_str, passed on the stack), so the test
+/// builds the op the helper does. C and cgo callers aren't affected.
+fn addAttachment(id: c.issuez_str, name: c.issuez_str, data: c.issuez_str) c.issuez_op {
+    if (comptime builtin.cpu.arch != .x86_64 or !builtin.os.tag.isDarwin())
+        return c.issuez_add_attachment(id, name, data);
+    var o = std.mem.zeroes(c.issuez_op);
+    o.verb = c.ISSUEZ_OP_ADD;
+    o.target = c.ISSUEZ_FIELD_ATTACHMENTS;
+    o.id = id;
+    o.name = name;
+    o.str = data;
+    return o;
+}
 
 // covers: issuez_set_description, issuez_set_comment, issuez_set_state, issuez_set_fixed_by
 // covers: issuez_set_release, issuez_set_reason, issuez_set_workflow_state
@@ -258,7 +275,7 @@ test "issuez_set_title: each builds its op, and its call accepts it" {
         },
         .{
             .name = "issuez_add_attachment",
-            .op = c.issuez_add_attachment(
+            .op = addAttachment(
                 fixture.str("0b6c4f63-6f5a-4a3e-9c2b-1d2e3f4a5b6c"),
                 fixture.str("a.png"),
                 fixture.str("bytes"),

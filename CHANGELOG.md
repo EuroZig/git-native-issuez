@@ -491,6 +491,13 @@ the on-disk format only grew.
 - zsh completion offered no subcommands for `git issue attach`: the
   apostrophe in "attachment's" left `_arguments`' list unparsed.
 
+### Known limitations
+
+- Zig 0.16 can't compile a call to the header's `issuez_add_attachment`
+  through `@cImport` on x86_64 macOS (LLVM: "Intrinsic has incorrect
+  argument type!"). Build that op by hand there, as
+  `test/capi_zig/helpers_test.zig` does; C and Go callers aren't affected.
+
 ## [0.3.0] - 2026-11-05
 
 ### Added
