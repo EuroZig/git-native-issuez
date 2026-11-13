@@ -21,6 +21,7 @@ const milestone_filter = @import("milestone_filter.zig");
 const timeline_view = @import("timeline_view.zig");
 const sync_job = @import("sync_job.zig");
 const modal_mod = @import("modal.zig");
+const star_mod = @import("star.zig");
 
 const State = @This();
 const Id = store.Id;
@@ -79,6 +80,8 @@ pub const Action = union(enum) {
     resolve: struct { id: Id, how: issuez.sync.Resolution },
     /// The remote syncs go to; in the modal arena.
     choose_remote: []const u8,
+    /// A click on the star notice.
+    star: ui.StarChoice,
 };
 
 /// Where syncing stands, for the badge and the panel.
@@ -155,6 +158,7 @@ today: issuez.format.fields.Date = .{ .year = 1970, .month = 1, .day = 1 },
 /// changes with summer time.
 utc_offset_s: i32 = 0,
 sync: SyncUi = .{},
+star: star_mod.Ui = .{},
 /// Unix seconds of the last frame drawn.
 now_s: i64 = 0,
 /// A second q or ctrl+c quits while a sync runs.
@@ -546,7 +550,7 @@ pub fn draw(s: *State, win: ui.Window, now_s: i64) Allocator.Error!void {
     // timeline's pending changes.
     try s.drawView(f, win.child(.{ .y_off = 1, .height = win.height - 2 }));
     try s.drawTopBar(f, win.child(.{ .height = 1 }));
-    s.drawStatusBar(f, win.child(.{ .y_off = @intCast(win.height - 1), .height = 1 }));
+    try s.drawStatusBar(f, win.child(.{ .y_off = @intCast(win.height - 1), .height = 1 }));
     if (s.modal) |*m| {
         s.hits.modal();
         try m.draw(s, f, win);
@@ -745,19 +749,19 @@ fn drawEditBanner(s: *State, f: ui.Frame, bar: ui.Window) Allocator.Error!void {
     }
 }
 
-fn drawStatusBar(s: *State, f: ui.Frame, bar: ui.Window) void {
-    _ = f;
+fn drawStatusBar(s: *State, f: ui.Frame, bar: ui.Window) Allocator.Error!void {
     bar.fill(.{ .style = .{ .bg = ui.palette.bar_bg } });
     if (s.status_len > 0) {
         const fg = if (s.status_kind == .err) ui.palette.err else ui.palette.ok;
-        _ = ui.text(
+        const used = ui.text(
             bar,
             1,
             0,
             s.status(),
             .{ .fg = fg, .bg = ui.palette.bar_bg, .bold = s.status_kind == .err },
         );
-        return;
+        // Beside a message, never over it.
+        return s.drawStarNotice(f, bar, 1 + used + 2);
     }
     const hint: []const u8 = if (s.modal) |m| m.hint() else switch (s.view) {
         .list => "↑↓ move  ⏎ open  n new  a sub-issue  x close/reopen  / filter  s sort  t tree " ++
@@ -782,6 +786,40 @@ fn drawStatusBar(s: *State, f: ui.Frame, bar: ui.Window) void {
             "A add existing  x close/reopen  t title  esc back  ? help",
     };
     _ = ui.text(bar, 1, 0, hint, .{ .fg = ui.palette.muted, .bg = ui.palette.bar_bg });
+    // Over the end of the hints, which are cut anyway on most terminals.
+    try s.drawStarNotice(f, bar, 24);
+}
+
+/// `★ Like git issue? Star it on GitHub  !  Later  Never`, at the right of
+/// the status bar, when there are `keep` columns left of it. Not over a
+/// dialog's hints.
+fn drawStarNotice(s: *State, f: ui.Frame, bar: ui.Window, keep: u16) Allocator.Error!void {
+    if (s.modal != null) return;
+    const shown = s.star.phase == .shown or s.star.phase == .starring;
+    if (!shown) return;
+    const lead = "★ Like git issue? ";
+    const buttons = [_]struct { []const u8, ui.StarChoice }{
+        .{
+            if (s.star.phase == .starring)
+                "Starring…"
+            else if (s.star.gh) "Star it on GitHub  !" else "Star it on GitHub ↗  !",
+            .star,
+        },
+        .{ "Later", .later },
+        .{ "Never", .never },
+    };
+    var w: u16 = bar.gwidth(lead) + 2;
+    for (buttons) |b| w += bar.gwidth(b[0]) + 3;
+    if (bar.width < keep + w) return;
+    const notice = bar.child(.{ .x_off = @intCast(bar.width - w), .width = w, .height = 1 });
+    const bg = ui.palette.bar_bg;
+    notice.fill(.{ .style = .{ .bg = bg } });
+    var l: ui.Line = .{ .f = f, .win = notice, .x = 1 };
+    l.text(lead, .{ .fg = ui.palette.medium, .bg = bg, .bold = true });
+    for (buttons, 0..) |b, n| {
+        try l.button(b[0], .{ .star = b[1] }, ui.buttonStyle(n == 0));
+        l.x += 1;
+    }
 }
 
 // Input.
@@ -865,6 +903,10 @@ fn handleKey(s: *State, k: vaxis.Key) Allocator.Error!Action {
         if (!timeline_view.edit.mayLeave(s, .quit)) return .none;
         s.quit_armed = armed;
         return s.quitUnlessSyncing();
+    }
+    if (k.matches('!', .{}) and s.star.phase == .shown) {
+        modal_mod.openStar(s);
+        return .none;
     }
     if (k.matches('y', .{})) return .{ .sync = .sync };
     if (k.matches('Y', .{})) return .open_sync_panel;
@@ -1084,6 +1126,7 @@ fn handleMouse(s: *State, m: vaxis.Mouse, now_ms: i64) Allocator.Error!Action {
         .tl_header => timeline_view.clickHeader(s, h.x),
         .tl_zoom => |z| timeline_view.setZoom(s, z),
         .tl_command => |c| timeline_view.command(s, c),
+        .star => |c| return .{ .star = c },
         .modal, .backdrop => {},
     }
     return .none;

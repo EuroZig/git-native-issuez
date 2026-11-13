@@ -14,6 +14,7 @@ const modal = @import("modal.zig");
 const milestone_view = @import("milestone_view.zig");
 const filter = @import("filter.zig");
 const timeline_edit = @import("timeline_edit.zig");
+const star = @import("star.zig");
 
 const core = issuez.format.core;
 const shortId = issuez.format.uuid.shortId;
@@ -28,6 +29,9 @@ pub fn App(comptime B: type) type {
         /// Runs syncs in the background; null runs them here, which the
         /// tests do on the simulator.
         runner: ?Runner = null,
+        /// Checks for and gives the star the notice asks for, in the
+        /// background; null never asks, as in the tests.
+        star_runner: ?StarRunner = null,
         /// For syncs run here: the simulator keeps what they write in
         /// it, so it lives as long as the app and is never reset. It
         /// grows with each sync, which only tests run.
@@ -45,11 +49,21 @@ pub fn App(comptime B: type) type {
             ) anyerror!void,
         };
 
+        /// Each posts its result back: to `starChecked`, `starDone`.
+        pub const StarRunner = struct {
+            context: *anyopaque,
+            check: *const fn (context: *anyopaque) anyerror!void,
+            star: *const fn (context: *anyopaque, gh: bool) anyerror!void,
+            /// "Never", written down at once.
+            decline: *const fn (context: *anyopaque) void,
+        };
+
         /// In place: the state points into the store.
         pub fn init(self: *Self, gpa: Allocator, backend: *B) void {
             self.store = .init(gpa, backend);
             self.state = .init(gpa, &self.store.snap);
             self.runner = null;
+            self.star_runner = null;
             self.inline_arena = .init(gpa);
         }
 
@@ -268,6 +282,7 @@ pub fn App(comptime B: type) type {
                     s.info("syncs go to {s} now", .{name});
                     self.openSyncPanel();
                 },
+                .star => |choice| self.starChoice(choice),
                 .quick_create => |input| {
                     const id = st.create(input) catch |e| return self.failed(e);
                     s.info(
@@ -406,6 +421,7 @@ pub fn App(comptime B: type) type {
         /// Every few seconds: an automatic fetch and merge when
         /// `issue.autoSync` says it's time.
         pub fn tick(self: *Self, now_s: i64) void {
+            self.tickStar(now_s);
             const s = &self.state;
             const minutes = self.store.snap.settings.auto_sync_minutes orelse return;
             if (self.store.snap.remote.name == null or s.sync.running != null) return;
@@ -419,6 +435,79 @@ pub fn App(comptime B: type) type {
             // Also when it can't start: the next try is minutes away.
             s.sync.auto_at = now_s;
             self.startSync(.merge, true);
+        }
+
+        /// The star notice: checked for once the session has run a while,
+        /// gone again after a few minutes untouched.
+        fn tickStar(self: *Self, now_s: i64) void {
+            const u = &self.state.star;
+            switch (u.phase) {
+                .idle => {
+                    const r = self.star_runner orelse return;
+                    if (u.started_at == 0) {
+                        u.started_at = now_s;
+                        return;
+                    }
+                    if (now_s - u.started_at < u.timing.session_s) return;
+                    u.phase = .checking;
+                    r.check(r.context) catch {
+                        u.phase = .off;
+                    };
+                },
+                .shown => if (now_s - u.shown_at >= u.timing.visible_s) {
+                    u.phase = .off;
+                },
+                .checking, .starring, .off => {},
+            }
+        }
+
+        pub fn starChecked(self: *Self, check: star.Check, now_s: i64) void {
+            const u = &self.state.star;
+            if (u.phase != .checking) return;
+            if (check == .off) {
+                u.phase = .off;
+                return;
+            }
+            u.phase = .shown;
+            u.gh = check == .ask_gh;
+            u.shown_at = now_s;
+        }
+
+        fn starChoice(self: *Self, choice: ui.StarChoice) void {
+            const s = &self.state;
+            const u = &s.star;
+            if (u.phase != .shown) return;
+            // Chosen in `!`'s dialog, or on the notice.
+            s.closeModal();
+            switch (choice) {
+                .star => {
+                    const r = self.star_runner orelse return;
+                    u.phase = .starring;
+                    r.star(r.context, u.gh) catch {
+                        u.phase = .off;
+                        s.info("★ star it at {s}: thank you!", .{star.url});
+                    };
+                },
+                .later => {
+                    u.phase = .off;
+                    s.info("★ later, then", .{});
+                },
+                .never => {
+                    u.phase = .off;
+                    if (self.star_runner) |r| r.decline(r.context);
+                    s.info("★ it won't ask again", .{});
+                },
+            }
+        }
+
+        pub fn starDone(self: *Self, outcome: star.Outcome) void {
+            const s = &self.state;
+            s.star.phase = .off;
+            switch (outcome) {
+                .starred => s.info("★ starred {s} on GitHub: thank you!", .{star.repo}),
+                .opened => s.info("★ opened {s} in the browser: thank you!", .{star.url}),
+                .no_browser => s.info("★ star it at {s}: thank you!", .{star.url}),
+            }
         }
 
         /// The sync panel, with what local refs say now.

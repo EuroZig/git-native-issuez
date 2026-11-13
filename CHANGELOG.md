@@ -8,6 +8,13 @@ versions may change the library API; the on-disk format only ever grows (see
 
 ## [Unreleased]
 
+### Added
+
+- TUI: now and then, never early in a session and at most once a month, the
+  status bar asks for a star on GitHub. With `gh` logged in it stays quiet
+  once the project is starred and stars it in one click, or with `!`;
+  otherwise it opens the project's page. `Never` stops it for good.
+
 ## [0.5.0] - 2026-11-10
 
 Zig 0.17, and a purge fix. The library API, the C ABI and the on-disk

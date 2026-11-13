@@ -49,6 +49,8 @@ pub const Target = union(enum) {
     tl_header,
     tl_zoom: timeline_view.Zoom,
     tl_command: TimelineCommand,
+    /// The star notice's buttons.
+    star: StarChoice,
     /// Modals.
     modal: ModalTarget,
     /// Anywhere outside the open modal.
@@ -81,6 +83,8 @@ pub const Command = enum {
     pick_pane,
     sync_panel,
 };
+
+pub const StarChoice = enum { star, later, never };
 
 pub const TimelineCommand = enum {
     earlier,

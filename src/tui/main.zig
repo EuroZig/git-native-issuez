@@ -11,6 +11,7 @@ const RepoWatcher = @import("RepoWatcher");
 const app_mod = @import("app.zig");
 const State = @import("State.zig");
 const sync_job = @import("sync_job.zig");
+const star = @import("star.zig");
 const local_time = issuez.local_time;
 
 const GitProcess = issuez.backend.GitProcess;
@@ -44,6 +45,10 @@ const Event = union(enum) {
     sync_done,
     /// Every few seconds, for automatic syncs.
     tick,
+    /// Whether to ask for a star: `StarWorker.checked`.
+    star_checked,
+    /// The star was given: `StarWorker.outcome`.
+    star_done,
 };
 
 /// Syncs as a task of their own with a git of their own, so the UI
@@ -190,6 +195,81 @@ const SyncWorker = struct {
     /// Quitting: a sync still running is cancelled, and over before what
     /// it uses goes.
     fn stop(w: *SyncWorker) void {
+        w.stopping.store(true, .release);
+        if (w.task) |*t| t.cancel(w.io);
+        w.task = null;
+    }
+};
+
+/// The star notice's checks and clicks, as a task of their own: `gh`
+/// talks to GitHub meanwhile. Quitting cancels the task.
+const StarWorker = struct {
+    io: std.Io,
+    gpa: std.mem.Allocator,
+    environ_map: *const std.process.Environ.Map,
+    loop: *vaxis.Loop(Event),
+    timing: star.Timing,
+    task: ?std.Io.Future(void) = null,
+    /// Set before cancelling: the task posts nothing more.
+    stopping: std.atomic.Value(bool) = .init(false),
+    /// What the task does: a check, or the star, with `gh` or not.
+    job: union(enum) { check, star: bool } = .check,
+    /// Written by the task before it posts.
+    checked: star.Check = .off,
+    outcome: star.Outcome = .no_browser,
+
+    fn check(context: *anyopaque) anyerror!void {
+        const w: *StarWorker = @ptrCast(@alignCast(context));
+        return w.start(.check);
+    }
+
+    fn give(context: *anyopaque, gh: bool) anyerror!void {
+        const w: *StarWorker = @ptrCast(@alignCast(context));
+        return w.start(.{ .star = gh });
+    }
+
+    fn decline(context: *anyopaque) void {
+        const w: *StarWorker = @ptrCast(@alignCast(context));
+        var arena_state: std.heap.ArenaAllocator = .init(w.gpa);
+        defer arena_state.deinit();
+        star.decline(w.io, arena_state.allocator(), w.environ_map);
+    }
+
+    fn start(w: *StarWorker, job: @FieldType(StarWorker, "job")) !void {
+        if (w.task != null) return error.Busy;
+        w.job = job;
+        w.task = try w.io.concurrent(work, .{w});
+    }
+
+    fn work(w: *StarWorker) void {
+        var arena_state: std.heap.ArenaAllocator = .init(w.gpa);
+        defer arena_state.deinit();
+        const a = arena_state.allocator();
+        switch (w.job) {
+            .check => {
+                w.checked = star.check(w.io, a, w.environ_map, nowS(w.io), w.timing);
+                w.post(.star_checked);
+            },
+            .star => |gh| {
+                w.outcome = star.star(w.io, a, w.environ_map, gh);
+                w.post(.star_done);
+            },
+        }
+    }
+
+    /// Like `SyncWorker.post`.
+    fn post(w: *StarWorker, e: Event) void {
+        if (w.stopping.load(.acquire)) return;
+        w.loop.postEvent(e) catch |err| if (err == error.Canceled) w.io.recancel();
+    }
+
+    /// After it posted: the task is over.
+    fn finish(w: *StarWorker) void {
+        if (w.task) |*t| t.await(w.io);
+        w.task = null;
+    }
+
+    fn stop(w: *StarWorker) void {
         w.stopping.store(true, .release);
         if (w.task) |*t| t.cancel(w.io);
         w.task = null;
@@ -366,6 +446,26 @@ fn run(
         app.runner = null;
         worker.stop();
     }
+    // Now and then, a star on GitHub.
+    const timing: star.Timing = .fromEnv(environ_map);
+    app.state.star.timing = timing;
+    var star_worker: StarWorker = .{
+        .io = io,
+        .gpa = gpa,
+        .environ_map = environ_map,
+        .loop = &loop,
+        .timing = timing,
+    };
+    app.star_runner = .{
+        .context = &star_worker,
+        .check = StarWorker.check,
+        .star = StarWorker.give,
+        .decline = StarWorker.decline,
+    };
+    defer {
+        app.star_runner = null;
+        star_worker.stop();
+    }
     var ticker: Ticker = .{ .io = io, .loop = &loop };
     ticker.thread = std.Thread.spawn(.{}, Ticker.run, .{&ticker}) catch null;
     defer if (ticker.thread) |t| {
@@ -411,6 +511,16 @@ fn run(
                 app.tick(nowS(io));
                 break :blk null;
             },
+            .star_checked => blk: {
+                star_worker.finish();
+                app.starChecked(star_worker.checked, nowS(io));
+                break :blk null;
+            },
+            .star_done => blk: {
+                star_worker.finish();
+                app.starDone(star_worker.outcome);
+                break :blk null;
+            },
         };
         if (input) |in| if (!try app.handle(in, nowMs(io))) break;
         if (live.take()) |change| app.changedElsewhere(change.config);
@@ -431,6 +541,8 @@ test {
     _ = @import("timeline_view.zig");
     _ = @import("timeline_draft.zig");
     _ = @import("sync_job.zig");
+    _ = star;
+    _ = @import("user_state.zig");
     _ = app_mod;
     _ = @import("app_test.zig");
 }

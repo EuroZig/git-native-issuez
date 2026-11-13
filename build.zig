@@ -1121,6 +1121,8 @@ const Cli = struct {
         };
         const tui_module: ?*std.Build.Module = if (!want.tui) null else blk: {
             const vaxis = b.lazyDependency("vaxis", cli.dependencyArgs()) orelse break :blk null;
+            const known_folders = b.lazyDependency("known_folders", cli.dependencyArgs()) orelse
+                break :blk null;
             break :blk b.createModule(.{
                 .root_source_file = b.path("src/tui/main.zig"),
                 .target = cli.target,
@@ -1128,6 +1130,7 @@ const Cli = struct {
                 .imports = &.{
                     .{ .name = "issuez", .module = cli.issuez },
                     .{ .name = "vaxis", .module = vaxis.module("vaxis") },
+                    .{ .name = "known-folders", .module = known_folders.module("known-folders") },
                     .{ .name = "RepoWatcher", .module = watch_module orelse break :blk null },
                 },
             });

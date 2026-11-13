@@ -114,6 +114,15 @@ everywhere. The list is sortable and filterable
 (`label:ui @ada p:high is:blocked -label:wontfix`). It updates live when
 the CLI, another TUI or an agent writes.
 
+Now and then the status bar asks for a star on GitHub: never in a
+session's first ten minutes, at most once a month, a few times in all.
+With the GitHub CLI (`gh`) logged in it never asks once the project is
+starred, and one click (or `!`) stars it; without it the click opens the
+project's page. `Never` stops it for good. What it asked when is kept in
+the TUI's state file, `git-issue/tui.zon` in your configuration folder
+(`~/.config`, `~/Library/Application Support` on macOS, `%LOCALAPPDATA%`
+on Windows).
+
 Milestones (`3`) shows every milestone with its progress, due date and
 health, sorted and filtered as you like; `n` creates one. Enter opens its
 issues, where `m`, `[` `]`, marks and a second pane (`v`) move work
@@ -195,8 +204,8 @@ for (open) |issue| std.debug.print("{s} {s}\n", .{ issue.state.text(), issue.tit
 - `Repo` is generic over its backend: `GitProcess` drives the `git` binary,
   `GitSim` is an in-memory repository for tests, or bring your own
   ([docs/design.md](docs/design.md)).
-- As a dependency the package builds only the library: libvaxis, blitzmcp
-  and nightwatch are never fetched. Pass `.tui = true` or `.mcp = true` to
+- As a dependency the package builds only the library: libvaxis,
+  known-folders, blitzmcp and nightwatch are never fetched. Pass `.tui = true` or `.mcp = true` to
   build them into `git-issue`.
 
 | Example                                           | Shows                                                                                  | Run                                        |

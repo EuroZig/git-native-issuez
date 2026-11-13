@@ -15,6 +15,7 @@ const text_mod = @import("text.zig");
 const dates = issuez.format.dates;
 const milestone_filter = @import("milestone_filter.zig");
 const draft_mod = @import("timeline_draft.zig");
+const star = @import("star.zig");
 const AppState = @import("State.zig");
 
 const Id = store.Id;
@@ -1734,6 +1735,18 @@ pub fn openConfirm(
     s.openModal(.{ .confirm = .{ .title = dupe(s, title), .lines = ls, .choices = cs } });
 }
 
+/// `!` while the star notice shows: its buttons, with the keys.
+pub fn openStar(s: *AppState) void {
+    openConfirm(s, "Star git issue on GitHub", &.{
+        if (s.star.gh) "One click stars it, with gh." else "Opens " ++ star.url ++ ".",
+        "Later asks again in a month; Never stops asking.",
+    }, &.{
+        .{ .label = "Star it", .action = .{ .star = .star } },
+        .{ .label = "Later", .action = .{ .star = .later } },
+        .{ .label = "Never", .action = .{ .star = .never } },
+    });
+}
+
 // Milestone dialogs.
 
 /// The milestones view's sort keys; choosing the current one flips.
@@ -1984,6 +1997,7 @@ const help_lines = [_][]const u8{
     "  f               open, done, all       ctrl+r   reload",
     "  M               milestones            p        sync with the remote",
     "  ?               this help             q        quit (back in an issue)",
+    "  !               star git issue on GitHub, while the status bar asks",
     "  in menus a letter jumps to an option; j k q still move and close",
     "",
     "List and board",

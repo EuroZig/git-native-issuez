@@ -364,6 +364,17 @@ hold identical refs: the fuzzer checks exactly that.
   for the UTC offset before every frame, and `schedule.health` takes the
   same offset.
 
+## The TUI's state file
+
+- `src/tui/user_state.zig`: what the TUI keeps for the user between
+  sessions (so far, when the star notice asked), as ZON in
+  `git-issue/tui.zon` in the local configuration folder that
+  [known-folders](https://github.com/ziglibs/known-folders), a lazy
+  dependency of builds with the TUI, finds. Fields are only added, each
+  with a default; unknown ones are skipped on reading, so any version
+  reads any file. A file that doesn't parse is never saved over. Saves
+  write a temporary file and rename it.
+
 ## Live updates
 
 - `src/watch/RepoWatcher.zig`, over

@@ -12,6 +12,13 @@
             .hash = "vaxis-0.6.0-BWNV_J2zDQArkPcsc2nkktgxfg2r0u1AwwQP9WLugo_1",
             .lazy = true,
         },
+        // Where the TUI keeps the user's state file. A known-folders master
+        // commit on Zig 0.17; only fetched with the TUI.
+        .known_folders = .{
+            .url = "git+https://github.com/ziglibs/known-folders#c7a8a1974ccf8b5b022ee7f4b13fd734cdd89ae1",
+            .hash = "known_folders-0.0.0-Fy-PJiLLAABzqCdF6GWFmE36oCwioOh6Uxj4FF1Neanr",
+            .lazy = true,
+        },
         // MCP server (`git issue mcp`). A blitzmcp main commit on Zig 0.17;
         // only fetched when -Dmcp=true (default).
         .blitzmcp = .{

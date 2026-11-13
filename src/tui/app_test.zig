@@ -13,6 +13,7 @@ const modal = @import("modal.zig");
 const filter = @import("filter.zig");
 const timeline_view = @import("timeline_view.zig");
 const timeline_edit = @import("timeline_edit.zig");
+const star = @import("star.zig");
 const App = @import("app.zig").App;
 
 const core = issuez.format.core;
@@ -3125,4 +3126,96 @@ test "external pushes refresh the badge and unpushed filter without moving issue
     try testing.expect(h.shows("origin ✓"));
     // Unchanged records do not trigger another reload.
     try testing.expect(try h.app.store.reloadIfChanged(false) == null);
+}
+
+test "star notice: not at start, shown once checked, a click stars, gone untouched" {
+    const h = try Harness.create();
+    defer h.destroy();
+    const Fake = struct {
+        var checks: u32 = 0;
+        var stars: u32 = 0;
+        var with_gh: bool = false;
+        var declines: u32 = 0;
+        fn check(_: *anyopaque) anyerror!void {
+            checks += 1;
+        }
+        fn star(_: *anyopaque, gh: bool) anyerror!void {
+            stars += 1;
+            with_gh = gh;
+        }
+        fn decline(_: *anyopaque) void {
+            declines += 1;
+        }
+    };
+    var context: u8 = 0;
+    h.app.star_runner = .{
+        .context = &context,
+        .check = Fake.check,
+        .star = Fake.star,
+        .decline = Fake.decline,
+    };
+    const t0: i64 = 1_700_000_000;
+    h.app.tick(t0);
+    h.app.tick(t0 + (star.Timing{}).session_s - 1);
+    try testing.expectEqual(@as(u32, 0), Fake.checks);
+    h.app.tick(t0 + (star.Timing{}).session_s);
+    try testing.expectEqual(@as(u32, 1), Fake.checks);
+    // Once a session.
+    h.app.tick(t0 + (star.Timing{}).session_s + 15);
+    try testing.expectEqual(@as(u32, 1), Fake.checks);
+    try h.draw();
+    try testing.expect(!h.shows("Like git issue?"));
+
+    h.app.starChecked(.ask_gh, t0 + (star.Timing{}).session_s);
+    try h.draw();
+    try testing.expect(h.shows("★ Like git issue?"));
+    // Not over a dialog.
+    try h.press('?', .{});
+    try testing.expect(!h.shows("Like git issue?"));
+    try h.press(K.escape, .{});
+    try testing.expect(h.shows("Like git issue?"));
+    try h.click(.{ .star = .star });
+    try testing.expectEqual(@as(u32, 1), Fake.stars);
+    try testing.expect(Fake.with_gh);
+    try testing.expect(h.shows("Starring…"));
+    h.app.starDone(.starred);
+    try h.draw();
+    try testing.expect(!h.shows("Like git issue?"));
+    try testing.expect(h.shows("thank you!"));
+
+    // Shown, then left alone: it goes after a while, saying nothing.
+    h.app.state.star = .{ .phase = .checking };
+    h.app.starChecked(.ask_browser, t0);
+    try h.draw();
+    try testing.expect(h.shows("Star it on GitHub ↗"));
+    h.app.tick(t0 + (star.Timing{}).visible_s);
+    try h.draw();
+    try testing.expect(!h.shows("Like git issue?"));
+
+    // Never: written down.
+    h.app.state.star = .{ .phase = .checking };
+    h.app.starChecked(.ask_browser, t0);
+    try h.draw();
+    try h.click(.{ .star = .never });
+    try testing.expectEqual(@as(u32, 1), Fake.declines);
+    try testing.expect(!h.shows("Like git issue?"));
+    try testing.expectEqual(star.Ui.Phase.off, h.app.state.star.phase);
+
+    // With the keyboard: `!` only while it shows; Esc leaves it be.
+    try h.press('!', .{});
+    try testing.expect(h.app.state.modal == null);
+    h.app.state.star = .{ .phase = .checking };
+    h.app.starChecked(.ask_browser, t0);
+    try h.draw();
+    try h.press('!', .{});
+    try testing.expect(h.shows("Star git issue on GitHub"));
+    try h.press(K.escape, .{});
+    try testing.expect(h.app.state.modal == null);
+    try testing.expect(h.shows("Like git issue?"));
+    try h.press('!', .{});
+    try h.press(K.enter, .{});
+    try testing.expect(h.app.state.modal == null);
+    try testing.expectEqual(@as(u32, 2), Fake.stars);
+    try testing.expect(!Fake.with_gh);
+    try testing.expect(h.shows("Starring…"));
 }
