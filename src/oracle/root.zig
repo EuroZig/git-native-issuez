@@ -894,6 +894,7 @@ fn sameNaive(a: commands.NaiveIssue, b: commands.NaiveIssue) bool {
         .{ a.due, b.due },
         .{ a.estimate, b.estimate },
         .{ a.workflow, b.workflow },
+        .{ a.rank, b.rank },
         .{ a.milestone_id, b.milestone_id },
         .{ a.milestone_mode, b.milestone_mode },
         .{ a.deleted, b.deleted },

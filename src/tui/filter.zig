@@ -46,6 +46,8 @@ pub const SortKey = enum {
     due,
     start,
     id,
+    /// The order set by hand (`X-Rank`): the board's.
+    rank,
 
     pub fn label(k: SortKey) []const u8 {
         return @tagName(k);
@@ -62,6 +64,7 @@ pub const SortKey = enum {
             .due => "earliest first",
             .start => "earliest first",
             .id => "by ID",
+            .rank => "your order",
         };
     }
 };
@@ -269,6 +272,8 @@ const Order = struct {
             .due => dateOrder(x.due_date, y.due_date),
             .start => dateOrder(x.start_date orelse x.due_date, y.start_date orelse y.due_date),
             .id => std.mem.order(u8, x.id, y.id),
+            // Equal keys go by ID (format.md §3), whatever else differs.
+            .rank => return issuez.order.compare(.of(x), .of(y)),
         };
         // Ties: the most recently touched first.
         return ord.differ() orelse std.math.order(y.updated, x.updated).differ() orelse

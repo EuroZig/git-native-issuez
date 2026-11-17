@@ -26,7 +26,8 @@ pub const help =
     \\   --priority <level>      Only issues with this priority
     \\   -a, --all               Same as --state all
     \\   -f, --format <format>   short (default), full or oneline
-    \\   --sort <field>          created (default), updated, priority or state
+    \\   --sort <field>          created (default), updated, priority, state or rank
+    \\                           (your order, as on the board)
     \\   --reverse               Reverse the sort order
     \\   --problems              Only issues with problems (a parent or blocker that
     \\                           is missing or loops back, invalid values, ...), each
@@ -95,7 +96,7 @@ pub fn main(comptime B: type, ctx: *context.Context(B), argv: []const []const u8
             const v = parser.value("--sort") orelse return common.exit_error;
             sort = std.meta.stringToEnum(query.SortKey, v) orelse return common.fail(
                 ctx.err,
-                "error: sort must be created, updated, priority, or state\n",
+                "error: sort must be created, updated, priority, state, or rank\n",
             );
         } else return parser.unknown(arg);
     }

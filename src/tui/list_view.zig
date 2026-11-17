@@ -176,8 +176,8 @@ pub fn drawTable(s: *AppState, f: ui.Frame, win: ui.Window, t: Table) Allocator.
         const marked = for (t.marks) |*m| {
             if (m.eql(snap.issues[r.issue].id)) break true;
         } else false;
-        const dragged = if (s.drag) |d| d.moved and t.pane != null and d.card.column == t.pane.? and
-            d.card.index == index else false;
+        const dragged = if (s.drag) |d| d.moved and d.card.index == index and
+            (if (t.pane) |p| d.card.column == p else s.view == .list) else false;
         drawRow(
             s,
             f,
@@ -195,6 +195,12 @@ pub fn drawTable(s: *AppState, f: ui.Frame, win: ui.Window, t: Table) Allocator.
             row_win,
             if (t.pane) |p| .{ .mrow = .{ .column = p, .index = index } } else .{ .row = index },
         );
+        // Where a dragged row lands in your order.
+        const lands = if (s.drag) |d| landsAt(s, d) else null;
+        if (t.pane == null and lands == index) row_win.writeCell(0, 0, .{
+            .char = .{ .grapheme = "▶" },
+            .style = .{ .fg = palette.accent, .bold = true },
+        });
     }
     // Scroll position.
     if (l.rows.len > body.height and body.height > 0) {
@@ -399,7 +405,77 @@ fn drawRow(
 }
 
 pub fn key(s: *AppState, k: vaxis.Key) Allocator.Error!AppState.Action {
+    if (k.matches('K', .{}) or k.matches(K.up, .{ .shift = true })) return reorder(s, -1);
+    if (k.matches('J', .{}) or k.matches(K.down, .{ .shift = true })) return reorder(s, 1);
     return tableKey(s, &s.list, k) orelse .none;
+}
+
+/// Why rows can't be ordered by hand now; null when they can.
+fn notInYourOrder(s: *const AppState) ?[]const u8 {
+    const q = s.query;
+    if (q.key != .rank) return "s → rank orders rows by hand";
+    if (q.reverse) return "S first: rows are ordered by hand top to bottom";
+    if (q.tree) return "t first: rows are ordered by hand without the tree";
+    return null;
+}
+
+/// The rows' issues but `skip`, for `reorder`: in the input arena.
+fn othersOf(s: *AppState, skip: Id) Allocator.Error![]const Id {
+    var out: std.ArrayList(Id) = .empty;
+    for (s.list.rows) |r| {
+        if (skip.eql(s.snap.issues[r.issue].id)) continue;
+        try out.append(s.input_arena.allocator(), .of(s.snap.issues[r.issue].id));
+    }
+    return out.items;
+}
+
+/// Where the issue's row is now, if it is shown.
+fn rowOf(s: *const AppState, id: Id) ?usize {
+    for (s.list.rows, 0..) |r, n| if (id.eql(s.snap.issues[r.issue].id)) return n;
+    return null;
+}
+
+/// J and K: the selected row a place down or up.
+fn reorder(s: *AppState, delta: i32) Allocator.Error!AppState.Action {
+    const l = &s.list;
+    const i = l.selectedIssue() orelse return .none;
+    if (notInYourOrder(s)) |why| return s.noted("{s}", .{why});
+    const to: i64 = @as(i64, l.selected) + delta;
+    if (to < 0 or to >= l.rows.len) return .none;
+    const id: Id = .of(s.snap.issues[i].id);
+    const others = try othersOf(s, id);
+    l.follow = true;
+    return .{ .reorder = .{ .id = id, .others = others, .at = @intCast(to) } };
+}
+
+/// The row a drag on the list is over.
+pub fn slotAt(found: ?ui.Hits.Found) ?u32 {
+    const h = found orelse return null;
+    return switch (h.target) {
+        .row => |r| r,
+        else => null,
+    };
+}
+
+/// Where the dragged row would go: the place of the row under the
+/// pointer. Null when it wouldn't move or the list isn't in your order.
+fn landsAt(s: *const AppState, d: AppState.Drag) ?u32 {
+    if (s.view != .list or !d.moved or notInYourOrder(s) != null) return null;
+    const slot = d.slot orelse return null;
+    // The rows may be of a newer snapshot than the press: by its ID.
+    const from = rowOf(s, d.id) orelse return null;
+    if (slot == from or slot >= s.list.rows.len) return null;
+    return slot;
+}
+
+/// A row let go of over another takes its place.
+pub fn drop(s: *AppState, d: AppState.Drag) Allocator.Error!AppState.Action {
+    const slot = d.slot orelse return .none;
+    if (rowOf(s, d.id) == slot) return .none;
+    if (notInYourOrder(s)) |why| return s.noted("{s}", .{why});
+    const at = landsAt(s, d) orelse return .none;
+    s.list.follow = true;
+    return .{ .reorder = .{ .id = d.id, .others = try othersOf(s, d.id), .at = at } };
 }
 
 /// Keys on an issue table; null when the key isn't one of them.
@@ -425,6 +501,12 @@ pub fn click(s: *AppState, row: u32, double: bool) AppState.Action {
     const l = &s.list;
     if (row >= l.rows.len) return .none;
     l.moveTo(s.snap, row);
-    if (double) s.openIssue(s.snap.issues[l.rows[row].issue].id);
+    const id = s.snap.issues[l.rows[row].issue].id;
+    if (double) {
+        s.openIssue(id);
+        return .none;
+    }
+    // Held, it may be dragged to another place.
+    s.drag = .{ .card = .{ .column = 0, .index = row }, .id = .of(id) };
     return .none;
 }

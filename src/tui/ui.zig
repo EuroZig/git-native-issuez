@@ -22,6 +22,8 @@ pub const View = enum { list, board, milestones, timeline, milestone, detail };
 /// What a click means. One union for every view, so the hit map is shared.
 pub const Target = union(enum) {
     tab: View,
+    /// A view of the user's, by slot.
+    custom_view: u8,
     command: Command,
     scope: filter.Scope,
     tree,
@@ -82,6 +84,12 @@ pub const Command = enum {
     ms_move,
     pick_pane,
     sync_panel,
+    /// The filter and sort shown, as a view of the user's.
+    save_view,
+    /// The view of the user's shown, after asking.
+    delete_view,
+    /// The templates of views.
+    templates,
 };
 
 pub const StarChoice = enum { star, later, never };

@@ -37,6 +37,7 @@ const clear: c_uint = c.ISSUEZ_OP_CLEAR;
 const remove: c_uint = c.ISSUEZ_OP_REMOVE;
 const inherit: c_uint = c.ISSUEZ_OP_INHERIT;
 
+const sample_uuid = "0c8d7a52-3f1e-4b6a-9d2c-5e4f3a2b1c0d";
 const update: c.issuez_op_list = c.ISSUEZ_LIST_ISSUE_UPDATE;
 const milestone: c.issuez_op_list = c.ISSUEZ_LIST_MILESTONE_UPDATE;
 const query: c.issuez_op_list = c.ISSUEZ_LIST_QUERY;
@@ -248,6 +249,10 @@ test "issuez_set_title: each builds its op, and its call accepts it" {
         },
         strRow("set_ref", "main", set, "FIELD_REF", update),
         row("clear_ref", .{}, clear, "FIELD_REF", update, .{}),
+        strRow("set_rank", "m", set, "FIELD_RANK", update),
+        row("clear_rank", .{}, clear, "FIELD_RANK", update, .{}),
+        strRow("rank_before", sample_uuid, set, "OPT_RANK_BEFORE", update),
+        strRow("rank_after", sample_uuid, set, "OPT_RANK_AFTER", update),
         .{
             .name = "issuez_set_locked",
             .op = c.issuez_set_locked(true, fixture.str("heated")),

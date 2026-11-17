@@ -76,7 +76,7 @@ const known_keys = [_][]const u8{
     "X-Workflow-State", "X-Deleted",      "X-Attachment",     "X-Attachment-Removed",
     "X-Event",          "X-Comment",      "Format-Version",   "X-Number",
     "X-Locked",         "X-Lock-Reason",  "X-Ref",            "Provider-Comment-ID",
-    "Exported-Commit",
+    "Exported-Commit",  "X-Rank",
 };
 
 fn isKnown(key: []const u8) bool {
@@ -327,6 +327,7 @@ pub fn build(a: Allocator, issue: Issue, ctx: Context) Allocator.Error!IssueObj 
             .original_author = try rt.optZ(a, issue.original_author),
             .original_id = try rt.optZ(a, issue.original_id),
             .rewritten = false,
+            .rank = try rt.optZ(a, issue.rank),
         },
         .attachments = attachments,
         .labels = try rt.strs(a, issue.labels),
@@ -764,6 +765,7 @@ pub fn parseQuery(a: Allocator, ops: []const api.Op, problems: *rt.Problems) !Qu
                 q.ascending = op.num2 != 0;
                 switch (q.order) {
                     .created, .updated, .number, .priority, .due_date, .comments, .state => {},
+                    .rank => {},
                     else => try check.add(.bad_format, "unknown sort"),
                 }
             },
@@ -873,6 +875,10 @@ fn sortKey(issue: Issue, order: api.Sort, ctx: Context) i64 {
 const SortCtx = struct { order: api.Sort, ascending: bool, ctx: Context };
 
 fn lessThan(s: SortCtx, x: Issue, y: Issue) bool {
+    if (s.order == .rank) {
+        const o = issuez.order.compare(.of(x), .of(y));
+        return if (s.ascending) o == .gt else o == .lt;
+    }
     const kx = sortKey(x, s.order, s.ctx);
     const ky = sortKey(y, s.order, s.ctx);
     // Newest, highest, most first unless ascending; due dates soonest

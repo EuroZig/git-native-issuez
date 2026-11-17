@@ -37,7 +37,9 @@ pub const help =
     \\   --fixed-by <sha>          With --state: commit that fixes the issue
     \\   --release <version>       With --state: release that ships the fix
     \\   --reason <reason>         With --state: why it changed
-    \\
+    \\   --before <issue-id>       Right before that issue in your order, as in
+    \\                             its board column; with the other changes
+    \\   --after <issue-id>        Right after it
 ++ ext_flags.help_edit ++
     \\   -h, --help                Show this help
     \\
@@ -57,6 +59,8 @@ pub fn main(comptime B: type, ctx: *context.Context(B), argv: []const []const u8
     // `--milestone`, chosen once the repository is open.
     var milestone: ?[]const u8 = null;
     var remove_assignees: std.ArrayList([]const u8) = .empty;
+    var before: ?[]const u8 = null;
+    var after: ?[]const u8 = null;
 
     const flags = [_]common.Flag{
         .{ "-l --label", .{ .label = &set_labels } },
@@ -69,6 +73,8 @@ pub fn main(comptime B: type, ctx: *context.Context(B), argv: []const []const u8
         .{ "--release", .{ .line = .{ &spec.release, "--release value" } } },
         .{ "--reason", .{ .line = .{ &spec.reason, "--reason value" } } },
         .{ "--unblock", .{ .list = &ext.unblock } },
+        .{ "--before", .{ .text = &before } },
+        .{ "--after", .{ .text = &after } },
     } ++ ext.table();
     var parser = common.argParser(ctx, argv, .{
         .command = "edit",
@@ -169,7 +175,13 @@ pub fn main(comptime B: type, ctx: *context.Context(B), argv: []const []const u8
     const closing_field = spec.fixed_by != null or spec.release != null or spec.reason != null;
     if (spec.state == null and closing_field)
         return common.fail(ctx.err, "error: --fixed-by, --release and --reason need --state\n");
-    if (spec.isEmpty() and milestone == null and !ext.any()) return common.missing(
+    if (before != null and after != null)
+        return common.fail(ctx.err, "error: --before and --after go one at a time\n");
+    const anchor = before orelse after;
+    if (anchor != null and (ext.rank != null or ext.no.contains(.rank)))
+        return common.fail(ctx.err, "error: --before and --after set the rank themselves\n");
+    const nothing = spec.isEmpty() and milestone == null and !ext.any() and anchor == null;
+    if (nothing) return common.missing(
         ctx.err,
         "edit",
         "at least one edit option is required",
@@ -195,8 +207,14 @@ pub fn main(comptime B: type, ctx: *context.Context(B), argv: []const []const u8
     if (clears.contains(.estimate)) spec.estimate_minutes = .clear;
     if (x.workflow) |v| spec.workflow = .{ .set = v };
     if (clears.contains(.workflow)) spec.workflow = .clear;
+    if (x.rank) |v| spec.rank = .{ .set = v };
+    if (clears.contains(.rank)) spec.rank = .clear;
     var names: std.ArrayList([]const u8) = .empty;
-    if (!spec.isEmpty()) {
+    if (anchor) |a| {
+        const r = reorder(B, ctx, repo, ref, a, after != null, spec) orelse
+            return common.exit_error;
+        for (r.changes) |c| names.append(arena, c.name()) catch return common.oom(ctx.err);
+    } else if (!spec.isEmpty()) {
         const result = repo.edit(arena, ref.name, spec, .{}) catch |e|
             return common.repoFailed(B, ctx, e);
         if (!result.wrote) {
@@ -208,4 +226,26 @@ pub fn main(comptime B: type, ctx: *context.Context(B), argv: []const []const u8
     const joined = std.mem.join(arena, ", ", names.items) catch return common.oom(ctx.err);
     ctx.out.print("Updated {s} ({s})\n", .{ uuid.shortId(ref.id()), joined }) catch {};
     return common.exit_ok;
+}
+
+/// `ref` right before, or `after`, the issue `anchor` names, in its board
+/// column (`Repo.reorderBeside`). The moved issue's result.
+fn reorder(
+    comptime B: type,
+    ctx: *context.Context(B),
+    repo: issuez.engine.Repo(B),
+    ref: issuez.engine.IssueRef,
+    anchor: []const u8,
+    after: bool,
+    spec: issuez.engine.EditSpec,
+) ?issuez.engine.Repo(B).EditResult {
+    const target = common.resolveOne(B, repo, ctx.arena, ctx.err, anchor) orelse return null;
+    if (std.mem.eql(u8, target.name, ref.name)) {
+        _ = common.fail(ctx.err, "error: an issue goes before or after another one\n");
+        return null;
+    }
+    return repo.reorderBeside(ctx.arena, ref.name, spec, target.name, after, .{}) catch |e| {
+        _ = common.repoFailed(B, ctx, e);
+        return null;
+    };
 }

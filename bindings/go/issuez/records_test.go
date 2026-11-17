@@ -47,7 +47,7 @@ var handWritten = map[string]map[string]string{
 		"commit_count": "Issue.CommitCount", "title": "Issue.Title", "description": "Issue.Description",
 		"author": "Issue.Author", "created": "Issue.Created", "updated": "Issue.Updated",
 		"state": "left out: Issue.State is the name", "state_name": "Issue.State", "is_done": "Issue.Done",
-		"workflow_state": "Issue.WorkflowState", "closed_by": "Closure.By (nil Closed for none)",
+		"workflow_state": "Issue.WorkflowState", "rank": "Issue.Rank", "closed_by": "Closure.By (nil Closed for none)",
 		"closed_at": "Closure.At", "fixed_by": "Closure.FixedBy", "release": "Closure.Release",
 		"reason": "Closure.Reason", "is_deleted": "Issue.Deleted", "is_locked": "Issue.Locked",
 		"lock_reason": "Issue.LockReason", "priority": "Issue.Priority", "milestone_id": "Issue.MilestoneID",

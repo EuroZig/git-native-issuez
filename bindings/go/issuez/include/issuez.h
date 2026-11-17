@@ -373,6 +373,7 @@ typedef enum issuez_field {
     ISSUEZ_FIELD_EXTRA = 26, /* a host field (X-Forgejo-*) or another unknown trailer */
     /* timeline only: the lock's reason changed (the LOCKED change of the same commit carries it too) */
     ISSUEZ_FIELD_LOCK_REASON = 27,
+    ISSUEZ_FIELD_RANK = 28, /* X-Rank, the place in an order set by hand */
 } issuez_field;
 
 /*
@@ -449,6 +450,9 @@ typedef enum issuez_opt {
     ISSUEZ_OPT_REACTION_TARGET = 264,
     /* ADD str: "<id> <media_type> <size> sha256:<sha256> <name>", from issuez_prepared_attachment_info; external storage only */
     ISSUEZ_OPT_PREPARED_ATTACHMENT = 265,
+    /* update: str, an issue's full UUID. The issue goes right before that one in your order, among the issues of its board column, its key (RANK) chosen to fit, with the other changes; not with RANK, a comment event, a reaction or DELETED */
+    ISSUEZ_OPT_RANK_BEFORE = 266,
+    ISSUEZ_OPT_RANK_AFTER = 267, /* update: str. As RANK_BEFORE, right after that issue */
     ISSUEZ_OPT_Q_DONE = 512, /* query: num 0 not done (default), 1 done, -1 any */
     ISSUEZ_OPT_Q_DELETED = 513, /* query: num 0 (default), 1, -1 */
     ISSUEZ_OPT_Q_STATE = 514, /* query: ADD str; members OR */
@@ -775,6 +779,7 @@ typedef struct issuez_issue_info {
     issuez_str original_id;
     /* issuez_issue_load_since's since isn't in the history; false from other loads */
     bool rewritten;
+    issuez_str rank; /* its key in your order (X-Rank); {NULL,0} for none */
 } issuez_issue_info;
 
 /*
@@ -959,6 +964,8 @@ typedef enum issuez_sort {
     ISSUEZ_SORT_DUE_DATE = 5,
     ISSUEZ_SORT_COMMENTS = 6,
     ISSUEZ_SORT_STATE = 7,
+    /* your order (X-Rank): issues with a key by key, then the rest oldest first */
+    ISSUEZ_SORT_RANK = 8,
 } issuez_sort;
 
 /*
@@ -1741,6 +1748,33 @@ static inline issuez_op issuez_clear_ref(void) {
     issuez_op o = ISSUEZ_OP_INIT;
     o.verb = ISSUEZ_OP_CLEAR;
     o.target = ISSUEZ_FIELD_REF;
+    return o;
+}
+static inline issuez_op issuez_set_rank(issuez_str v) {
+    issuez_op o = ISSUEZ_OP_INIT;
+    o.verb = ISSUEZ_OP_SET;
+    o.target = ISSUEZ_FIELD_RANK;
+    o.str = v;
+    return o;
+}
+static inline issuez_op issuez_clear_rank(void) {
+    issuez_op o = ISSUEZ_OP_INIT;
+    o.verb = ISSUEZ_OP_CLEAR;
+    o.target = ISSUEZ_FIELD_RANK;
+    return o;
+}
+static inline issuez_op issuez_rank_before(issuez_str v) {
+    issuez_op o = ISSUEZ_OP_INIT;
+    o.verb = ISSUEZ_OP_SET;
+    o.target = ISSUEZ_OPT_RANK_BEFORE;
+    o.str = v;
+    return o;
+}
+static inline issuez_op issuez_rank_after(issuez_str v) {
+    issuez_op o = ISSUEZ_OP_INIT;
+    o.verb = ISSUEZ_OP_SET;
+    o.target = ISSUEZ_OPT_RANK_AFTER;
+    o.str = v;
     return o;
 }
 static inline issuez_op issuez_set_locked(bool locked, issuez_str reason) {

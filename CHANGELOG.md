@@ -14,6 +14,36 @@ versions may change the library API; the on-disk format only ever grows (see
   status bar asks for a star on GitHub. With `gh` logged in it stays quiet
   once the project is starred and stars it in one click, or with `!`;
   otherwise it opens the project's page. `Never` stops it for good.
+- TUI: views of your own. `V`, or `+ View` after the tabs, saves the filter
+  and sort of the list, the board, the milestones or the timeline under a
+  name and a key of 5 to 0, next to the default views' 1 to 4; the key or
+  its tab shows it again, `X` or the `×` on its tab deletes it. The default
+  view keeps its own filter and sort meanwhile. Each repository has its
+  own (its worktrees share them), kept in the TUI's state file, `tui.zon`.
+  `ctrl+t` (or `☰`) saves them under a name as a template, and
+  loads or deletes one: a template's views replace a repository's. Views
+  from before they were per repository are a template called Imported.
+- Your own order on the board: `X-Rank`, a new issue field (format.md §3),
+  is each issue's key in an order set by hand, merged like any field. The
+  board is in that order by default; drag a card to a place in its column
+  or in another (a line shows where), or move it with `J` and `K`. A move
+  writes the moved issue alone, or gives the cards above it keys when they
+  have none; new issues come last. The board has its own filter and sort
+  now, apart from the list's. The list, sorted by rank, orders rows the
+  same way: dragged onto another row, or with `J` and `K`.
+- `create --rank`, `edit --rank`, `--no-rank`, `--before` and `--after`,
+  `ls --sort rank`; `rank` in the JSON. MCP: `rank`, `before` and `after`
+  on `create_issue` and `edit_issue`, `rank` as a sort. Library:
+  `issuez.format.rank`, `issuez.order`, `Repo.reorder` and
+  `Repo.reorderBeside`. C API: `ISSUEZ_FIELD_RANK`,
+  `ISSUEZ_OPT_RANK_BEFORE` / `_AFTER`, `ISSUEZ_SORT_RANK` and `rank` in
+  `issuez_issue_info`; Go: `Edit.SetRank`, `RankBefore`, `RankAfter`,
+  `Issue.Rank`, `SortRank`.
+
+### Fixed
+
+- TUI: with many views of your own the top bar dropped the sync badge and
+  its buttons; views that don't fit now end in `…`.
 
 ## [0.5.0] - 2026-11-10
 

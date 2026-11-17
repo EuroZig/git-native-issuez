@@ -157,7 +157,8 @@ fn drawColumn(s: *AppState, f: ui.Frame, win: ui.Window, c: u16) Allocator.Error
     );
 
     const body = inner.child(.{ .y_off = 2, .height = inner.height -| 2 });
-    if (col.done and s.query.scope == .open) {
+    defer drawDropLine(s, inner, body, c);
+    if (col.done and s.bd_query.scope == .open) {
         _ = ui.text(body, 1, 0, "Done work is hidden.", .{ .fg = palette.muted, .italic = true });
         _ = try ui.button(f, body, 1, 2, "Show all", .{ .scope = .all }, ui.buttonStyle(false));
         return;
@@ -198,6 +199,59 @@ fn drawColumn(s: *AppState, f: ui.Frame, win: ui.Window, c: u16) Allocator.Error
         f.fmt("↓{d}", .{hidden}),
         .{ .fg = palette.muted },
     );
+}
+
+/// Where a dragged card lands in your order: a line in the gap above
+/// that place, or under the header for the top.
+fn drawDropLine(s: *AppState, inner: ui.Window, body: ui.Window, c: u16) void {
+    const d = s.drag orelse return;
+    if (!d.moved or d.over != c) return;
+    const slot = d.slot orelse return;
+    if (lands(s, d) == null) return;
+    const top = s.board.scroll[c];
+    if (slot < top or slot > top + s.board.visible) return;
+    const row: u16 = @intCast((slot - top) * (card_height + card_gap));
+    const win, const y = if (row == 0) .{ inner, @as(u16, 1) } else .{ body, row - 1 };
+    if (y >= win.height) return;
+    const line = win.child(.{ .y_off = y, .height = 1 });
+    line.fill(.{ .char = .{ .grapheme = "━", .width = 1 }, .style = .{ .fg = palette.accent } });
+}
+
+/// Where in a column the pointer over `found` would put a card: before
+/// the card under it, or after it in its lower half, or at the end.
+pub fn slotAt(s: *const AppState, found: ?ui.Hits.Found) ?u32 {
+    const h = found orelse return null;
+    const b = &s.board;
+    return switch (h.target) {
+        .card => |card| if (h.y < card_height / 2) card.index else card.index + 1,
+        .column => |c| if (c < b.columns.len) @intCast(b.columns[c].cards.len) else null,
+        else => null,
+    };
+}
+
+/// Where a drop puts the dragged card in your order: its place among the
+/// target column's other cards. Null when the drop doesn't order: not in
+/// your order, done work, nowhere to land, or the place it has.
+fn lands(s: *const AppState, d: AppState.Drag) ?u32 {
+    const to = d.over orelse return null;
+    if (notInYourOrder(s) != null or to >= s.board.columns.len) return null;
+    const col = s.board.columns[to];
+    if (col.done or !col.target) return null;
+    // The frame may be of a newer snapshot than the press: where the card
+    // is now, by its ID.
+    const slot = @min(d.slot orelse return null, col.cards.len);
+    const from = indexIn(s, to, d.id) orelse return @intCast(slot);
+    // Its own column: the others close the gap it leaves.
+    const at = if (slot > from) slot - 1 else slot;
+    return if (at == from) null else @intCast(at);
+}
+
+/// Where the issue is in a column, if it is there.
+fn indexIn(s: *const AppState, column: u16, id: Id) ?usize {
+    for (s.board.columns[column].cards, 0..) |i, n| {
+        if (id.eql(s.snap.issues[i].id)) return n;
+    }
+    return null;
 }
 
 fn drawCard(
@@ -292,6 +346,10 @@ pub fn key(s: *AppState, k: vaxis.Key) Allocator.Error!AppState.Action {
         b.select(snap, col, std.math.maxInt(i32));
     } else if (k.matches(K.enter, .{})) {
         if (b.selectedIssue()) |i| s.openIssue(snap.issues[i].id);
+    } else if (k.matches('K', .{}) or k.matches(K.up, .{ .shift = true })) {
+        return try reorder(s, -1);
+    } else if (k.matches('J', .{}) or k.matches(K.down, .{ .shift = true })) {
+        return try reorder(s, 1);
     } else if (k.matches('<', .{}) or k.matches('H', .{}) or
         k.matches(K.left, .{ .shift = true }))
     {
@@ -318,6 +376,38 @@ fn move(s: *AppState, delta: i32) AppState.Action {
     // Follow the card.
     b.column = @intCast(to);
     return .{ .move = .{ .id = .of(s.snap.issues[i].id), .column = col.name, .done = col.done } };
+}
+
+/// Why cards can't be ordered by hand now; null when they can.
+pub fn notInYourOrder(s: *const AppState) ?[]const u8 {
+    const q = s.bd_query;
+    if (q.key != .rank) return "s → rank orders cards by hand";
+    if (q.reverse) return "S first: cards are ordered by hand top to bottom";
+    return null;
+}
+
+/// A column's cards but the issue `skip`, for `reorder`: in the input
+/// arena.
+pub fn othersOf(s: *AppState, column: u16, skip: Id) Allocator.Error![]const Id {
+    var out: std.ArrayList(Id) = .empty;
+    for (s.board.columns[column].cards) |i| {
+        if (skip.eql(s.snap.issues[i].id)) continue;
+        try out.append(s.input_arena.allocator(), .of(s.snap.issues[i].id));
+    }
+    return out.items;
+}
+
+/// J and K: the selected card a place up or down its column.
+fn reorder(s: *AppState, delta: i32) Allocator.Error!AppState.Action {
+    const b = &s.board;
+    const i = b.selectedIssue() orelse return .none;
+    if (notInYourOrder(s)) |why| return s.noted("{s}", .{why});
+    const to: i64 = @as(i64, b.index) + delta;
+    if (to < 0 or to >= b.columns[b.column].cards.len) return .none;
+    const id: Id = .of(s.snap.issues[i].id);
+    const others = try othersOf(s, b.column, id);
+    b.follow = true;
+    return .{ .reorder = .{ .id = id, .others = others, .at = @intCast(to) } };
 }
 
 pub fn click(s: *AppState, card: ui.Target.Card, double: bool) AppState.Action {
@@ -354,12 +444,27 @@ pub fn wheel(s: *AppState, found: ?ui.Hits.Found, delta: i32) void {
     );
 }
 
-pub fn drop(s: *AppState, d: AppState.Drag) AppState.Action {
+pub fn drop(s: *AppState, d: AppState.Drag) Allocator.Error!AppState.Action {
     const b = &s.board;
     const to = d.over orelse return .none;
-    if (to == d.card.column or to >= b.columns.len) return .none;
+    if (to >= b.columns.len) return .none;
     const col = b.columns[to];
+    // In the column it is in now, which a reload during the drag may have
+    // changed: an order within it.
+    if (indexIn(s, to, d.id) != null) {
+        if (d.slot == null) return .none;
+        if (notInYourOrder(s)) |why| return s.noted("{s}", .{why});
+        const at = lands(s, d) orelse return .none;
+        b.follow = true;
+        return .{ .reorder = .{ .id = d.id, .others = try othersOf(s, to, d.id), .at = at } };
+    }
     if (refused(s, col)) return .none;
     b.column = to;
+    if (lands(s, d)) |at| return .{ .reorder = .{
+        .id = d.id,
+        .others = try othersOf(s, to, d.id),
+        .at = at,
+        .column = col.name,
+    } };
     return .{ .move = .{ .id = d.id, .column = col.name, .done = col.done } };
 }

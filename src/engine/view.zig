@@ -43,6 +43,7 @@ pub const Field = enum {
     comment,
     state,
     workflow_state,
+    rank,
     labels,
     assignees,
     priority,
@@ -83,7 +84,7 @@ pub const Field = enum {
             .{ "Fixed-By", .fixed_by },                   .{ "Release", .release },
             .{ "Reason", .reason },                       .{ "X-Attachment", .attachments },
             .{ "X-Reaction", .reactions },                .{ "Name", .name },
-            .{ "X-Milestone-Status", .milestone_status },
+            .{ "X-Milestone-Status", .milestone_status }, .{ "X-Rank", .rank },
         };
         inline for (keys) |k| if (std.ascii.eqlIgnoreCase(k[0], key)) return k[1];
         return .extra;

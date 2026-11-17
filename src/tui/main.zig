@@ -12,6 +12,8 @@ const app_mod = @import("app.zig");
 const State = @import("State.zig");
 const sync_job = @import("sync_job.zig");
 const star = @import("star.zig");
+const user_state = @import("user_state.zig");
+const custom_view = @import("custom_view.zig");
 const local_time = issuez.local_time;
 
 const GitProcess = issuez.backend.GitProcess;
@@ -198,6 +200,77 @@ const SyncWorker = struct {
         w.stopping.store(true, .release);
         if (w.task) |*t| t.cancel(w.io);
         w.task = null;
+    }
+};
+
+/// The user's views of this repository, in the state file.
+const ViewsFile = struct {
+    io: std.Io,
+    gpa: std.mem.Allocator,
+    environ_map: *const std.process.Environ.Map,
+    /// The project's key: git's common directory, symlinks resolved.
+    project: []const u8,
+
+    /// Into the UI; none when the file can't be read. The views from
+    /// before projects become a template first.
+    fn load(vf: *ViewsFile, s: *State) void {
+        var arena_state: std.heap.ArenaAllocator = .init(vf.gpa);
+        defer arena_state.deinit();
+        const a = arena_state.allocator();
+        const file = user_state.path(vf.io, a, vf.environ_map) orelse return;
+        var state = user_state.load(vf.io, a, file) orelse
+            return s.fail("your views couldn't be read: {s} isn't as it should be", .{file});
+        if (state.views.len > 0) {
+            _ = user_state.update(vf.io, a, file, {}, struct {
+                fn migrate(_: void, ar: std.mem.Allocator, st: *user_state.State) !void {
+                    if (try user_state.migrated(ar, st.*)) |m| st.* = m;
+                }
+            }.migrate);
+            state = user_state.load(vf.io, a, file) orelse state;
+        }
+        const views = user_state.viewsOf(state, vf.project);
+        custom_view.load(s, views) catch s.fail("out of memory", .{});
+    }
+
+    fn save(context: *anyopaque, views: []const custom_view.Saved) bool {
+        const vf: *ViewsFile = @ptrCast(@alignCast(context));
+        var arena_state: std.heap.ArenaAllocator = .init(vf.gpa);
+        defer arena_state.deinit();
+        const a = arena_state.allocator();
+        const file = user_state.path(vf.io, a, vf.environ_map) orelse return false;
+        return user_state.update(vf.io, a, file, .{ vf.project, views }, struct {
+            fn set(
+                c: struct { []const u8, []const custom_view.Saved },
+                ar: std.mem.Allocator,
+                st: *user_state.State,
+            ) !void {
+                st.* = try user_state.withViews(ar, st.*, c[0], c[1]);
+            }
+        }.set);
+    }
+
+    fn templates(context: *anyopaque, a: std.mem.Allocator) ?[]const user_state.Template {
+        const vf: *ViewsFile = @ptrCast(@alignCast(context));
+        const file = user_state.path(vf.io, a, vf.environ_map) orelse return null;
+        const state = user_state.load(vf.io, a, file) orelse return null;
+        return state.templates;
+    }
+
+    fn setTemplate(context: *anyopaque, name: []const u8, views: ?[]const custom_view.Saved) bool {
+        const vf: *ViewsFile = @ptrCast(@alignCast(context));
+        var arena_state: std.heap.ArenaAllocator = .init(vf.gpa);
+        defer arena_state.deinit();
+        const a = arena_state.allocator();
+        const file = user_state.path(vf.io, a, vf.environ_map) orelse return false;
+        return user_state.update(vf.io, a, file, .{ name, views }, struct {
+            fn set(
+                c: struct { []const u8, ?[]const custom_view.Saved },
+                ar: std.mem.Allocator,
+                st: *user_state.State,
+            ) !void {
+                st.* = try user_state.withTemplate(ar, st.*, c[0], c[1]);
+            }
+        }.set);
     }
 };
 
@@ -446,6 +519,30 @@ fn run(
         app.runner = null;
         worker.stop();
     }
+    // The user's views, kept between sessions.
+    // Worktrees share their repository's common directory, and so its views.
+    const project: []const u8 = blk: {
+        const real = std.Io.Dir.cwd().realPathFileAlloc(io, git_dir, gpa) catch
+            break :blk try gpa.dupe(u8, git_dir);
+        // Freed as a plain slice: without the sentinel.
+        defer gpa.free(real);
+        break :blk try gpa.dupe(u8, real);
+    };
+    defer gpa.free(project);
+    var views_file: ViewsFile = .{
+        .io = io,
+        .gpa = gpa,
+        .environ_map = environ_map,
+        .project = project,
+    };
+    views_file.load(&app.state);
+    app.views_store = .{
+        .context = &views_file,
+        .save = ViewsFile.save,
+        .templates = ViewsFile.templates,
+        .set_template = ViewsFile.setTemplate,
+    };
+    defer app.views_store = null;
     // Now and then, a star on GitHub.
     const timing: star.Timing = .fromEnv(environ_map);
     app.state.star.timing = timing;
@@ -542,7 +639,8 @@ test {
     _ = @import("timeline_draft.zig");
     _ = @import("sync_job.zig");
     _ = star;
-    _ = @import("user_state.zig");
+    _ = user_state;
+    _ = custom_view;
     _ = app_mod;
     _ = @import("app_test.zig");
 }

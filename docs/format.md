@@ -125,6 +125,7 @@ Format-Version: 1
 | `X-Start-Date`, `X-Due-Date` | scalar | `YYYY-MM-DD`, a real calendar day |
 | `X-Estimate-Minutes` | scalar | decimal minutes, `0` allowed, no leading zeros, at most 10 × 366 days |
 | `X-Workflow-State` | scalar | slug: lowercase letter, then lowercase letters, digits, `-` (at most 64 bytes) |
+| `X-Rank` | scalar | a fractional key, the place in an order set by hand: `0`-`9`, `a`-`z`, 1 to 128 bytes, not ending in `0` |
 | `X-Deleted` | scalar | `true` or `false` |
 | `X-Attachment` | keyed set | an attachment (§7) |
 | `X-Attachment-Removed` | keyed set | an attachment's UUID (§7) |
@@ -166,6 +167,11 @@ Format-Version: 1
 - Workflow states come from `git config issue.workflowStates` (default
   `backlog, ready, in-progress, review`). An open issue without a value
   reads as the first one.
+- `X-Rank` orders issues by hand, as on a board. Its value is the digits
+  after a point in base 36 (`0`-`9` then `a`-`z`), so bytewise order is
+  its order and, as none ends in `0`, another key always fits between two:
+  moving an issue writes that issue alone. Equal keys go by issue ID, and
+  issues without one come after those with one.
 
 ### Guards
 
@@ -250,8 +256,8 @@ pair write the identical commit:
   reader that takes the newest value finds no older one. The order:
   `State`, `Title` (only when it overrides the root subject), `Labels`,
   `Assignee`, `Priority`, `Milestone`, then `X-Parent`, `X-Start-Date`,
-  `X-Due-Date`, `X-Estimate-Minutes`, `X-Workflow-State`, `X-Milestone-Id`,
-  `X-Milestone-Mode`, `X-Deleted`, `X-Blocked-By`. Other fields,
+  `X-Due-Date`, `X-Estimate-Minutes`, `X-Workflow-State`, `X-Rank`,
+  `X-Milestone-Id`, `X-Milestone-Mode`, `X-Deleted`, `X-Blocked-By`. Other fields,
   attachments and events follow from the parents;
 - when the remote's tip has a number and the parents resolve to another
   (or to none readable), `X-Number` follows with the remote's: a host keeps
@@ -479,6 +485,9 @@ the next sync. Milestones have the same refs, with `milestones` in place of
 - Upstream's writes (comments, edits, state changes, merges) never lose
   data, extension fields included, because fields come from the whole
   history and a missing trailer never clears a field.
+- Upstream doesn't know `X-Rank`: it shows it as a plain trailer and keeps
+  it through its writes and merges, so the order survives a trip through
+  upstream, and its own new issues come after the ordered ones.
 - Upstream doesn't know events or `X-Deleted`: it lists deleted issues and
   shows edited and deleted comments as they were first written, followed by
   the event commits.

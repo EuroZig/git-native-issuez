@@ -17,6 +17,7 @@ const milestone_filter = @import("milestone_filter.zig");
 const draft_mod = @import("timeline_draft.zig");
 const star = @import("star.zig");
 const AppState = @import("State.zig");
+const custom_view = @import("custom_view.zig");
 
 const Id = store.Id;
 const TextArea = text_mod.TextArea;
@@ -88,6 +89,14 @@ pub const Purpose = union(enum) {
     stage_ms_due: Id,
     stage_milestone: Id,
     stage_unblock: Id,
+    /// A name for the filter and sort shown, as a view of the user's.
+    view_name,
+    /// The key for the view named so, in the modal arena.
+    view_key: []const u8,
+    /// Save, load or delete a template of views.
+    templates,
+    /// A name for the views as a template.
+    template_name,
 
     pub const MilestonePart = struct { id: Id, tip: issuez.engine.Oid, what: enum { name, due } };
 
@@ -100,6 +109,7 @@ pub const Purpose = union(enum) {
             .comment, .sort, .milestones, .milestone_sort, .milestone => null,
             .move, .pane_pick, .quick_add, .add_to, .adopt => null,
             .stage_date, .stage_estimate, .stage_ms_due, .stage_milestone, .stage_unblock => null,
+            .view_name, .view_key, .templates, .template_name => null,
         };
     }
 };
@@ -1055,7 +1065,8 @@ fn submit(s: *AppState) Action {
 
 fn menuSubmit(s: *AppState, mn: *Menu) Action {
     const o = mn.options[mn.selected];
-    if (o.disabled) return s.failed("{s}: reopen it first to add open work", .{o.label});
+    if (o.disabled and mn.purpose != .templates)
+        return s.failed("{s}: reopen it first to add open work", .{o.label});
     switch (mn.purpose) {
         .stage_milestone => |id| {
             const link: draft_mod.Link = switch (linkOf(o.value)) {
@@ -1078,7 +1089,7 @@ fn menuSubmit(s: *AppState, mn: *Menu) Action {
         .milestones => {
             var buf: [256]u8 = undefined;
             const term = std.fmt.bufPrint(&buf, "m:{s}", .{o.value}) catch "m:";
-            s.search.set(s.gpa, term) catch return s.failed("out of memory", .{});
+            s.searchBox().set(s.gpa, term) catch return s.failed("out of memory", .{});
             s.closeModal();
             s.filterChanged();
             return .none;
@@ -1088,6 +1099,35 @@ fn menuSubmit(s: *AppState, mn: *Menu) Action {
             toggleSort(&s.ms_query, milestone_filter.SortKey, o.value);
             s.milestones.follow = true;
         },
+        .templates => {
+            if (o.disabled) return s.failed("no views of yours to save yet: V saves one", .{});
+            if (std.mem.eql(u8, o.value, "save")) {
+                openPrompt(
+                    s,
+                    "Save these views as a template",
+                    "a name; the template keeps every view of yours, with its key",
+                    "",
+                    .template_name,
+                    true,
+                );
+                return .none;
+            }
+            const name = o.value["load:".len..];
+            if (std.mem.startsWith(u8, o.value, "load:"))
+                return .{ .load_template = .{ .name = name } };
+            openConfirm(s, "Delete this template", &.{
+                s.fmtInput("{s} goes, for good.", .{name}),
+                "Views loaded from it stay as they are.",
+            }, &.{
+                .{ .label = "Keep it", .action = .none },
+                .{ .label = "Delete", .action = .{ .delete_template = dupe(s, name) } },
+            });
+            return .none;
+        },
+        .view_key => |name| return .{ .save_view = .{
+            .slot = custom_view.slotOf(o.value[0]).?,
+            .name = name,
+        } },
         .field => |fp| {
             if (o.current) return unchanged(s);
             if (o.other) {
@@ -1161,6 +1201,21 @@ fn promptSubmit(s: *AppState, p: *Prompt) Action {
                 .title = t,
                 .milestone_id = if (scope == .id) dupe(s, scope.id.slice()) else null,
             } };
+        },
+        .template_name => {
+            if (!custom_view.validName(t)) return s.failed(
+                "a template's name is one line of at most {d} bytes",
+                .{custom_view.max_name},
+            );
+            return .{ .save_template = .{ .name = t } };
+        },
+        .view_name => {
+            if (!custom_view.validName(t)) return s.failed(
+                "a view's name is one line of at most {d} bytes",
+                .{custom_view.max_name},
+            );
+            openViewKeys(s, t);
+            return .none;
         },
         .milestone => |mp| {
             var edit: store.MilestoneEdit = .{ .expect = mp.tip };
@@ -1747,6 +1802,88 @@ pub fn openStar(s: *AppState) void {
     });
 }
 
+// The user's views.
+
+/// `V`: a name for the filter and sort shown, then a key for them. The
+/// name of the view shown is offered, to save it again.
+pub fn openSaveView(s: *AppState) void {
+    const name = if (s.custom) |c| s.views[c].?.name else "";
+    openPrompt(
+        s,
+        "Save this view",
+        "its filter and sort, under a name; next, a key of 5 to 0",
+        name,
+        .view_name,
+        true,
+    );
+}
+
+/// The keys 5 to 0, with the views on them, the suggested one selected.
+fn openViewKeys(s: *AppState, name: []const u8) void {
+    // In the modal arena, which closing the prompt resets.
+    const kept = s.fmtInput("{s}", .{name});
+    s.closeModal();
+    const a = s.modalArena();
+    const options = a.alloc(Menu.Option, custom_view.max) catch return s.fail("out of memory", .{});
+    for (options, 0..) |*o, n| {
+        const digit = custom_view.keys[n .. n + 1];
+        o.* = .{
+            .label = if (s.views[n]) |v|
+                print(s, "{s}  {s}, replaced", .{ digit, v.name })
+            else
+                print(s, "{s}  free", .{digit}),
+            .value = digit,
+            .current = if (s.custom) |c| c == n else false,
+        };
+    }
+    s.openModal(.{ .menu = .{
+        .title = print(s, "Key for {s}", .{kept}),
+        .options = options,
+        .selected = custom_view.suggestedSlot(s),
+        .purpose = .{ .view_key = dupe(s, kept) },
+    } });
+}
+
+/// ctrl+t: save the views as a template, or load or delete one. `names`
+/// are the templates', with how many views each has.
+pub fn openTemplates(s: *AppState, templates: []const struct { []const u8, usize }) void {
+    s.closeModal();
+    const a = s.modalArena();
+    var options: std.ArrayList(Menu.Option) = .empty;
+    var views: usize = 0;
+    for (s.views) |v| views += @intFromBool(v != null);
+    options.append(a, .{
+        .label = print(s, "Save these {d} views as…", .{views}),
+        .value = "save",
+        .disabled = views == 0,
+    }) catch return s.fail("out of memory", .{});
+    for (templates) |t| options.append(a, .{
+        .label = print(s, "Load {s}  {d} {s}", .{ t[0], t[1], if (t[1] == 1) "view" else "views" }),
+        .value = print(s, "load:{s}", .{t[0]}),
+    }) catch return s.fail("out of memory", .{});
+    for (templates) |t| options.append(a, .{
+        .label = print(s, "Delete {s}", .{t[0]}),
+        .value = print(s, "drop:{s}", .{t[0]}),
+    }) catch return s.fail("out of memory", .{});
+    s.openModal(.{ .menu = .{
+        .title = "Templates of views",
+        .options = options.items,
+        .purpose = .templates,
+    } });
+}
+
+/// `X` in a view of the user's.
+pub fn confirmDeleteView(s: *AppState, slot: u8) void {
+    const v = s.views[slot].?;
+    openConfirm(s, "Delete this view", &.{
+        s.fmtInput("{c} {s} goes, for good.", .{ custom_view.keys[slot], v.name }),
+        "Its issues stay as they are.",
+    }, &.{
+        .{ .label = "Keep it", .action = .none },
+        .{ .label = "Delete", .action = .{ .delete_view = slot } },
+    });
+}
+
 // Milestone dialogs.
 
 /// The milestones view's sort keys; choosing the current one flips.
@@ -1992,6 +2129,9 @@ pub const MilestoneForm = struct {
 const help_lines = [_][]const u8{
     "Everywhere",
     "  1 2 3 4 / tab   list, board, milestones, timeline",
+    "  5 … 9 0         your views: a filter and sort of one of the four",
+    "  V               save the filter and sort shown as a view; X deletes yours",
+    "  ctrl+t          templates: save your views under a name, load them elsewhere",
     "  n               new issue",
     "  /               filter                s / S    sort by… / reverse",
     "  f               open, done, all       ctrl+r   reload",
@@ -2005,6 +2145,7 @@ const help_lines = [_][]const u8{
     "  a               new sub-issue         x        close / reopen",
     "  t               tree (list)           < >      move card (board)",
     "  ←→ h l          column (board)        g G      first / last",
+    "  J K shift+↑↓    row or card down / up, in your order: s → rank; or drag it",
     "",
     "Issue",
     "  ↑↓ j k tab      select a part         ⏎ space  edit or open it",

@@ -326,6 +326,13 @@ hold identical refs: the fuzzer checks exactly that.
   reload; views keep issue IDs, never pointers into it. Every write goes
   through the same library calls as the CLI and checks the tip it showed,
   so a change made meanwhile fails the write instead of being overwritten.
+- The board's order is `X-Rank` (format.md §3), a fractional key per
+  issue: `src/format/rank.zig` makes keys between two others,
+  `issuez.order.place` works out which a move writes (the moved issue's;
+  keys for those above it that have none; the whole column when no key
+  fits), and `Repo.reorder` writes them in one batch. `Repo.reorderBeside`
+  places an issue beside another in its board column, for the CLI, MCP
+  and the C API.
 - Input turns into actions on a state that knows nothing of the repository,
   so the whole UI is tested on `GitSim`, driven by keys and clicks.
 - Live: a `RepoWatcher` posts to the event loop when anyone else writes.
@@ -367,13 +374,22 @@ hold identical refs: the fuzzer checks exactly that.
 ## The TUI's state file
 
 - `src/tui/user_state.zig`: what the TUI keeps for the user between
-  sessions (so far, when the star notice asked), as ZON in
+  sessions (when the star notice asked; the user's views per repository,
+  keyed by git's common directory with symlinks resolved, so worktrees
+  share them), as ZON in
   `git-issue/tui.zon` in the local configuration folder that
   [known-folders](https://github.com/ziglibs/known-folders), a lazy
   dependency of builds with the TUI, finds. Fields are only added, each
   with a default; unknown ones are skipped on reading, so any version
   reads any file. A file that doesn't parse is never saved over. Saves
-  write a temporary file and rename it.
+  write a temporary file and rename it; each change reads the file again
+  under a lock, as the star notice's task writes it too.
+- `src/tui/custom_view.zig`: the user's views, a filter and sort of one of
+  the four views on a key of 5 to 0. Views, scopes and sort keys are kept
+  by name, so one a newer version adds skips only that view. A view shown
+  puts its filter and sort in its default view's query; the default's own
+  wait in a stash until another tab is chosen, so none of the views reads
+  anything else.
 
 ## Live updates
 

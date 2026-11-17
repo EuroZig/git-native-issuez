@@ -44,6 +44,9 @@ type Issue struct {
 	DueDate     *Date
 	Estimate    time.Duration // whole minutes; 0: none
 	Ref         string
+	// Rank is its key in your order (X-Rank), "" for none: keys compare
+	// as bytes, and issues without one come after.
+	Rank string
 	// An imported issue's author and ID in the other tracker.
 	OriginalAuthor string
 	OriginalID     string
@@ -274,6 +277,7 @@ func goIssue(i *C.issuez_issue, history bool) *Issue {
 		DueDate:        goOptDate(r.due_date),
 		Estimate:       time.Duration(r.estimate_minutes) * time.Minute,
 		Ref:            goStr(r.ref),
+		Rank:           goStr(r.rank),
 		OriginalAuthor: goStr(r.original_author),
 		OriginalID:     goStr(r.original_id),
 		Problems:       goProblems(C.issuez_issue_problems(i)),
@@ -457,6 +461,9 @@ const (
 	SortDueDate  Sort = C.ISSUEZ_SORT_DUE_DATE
 	SortComments Sort = C.ISSUEZ_SORT_COMMENTS
 	SortState    Sort = C.ISSUEZ_SORT_STATE
+	// SortRank is your order, as on a board: issues with a key by key,
+	// then the rest oldest first.
+	SortRank Sort = C.ISSUEZ_SORT_RANK
 )
 
 // Query is a filter as a plain struct. The zero value: open work, not

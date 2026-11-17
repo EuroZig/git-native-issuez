@@ -22,6 +22,7 @@ const timeline_view = @import("timeline_view.zig");
 const sync_job = @import("sync_job.zig");
 const modal_mod = @import("modal.zig");
 const star_mod = @import("star.zig");
+const custom_view = @import("custom_view.zig");
 
 const State = @This();
 const Id = store.Id;
@@ -56,6 +57,10 @@ pub const Action = union(enum) {
     toggle: Id,
     /// To a board column: a workflow state, or done.
     move: struct { id: Id, column: []const u8, done: bool },
+    /// To `at` among `others`, its column's other cards in your order as
+    /// shown (in the input arena). With `column`, into that board column
+    /// from another, its workflow state in the same commit.
+    reorder: struct { id: Id, others: []const Id, at: u32, column: ?[]const u8 = null },
     create_milestone: store.MilestoneInput,
     edit_milestone: struct { id: Id, edit: store.MilestoneEdit },
     /// The milestone view, for a catalog milestone.
@@ -82,6 +87,19 @@ pub const Action = union(enum) {
     choose_remote: []const u8,
     /// A click on the star notice.
     star: ui.StarChoice,
+    /// The filter and sort shown, as the user's view on `slot`; the name
+    /// is in the modal arena.
+    save_view: struct { slot: u8, name: []const u8 },
+    delete_view: u8,
+    /// The templates of views, in a menu: `App` reads them.
+    templates_menu,
+    /// The views of this repository as the template `name` (in the modal
+    /// arena); `replace` once the user said yes to replacing one.
+    save_template: struct { name: []const u8, replace: bool = false },
+    /// The template's views in place of this repository's; `confirmed`
+    /// once the user said yes to replacing them.
+    load_template: struct { name: []const u8, confirmed: bool = false },
+    delete_template: []const u8,
 };
 
 /// Where syncing stands, for the badge and the panel.
@@ -139,6 +157,9 @@ list: list_view.State = .{},
 board: board_view.State = .{},
 detail: detail_view.State = .{},
 milestones: milestones_view.State = .{},
+/// The board's query, in your order first; its text is `bd_search`'s.
+bd_query: filter.Query = default_bd_query,
+bd_search: TextArea = .init(false),
 /// The milestones view's query, without the text, which is `ms_search`'s.
 ms_query: milestone_filter.Query = .{},
 ms_search: TextArea = .init(false),
@@ -149,8 +170,15 @@ mv_query: filter.Query = .{ .tree = true },
 mv_search: TextArea = .init(false),
 timeline: timeline_view.State = .{},
 /// The timeline's issue query, by start date; its text is `tl_search`'s.
-tl_query: filter.Query = .{ .tree = true, .key = .start },
+tl_query: filter.Query = default_tl_query,
 tl_search: TextArea = .init(false),
+/// The user's views, by key: 5 first, 0 last.
+views: [custom_view.max]?custom_view.View = @splat(null),
+/// The one shown, by slot: its filter and sort are in its default view's
+/// query, whose own wait in `stash`.
+custom: ?u8 = null,
+stash: custom_view.Stash = .{},
+stash_base: custom_view.Base = .list,
 /// For dates typed as `+3d` and for what is late: the date of the last
 /// frame drawn, where the user is.
 today: issuez.format.fields.Date = .{ .year = 1970, .month = 1, .day = 1 },
@@ -197,10 +225,15 @@ pub const Drag = struct {
     id: Id,
     /// The column under the pointer.
     over: ?u16 = null,
+    /// On the board: where in that column it would land, as an index
+    /// into its cards (`board_view.slotAt`).
+    slot: ?u32 = null,
     moved: bool = false,
 };
 
 pub const double_click_ms = 400;
+pub const default_tl_query: filter.Query = .{ .tree = true, .key = .start };
+pub const default_bd_query: filter.Query = .{ .key = .rank };
 const max_nav = 8;
 
 pub fn init(gpa: Allocator, snap: *const Snapshot) State {
@@ -215,7 +248,9 @@ pub fn init(gpa: Allocator, snap: *const Snapshot) State {
 
 pub fn deinit(s: *State) void {
     s.closeModal();
+    custom_view.deinit(s);
     s.search.deinit(s.gpa);
+    s.bd_search.deinit(s.gpa);
     s.ms_search.deinit(s.gpa);
     s.mv_search.deinit(s.gpa);
     s.tl_search.deinit(s.gpa);
@@ -415,7 +450,8 @@ fn timelineChanges(s: *State) usize {
 
 /// To a tab, unless the timeline's draft holds the user back.
 pub fn goTo(s: *State, v: ui.View) void {
-    if (v == s.view) return;
+    // From a view of the user's to its default one, too.
+    if (v == s.view and s.custom == null) return;
     if (!timeline_view.edit.mayLeave(s, .{ .view = v })) return;
     s.switchView(v);
 }
@@ -424,6 +460,7 @@ pub fn goTo(s: *State, v: ui.View) void {
 pub fn switchView(s: *State, v: ui.View) void {
     assert(v != .detail and v != .milestone);
     milestone_view.leave(s);
+    custom_view.leave(s);
     s.view = v;
     s.nav_len = 0;
     s.search_focused = false;
@@ -441,9 +478,11 @@ pub fn current(s: *const State) ?u32 {
     };
 }
 
-/// The issue query of the view: the milestone view has its own.
+/// The issue query of the view: the board, the milestone view and the
+/// timeline have their own.
 pub fn issueQuery(s: *State) *filter.Query {
     return switch (s.view) {
+        .board => &s.bd_query,
         .milestone => &s.mv_query,
         .timeline => &s.tl_query,
         else => &s.query,
@@ -453,6 +492,7 @@ pub fn issueQuery(s: *State) *filter.Query {
 /// The filter text box of the view.
 pub fn searchBox(s: *State) *TextArea {
     return switch (s.view) {
+        .board => &s.bd_search,
         .milestones => &s.ms_search,
         .milestone => &s.mv_search,
         .timeline => &s.tl_search,
@@ -498,6 +538,11 @@ pub fn currentQuery(s: *const State) filter.Query {
     if (s.view == .timeline) {
         var q = s.tl_query;
         q.text = s.tl_search.text();
+        return q;
+    }
+    if (s.view == .board) {
+        var q = s.bd_query;
+        q.text = s.bd_search.text();
         return q;
     }
     var q = s.query;
@@ -586,19 +631,11 @@ fn drawTopBar(s: *State, f: ui.Frame, bar: ui.Window) Allocator.Error!void {
         .{ .timeline, "Timeline" },
     };
     for (tabs, 1..) |t, n| {
-        const active = s.view == t[0] or (t[0] == .milestones and s.view == .milestone);
+        const here = s.view == t[0] or (t[0] == .milestones and s.view == .milestone);
+        // Not under the user's view in its place.
+        const active = here and s.custom == null;
         try l.button(f.fmt("{d} {s}", .{ n, t[1] }), .{ .tab = t[0] }, ui.buttonStyle(active));
         l.x += 1;
-    }
-    if (s.view == .milestone) {
-        const name = milestone_view.scopeName(s.snap, s.milestone.scope);
-        try l.button(f.fmt("◆ {s}", .{name}), .{ .command = .back }, ui.buttonStyle(true));
-    }
-    if (s.view == .detail) {
-        if (s.detail.issue(s.snap)) |i| {
-            const label = f.fmt("#{s}", .{issuez.format.uuid.shortId(s.snap.issues[i].id)});
-            try l.button(label, .{ .command = .back }, ui.buttonStyle(true));
-        }
     }
     // Counts.
     var open: u32 = 0;
@@ -622,6 +659,50 @@ fn drawTopBar(s: *State, f: ui.Frame, bar: ui.Window) Allocator.Error!void {
     var right: u16 = 0;
     for (buttons) |b| right += bar.gwidth(b[0]) + 3;
     right += bar.gwidth(badge.text) + 3;
+    // What comes after the user's views, which give way to it and to the
+    // right side.
+    const back_label: ?[]const u8 = switch (s.view) {
+        .milestone => f.fmt("◆ {s}", .{milestone_view.scopeName(s.snap, s.milestone.scope)}),
+        .detail => if (s.detail.issue(s.snap)) |i|
+            f.fmt("#{s}", .{issuez.format.uuid.shortId(s.snap.issues[i].id)})
+        else
+            null,
+        else => null,
+    };
+    const keep = right + 2 + if (back_label) |t| bar.gwidth(t) + 2 else 0;
+    const fits = struct {
+        fn check(line: *const ui.Line, w: u16, kept: u16) bool {
+            return @as(u32, line.x) + w + kept <= line.win.width;
+        }
+    }.check;
+    views: {
+        for (s.views, 0..) |maybe, n| if (maybe) |v| {
+            const slot: u8 = @intCast(n);
+            const shown = custom_view.shown(s, slot);
+            const label = f.fmt("{c} {s}", .{ custom_view.keys[slot], v.name });
+            const w = bar.gwidth(label) + 3 + if (shown) bar.gwidth("×") + 2 else 0;
+            if (!fits(&l, w, keep)) {
+                l.text("…", .{ .fg = ui.palette.muted, .bg = ui.palette.bar_bg });
+                l.x += 1;
+                break :views;
+            }
+            try l.button(label, .{ .custom_view = slot }, ui.buttonStyle(shown));
+            // The one shown deletes on its own tab.
+            if (shown) try l.button("×", .{ .command = .delete_view }, ui.buttonStyle(true));
+            l.x += 1;
+        };
+        // Where `V` saves one.
+        if (custom_view.Base.of(s.view) != null and fits(&l, bar.gwidth("+ View") + 3, keep)) {
+            try l.button("+ View", .{ .command = .save_view }, ui.buttonStyle(false));
+            l.x += 1;
+            // Templates: a menu of them, in a column.
+            if (fits(&l, bar.gwidth("☰") + 3, keep)) {
+                try l.button("☰", .{ .command = .templates }, ui.buttonStyle(false));
+                l.x += 1;
+            }
+        }
+    }
+    if (back_label) |t| try l.button(t, .{ .command = .back }, ui.buttonStyle(true));
     if (bar.width > right + l.x + 2) {
         var x = bar.width - right;
         const cw = bar.gwidth(counts);
@@ -765,9 +846,9 @@ fn drawStatusBar(s: *State, f: ui.Frame, bar: ui.Window) Allocator.Error!void {
     }
     const hint: []const u8 = if (s.modal) |m| m.hint() else switch (s.view) {
         .list => "↑↓ move  ⏎ open  n new  a sub-issue  x close/reopen  / filter  s sort  t tree " ++
-            " f scope  2 board  ? help  q quit",
-        .board => "←→ column  ↑↓ card  ⏎ open  < > move card  n new  x close/reopen  / filter  " ++
-            "s sort  1 list  ? help",
+            " J K order  f scope  ? help  q quit",
+        .board => "←→ column  ↑↓ card  ⏎ open  < > move card  J K order  n new  x close/reopen  " ++
+            "/ filter  s sort  ? help",
         .milestones => "↑↓ move  ⏎ open  n new  e edit  r rename  d due  c complete  R retire  " ++
             "o reopen  / filter  s sort  f scope  w progress  ? help",
         .timeline => if (s.timeline.editing)
@@ -923,6 +1004,15 @@ fn handleKey(s: *State, k: vaxis.Key) Allocator.Error!Action {
         s.goTo(t[1]);
         return .none;
     };
+    for (custom_view.keys, 0..) |c, n| if (k.matches(c, .{})) {
+        const slot: u8 = @intCast(n);
+        if (s.views[slot] == null) return s.failed(
+            "no view on {c}: V saves the filter and sort shown as one",
+            .{c},
+        );
+        custom_view.open(s, slot);
+        return .none;
+    };
     if (s.view != .detail) {
         if (k.matches('/', .{})) {
             s.search_focused = true;
@@ -971,6 +1061,19 @@ fn handleKey(s: *State, k: vaxis.Key) Allocator.Error!Action {
                 .all => .open,
             };
             s.filterChanged();
+            return .none;
+        }
+    }
+    if (custom_view.Base.of(s.view) != null and !(s.view == .timeline and s.timeline.editing)) {
+        if (k.matches('V', .{})) {
+            modal_mod.openSaveView(s);
+            return .none;
+        }
+        if (k.matches('t', .{ .ctrl = true })) return .templates_menu;
+        if (k.matches('X', .{})) {
+            const slot = s.custom orelse
+                return s.failed("X deletes a view of yours, on 5 to 0: this is a default one", .{});
+            modal_mod.confirmDeleteView(s, slot);
             return .none;
         }
     }
@@ -1049,6 +1152,11 @@ fn handleMouse(s: *State, m: vaxis.Mouse, now_ms: i64) Allocator.Error!Action {
                     .mpane => |p| p,
                     else => null,
                 } else null;
+                d.slot = switch (s.view) {
+                    .board => board_view.slotAt(s, found),
+                    .list => list_view.slotAt(found),
+                    else => null,
+                };
             }
             return .none;
         },
@@ -1061,6 +1169,7 @@ fn handleMouse(s: *State, m: vaxis.Mouse, now_ms: i64) Allocator.Error!Action {
             s.drag = null;
             if (!d.moved) return .none;
             if (s.view == .milestone) return milestone_view.drop(s, d);
+            if (s.view == .list) return list_view.drop(s, d);
             return board_view.drop(s, d);
         },
     }
@@ -1081,6 +1190,7 @@ fn handleMouse(s: *State, m: vaxis.Mouse, now_ms: i64) Allocator.Error!Action {
     const q = s.issueQuery();
     switch (h.target) {
         .tab => |v| s.goTo(v),
+        .custom_view => |slot| custom_view.open(s, slot),
         .command => |c| return s.command(c),
         .scope => |sc| {
             q.scope = sc;
@@ -1161,6 +1271,9 @@ pub fn command(s: *State, c: ui.Command) Action {
         .pick_pane => milestone_view.openPaneMenu(s),
         .ms_add => milestone_view.openAddPicker(s),
         .ms_move => milestone_view.openMoveMenu(s),
+        .save_view => if (custom_view.Base.of(s.view) != null) modal_mod.openSaveView(s),
+        .templates => return if (custom_view.Base.of(s.view) != null) .templates_menu else .none,
+        .delete_view => if (s.custom) |slot| modal_mod.confirmDeleteView(s, slot),
     }
     return .none;
 }

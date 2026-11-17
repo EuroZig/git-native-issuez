@@ -111,6 +111,7 @@ pub fn main(comptime B: type, ctx: *context.Context(B), argv: []const []const u8
         .due_date = x.due,
         .estimate_minutes = x.estimate,
         .workflow = x.workflow,
+        .rank = x.rank,
     }, .{}) catch |e| return common.repoFailed(B, ctx, e);
     ctx.out.print("Created issue {s}\n", .{issuez.shortId(created.id)}) catch {};
     return common.exit_ok;

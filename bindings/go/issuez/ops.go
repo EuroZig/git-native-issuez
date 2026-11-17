@@ -46,6 +46,8 @@ const (
 	FieldExtra           Field = C.ISSUEZ_FIELD_EXTRA
 	// Timeline only: the lock's reason changed (FieldLocked has it too).
 	FieldLockReason Field = C.ISSUEZ_FIELD_LOCK_REASON
+	// X-Rank: the place in an order set by hand, as on a board.
+	FieldRank Field = C.ISSUEZ_FIELD_RANK
 )
 
 // String is the field's trailer key, e.g. "Labels", "X-Due-Date".
@@ -304,6 +306,24 @@ func (e *Edit) SetLocked(locked bool, reason string) *Edit {
 // SetRef sets the branch or tag the issue is about (X-Ref); "" clears it.
 func (e *Edit) SetRef(ref string) *Edit { return e.optional(FieldRef, ref) }
 
+// SetRank sets the issue's key in your order (X-Rank): 0-9 and a-z, not
+// ending in 0; "" takes it out of the order. Rather than a key,
+// RankBefore and RankAfter place it.
+func (e *Edit) SetRank(rank string) *Edit { return e.optional(FieldRank, rank) }
+
+// RankBefore puts the issue right before another one (its full ID) in
+// your order, among the issues of that one's board column, its key chosen
+// to fit: with the edit's other fields, in one commit (Update only; not
+// with SetRank, comment events, reactions or SetDeleted).
+func (e *Edit) RankBefore(id string) *Edit {
+	return e.add(op{verb: VerbSet, target: targetRankBefore, str: id})
+}
+
+// RankAfter is RankBefore, right after that issue.
+func (e *Edit) RankAfter(id string) *Edit {
+	return e.add(op{verb: VerbSet, target: targetRankAfter, str: id})
+}
+
 // SetDeleted soft-deletes the issue, or restores it.
 func (e *Edit) SetDeleted(deleted bool) *Edit { return e.num(VerbSet, FieldDeleted, b2i(deleted)) }
 
@@ -380,6 +400,8 @@ const (
 	targetOriginalID     = uint32(C.ISSUEZ_OPT_ORIGINAL_ID)
 	targetEditComment    = uint32(C.ISSUEZ_OPT_EDIT_COMMENT)
 	targetExpectEdits    = uint32(C.ISSUEZ_OPT_EXPECT_EDITS)
+	targetRankBefore     = uint32(C.ISSUEZ_OPT_RANK_BEFORE)
+	targetRankAfter      = uint32(C.ISSUEZ_OPT_RANK_AFTER)
 )
 
 // ExpectEdits makes an update that edits a text (SetDescription, or

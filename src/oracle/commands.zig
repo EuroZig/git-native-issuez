@@ -64,6 +64,7 @@ pub const NaiveIssue = struct {
     due: []const u8 = "",
     estimate: []const u8 = "",
     workflow: []const u8 = "",
+    rank: []const u8 = "",
     milestone_id: []const u8 = "",
     milestone_mode: []const u8 = "",
     /// In no particular order.
@@ -301,6 +302,7 @@ pub const change_scalars = [_][]const u8{
     "X-Parent",         "X-Start-Date",   "X-Due-Date",       "X-Estimate-Minutes",
     "X-Workflow-State", "X-Milestone-Id", "X-Milestone-Mode", "X-Deleted",
     "X-Number",         "X-Locked",       "X-Lock-Reason",    "X-Ref",
+    "X-Rank",
 };
 pub const change_sets = [_][]const u8{ "Labels", "X-Blocked-By", "X-Assignees" };
 
@@ -609,6 +611,7 @@ const Dag = struct {
             "X-Due-Date",
             "X-Estimate-Minutes",
             "X-Workflow-State",
+            "X-Rank",
             "X-Milestone-Id",
             "X-Milestone-Mode",
             "X-Deleted",
@@ -662,6 +665,7 @@ const Dag = struct {
             .due = (try d.scalar("X-Due-Date")) orelse "",
             .estimate = (try d.scalar("X-Estimate-Minutes")) orelse "",
             .workflow = (try d.scalar("X-Workflow-State")) orelse "",
+            .rank = (try d.scalar("X-Rank")) orelse "",
             .milestone_id = (try d.scalar("X-Milestone-Id")) orelse "",
             .milestone_mode = (try d.scalar("X-Milestone-Mode")) orelse "",
             .attachments = try d.attachments(),
@@ -1312,6 +1316,7 @@ pub fn restatedBy(arena: Allocator, n: NaiveIssue) Allocator.Error!std.ArrayList
         .{ .key = "X-Due-Date", .value = n.due },
         .{ .key = "X-Estimate-Minutes", .value = n.estimate },
         .{ .key = "X-Workflow-State", .value = n.workflow },
+        .{ .key = "X-Rank", .value = n.rank },
         .{ .key = "X-Milestone-Id", .value = n.milestone_id },
         .{ .key = "X-Milestone-Mode", .value = n.milestone_mode },
         .{ .key = "X-Deleted", .value = n.deleted },
@@ -1353,7 +1358,7 @@ const format_keys = [_][]const u8{
     "X-Attachment-Removed", "X-Event",           "X-Comment",      "X-Assignees",
     "X-Number",             "X-Locked",          "X-Lock-Reason",  "X-Ref",
     "X-Message",            "X-Original-Author", "X-Original-Id",  "Provider-Comment-ID",
-    "Exported-Commit",      "X-Author-Id",
+    "Exported-Commit",      "X-Author-Id",       "X-Rank",
 };
 
 /// format.md §2: a host field is an `X-` key the format doesn't use, made

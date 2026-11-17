@@ -15,6 +15,8 @@ const milestone_view = @import("milestone_view.zig");
 const filter = @import("filter.zig");
 const timeline_edit = @import("timeline_edit.zig");
 const star = @import("star.zig");
+const custom_view = @import("custom_view.zig");
+const user_state = @import("user_state.zig");
 
 const core = issuez.format.core;
 const shortId = issuez.format.uuid.shortId;
@@ -36,6 +38,9 @@ pub fn App(comptime B: type) type {
         /// it, so it lives as long as the app and is never reset. It
         /// grows with each sync, which only tests run.
         inline_arena: std.heap.ArenaAllocator,
+        /// Writes the user's views to the state file; null keeps them for
+        /// the session, as in the tests.
+        views_store: ?ViewsStore = null,
 
         pub const Runner = struct {
             context: *anyopaque,
@@ -58,12 +63,28 @@ pub fn App(comptime B: type) type {
             decline: *const fn (context: *anyopaque) void,
         };
 
+        pub const ViewsStore = struct {
+            context: *anyopaque,
+            /// False when they couldn't be written.
+            save: *const fn (context: *anyopaque, views: []const custom_view.Saved) bool,
+            /// The templates, in `a`; null when they can't be read.
+            templates: *const fn (context: *anyopaque, a: Allocator) ?[]const user_state.Template,
+            /// `views` as the template `name`, in place of one of that name;
+            /// null drops it. False when it couldn't be written.
+            set_template: *const fn (
+                context: *anyopaque,
+                name: []const u8,
+                views: ?[]const custom_view.Saved,
+            ) bool,
+        };
+
         /// In place: the state points into the store.
         pub fn init(self: *Self, gpa: Allocator, backend: *B) void {
             self.store = .init(gpa, backend);
             self.state = .init(gpa, &self.store.snap);
             self.runner = null;
             self.star_runner = null;
+            self.views_store = null;
             self.inline_arena = .init(gpa);
         }
 
@@ -199,6 +220,7 @@ pub fn App(comptime B: type) type {
                     );
                 },
                 .move => |m| self.move(m.id, m.column, m.done),
+                .reorder => |r| self.reorder(r.id, r.others, r.at, r.column),
                 .create_milestone => |input| {
                     const id = st.createMilestone(input) catch |e| return self.failed(e);
                     s.info("created milestone {s}", .{input.name});
@@ -253,6 +275,7 @@ pub fn App(comptime B: type) type {
                     }
                     switch (l.then) {
                         .view => |v| if (v != .timeline) s.switchView(v),
+                        .custom => |slot| custom_view.open(s, slot),
                         .quit => return s.quitUnlessSyncing() != .quit,
                         .issue => |id| s.openIssue(id.slice()),
                         .milestone => |m| s.openMilestone(m),
@@ -283,6 +306,12 @@ pub fn App(comptime B: type) type {
                     self.openSyncPanel();
                 },
                 .star => |choice| self.starChoice(choice),
+                .save_view => |sv| self.saveView(sv.slot, sv.name),
+                .delete_view => |slot| self.deleteView(slot),
+                .templates_menu => self.templatesMenu(),
+                .save_template => |t| self.saveTemplate(t.name, t.replace),
+                .load_template => |t| self.loadTemplate(t.name, t.confirmed),
+                .delete_template => |name| self.deleteTemplate(name),
                 .quick_create => |input| {
                     const id = st.create(input) catch |e| return self.failed(e);
                     s.info(
@@ -296,6 +325,138 @@ pub fn App(comptime B: type) type {
             // The write went through; showing it didn't.
             if (st.takeReloadError()) |e| self.failWith(e);
             return true;
+        }
+
+        fn saveView(self: *Self, slot: u8, name: []const u8) void {
+            const s = &self.state;
+            // The name is in the modal arena.
+            defer s.closeModal();
+            custom_view.save(s, slot, name) catch return s.fail("out of memory", .{});
+            const v = s.views[slot].?;
+            const key = custom_view.keys[slot];
+            if (self.saveViews()) return s.info("view {s} saved: {c} shows it", .{ v.name, key });
+            s.fail("view {s} is on {c} for this session only: {s}", .{ v.name, key, unwritten });
+        }
+
+        fn deleteView(self: *Self, slot: u8) void {
+            const s = &self.state;
+            s.closeModal();
+            const v = s.views[slot] orelse return;
+            const name = s.fmtInput("{s}", .{v.name});
+            custom_view.delete(s, slot);
+            if (self.saveViews()) return s.info("view {s} deleted", .{name});
+            s.fail("view {s} is gone for this session only: {s}", .{ name, unwritten });
+        }
+
+        const unwritten = "the state file couldn't be written";
+        const no_templates = "templates live in the state file, which can't be read here";
+
+        /// The templates, in the input arena; null, said, when there are none
+        /// to have.
+        fn readTemplates(self: *Self) ?[]const user_state.Template {
+            const s = &self.state;
+            const vs = self.views_store orelse {
+                s.fail("{s}", .{no_templates});
+                return null;
+            };
+            return vs.templates(vs.context, s.input_arena.allocator()) orelse {
+                s.fail("{s}", .{no_templates});
+                return null;
+            };
+        }
+
+        fn templatesMenu(self: *Self) void {
+            const s = &self.state;
+            const list = self.readTemplates() orelse return;
+            const a = s.input_arena.allocator();
+            const rows = a.alloc(struct { []const u8, usize }, list.len) catch
+                return s.fail("out of memory", .{});
+            for (list, rows) |t, *r| r.* = .{ t.name, t.views.len };
+            modal.openTemplates(s, rows);
+        }
+
+        fn saveTemplate(self: *Self, name_in: []const u8, replace: bool) void {
+            const s = &self.state;
+            // In the modal arena, which closing resets.
+            const name = s.fmtInput("{s}", .{name_in});
+            s.closeModal();
+            const list = self.readTemplates() orelse return;
+            const taken = for (list) |t| {
+                if (std.mem.eql(u8, t.name, name)) break true;
+            } else false;
+            if (taken and !replace) return modal.openConfirm(s, "Replace this template", &.{
+                s.fmtInput("{s} has views already: yours take their place.", .{name}),
+            }, &.{
+                .{ .label = "Keep it", .action = .none },
+                .{
+                    .label = "Replace",
+                    .action = .{ .save_template = .{
+                        .name = s.modalArena().dupe(u8, name) catch "",
+                        .replace = true,
+                    } },
+                },
+            });
+            const vs = self.views_store.?;
+            const views = custom_view.toSaved(s, s.input_arena.allocator()) catch
+                return s.fail("out of memory", .{});
+            if (!vs.set_template(vs.context, name, views)) return s.fail("{s}", .{unwritten});
+            s.info("template {s} saved: {d} views", .{ name, views.len });
+        }
+
+        fn loadTemplate(self: *Self, name_in: []const u8, confirmed: bool) void {
+            const s = &self.state;
+            const name = s.fmtInput("{s}", .{name_in});
+            s.closeModal();
+            const list = self.readTemplates() orelse return;
+            const t = for (list) |t| {
+                if (std.mem.eql(u8, t.name, name)) break t;
+            } else return s.fail("template {s} is gone", .{name});
+            var have: usize = 0;
+            for (s.views) |v| have += @intFromBool(v != null);
+            if (have > 0 and !confirmed) return modal.openConfirm(s, "Load this template", &.{
+                s.fmtInput(
+                    "Its {d} views take the place of your {d} here.",
+                    .{ t.views.len, have },
+                ),
+            }, &.{
+                .{ .label = "Keep mine", .action = .none },
+                .{
+                    .label = "Load",
+                    .action = .{ .load_template = .{
+                        .name = s.modalArena().dupe(u8, name) catch "",
+                        .confirmed = true,
+                    } },
+                },
+            });
+            // The view shown gives its default view's filter back first.
+            custom_view.leave(s);
+            custom_view.load(s, t.views) catch return s.fail("out of memory", .{});
+            if (!self.saveViews()) return s.fail(
+                "template {s} is loaded for this session only: {s}",
+                .{ name, unwritten },
+            );
+            s.info("template {s} loaded: {d} views", .{ name, t.views.len });
+        }
+
+        fn deleteTemplate(self: *Self, name_in: []const u8) void {
+            const s = &self.state;
+            const name = s.fmtInput("{s}", .{name_in});
+            s.closeModal();
+            const vs = self.views_store orelse return s.fail("{s}", .{no_templates});
+            if (!vs.set_template(vs.context, name, null)) return s.fail("{s}", .{unwritten});
+            s.info("template {s} deleted", .{name});
+        }
+
+        /// True when written, or when there is nowhere to write them.
+        fn saveViews(self: *Self) bool {
+            const vs = self.views_store orelse return true;
+            var arena_state: std.heap.ArenaAllocator = .init(self.state.gpa);
+            defer arena_state.deinit();
+            const views = custom_view.toSaved(
+                &self.state,
+                arena_state.allocator(),
+            ) catch return false;
+            return vs.save(vs.context, views);
         }
 
         /// `failWith`, then go on.
@@ -885,6 +1046,35 @@ pub fn App(comptime B: type) type {
 
         /// A card to another column: close it, reopen it, set its workflow
         /// state.
+        /// To `at` among `others`; from another column into `column`, a
+        /// workflow state, with the state change in the same commit.
+        fn reorder(
+            self: *Self,
+            id: store_mod.Id,
+            others: []const store_mod.Id,
+            at: u32,
+            column: ?[]const u8,
+        ) void {
+            const s = &self.state;
+            const st = &self.store;
+            const i = st.snap.find(id.slice()) orelse return;
+            var spec: issuez.engine.EditSpec = .{};
+            // The column name lives in the snapshot the write replaces.
+            var name_buf: [256]u8 = undefined;
+            var name: ?[]const u8 = null;
+            if (column) |c| {
+                if (c.len > name_buf.len) return self.failWith(error.UnknownWorkflowState);
+                @memcpy(name_buf[0..c.len], c);
+                const workflow = if (std.mem.eql(u8, c, "(none)")) "" else name_buf[0..c.len];
+                const current = st.snap.proj.workflow(i) orelse "";
+                if (!std.mem.eql(u8, current, workflow)) spec.workflow = .fromInput(workflow);
+                if (st.snap.isDone(i)) spec.state = .open;
+                name = name_buf[0..c.len];
+            }
+            st.reorder(id.slice(), others, at, spec) catch |e| return self.failWith(e);
+            if (name) |n| s.info("#{s} → {s}", .{ shortId(id.slice()), n });
+        }
+
         fn move(self: *Self, id: store_mod.Id, column: []const u8, to_done: bool) void {
             const s = &self.state;
             const st = &self.store;

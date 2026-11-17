@@ -883,6 +883,50 @@ test "ls --conflicts" {
     try testing.expectEqualStrings("", none.stdout);
 }
 
+test "your order: --rank, --before and --after, ls --sort rank" {
+    var sb = try Sandbox.init(.{});
+    defer sb.deinit();
+    const a = try createdId(try gitIssue(&sb, &.{ "create", "A", "--rank", "m" }));
+    const b = try createdId(try gitIssue(&sb, &.{ "create", "B" }));
+    const c = try createdId(try gitIssue(&sb, &.{ "create", "C" }));
+    // Done work is another column: --before it leaves the open ones alone.
+    const done = try createdId(try gitIssue(&sb, &.{ "create", "Done" }));
+    try expectSuccess(try gitIssue(&sb, &.{ "close", done }));
+
+    try expectSuccess(try gitIssue(&sb, &.{ "edit", c, "--before", a }));
+    // After B, which has no key: B gets one too, after A's.
+    try expectSuccess(try gitIssue(&sb, &.{ "edit", a, "--after", b, "-p", "high" }));
+    const listed = try gitIssue(&sb, &.{ "ls", "--sort", "rank", "-f", "oneline" });
+    try expectSuccess(listed);
+    const want = try std.fmt.allocPrint(sb.arena(), "{s} open C\n{s} open B\n{s} open A\n", .{
+        c[0..7],
+        b[0..7],
+        a[0..7],
+    });
+    try testing.expectEqualStrings(want, listed.stdout);
+    const shown = try gitIssue(&sb, &.{ "show", a });
+    try testing.expect(std.mem.find(u8, shown.stdout, "Priority: high") != null);
+    try testing.expect(std.mem.find(u8, shown.stdout, "Rank:    ") != null);
+
+    try expectFailure(
+        try gitIssue(&sb, &.{ "edit", a, "--rank", "a0" }),
+        1,
+        "error: --rank takes 0-9 and a-z, at most 128, not ending in 0, not 'a0'\n",
+    );
+    try expectFailure(
+        try gitIssue(&sb, &.{ "edit", a, "--before", b, "--rank", "b" }),
+        1,
+        "error: --before and --after set the rank themselves\n",
+    );
+    // A deleted anchor has no place: refused, not to the top.
+    try expectSuccess(try gitIssue(&sb, &.{ "delete", b }));
+    const gone = try gitIssue(&sb, &.{ "edit", c, "--after", b });
+    try testing.expectEqual(@as(u8, 1), gone.code);
+    try expectSuccess(try gitIssue(&sb, &.{ "edit", a, "--no-rank" }));
+    const json = try gitIssue(&sb, &.{ "show", a, "--json" });
+    try testing.expect(std.mem.find(u8, json.stdout, "\"rank\": null") != null);
+}
+
 test "lifecycle commands" {
     var sb = try Sandbox.init(.{});
     defer sb.deinit();

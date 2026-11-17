@@ -1,6 +1,7 @@
 package issuez_test
 
 import (
+	"context"
 	"slices"
 	"testing"
 	"time"
@@ -165,5 +166,82 @@ func TestEditAppliesEveryBuilder(t *testing.T) {
 	// Nothing open is left in v1: it can be completed.
 	if _, err = r.UpdateMilestone(ctx, m.ID, new(issuez.MilestoneEdit).SetStatus(issuez.MilestoneCompleted), ada); err != nil {
 		t.Fatal(err)
+	}
+}
+
+// TestEdit_SetRank: a key on create and update, refused when it isn't one,
+// "" takes it out of the order.
+func TestEdit_SetRank(t *testing.T) {
+	ctx := context.Background()
+	r := newRepo(t)
+	a, err := r.Create(ctx, new(issuez.Edit).SetTitle("A").SetRank("m"), ada, issuez.Reload())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if a.Issue.Rank != "m" {
+		t.Fatalf("rank on create: %q", a.Issue.Rank)
+	}
+	if _, err := r.Update(ctx, a.ID, new(issuez.Edit).SetRank("a0"), ada); err == nil {
+		t.Error("SetRank(a0) was written")
+	}
+	w, err := r.Update(ctx, a.ID, new(issuez.Edit).SetRank(""), ada, issuez.Reload())
+	if err != nil || w.Issue.Rank != "" {
+		t.Fatalf("SetRank(\"\"): %v %+v", err, w)
+	}
+}
+
+// rankTitles: the open issues' titles in your order.
+func rankTitles(t *testing.T, r *issuez.Repo) []string {
+	t.Helper()
+	page, err := r.Query(context.Background(), issuez.Query{Order: issuez.SortRank})
+	if err != nil {
+		t.Fatal(err)
+	}
+	var titles []string
+	for _, i := range page.Issues {
+		titles = append(titles, i.Title)
+	}
+	return titles
+}
+
+// TestEdit_RankBefore: one key between its neighbours; not with SetRank.
+func TestEdit_RankBefore(t *testing.T) {
+	ctx := context.Background()
+	r := newRepo(t)
+	a, err := r.Create(ctx, new(issuez.Edit).SetTitle("A").SetRank("m"), ada)
+	if err != nil {
+		t.Fatal(err)
+	}
+	b := create(t, r, "B")
+	if _, err := r.Update(ctx, b.ID, new(issuez.Edit).RankBefore(a.ID), ada); err != nil {
+		t.Fatal(err)
+	}
+	if got := rankTitles(t, r); !slices.Equal(got, []string{"B", "A"}) {
+		t.Fatalf("in your order: %v", got)
+	}
+	if _, err := r.Update(ctx, a.ID, new(issuez.Edit).RankBefore(b.ID).SetRank("b"), ada); err == nil {
+		t.Error("RankBefore with SetRank was written")
+	}
+}
+
+// TestEdit_RankAfter: after an issue without a key, which gets one too;
+// the edit's other fields in the moved issue's commit.
+func TestEdit_RankAfter(t *testing.T) {
+	ctx := context.Background()
+	r := newRepo(t)
+	a, err := r.Create(ctx, new(issuez.Edit).SetTitle("A").SetRank("m"), ada)
+	if err != nil {
+		t.Fatal(err)
+	}
+	b := create(t, r, "B")
+	w, err := r.Update(ctx, a.ID, new(issuez.Edit).RankAfter(b.ID).AddLabel("x"), ada, issuez.Reload())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !slices.Equal(w.Issue.Labels, []string{"x"}) || w.Issue.Rank == "" {
+		t.Fatalf("after RankAfter: %+v", w.Issue)
+	}
+	if got := rankTitles(t, r); !slices.Equal(got, []string{"B", "A"}) {
+		t.Fatalf("in your order: %v", got)
 	}
 }

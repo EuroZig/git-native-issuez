@@ -114,6 +114,13 @@ everywhere. The list is sortable and filterable
 (`label:ui @ada p:high is:blocked -label:wontfix`). It updates live when
 the CLI, another TUI or an agent writes.
 
+The board (`2`) is in your order: drag a card to a place in its column or
+in another one, where a line shows where it lands, or move it with `J` and
+`K`. The list does the same once sorted by rank (`s`), without the tree.
+The order is the issues' `X-Rank` keys, shared like any field: a move
+writes the moved issue alone, and new issues come last. `git issue edit
+--before` / `--after` and `ls --sort rank` use it from the command line.
+
 Now and then the status bar asks for a star on GitHub: never in a
 session's first ten minutes, at most once a month, a few times in all.
 With the GitHub CLI (`gh`) logged in it never asks once the project is
@@ -143,6 +150,16 @@ conflicts opened. `git config issue.remote` picks the remote, and `git
 config issue.autoSync 10` fetches and merges every 10 minutes (it never
 pushes on its own). git never prompts: it runs without a terminal, ssh in
 batch mode unless you set your own ssh command, so a key needs an agent.
+
+Views of your own sit next to the four on `1` to `4`: `V`, or the
+`+ View` button after the tabs, saves the filter and sort shown (of the
+list, the board, the milestones or the timeline) under a name and a key of
+`5` to `0`, and that key, or its tab, shows them again. The default view
+keeps its own filter and sort meanwhile; `X`, or the `×` on its tab,
+deletes the view shown. Each repository has its own views (its worktrees
+share them), kept in the TUI's state file, `git-issue/tui.zon`. `ctrl+t`,
+or `☰` after the tabs, saves them under a name as a template, for loading
+in place of another repository's.
 
 ### Coding agents (MCP)
 

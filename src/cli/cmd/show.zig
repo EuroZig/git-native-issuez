@@ -200,6 +200,7 @@ const extension_fields = [_][]const u8{
     "X-Parent", "X-Start-Date",       "X-Due-Date",
     "X-Number", "X-Locked",           "X-Lock-Reason",
     "X-Ref",    "X-Estimate-Minutes", "X-Workflow-State",
+    "X-Rank",
 };
 
 fn isExtensionField(key: []const u8) bool {
@@ -231,6 +232,7 @@ fn printExtensions(
         w.writeAll("\n") catch {};
     }
     if (x.workflow) |s| w.print("Workflow: {s}\n", .{s}) catch {};
+    if (x.rank) |r| w.print("Rank:    {s}\n", .{r}) catch {};
 }
 
 fn reference(
