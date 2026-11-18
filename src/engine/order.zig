@@ -1,8 +1,9 @@
 //! Placing an issue in an order set by hand (`X-Rank`, format.md §3):
 //! which keys a move writes. Most moves write the moved issue's key
 //! alone. Issues without a key come after those with one, so a move below
-//! some of them gives them keys too; neighbours with the same key, or a
-//! key that would be too long, give the whole column keys anew.
+//! some of them gives them keys too; neighbours with the same key (two
+//! clones that moved cards to the same place) give that run of keys new
+//! ones, and a key that would be too long the whole column.
 
 const std = @import("std");
 const assert = std.debug.assert;
@@ -67,8 +68,14 @@ pub fn place(arena: Allocator, ranks: []const ?[]const u8, at: usize) Error!Plac
                 error.TooLong => {},
                 error.OutOfMemory => return error.OutOfMemory,
             }
+            return anew(arena, ranks.len, at);
         }
-        return anew(arena, ranks.len, at);
+        // Out of order: no run to give keys.
+        if (!std.mem.eql(u8, lo.?, hi.?)) return anew(arena, ranks.len, at);
+        return rekeyRun(arena, ranks[0..ranked], at) catch |e| switch (e) {
+            error.TooLong => anew(arena, ranks.len, at),
+            error.OutOfMemory => error.OutOfMemory,
+        };
     }
     // Below issues without a key: those above it get keys, after the last
     // key, in the order shown.
@@ -80,6 +87,25 @@ pub fn place(arena: Allocator, ranks: []const ?[]const u8, at: usize) Error!Plac
     const others = try arena.alloc(Placement.Other, at - ranked);
     for (others, keys[0 .. keys.len - 1], ranked..) |*o, k, n| o.* = .{ .index = n, .key = k };
     return .{ .key = keys[keys.len - 1], .others = others };
+}
+
+/// New keys for the run of equal keys around `at`, between the keys on
+/// either side of it, so the rest of the column keeps its own.
+fn rekeyRun(arena: Allocator, ranked: []const ?[]const u8, at: usize) rank.Error!Placement {
+    assert(at > 0 and at < ranked.len);
+    const key = ranked[at].?;
+    var start = at;
+    while (start > 0 and std.mem.eql(u8, ranked[start - 1].?, key)) start -= 1;
+    var end = at;
+    while (end < ranked.len and std.mem.eql(u8, ranked[end].?, key)) end += 1;
+    const lo = if (start > 0) ranked[start - 1] else null;
+    const hi = if (end < ranked.len) ranked[end] else null;
+    const keys = try rank.spread(arena, lo, hi, end - start + 1);
+    const others = try arena.alloc(Placement.Other, end - start);
+    for (others, start..) |*o, n| {
+        o.* = .{ .index = n, .key = keys[n - start + @intFromBool(n >= at)] };
+    }
+    return .{ .key = keys[at - start], .others = others };
 }
 
 /// Keys anew for the whole column, the moved issue at `at`.
@@ -139,15 +165,25 @@ test "below issues without a key: they get keys, in the order shown" {
     try testing.expectEqual(.lt, rank.order(q.others[1].key, q.key));
 }
 
-test "the same key on both sides, or too long: the column anew" {
+test "the same key on both sides: that run anew; too long: the column" {
     var arena_state: std.heap.ArenaAllocator = .init(testing.allocator);
     defer arena_state.deinit();
     const a = arena_state.allocator();
-    const p = try place(a, &.{ "b", "b", "c" }, 1);
-    try testing.expectEqual(3, p.others.len);
+    // The two b's get keys between a and c; a, c and d keep theirs.
+    const p = try place(a, &.{ "a", "b", "b", "c", "d" }, 2);
+    try testing.expectEqual(2, p.others.len);
+    try testing.expectEqual(1, p.others[0].index);
+    try testing.expectEqual(2, p.others[1].index);
+    try testing.expectEqual(.lt, rank.order("a", p.others[0].key));
     try testing.expectEqual(.lt, rank.order(p.others[0].key, p.key));
     try testing.expectEqual(.lt, rank.order(p.key, p.others[1].key));
-    try testing.expectEqual(.lt, rank.order(p.others[1].key, p.others[2].key));
+    try testing.expectEqual(.lt, rank.order(p.others[1].key, "c"));
+    // A run at the top.
+    const top = try place(a, &.{ "b", "b", "b", "c" }, 1);
+    try testing.expectEqual(3, top.others.len);
+    try testing.expectEqual(.lt, rank.order(top.others[0].key, top.key));
+    try testing.expectEqual(.lt, rank.order(top.key, top.others[1].key));
+    try testing.expectEqual(.lt, rank.order(top.others[2].key, "c"));
     // No key of at most `max_len` bytes fits between these two.
     var lo: [rank.max_len]u8 = @splat('0');
     var hi: [rank.max_len]u8 = @splat('0');

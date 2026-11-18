@@ -1790,11 +1790,19 @@ pub fn openConfirm(
     s.openModal(.{ .confirm = .{ .title = dupe(s, title), .lines = ls, .choices = cs } });
 }
 
+/// Whether `!`'s dialog is open: the notice waits for it.
+pub fn isStarOpen(s: *const AppState) bool {
+    const m = s.modal orelse return false;
+    if (m != .confirm) return false;
+    for (m.confirm.choices) |ch| if (ch.action == .star) return true;
+    return false;
+}
+
 /// `!` while the star notice shows: its buttons, with the keys.
 pub fn openStar(s: *AppState) void {
     openConfirm(s, "Star git issue on GitHub", &.{
         if (s.star.gh) "One click stars it, with gh." else "Opens " ++ star.url ++ ".",
-        "Later asks again in a month; Never stops asking.",
+        "Later may ask again in a month; Never stops asking.",
     }, &.{
         .{ .label = "Star it", .action = .{ .star = .star } },
         .{ .label = "Later", .action = .{ .star = .later } },
@@ -2153,6 +2161,7 @@ const help_lines = [_][]const u8{
     "  a new sub-issue  A add existing issues as sub-issues",
     "  s state  w workflow  p priority  u assignee  l labels  m milestone",
     "  P parent  b blocked by  S start  d due  E estimate  o go to parent",
+    "  r               Markdown as written / rendered",
     "  esc ← h         back",
     "",
     "Milestones",

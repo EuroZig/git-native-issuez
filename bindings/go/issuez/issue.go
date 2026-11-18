@@ -462,7 +462,8 @@ const (
 	SortComments Sort = C.ISSUEZ_SORT_COMMENTS
 	SortState    Sort = C.ISSUEZ_SORT_STATE
 	// SortRank is your order, as on a board: issues with a key by key,
-	// then the rest oldest first.
+	// then the rest oldest first. Ascending reverses it, as for
+	// SortDueDate and SortState.
 	SortRank Sort = C.ISSUEZ_SORT_RANK
 )
 

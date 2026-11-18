@@ -1,6 +1,6 @@
 .{
     .name = .git_native_issuez,
-    .version = "0.5.0",
+    .version = "0.6.0",
     .minimum_zig_version = "0.17.0",
     .fingerprint = 0x7bba8a1d2cbb8815,
     // What the release archives link is in THIRD_PARTY_LICENSES: keep it current.
@@ -10,6 +10,21 @@
         .vaxis = .{
             .url = "git+https://github.com/rockorager/libvaxis#74b7d916c8879e5379f428ea8c4d43d1a1bb061b",
             .hash = "vaxis-0.6.0-BWNV_J2zDQArkPcsc2nkktgxfg2r0u1AwwQP9WLugo_1",
+            .lazy = true,
+        },
+        // Markdown descriptions and comments, rendered by `show` and the TUI.
+        // A markdownz main commit on Zig 0.17; fetched for git-issue, not
+        // for projects that only use the library.
+        .markdownz = .{
+            .url = "git+https://github.com/StaffinityAI/markdownz#49a0cefd6c23387cdbf0b2ee8b424ddcc1408ae3",
+            .hash = "markdown-0.1.0-B0nUV6Q8AwBbBCNd7pWUPws9rQWHq9c9zSQohEQOyT8y",
+            .lazy = true,
+        },
+        // Grapheme widths for markdown-term and libvaxis, one module for
+        // both: the commit libvaxis pins.
+        .uucode = .{
+            .url = "git+https://github.com/jacobsandlund/uucode#1fb73433bba5d93366c57f23ff2e9d7939746500",
+            .hash = "uucode-0.2.0-ZZjBPm6FVgBcY-79AHV8ckQj86z0JwOyVyj89VeZrEiv",
             .lazy = true,
         },
         // Where the TUI keeps the user's state file. A known-folders master

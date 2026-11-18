@@ -371,9 +371,11 @@ pub fn modalArena(s: *State) Allocator {
 
 // Navigation.
 
+/// When full, the oldest after the first goes: back still ends where
+/// you came from, on your own view's base when one is shown.
 fn push(s: *State, v: ui.View) void {
     if (s.nav_len == max_nav) {
-        std.mem.copyForwards(ui.View, s.nav[0 .. max_nav - 1], s.nav[1..max_nav]);
+        std.mem.copyForwards(ui.View, s.nav[1 .. max_nav - 1], s.nav[2..max_nav]);
         s.nav_len -= 1;
     }
     s.nav[s.nav_len] = v;
@@ -424,7 +426,12 @@ pub fn back(s: *State) void {
         .milestone => milestone_view.leave(s),
         else => return,
     }
-    s.view = s.pop() orelse if (s.view == .milestone) .milestones else .list;
+    s.view = s.pop() orelse fallback: {
+        const tab: ui.View = if (s.view == .milestone) .milestones else .list;
+        // Your own view is only shown on its base.
+        if (s.custom) |c| if (s.views[c].?.base.view() != tab) custom_view.leave(s);
+        break :fallback tab;
+    };
     s.search_focused = false;
 }
 
@@ -864,7 +871,7 @@ fn drawStatusBar(s: *State, f: ui.Frame, bar: ui.Window) Allocator.Error!void {
             "↑↓ move  + add existing  m move to…  space mark  [ ] prev/next milestone  " ++
                 "n new  N quick add  v split  ⏎ open  esc back",
         .detail => "↑↓ select  ⏎ edit/open  e description  c comment  a sub-issue  " ++
-            "A add existing  x close/reopen  t title  esc back  ? help",
+            "A add existing  x close/reopen  t title  r raw  esc back  ? help",
     };
     _ = ui.text(bar, 1, 0, hint, .{ .fg = ui.palette.muted, .bg = ui.palette.bar_bg });
     // Over the end of the hints, which are cut anyway on most terminals.

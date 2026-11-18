@@ -615,7 +615,10 @@ pub fn App(comptime B: type) type {
                         u.phase = .off;
                     };
                 },
-                .shown => if (now_s - u.shown_at >= u.timing.visible_s) {
+                // Not while its dialog is open, so a choice there counts.
+                .shown => if (now_s - u.shown_at >= u.timing.visible_s and
+                    !modal.isStarOpen(&self.state))
+                {
                     u.phase = .off;
                 },
                 .checking, .starring, .off => {},

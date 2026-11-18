@@ -175,6 +175,27 @@ const Harness = struct {
     }
 
     /// Whether the screen shows the text on some row.
+    /// The cell `needle` starts on, on the first row showing it.
+    fn cellOf(h: *Harness, needle: []const u8) ?vaxis.Cell {
+        var line: std.ArrayList(u8) = .empty;
+        defer line.deinit(testing.allocator);
+        var starts: std.ArrayList(u16) = .empty;
+        defer starts.deinit(testing.allocator);
+        for (0..rows) |y| {
+            line.clearRetainingCapacity();
+            starts.clearRetainingCapacity();
+            for (0..cols) |x| {
+                const cell = h.screen.readCell(@intCast(x), @intCast(y)) orelse continue;
+                for (cell.char.grapheme) |_|
+                    starts.append(testing.allocator, @intCast(x)) catch return null;
+                line.appendSlice(testing.allocator, cell.char.grapheme) catch return null;
+            }
+            const at = std.mem.find(u8, line.items, needle) orelse continue;
+            return h.screen.readCell(starts.items[at], @intCast(y));
+        }
+        return null;
+    }
+
     fn shows(h: *Harness, needle: []const u8) bool {
         var line: std.ArrayList(u8) = .empty;
         defer line.deinit(testing.allocator);
@@ -391,6 +412,35 @@ test "detail: number, lock, ref, origin, reactions and purged comments" {
     try testing.expect(h.shows("heart 1"));
     try testing.expect(h.shows("(purged)"));
     try testing.expect(!h.shows("Abuse"));
+}
+
+test "detail: descriptions and comments as Markdown, r as written" {
+    const h = try Harness.create();
+    defer h.destroy();
+    const id = try h.app.store.create(.{
+        .title = "Doc",
+        .body = "# Plan\n\nSome **bold** and [a link](https://example.com).\n\n" ++
+            "- one\n- two\n\n[WIP",
+    });
+    try h.app.store.comment(id.slice(), "A *note*\n\nmore text");
+    h.app.state.openIssue(id.slice());
+    try h.draw();
+    try testing.expect(h.shows("Some bold and a link."));
+    try testing.expect(!h.shows("**"));
+    try testing.expect(h.shows("[WIP"));
+    // The subject is the comment's first paragraph.
+    try testing.expect(h.shows("A note"));
+    try testing.expect(h.shows("more text"));
+    const bold = h.cellOf("bold and").?;
+    try testing.expect(bold.style.bold);
+    const link = h.cellOf("a link").?;
+    try testing.expectEqualStrings("https://example.com", link.link.uri);
+
+    try h.press('r', .{});
+    try testing.expect(h.shows("Some **bold** and [a link](https://example.com)."));
+    try testing.expect(h.shows("A *note*"));
+    try h.press('r', .{});
+    try testing.expect(!h.shows("**"));
 }
 
 test "board: move cards with keys and by dragging" {
@@ -3435,6 +3485,17 @@ test "star notice: not at start, shown once checked, a click stars, gone untouch
     try testing.expectEqual(@as(u32, 2), Fake.stars);
     try testing.expect(!Fake.with_gh);
     try testing.expect(h.shows("Starring…"));
+
+    // The dialog open past the notice's time: Never still counts.
+    h.app.state.star = .{ .phase = .checking };
+    h.app.starChecked(.ask_browser, t0);
+    try h.draw();
+    try h.press('!', .{});
+    h.app.tick(t0 + (star.Timing{}).visible_s + 60);
+    try testing.expectEqual(star.Ui.Phase.shown, h.app.state.star.phase);
+    try h.press('n', .{});
+    try testing.expectEqual(@as(u32, 2), Fake.declines);
+    try testing.expect(h.app.state.modal == null);
 }
 
 /// The state file's views and templates, in memory.
@@ -3699,6 +3760,32 @@ test "custom views: saved from a default view, on their key, kept apart from it"
     try h.press(K.enter, .{});
     try testing.expect(h.shows("for this session only"));
     try testing.expect(s.views[0] != null);
+}
+
+test "custom views: back from a long way keeps the view on its base" {
+    const h = try Harness.create();
+    defer h.destroy();
+    const id = try h.app.store.create(.{ .title = "Alpha" });
+    try h.draw();
+    const s = &h.app.state;
+    try custom_view.load(s, &.{.{ .name = "B", .key = 5, .view = "board" }});
+    try h.press('5', .{});
+    try testing.expectEqual(ui.View.board, s.view);
+    // More issues and milestones than the way back holds.
+    for (0..10) |_| {
+        s.openIssue(id.slice());
+        s.openMilestone(.none);
+    }
+    for (0..30) |_| s.back();
+    try h.draw();
+    try testing.expectEqual(ui.View.board, s.view);
+    try testing.expect(s.custom != null);
+    // Saving from here saves the view shown (it crashed when back fell
+    // through to another tab with the view still set).
+    try h.press('V', .{});
+    try h.typeText("X");
+    try h.press(K.enter, .{});
+    try h.press(K.enter, .{});
 }
 
 test "custom views: many give way to the sync badge and the buttons" {

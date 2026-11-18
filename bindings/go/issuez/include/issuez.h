@@ -135,7 +135,7 @@ extern "C" {
 /* ---------------------------------------- Version and init --------------------------------- */
 
 #define ISSUEZ_VERSION_MAJOR 0
-#define ISSUEZ_VERSION_MINOR 5
+#define ISSUEZ_VERSION_MINOR 6
 #define ISSUEZ_VERSION_PATCH 0
 /* Major in the high 16 bits, minor in the low 16. The library accepts a
  * header with the same major and a minor <= its own; before 1.0 the minor
@@ -964,7 +964,7 @@ typedef enum issuez_sort {
     ISSUEZ_SORT_DUE_DATE = 5,
     ISSUEZ_SORT_COMMENTS = 6,
     ISSUEZ_SORT_STATE = 7,
-    /* your order (X-Rank): issues with a key by key, then the rest oldest first */
+    /* your order (X-Rank): issues with a key by key, then the rest oldest first; ascending reverses it, as for due dates and state */
     ISSUEZ_SORT_RANK = 8,
 } issuez_sort;
 

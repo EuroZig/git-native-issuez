@@ -631,6 +631,7 @@ fn run(
 
 test {
     _ = @import("text.zig");
+    _ = @import("markdown.zig");
     _ = @import("filter.zig");
     _ = @import("ui.zig");
     _ = @import("store.zig");

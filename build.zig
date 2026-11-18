@@ -56,6 +56,11 @@ pub fn build(b: *std.Build) void {
         "mcp",
         "Include the MCP server (default: true, false with -Dminimal or as a dependency)",
     ) orelse full;
+    const markdown = b.option(
+        bool,
+        "markdown",
+        "Render Markdown in `show` and the TUI (default: true, false as a dependency)",
+    ) orelse isRootPackage(b);
     const fuzz = b.option(bool, "fuzz", "Install the fuzzer") orelse false;
 
     // Dependents and the tests get build.zig.zon's version, so a commit alone
@@ -73,10 +78,10 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
         .imports = &.{versionImport(b, version)},
     }));
-    const extras = cli.parts(.{ .tui = tui, .mcp = mcp });
+    const extras = cli.parts(.{ .tui = tui, .mcp = mcp, .markdown = markdown });
     const test_cli: Cli = .init(b, target, optimize, issuez);
     const oracle = test_cli.oracle;
-    const test_extras = test_cli.parts(.{ .tui = tui, .mcp = mcp });
+    const test_extras = test_cli.parts(.{ .tui = tui, .mcp = mcp, .markdown = markdown });
 
     const exe = cli.exe("git-issue", "src/cli/main.zig", optimize, extras);
     b.installArtifact(exe);
@@ -316,7 +321,7 @@ pub fn build(b: *std.Build) void {
         .imports = &.{versionImport(b, zon_version)},
     });
     const release_cli: Cli = .init(b, target, .safe, release_issuez);
-    const release_extras = release_cli.parts(.{ .tui = tui, .mcp = mcp });
+    const release_extras = release_cli.parts(.{ .tui = tui, .mcp = mcp, .markdown = markdown });
     const all_perf_exes = [_]*std.Build.Step.Compile{
         release_cli.exe("git-issue", "src/cli/main.zig", .safe, .{}),
         release_cli.exe("git-issue", "src/cli/main.zig", .safe, release_extras),
@@ -683,6 +688,7 @@ fn releaseExe(
     const exe = cli.exe("git-issue", "src/cli/main.zig", .safe, cli.parts(.{
         .tui = flavor.full,
         .mcp = flavor.full,
+        .markdown = true,
     }));
     // Debug info would make the Linux binaries five times larger; macOS
     // builds go without it anyway. Stack traces show addresses instead.
@@ -1065,6 +1071,8 @@ const Extras = struct {
     mcp: ?*std.Build.Module = null,
     /// The repository watcher both use.
     watch: ?*std.Build.Module = null,
+    /// markdownz's markdown-term, rendering Markdown for `show` and the TUI.
+    markdown: ?*std.Build.Module = null,
 };
 
 /// The modules `git-issue` is built from, for one target.
@@ -1106,8 +1114,36 @@ const Cli = struct {
 
     /// The optional parts asked for, each null until its lazy dependency
     /// is fetched.
-    fn parts(cli: Cli, want: struct { tui: bool, mcp: bool }) Extras {
+    fn parts(cli: Cli, want: struct { tui: bool, mcp: bool, markdown: bool }) Extras {
         const b = cli.b;
+        // One uucode for markdown-term and libvaxis, so text is measured
+        // the same way by both and its tables are in the binary once.
+        const uucode: ?*std.Build.Module = if (!want.markdown and !want.tui) null else blk: {
+            const dep = b.lazyDependency("uucode", .{
+                .target = cli.target,
+                .optimize = cli.optimize,
+                // What both need.
+                .fields = @as([]const []const u8, &.{
+                    "east_asian_width",
+                    "grapheme_break",
+                    "general_category",
+                    "is_emoji_presentation",
+                }),
+            }) orelse break :blk null;
+            break :blk dep.module("uucode");
+        };
+        // The TUI renders Markdown whatever -Dmarkdown says.
+        const markdown_module: ?*std.Build.Module = if (uucode == null) null else blk: {
+            const markdownz = b.lazyDependency("markdownz", .{
+                .target = cli.target,
+                .optimize = cli.optimize,
+                .terminal = true,
+                .external_uucode = true,
+            }) orelse break :blk null;
+            const term = markdownz.module("markdown-term");
+            term.addImport("uucode", uucode.?);
+            break :blk term;
+        };
         // Live updates, for both.
         const watch_module: ?*std.Build.Module = if (!want.tui and !want.mcp) null else blk: {
             const nightwatch = b.lazyDependency("nightwatch", cli.dependencyArgs()) orelse
@@ -1120,7 +1156,12 @@ const Cli = struct {
             });
         };
         const tui_module: ?*std.Build.Module = if (!want.tui) null else blk: {
-            const vaxis = b.lazyDependency("vaxis", cli.dependencyArgs()) orelse break :blk null;
+            const vaxis = b.lazyDependency("vaxis", .{
+                .target = cli.target,
+                .optimize = cli.optimize,
+                .external_uucode = true,
+            }) orelse break :blk null;
+            vaxis.module("vaxis").addImport("uucode", uucode orelse break :blk null);
             const known_folders = b.lazyDependency("known_folders", cli.dependencyArgs()) orelse
                 break :blk null;
             break :blk b.createModule(.{
@@ -1132,6 +1173,7 @@ const Cli = struct {
                     .{ .name = "vaxis", .module = vaxis.module("vaxis") },
                     .{ .name = "known-folders", .module = known_folders.module("known-folders") },
                     .{ .name = "RepoWatcher", .module = watch_module orelse break :blk null },
+                    .{ .name = "markdown-term", .module = markdown_module orelse break :blk null },
                 },
             });
         };
@@ -1150,7 +1192,12 @@ const Cli = struct {
                 },
             });
         };
-        return .{ .tui = tui_module, .mcp = mcp_module, .watch = watch_module };
+        return .{
+            .tui = tui_module,
+            .mcp = mcp_module,
+            .watch = watch_module,
+            .markdown = if (want.markdown) markdown_module else null,
+        };
     }
 
     fn module(
@@ -1163,6 +1210,7 @@ const Cli = struct {
         const options = b.addOptions();
         options.addOption(bool, "tui", extras.tui != null);
         options.addOption(bool, "mcp", extras.mcp != null);
+        options.addOption(bool, "markdown", extras.markdown != null);
         const m = b.createModule(.{
             .root_source_file = b.path(root),
             .target = cli.target,
@@ -1176,6 +1224,7 @@ const Cli = struct {
         });
         if (extras.tui) |t| m.addImport("tui", t);
         if (extras.mcp) |t| m.addImport("mcp", t);
+        if (extras.markdown) |t| m.addImport("markdown-term", t);
         return m;
     }
 

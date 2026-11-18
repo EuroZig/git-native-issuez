@@ -191,7 +191,16 @@ pub fn save(io: std.Io, a: Allocator, file: []const u8, state: State) bool {
     var suffix: [8]u8 = undefined;
     io.random(&suffix);
     const tmp = std.fmt.allocPrint(a, "{s}.tmp-{x}", .{ file, suffix }) catch return false;
-    cwd.writeFile(io, .{ .sub_path = tmp, .data = out.written() }) catch return false;
+    // On the disk before the rename: a crash leaves the old file or the
+    // new one, never an empty one.
+    const f = cwd.createFile(io, tmp, .{}) catch return false;
+    f.writeStreamingAll(io, out.written()) catch {
+        f.close(io);
+        cwd.deleteFile(io, tmp) catch {};
+        return false;
+    };
+    f.sync(io) catch {};
+    f.close(io);
     std.Io.Dir.rename(cwd, tmp, cwd, file, io) catch {
         cwd.deleteFile(io, tmp) catch {};
         return false;

@@ -169,8 +169,9 @@ Format-Version: 1
   reads as the first one.
 - `X-Rank` orders issues by hand, as on a board. Its value is the digits
   after a point in base 36 (`0`-`9` then `a`-`z`), so bytewise order is
-  its order and, as none ends in `0`, another key always fits between two:
-  moving an issue writes that issue alone. Equal keys go by issue ID, and
+  its order and, as none ends in `0`, another key almost always fits
+  between two: moving an issue mostly writes that issue alone. Equal keys
+  (two clones that moved cards to the same place) go by issue ID, and
   issues without one come after those with one.
 
 ### Guards

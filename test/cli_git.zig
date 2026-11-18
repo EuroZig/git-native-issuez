@@ -1289,3 +1289,36 @@ test "dates relative to today, in the local time zone" {
         ms_due,
     );
 }
+
+test "show renders Markdown only when asked or on a terminal" {
+    var sb = try Sandbox.init(.{});
+    defer sb.deinit();
+    const id = try createdId(try gitIssue(&sb, &.{
+        "create", "Markdown", "-m", "# Plan\n\nSome **bold** text.\n\n[WIP",
+    }));
+    try expectSuccess(try gitIssue(&sb, &.{ "comment", id, "-m", "A *note*\n\n- one\n- two" }));
+
+    // A pipe gets the text as it is.
+    const piped = try gitIssue(&sb, &.{ "show", id });
+    try expectSuccess(piped);
+    try testing.expect(std.mem.find(u8, piped.stdout, "Some **bold** text.") != null);
+    try testing.expect(std.mem.find(u8, piped.stdout, "\x1b[") == null);
+
+    try sb.env.put("COLUMNS", "40");
+    const styled = try gitIssue(&sb, &.{ "show", id, "--color", "always" });
+    try expectSuccess(styled);
+    try testing.expect(std.mem.find(u8, styled.stdout, "**") == null);
+    try testing.expect(std.mem.find(u8, styled.stdout, "\x1b[0;1mbold\x1b[0m") != null);
+    try testing.expect(std.mem.find(u8, styled.stdout, "[WIP\n") != null);
+    // Comments keep their indent.
+    try testing.expect(std.mem.find(u8, styled.stdout, "\n  A \x1b[0;3mnote\x1b[0m\n") != null);
+
+    const raw = try gitIssue(&sb, &.{ "show", id, "--color", "always", "--raw" });
+    try testing.expectEqualStrings(piped.stdout, raw.stdout);
+
+    try expectFailure(
+        try gitIssue(&sb, &.{ "show", id, "--color", "sometimes" }),
+        1,
+        "error: --color takes auto, always or never\n",
+    );
+}

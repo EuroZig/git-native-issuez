@@ -527,7 +527,8 @@ pub const Sort = enum(u32) {
     due_date,
     comments,
     state,
-    /// your order (X-Rank): issues with a key by key, then the rest oldest first
+    /// your order (X-Rank): issues with a key by key, then the rest oldest
+    /// first; ascending reverses it, as for due dates and state
     rank,
     _,
 
