@@ -47,6 +47,7 @@ Conventions:
   "due": "2026-12-01",
   "estimate_minutes": 120,
   "workflow": "in-progress",
+  "rank": "i",
   "locked": false,
   "lock_reason": null,
   "ref": null,
@@ -74,6 +75,8 @@ Conventions:
 - `number` is the issue's number in its host (`X-Number`), `null` when it
   has none. `locked`, `lock_reason` and `ref` are `X-Locked`,
   `X-Lock-Reason` and `X-Ref`.
+- `rank` is `X-Rank`, the issue's key in an order set by hand, as on the
+  board: keys compare as bytes; null when it has none, and those come after.
 - `workflow` is as written. `effective_workflow` includes the default for
   open issues without one.
 - `fields` holds every other trailer field with a value, as written (for

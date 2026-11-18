@@ -1056,6 +1056,7 @@ const foreign_pools = [_]struct { []const u8, []const []const u8 }{
     .{ "X-Due-Date", &(date_pool ++ [_][]const u8{""}) },
     .{ "X-Estimate-Minutes", &estimate_pool },
     .{ "X-Workflow-State", &(workflow_pool ++ [_][]const u8{ "", "do\xffing" }) },
+    .{ "X-Rank", &.{ "i", "0z", "zz9", "", "a0", "Up" } },
     .{ "X-Milestone-Mode", &milestone_mode_pool },
     .{ "X-Deleted", &.{ "true", "false", "maybe", "" } },
 };

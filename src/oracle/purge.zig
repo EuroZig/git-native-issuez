@@ -110,7 +110,7 @@ const comment_keeps = [_][]const u8{
     "X-Milestone-Mode",   "X-Number",         "X-Locked",     "X-Lock-Reason",
     "X-Ref",              "Labels",           "X-Blocked-By", "X-Assignees",
     "Exported-Commit",    "X-Message",        "X-Reaction",   "X-Author-Id",
-    "X-Event",            "X-Comment",
+    "X-Event",            "X-Comment",        "X-Rank",
 };
 
 /// The tip `tip` rewrites to with `purged` (first IDs) purged. Null when

@@ -157,7 +157,8 @@ fn drawColumn(s: *AppState, f: ui.Frame, win: ui.Window, c: u16) Allocator.Error
     );
 
     const body = inner.child(.{ .y_off = 2, .height = inner.height -| 2 });
-    if (col.done and s.query.scope == .open) {
+    defer drawDropLine(s, inner, body, c);
+    if (col.done and s.bd_query.scope == .open) {
         _ = ui.text(body, 1, 0, "Done work is hidden.", .{ .fg = palette.muted, .italic = true });
         _ = try ui.button(f, body, 1, 2, "Show all", .{ .scope = .all }, ui.buttonStyle(false));
         return;
@@ -166,6 +167,10 @@ fn drawColumn(s: *AppState, f: ui.Frame, win: ui.Window, c: u16) Allocator.Error
         _ = ui.text(body, 1, 0, "No cards", .{ .fg = palette.faint, .italic = true });
         return;
     }
+    const snap = s.snap;
+    var q = s.currentQuery();
+    q.tree = false;
+    const grouped = filter.grouped(q);
     // Scroll the selected card into view.
     const top = &b.scroll[c];
     if (b.follow and c == b.column) ui.keepInView(top, b.index, b.visible);
@@ -182,6 +187,18 @@ fn drawColumn(s: *AppState, f: ui.Frame, win: ui.Window, c: u16) Allocator.Error
             false;
         try drawCard(s, f, card, col.cards[index], selected, dragged);
         try f.hit(card, .{ .card = .{ .column = c, .index = index } });
+        if (grouped and (index == 0 or
+            !filter.sameGroup(snap, q, col.cards[index - 1], col.cards[index])))
+        {
+            // In the gap above the card, or under the header for the top.
+            const win_y, const at = if (y == 0) .{ inner, @as(u16, 1) } else .{ body, y - 1 };
+            ui.divider(win_y.child(.{ .y_off = at, .height = 1 }), try filter.groupName(
+                f.arena,
+                snap,
+                q,
+                col.cards[index],
+            ));
+        }
     }
     const hidden = col.cards.len - top.* - n;
     if (top.* > 0) _ = ui.text(
@@ -198,6 +215,83 @@ fn drawColumn(s: *AppState, f: ui.Frame, win: ui.Window, c: u16) Allocator.Error
         f.fmt("↓{d}", .{hidden}),
         .{ .fg = palette.muted },
     );
+}
+
+/// Where a dragged card lands in your order: a line in the gap above
+/// that place, or under the header for the top.
+fn drawDropLine(s: *AppState, inner: ui.Window, body: ui.Window, c: u16) void {
+    const d = s.drag orelse return;
+    if (!d.moved or d.over != c) return;
+    const slot = d.slot orelse return;
+    if (lands(s, d) == null) return;
+    const top = s.board.scroll[c];
+    if (slot < top or slot > top + s.board.visible) return;
+    const row: u16 = @intCast((slot - top) * (card_height + card_gap));
+    const win, const y = if (row == 0) .{ inner, @as(u16, 1) } else .{ body, row - 1 };
+    if (y >= win.height) return;
+    const line = win.child(.{ .y_off = y, .height = 1 });
+    line.fill(.{ .char = .{ .grapheme = "━", .width = 1 }, .style = .{ .fg = palette.accent } });
+}
+
+/// Where in a column the pointer over `found` would put a card: before
+/// the card under it, or after it in its lower half, or at the end.
+pub fn slotAt(s: *const AppState, found: ?ui.Hits.Found) ?u32 {
+    const h = found orelse return null;
+    const b = &s.board;
+    return switch (h.target) {
+        .card => |card| if (h.y < card_height / 2) card.index else card.index + 1,
+        .column => |c| if (c < b.columns.len) @intCast(b.columns[c].cards.len) else null,
+        else => null,
+    };
+}
+
+/// Where a drop puts the dragged card in your order: its place among the
+/// target column's other cards. Null when the drop doesn't order: not in
+/// your order, into done work, nowhere to land, out of its group, or the
+/// place it has.
+fn lands(s: *const AppState, d: AppState.Drag) ?Landing {
+    const to = d.over orelse return null;
+    if (notInYourOrder(s) != null or to >= s.board.columns.len) return null;
+    const col = s.board.columns[to];
+    // The frame may be of a newer snapshot than the press: where the card
+    // is now, by its ID.
+    const in = indexIn(s, to, d.id);
+    // Into done work, or where it can't go: a move, if any.
+    if (in == null and (col.done or !col.target)) return null;
+    const slot = @min(d.slot orelse return null, col.cards.len);
+    // Sorted by a key then by rank: among the cards of its group.
+    const i = s.snap.find(d.id.slice()) orelse return null;
+    const g = filter.groupIn(s.snap, s.currentQuery(), col.cards, i) orelse return null;
+    if (slot < g.start or slot > g.end) return null;
+    const cards = col.cards[g.start..g.end];
+    const local = slot - g.start;
+    const from = (in orelse return .{ .cards = cards, .at = @intCast(local) }) - g.start;
+    // Its own column: the others close the gap it leaves.
+    const at = if (local > from) local - 1 else local;
+    return if (at == from) null else .{ .cards = cards, .at = @intCast(at) };
+}
+
+/// Where a drop lands: a place among `cards`, the column's in its group.
+const Landing = struct { cards: []const u32, at: u32 };
+
+/// Dropped in its column outside its group, which rank doesn't leave.
+fn outsideGroup(s: *AppState, d: AppState.Drag, column: u16) ?[]const u8 {
+    const q = s.currentQuery();
+    if (q.key == .rank) return null;
+    const cards = s.board.columns[column].cards;
+    const slot = @min(d.slot orelse return null, cards.len);
+    const i = s.snap.find(d.id.slice()) orelse return null;
+    const g = filter.groupIn(s.snap, q, cards, i) orelse return null;
+    if (slot >= g.start and slot <= g.end) return null;
+    return filter.groupName(s.input_arena.allocator(), s.snap, q, i) catch "its group";
+}
+
+/// Where the issue is in a column, if it is there.
+fn indexIn(s: *const AppState, column: u16, id: Id) ?usize {
+    for (s.board.columns[column].cards, 0..) |i, n| {
+        if (id.eql(s.snap.issues[i].id)) return n;
+    }
+    return null;
 }
 
 fn drawCard(
@@ -292,6 +386,10 @@ pub fn key(s: *AppState, k: vaxis.Key) Allocator.Error!AppState.Action {
         b.select(snap, col, std.math.maxInt(i32));
     } else if (k.matches(K.enter, .{})) {
         if (b.selectedIssue()) |i| s.openIssue(snap.issues[i].id);
+    } else if (k.matches('K', .{}) or k.matches(K.up, .{ .shift = true })) {
+        return try reorder(s, -1);
+    } else if (k.matches('J', .{}) or k.matches(K.down, .{ .shift = true })) {
+        return try reorder(s, 1);
     } else if (k.matches('<', .{}) or k.matches('H', .{}) or
         k.matches(K.left, .{ .shift = true }))
     {
@@ -318,6 +416,34 @@ fn move(s: *AppState, delta: i32) AppState.Action {
     // Follow the card.
     b.column = @intCast(to);
     return .{ .move = .{ .id = .of(s.snap.issues[i].id), .column = col.name, .done = col.done } };
+}
+
+/// Why cards can't be ordered by hand now; null when they can.
+fn notInYourOrder(s: *const AppState) ?[]const u8 {
+    const q = s.bd_query;
+    if (filter.byHand(q)) return null;
+    if (q.key == .rank) return "S first: cards are ordered by hand top to bottom";
+    if (q.then == .rank and q.then_reverse)
+        return "B first: cards are ordered by hand top to bottom";
+    return "s → rank orders cards by hand, b → rank within groups";
+}
+
+/// J and K: the selected card a place up or down its column.
+fn reorder(s: *AppState, delta: i32) Allocator.Error!AppState.Action {
+    const b = &s.board;
+    const i = b.selectedIssue() orelse return .none;
+    if (notInYourOrder(s)) |why| return s.noted("{s}", .{why});
+    const cards = b.columns[b.column].cards;
+    const q = s.currentQuery();
+    const g = filter.groupIn(s.snap, q, cards, i).?;
+    const to = @as(i64, b.index) + delta;
+    if (to >= 0 and to < cards.len and (to < g.start or to >= g.end)) return s.noted(
+        "rank orders cards within {s}",
+        .{try filter.groupName(s.input_arena.allocator(), s.snap, q, i)},
+    );
+    const action = try s.reorderStep(cards[g.start..g.end], b.index - g.start, delta);
+    if (action != .none) b.follow = true;
+    return action;
 }
 
 pub fn click(s: *AppState, card: ui.Target.Card, double: bool) AppState.Action {
@@ -354,12 +480,31 @@ pub fn wheel(s: *AppState, found: ?ui.Hits.Found, delta: i32) void {
     );
 }
 
-pub fn drop(s: *AppState, d: AppState.Drag) AppState.Action {
+pub fn drop(s: *AppState, d: AppState.Drag) Allocator.Error!AppState.Action {
     const b = &s.board;
     const to = d.over orelse return .none;
-    if (to == d.card.column or to >= b.columns.len) return .none;
+    if (to >= b.columns.len) return .none;
     const col = b.columns[to];
+    // In the column it is in now, which a reload during the drag may have
+    // changed: an order within it.
+    if (indexIn(s, to, d.id) != null) {
+        if (d.slot == null) return .none;
+        if (notInYourOrder(s)) |why| return s.noted("{s}", .{why});
+        const l = lands(s, d) orelse {
+            const group = outsideGroup(s, d, to) orelse return .none;
+            return s.noted("rank orders cards within {s}", .{group});
+        };
+        b.follow = true;
+        const others = try s.othersBut(l.cards, d.id);
+        return .{ .reorder = .{ .id = d.id, .others = others, .at = l.at } };
+    }
     if (refused(s, col)) return .none;
     b.column = to;
+    if (lands(s, d)) |l| return .{ .reorder = .{
+        .id = d.id,
+        .others = try s.othersBut(l.cards, d.id),
+        .at = l.at,
+        .column = col.name,
+    } };
     return .{ .move = .{ .id = d.id, .column = col.name, .done = col.done } };
 }

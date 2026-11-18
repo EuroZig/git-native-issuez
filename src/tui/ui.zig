@@ -22,11 +22,14 @@ pub const View = enum { list, board, milestones, timeline, milestone, detail };
 /// What a click means. One union for every view, so the hit map is shared.
 pub const Target = union(enum) {
     tab: View,
+    /// A view of the user's, by slot.
+    custom_view: u8,
     command: Command,
     scope: filter.Scope,
     tree,
     sort: filter.SortKey,
     sort_reverse,
+    then_reverse,
     search,
     /// A list row, by position in the rows.
     row: u32,
@@ -74,6 +77,8 @@ pub const Command = enum {
     reload,
     help,
     sort,
+    /// The second key's menu.
+    then_sort,
     quit,
     back,
     ms_edit,
@@ -82,6 +87,12 @@ pub const Command = enum {
     ms_move,
     pick_pane,
     sync_panel,
+    /// The filter and sort shown, as a view of the user's.
+    save_view,
+    /// The view of the user's shown, after asking.
+    delete_view,
+    /// The templates of views.
+    templates,
 };
 
 pub const StarChoice = enum { star, later, never };
@@ -219,6 +230,16 @@ pub const palette = struct {
     pub const label: vaxis.Color = .{ .index = 180 };
     pub const id: vaxis.Color = .{ .index = 109 };
 };
+
+/// `── name ───`, faint: where a group starts, in the list and on the board.
+pub fn divider(line: Window, name: []const u8) void {
+    line.fill(.{ .char = .{ .grapheme = "─", .width = 1 }, .style = .{ .fg = palette.faint } });
+    // Narrow: the rule alone.
+    const w = line.gwidth(name);
+    if (w + 6 > line.width) return;
+    line.child(.{ .x_off = 2, .width = w + 2 }).fill(.{ .style = .{} });
+    _ = text(line, 3, 0, name, .{ .fg = palette.muted });
+}
 
 pub fn healthColor(h: issuez.schedule.Health) vaxis.Color {
     return switch (h) {

@@ -46,6 +46,8 @@ pub const SortKey = enum {
     due,
     start,
     id,
+    /// The order set by hand (`X-Rank`): the board's.
+    rank,
 
     pub fn label(k: SortKey) []const u8 {
         return @tagName(k);
@@ -62,6 +64,7 @@ pub const SortKey = enum {
             .due => "earliest first",
             .start => "earliest first",
             .id => "by ID",
+            .rank => "your order",
         };
     }
 };
@@ -73,6 +76,13 @@ pub const Query = struct {
     /// Flips the key's natural order: newest, highest, A to Z, not done,
     /// earliest due first.
     reverse: bool = false,
+    /// Orders the issues equal in `key`, a group. With it, `updated` and
+    /// `created` are equal on the same local day.
+    then: ?SortKey = null,
+    /// Flips `then`'s natural order.
+    then_reverse: bool = false,
+    /// Seconds the local clock is ahead of UTC: where a day starts.
+    utc_offset_s: i32 = 0,
     /// The list shows sub-issues under their parents.
     tree: bool = false,
     /// Only the issues of one milestone, by effective milestone.
@@ -249,18 +259,120 @@ pub fn matches(snap: *const Snapshot, i: u32, scope: Scope, terms: []const Term)
     return true;
 }
 
+/// Whether `a` and `b` are in one group: equal in the query's key, as
+/// they are compared with a `then`.
+pub fn sameGroup(snap: *const Snapshot, q: Query, a: u32, b: u32) bool {
+    return Order.of(snap, q).keyOrder(q.key, a, b) == .eq;
+}
+
+/// Whether issues share the key's values: titles, IDs and ranks hardly
+/// ever tie, so they make no groups.
+fn ties(key: SortKey) bool {
+    return switch (key) {
+        .priority, .state, .due, .start, .updated, .created => true,
+        .title, .id, .rank => false,
+    };
+}
+
+/// Whether the list and the board show where groups end: with a `then`,
+/// by a key issues share.
+pub fn grouped(q: Query) bool {
+    return q.then != null and !q.tree and ties(q.key);
+}
+
+/// Ordered by hand: sorted by rank, or by a key issues share then by
+/// rank, in the natural order. Then only within the key's groups.
+pub fn byHand(q: Query) bool {
+    if (q.key == .rank) return !q.reverse;
+    return q.then == .rank and !q.then_reverse and ties(q.key);
+}
+
+pub const Range = struct { start: usize, end: usize };
+
+/// Where in `issues`, sorted by `q`, the ones in `i`'s group are; null
+/// when none is. Sorted by rank, all of them.
+pub fn groupIn(snap: *const Snapshot, q: Query, issues: []const u32, i: u32) ?Range {
+    if (q.key == .rank) return .{ .start = 0, .end = issues.len };
+    const start = for (issues, 0..) |x, n| {
+        if (sameGroup(snap, q, x, i)) break n;
+    } else return null;
+    var end = start + 1;
+    while (end < issues.len and sameGroup(snap, q, issues[end], i)) end += 1;
+    return .{ .start = start, .end = end };
+}
+
+/// What the issues of `i`'s group share, for its divider.
+pub fn groupName(
+    arena: Allocator,
+    snap: *const Snapshot,
+    q: Query,
+    i: u32,
+) Allocator.Error![]const u8 {
+    const issue = snap.issues[i];
+    const print = std.fmt.allocPrint;
+    const day = fields_fmt.Date.fromUnixLocal;
+    const off = q.utc_offset_s;
+    return switch (q.key) {
+        .priority => issue.field("Priority") orelse "no priority",
+        .state => if (snap.isDone(i)) "done" else snap.proj.workflow(i) orelse "no state",
+        .due => if (issue.due_date) |d| try print(arena, "due {f}", .{d}) else "no due date",
+        .start => if (issue.start_date orelse issue.due_date) |d|
+            try print(arena, "from {f}", .{d})
+        else
+            "no dates",
+        .updated => try print(arena, "updated {f}", .{day(issue.updated, off)}),
+        .created => try print(arena, "created {f}", .{day(issue.created, off)}),
+        .title, .id, .rank => "",
+    };
+}
+
 const Order = struct {
     snap: *const Snapshot,
     key: SortKey,
     reverse: bool,
+    then: ?SortKey = null,
+    then_reverse: bool = false,
+    utc_offset_s: i32 = 0,
 
-    /// Negative: `a` comes first, in the key's natural order.
+    fn of(snap: *const Snapshot, q: Query) Order {
+        return .{
+            .snap = snap,
+            .key = q.key,
+            .reverse = q.reverse,
+            .then = q.then,
+            .then_reverse = q.then_reverse,
+            .utc_offset_s = q.utc_offset_s,
+        };
+    }
+
+    /// `.lt`: `a` comes first. The key, then `then`, each in its own
+    /// direction; ties in the direction of the last.
     fn compare(o: Order, a: u32, b: u32) std.math.Order {
+        const first = o.keyOrder(o.key, a, b);
+        if (first != .eq) return flip(first, o.reverse);
+        const then = o.then orelse return flip(o.ties(a, b), o.reverse);
+        return flip(o.keyOrder(then, a, b).differ() orelse o.ties(a, b), o.then_reverse);
+    }
+
+    fn flip(ord: std.math.Order, reverse: bool) std.math.Order {
+        return if (reverse) ord.invert() else ord;
+    }
+
+    /// Ties: the most recently touched first.
+    fn ties(o: Order, a: u32, b: u32) std.math.Order {
         const x = o.snap.issues[a];
         const y = o.snap.issues[b];
-        const ord: std.math.Order = switch (o.key) {
-            .updated => std.math.order(y.updated, x.updated),
-            .created => std.math.order(y.created, x.created),
+        return std.math.order(y.updated, x.updated).differ() orelse std.mem.order(u8, x.id, y.id);
+    }
+
+    /// Negative: `a` comes first, in the key's natural order. Times by
+    /// local day when there is a `then` to order the day's issues.
+    fn keyOrder(o: Order, key: SortKey, a: u32, b: u32) std.math.Order {
+        const x = o.snap.issues[a];
+        const y = o.snap.issues[b];
+        return switch (key) {
+            .updated => o.timeOrder(y.updated, x.updated),
+            .created => o.timeOrder(y.created, x.created),
             .priority => std.math.order(rank(y), rank(x)),
             .title => titleOrder(x.title, y.title),
             .state => std.math.order(@intFromBool(o.snap.isDone(a)), @intFromBool(o.snap.isDone(b)))
@@ -269,15 +381,20 @@ const Order = struct {
             .due => dateOrder(x.due_date, y.due_date),
             .start => dateOrder(x.start_date orelse x.due_date, y.start_date orelse y.due_date),
             .id => std.mem.order(u8, x.id, y.id),
+            // Equal keys go by ID (format.md §3), whatever else differs.
+            .rank => issuez.order.compare(.of(x), .of(y)),
         };
-        // Ties: the most recently touched first.
-        return ord.differ() orelse std.math.order(y.updated, x.updated).differ() orelse
-            std.mem.order(u8, x.id, y.id);
+    }
+
+    fn timeOrder(o: Order, a: i64, b: i64) std.math.Order {
+        if (o.then == null) return std.math.order(a, b);
+        const da = fields_fmt.Date.fromUnixLocal(a, o.utc_offset_s);
+        const db = fields_fmt.Date.fromUnixLocal(b, o.utc_offset_s);
+        return da.order(db);
     }
 
     fn lessThan(o: Order, a: u32, b: u32) bool {
-        const c = o.compare(a, b);
-        return if (o.reverse) c == .gt else c == .lt;
+        return o.compare(a, b) == .lt;
     }
 
     /// In the configured order; states that aren't configured after, by
@@ -325,7 +442,7 @@ fn sort(snap: *const Snapshot, items: []u32, q: Query) void {
     stableSort(
         u32,
         items,
-        Order{ .snap = snap, .key = q.key, .reverse = q.reverse },
+        Order.of(snap, q),
         Order.lessThan,
     );
 }

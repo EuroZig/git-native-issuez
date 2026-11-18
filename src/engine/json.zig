@@ -182,6 +182,7 @@ pub fn issue(s: *Stringify, arena: Allocator, i: Issue, options: IssueOptions) E
     try s.objectField("estimate_minutes");
     try s.write(i.estimate_minutes);
     try optional(s, "workflow", i.workflow);
+    try optional(s, "rank", i.rank);
     try field(s, "locked", i.locked);
     try optional(s, "lock_reason", i.lock_reason);
     try optional(s, "ref", i.ref);
@@ -420,11 +421,11 @@ test "the documented keys, in order" {
     // docs/json.md promises these. Adding a key means adding it here and
     // there; renaming or removing one breaks scripts.
     const issue_keys = [_][]const u8{
-        "id",     "short_id",    "number",      "title",     "state",            "deleted",
-        "labels", "assignee",    "assignees",   "priority",  "milestone",        "milestone_id",
-        "parent", "blocked_by",  "start",       "due",       "estimate_minutes", "workflow",
-        "locked", "lock_reason", "ref",         "author",    "created",          "updated",
-        "fields", "conflicts",   "attachments", "reactions", "closed",
+        "id",      "short_id",   "number",      "title",       "state",            "deleted",
+        "labels",  "assignee",   "assignees",   "priority",    "milestone",        "milestone_id",
+        "parent",  "blocked_by", "start",       "due",         "estimate_minutes", "workflow",
+        "rank",    "locked",     "lock_reason", "ref",         "author",           "created",
+        "updated", "fields",     "conflicts",   "attachments", "reactions",        "closed",
     };
     const projection_keys = [_][]const u8{
         "effective_milestone_id", "effective_workflow", "progress", "blocked", "problems",
@@ -531,7 +532,7 @@ test "values: nulls, dates, times with the author's offset" {
         if (std.mem.eql(u8, i.title, "Bare")) {
             for ([_][]const u8{
                 "assignee", "priority", "milestone",        "milestone_id", "parent",
-                "start",    "due",      "estimate_minutes", "workflow",
+                "start",    "due",      "estimate_minutes", "workflow",     "rank",
             }) |k| try testing.expect(o.get(k).? == .null);
             try testing.expectEqual(@as(usize, 0), o.get("labels").?.array.items.len);
             try testing.expectEqual(@as(usize, 0), o.get("fields").?.object.count());

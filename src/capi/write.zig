@@ -52,6 +52,7 @@ fn verbsOf(list: api.OpList, target: u32) ?[]const Verb {
             set_only,
         .original_author, .original_id => if (milestone) null else set_only,
         .prepared_attachment => if (milestone) null else &.{.add},
+        .rank_before, .rank_after => if (update) set_only else null,
         .edit_comment,
         .expect_edits,
         .delete_comment,
@@ -70,6 +71,7 @@ fn verbsOf(list: api.OpList, target: u32) ?[]const Verb {
         .title, .description, .comment, .state, .fixed_by, .release, .reason => set_only,
         .locked, .deleted, .number, .extra => set_only,
         .ref, .workflow_state, .priority, .estimate, .parent, .start_date, .due_date => set_clear,
+        .rank => set_clear,
         .labels, .blocked_by, .assignees => &.{ .add, .remove, .clear },
         .milestone => &.{ .set, .clear, .inherit },
         .attachments => add_remove,
@@ -130,6 +132,11 @@ fn checkOps(a: Allocator, list: api.OpList, ops: []const api.Op, problems: *Prob
             ),
             .ref => if (!fields_fmt.isRefName(s))
                 try check.addValue(.bad_format, s, "not a branch or tag name"),
+            .rank => if (!issuez.format.rank.valid(s)) try check.addValue(
+                .bad_format,
+                s,
+                "a rank is " ++ issuez.format.rank.rule,
+            ),
             .locked, .fixed_by, .release, .reason => if (multiline)
                 try check.addValue(.newline, s, "must be one line"),
             .labels => labels_fmt.validate(s) catch
@@ -288,6 +295,8 @@ const Plan = struct {
     /// REACTIONS ADD or REMOVE, on REACTION_TARGET or the issue.
     reaction: ?struct { emoji: []const u8, present: bool } = null,
     reaction_target: ?Oid = null,
+    /// ISSUEZ_OPT_RANK_BEFORE / RANK_AFTER: placed beside this issue.
+    beside: ?struct { id: []const u8, after: bool } = null,
     /// The op each field came from, -1 for none.
     op_of: [32]i64 = @splat(-1),
 
@@ -350,6 +359,15 @@ fn plan(a: Allocator, list: api.OpList, ops: []const api.Op, problems: *Problems
                     };
                 },
                 .reaction_target => p.reaction_target = rt.oidFrom(op.oid),
+                .rank_before, .rank_after => {
+                    const check = whole.on(.rank, index);
+                    if (!uuid_fmt.isCanonical(s))
+                        try check.addValue(.bad_format, s, "references are full UUIDs");
+                    if (p.beside != null)
+                        try check.add(.incompatible, "one RANK_BEFORE or RANK_AFTER");
+                    p.beside = .{ .id = s, .after = op.target == @backingInt(Opt.rank_after) };
+                    p.has_fields = true;
+                },
                 else => unreachable,
             }
             continue;
@@ -448,6 +466,7 @@ fn plan(a: Allocator, list: api.OpList, ops: []const api.Op, problems: *Problems
                 if (op.num != 0 and s.len > 0) both(&p.edit.lock_reason, &p.create.lock_reason, s);
             },
             .ref => setText(&p.edit.ref, &p.create.ref, verb, s),
+            .rank => setText(&p.edit.rank, &p.create.rank, verb, s),
             .extra => try p.extra.append(a, .{ .key = op.name.slice(), .value = s }),
             .reactions => {
                 if (!fields_fmt.isEmoji(s)) try check.addValue(
@@ -1091,6 +1110,7 @@ pub fn issuez_issue_update(
         .{ .target = ce.target, .event = if (ce.delete) .delete else .restore }
     else
         null;
+    if (p.beside) |b| return besideWrite(&c, &w, o, err, p, ident, ref_name, old_tip, b);
     const receipt = engine.update(a, ref_name, .{
         .edit = p.edit,
         .comment_event = comment_event,
@@ -1120,6 +1140,46 @@ pub fn issuez_issue_update(
     const slot = w.receipt.?;
     const write = makeWrite(&c, slot, .issue, ident, parent, new_tip, entry_kind, changes, w.who);
     return w.give(o, write);
+}
+
+/// An update placed beside another issue in your order
+/// (`Repo.reorderBeside`): the fields it changes and the key, in one commit.
+fn besideWrite(
+    c: *Call,
+    w: *Begun,
+    out: *?*api.Write,
+    err: ?*?*api.Error,
+    p: *Plan,
+    ident: []const u8,
+    ref_name: []const u8,
+    old_tip: Oid,
+    beside: @FieldType(Plan, "beside"),
+) Code {
+    const at = beside.?;
+    const others = p.edit_comment != null or p.comment_event != null or p.reaction != null or
+        p.deleted != null or p.edit.rank != null;
+    if (others) return rt.fail(
+        err,
+        .e_invalid_value,
+        "RANK_BEFORE and RANK_AFTER go with fields only, not RANK, comment events, " ++
+            "reactions or DELETED",
+        .{},
+    );
+    if (std.mem.eql(u8, at.id, ident))
+        return rt.fail(err, .e_invalid_value, "an issue goes beside another one", .{});
+    const anchor_ref = c.issueRef(at.id) catch return rt.oom(err);
+    const engine = c.engine();
+    const a = c.arena();
+    const result = engine.reorderBeside(a, ref_name, p.edit, anchor_ref, at.after, .{}) catch |e|
+        // A missing anchor is the anchor's problem.
+        return writeFailed(c, err, e, p, if (e == error.IssueDisappeared) at.id else ident);
+    c.skipped = false;
+    const after_obj = loadObjAt(c, ident, result.tip) catch null;
+    const changes = if (after_obj) |x| entryChanges(x, result.tip) else &.{};
+    const parent = parentOf(c, result.tip) orelse old_tip;
+    const slot = w.receipt.?;
+    const write = makeWrite(c, slot, .issue, ident, parent, result.tip, .update, changes, w.who);
+    return w.give(out, write);
 }
 
 /// The first parent of `commit`, when it can be read.

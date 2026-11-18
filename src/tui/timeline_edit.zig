@@ -27,6 +27,8 @@ const none = std.math.maxInt(u32);
 /// Where the user was going when the draft stopped them.
 pub const Leave = union(enum) {
     view: ui.View,
+    /// A view of the user's, by slot.
+    custom: u8,
     quit,
     issue: Id,
     milestone: filter.MilestoneScope,

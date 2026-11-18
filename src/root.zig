@@ -34,6 +34,7 @@ pub const format = struct {
     pub const dates = @import("format/dates.zig");
     pub const attachment = @import("format/attachment.zig");
     pub const time = @import("format/time.zig");
+    pub const rank = @import("format/rank.zig");
 };
 
 pub const model = struct {
@@ -69,6 +70,8 @@ pub const push_check = @import("engine/push_check.zig");
 pub const PushCheck = push_check.PushCheck;
 pub const local_time = @import("engine/local_time.zig");
 pub const schedule = @import("engine/schedule.zig");
+/// Placing an issue in an order set by hand (`X-Rank`).
+pub const order = @import("engine/order.zig");
 pub const Settings = settings.Settings;
 /// The 7-character ID upstream prints, of an issue or milestone ID.
 pub const shortId = format.uuid.shortId;
@@ -112,6 +115,7 @@ test {
     _ = format.dates;
     _ = format.attachment;
     _ = format.time;
+    _ = format.rank;
     _ = model.issue;
     _ = engine;
     _ = sync;
@@ -132,4 +136,5 @@ test {
     _ = changes;
     _ = local_time;
     _ = schedule;
+    _ = order;
 }

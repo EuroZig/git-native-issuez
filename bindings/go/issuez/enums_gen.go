@@ -276,6 +276,8 @@ func (v Sort) String() string {
 		return "comments"
 	case SortState:
 		return "state"
+	case SortRank:
+		return "rank"
 	}
 	return "Sort(" + strconv.Itoa(int(v)) + ")"
 }

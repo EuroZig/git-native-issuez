@@ -114,27 +114,27 @@ pub fn check(
     t: Timing,
 ) Check {
     const file = user_state.path(io, a, environ_map) orelse return .off;
-    var state = user_state.load(io, a, file) orelse return .off;
-    const r = &state.star;
-    switch (decide(r.*, now_s, t)) {
+    const state = user_state.load(io, a, file) orelse return .off;
+    var r = state.star;
+    switch (decide(r, now_s, t)) {
         .wait => return .off,
         .start_clock => {
             r.first_seen = now_s;
-            _ = user_state.save(io, a, file, state);
+            _ = saveRecord(io, a, file, r);
             // Without days to settle, it asks at once.
-            if (decide(r.*, now_s, t) != .ask) return .off;
+            if (decide(r, now_s, t) != .ask) return .off;
         },
         .ask => {},
     }
     const gh = ghStatus(io, a, environ_map);
     if (gh == .starred) {
         r.done = .starred;
-        _ = user_state.save(io, a, file, state);
+        _ = saveRecord(io, a, file, r);
         return .off;
     }
     r.last_shown = now_s;
     r.shown += 1;
-    if (!user_state.save(io, a, file, state)) return .off;
+    if (!saveRecord(io, a, file, r)) return .off;
     return if (gh == .not_starred) .ask_gh else .ask_browser;
 }
 
@@ -156,9 +156,20 @@ pub fn decline(io: std.Io, a: Allocator, environ_map: *const Environ.Map) void {
 
 fn setDone(io: std.Io, a: Allocator, environ_map: *const Environ.Map, done: Record.Done) void {
     const file = user_state.path(io, a, environ_map) orelse return;
-    var state = user_state.load(io, a, file) orelse return;
-    state.star.done = done;
-    _ = user_state.save(io, a, file, state);
+    const state = user_state.load(io, a, file) orelse return;
+    var r = state.star;
+    r.done = done;
+    _ = saveRecord(io, a, file, r);
+}
+
+/// Into the file as it is now: the views may have changed since it was
+/// read.
+fn saveRecord(io: std.Io, a: Allocator, file: []const u8, r: Record) bool {
+    return user_state.update(io, a, file, r, struct {
+        fn set(record: Record, _: Allocator, state: *user_state.State) Allocator.Error!void {
+            state.star = record;
+        }
+    }.set);
 }
 
 const GhStatus = enum { starred, not_starred, unusable };

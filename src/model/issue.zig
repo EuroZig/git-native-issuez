@@ -20,6 +20,7 @@ const object = @import("../backend/object.zig");
 const trailers = @import("../format/trailers.zig");
 const labels_fmt = @import("../format/labels.zig");
 const fields_fmt = @import("../format/fields.zig");
+const rank_fmt = @import("../format/rank.zig");
 const uuid_fmt = @import("../format/uuid.zig");
 const attachment_fmt = @import("../format/attachment.zig");
 const core_fmt = @import("../format/core.zig");
@@ -246,6 +247,8 @@ pub const Extensions = struct {
     estimate_minutes: ?u32 = null,
     /// As written. The projection applies the default for open issues.
     workflow: ?[]const u8 = null,
+    /// `X-Rank`: its place in an order set by hand (`format.rank`).
+    rank: ?[]const u8 = null,
     milestone_id: ?[]const u8 = null,
     milestone_mode: ?fields_fmt.MilestoneMode = null,
     invalid_fields: []const Field = &.{},
@@ -301,6 +304,8 @@ pub const Issue = struct {
     estimate_minutes: ?u32 = null,
     /// As written. The projection applies the default for open issues.
     workflow: ?[]const u8 = null,
+    /// `X-Rank`: its place in an order set by hand (`format.rank`).
+    rank: ?[]const u8 = null,
     milestone_id: ?[]const u8 = null,
     milestone_mode: ?fields_fmt.MilestoneMode = null,
     /// Extension values that don't parse.
@@ -610,6 +615,7 @@ pub const restated_extensions = [_][]const u8{
     "X-Due-Date",
     "X-Estimate-Minutes",
     "X-Workflow-State",
+    "X-Rank",
     "X-Milestone-Id",
     "X-Milestone-Mode",
     "X-Deleted",
@@ -1466,6 +1472,11 @@ fn extensions(
             try invalid.append(arena, .{ .key = "X-Workflow-State", .value = v });
         }
     }
+    if (value(s, "X-Rank")) |v| {
+        if (rank_fmt.valid(v)) ext.rank = v else {
+            try invalid.append(arena, .{ .key = "X-Rank", .value = v });
+        }
+    }
     ext.invalid_fields = invalid.items;
     return ext;
 }
@@ -1513,6 +1524,7 @@ const scalar_keys = [_][]const u8{
     "X-Due-Date",
     "X-Estimate-Minutes",
     "X-Workflow-State",
+    "X-Rank",
     "X-Deleted",
     "X-Milestone-Id",
     "X-Milestone-Mode",
@@ -2275,6 +2287,30 @@ test "invalid extension values" {
     try testing.expectEqualStrings("X-Deleted", m.invalid_fields[2].key);
     const cleared = try d.issue(try d.add(&.{maybe}, 300, "Undo\n\nX-Deleted:\n"));
     try testing.expectEqual(@as(usize, 2), cleared.invalid_fields.len);
+}
+
+test "X-Rank: concurrent moves of one issue resolve to the later, merges restate it" {
+    var d: TestDag = .{};
+    defer d.deinit();
+    const root = try d.add(&.{}, 100, "T\n\nState: open\nX-Rank: i\nFormat-Version: 1\n");
+    try testing.expectEqualStrings("i", (try d.issue(root)).rank.?);
+    const left = try d.add(&.{root}, 200, "L\n\nX-Rank: 9\n");
+    const right = try d.add(&.{root}, 300, "R\n\nX-Rank: r\n");
+    const merged = try d.issue(try d.add(&.{ left, right }, 400, "Merge issue\n"));
+    try testing.expectEqualStrings("r", merged.rank.?);
+    const restated = try restatedTrailers(d.arena(), merged);
+    var found = false;
+    for (restated.items) |t| if (std.mem.eql(u8, t.key, "X-Rank")) {
+        try testing.expectEqualStrings("r", t.value);
+        found = true;
+    };
+    try testing.expect(found);
+    // Not a key: reported, kept as written; empty clears it.
+    const bad = try d.issue(try d.add(&.{root}, 500, "B\n\nX-Rank: a0\n"));
+    try testing.expect(bad.rank == null);
+    try testing.expectEqualStrings("X-Rank", bad.invalid_fields[0].key);
+    const none = try d.issue(try d.add(&.{root}, 600, "C\n\nX-Rank: \n"));
+    try testing.expect(none.rank == null and none.invalid_fields.len == 0);
 }
 
 test "an X-Ref git refuses reads as invalid, kept as written" {

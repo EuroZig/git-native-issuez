@@ -883,6 +883,50 @@ test "ls --conflicts" {
     try testing.expectEqualStrings("", none.stdout);
 }
 
+test "your order: --rank, --before and --after, ls --sort rank" {
+    var sb = try Sandbox.init(.{});
+    defer sb.deinit();
+    const a = try createdId(try gitIssue(&sb, &.{ "create", "A", "--rank", "m" }));
+    const b = try createdId(try gitIssue(&sb, &.{ "create", "B" }));
+    const c = try createdId(try gitIssue(&sb, &.{ "create", "C" }));
+    // Done work is another column: --before it leaves the open ones alone.
+    const done = try createdId(try gitIssue(&sb, &.{ "create", "Done" }));
+    try expectSuccess(try gitIssue(&sb, &.{ "close", done }));
+
+    try expectSuccess(try gitIssue(&sb, &.{ "edit", c, "--before", a }));
+    // After B, which has no key: B gets one too, after A's.
+    try expectSuccess(try gitIssue(&sb, &.{ "edit", a, "--after", b, "-p", "high" }));
+    const listed = try gitIssue(&sb, &.{ "ls", "--sort", "rank", "-f", "oneline" });
+    try expectSuccess(listed);
+    const want = try std.fmt.allocPrint(sb.arena(), "{s} open C\n{s} open B\n{s} open A\n", .{
+        c[0..7],
+        b[0..7],
+        a[0..7],
+    });
+    try testing.expectEqualStrings(want, listed.stdout);
+    const shown = try gitIssue(&sb, &.{ "show", a });
+    try testing.expect(std.mem.find(u8, shown.stdout, "Priority: high") != null);
+    try testing.expect(std.mem.find(u8, shown.stdout, "Rank:    ") != null);
+
+    try expectFailure(
+        try gitIssue(&sb, &.{ "edit", a, "--rank", "a0" }),
+        1,
+        "error: --rank takes 0-9 and a-z, at most 128 bytes, not ending in 0, not 'a0'\n",
+    );
+    try expectFailure(
+        try gitIssue(&sb, &.{ "edit", a, "--before", b, "--rank", "b" }),
+        1,
+        "error: --before and --after set the rank themselves\n",
+    );
+    // A deleted anchor has no place: refused, not to the top.
+    try expectSuccess(try gitIssue(&sb, &.{ "delete", b }));
+    const gone = try gitIssue(&sb, &.{ "edit", c, "--after", b });
+    try testing.expectEqual(@as(u8, 1), gone.code);
+    try expectSuccess(try gitIssue(&sb, &.{ "edit", a, "--no-rank" }));
+    const json = try gitIssue(&sb, &.{ "show", a, "--json" });
+    try testing.expect(std.mem.find(u8, json.stdout, "\"rank\": null") != null);
+}
+
 test "lifecycle commands" {
     var sb = try Sandbox.init(.{});
     defer sb.deinit();
@@ -1243,5 +1287,43 @@ test "dates relative to today, in the local time zone" {
     if (!std.mem.eql(u8, ms_due, tomorrow)) try testing.expectEqualStrings(
         try in(arena, 1),
         ms_due,
+    );
+}
+
+test "show renders Markdown only when asked or on a terminal" {
+    var sb = try Sandbox.init(.{});
+    defer sb.deinit();
+    const id = try createdId(try gitIssue(&sb, &.{
+        "create", "Markdown", "-m", "# Plan\n\nSome **bold** text.\n\n[WIP",
+    }));
+    try expectSuccess(try gitIssue(&sb, &.{ "comment", id, "-m", "A *note*\n\n- one\n- two" }));
+
+    // A pipe gets the text as it is.
+    const piped = try gitIssue(&sb, &.{ "show", id });
+    try expectSuccess(piped);
+    try testing.expect(std.mem.find(u8, piped.stdout, "Some **bold** text.") != null);
+    try testing.expect(std.mem.find(u8, piped.stdout, "\x1b[") == null);
+
+    try sb.env.put("COLUMNS", "40");
+    const styled = try gitIssue(&sb, &.{ "show", id, "--color", "always" });
+    try expectSuccess(styled);
+    try testing.expect(std.mem.find(u8, styled.stdout, "**") == null);
+    try testing.expect(std.mem.find(u8, styled.stdout, "\x1b[0;1mbold\x1b[0m") != null);
+    try testing.expect(std.mem.find(u8, styled.stdout, "[WIP\n") != null);
+    // Comments keep their indent.
+    try testing.expect(std.mem.find(u8, styled.stdout, "\n  A \x1b[0;3mnote\x1b[0m\n") != null);
+
+    const raw = try gitIssue(&sb, &.{ "show", id, "--color", "always", "--raw" });
+    try testing.expectEqualStrings(piped.stdout, raw.stdout);
+
+    // An update's field lines stay, as written.
+    try expectSuccess(try gitIssue(&sb, &.{ "edit", id, "--priority", "high" }));
+    const update = try gitIssue(&sb, &.{ "show", id, "--color", "always" });
+    try testing.expect(std.mem.find(u8, update.stdout, "\n  Priority: high\n") != null);
+
+    try expectFailure(
+        try gitIssue(&sb, &.{ "show", id, "--color", "sometimes" }),
+        1,
+        "error: --color takes auto, always or never\n",
     );
 }

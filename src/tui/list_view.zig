@@ -28,6 +28,9 @@ pub const State = struct {
     /// The last frame's.
     rows: []const filter.Row = &.{},
     visible: u16 = 1,
+    /// The last frame's: the first row shown with the last one in view,
+    /// dividers counted.
+    max_scroll: u32 = 0,
 
     pub fn selectedIssue(l: *const State) ?u32 {
         if (l.selected >= l.rows.len) return null;
@@ -35,7 +38,7 @@ pub const State = struct {
     }
 
     pub fn scrollBy(l: *State, delta: i32) void {
-        const max: i64 = @intCast(l.rows.len -| l.visible);
+        const max: i64 = l.max_scroll;
         l.scroll = @intCast(std.math.clamp(@as(i64, l.scroll) + delta, 0, max));
     }
 
@@ -92,6 +95,15 @@ pub fn drawFilterBar(s: *AppState, f: ui.Frame, bar: ui.Window, tree: bool) Allo
     };
     try l.button(sort_label, .{ .command = .sort }, ui.buttonStyle(false));
     try l.button(if (q.reverse) "↑" else "↓", .sort_reverse, ui.buttonStyle(false));
+    l.x += 1;
+    l.text("then ", .{ .fg = palette.muted, .bg = palette.panel_bg });
+    const then_label = if (q.then) |t| switch (t) {
+        inline else => |k| @tagName(k) ++ " ▾",
+    } else "…";
+    try l.button(then_label, .{ .command = .then_sort }, ui.buttonStyle(false));
+    if (q.then != null) {
+        try l.button(if (q.then_reverse) "↑" else "↓", .then_reverse, ui.buttonStyle(false));
+    }
     return l.x;
 }
 
@@ -143,13 +155,32 @@ pub fn drawTable(s: *AppState, f: ui.Frame, win: ui.Window, t: Table) Allocator.
     const head = win.child(.{ .height = 1 });
     const lay = Layout.of(win.width);
     try drawHeader(f, head, lay, t.query);
+    var q = t.query;
+    q.utc_offset_s = s.utc_offset_s;
+    const grouped = filter.grouped(q);
 
     const body = win.child(.{ .y_off = 1, .height = win.height -| 1 });
     if (t.drop) body.fill(.{ .style = .{ .bg = palette.hover_bg } });
     l.visible = @max(body.height, 1);
+    const follow = l.follow;
+    const was = l.scroll;
     ui.settleScroll(&l.scroll, &l.follow, l.selected, l.rows.len, l.visible);
+    l.max_scroll = @intCast(l.rows.len -| l.visible);
+    // Dividers take lines of their own: fewer rows fit, so the scroll may
+    // go further than settleScroll lets it.
+    if (grouped) {
+        l.max_scroll = maxScroll(snap, q, l.rows, body.height);
+        if (follow) {
+            while (l.scroll < l.selected and
+                linesFor(snap, q, l.rows, l.scroll, l.selected, body.height) > body.height)
+                l.scroll += 1;
+        } else l.scroll = was;
+        l.scroll = @min(l.scroll, l.max_scroll);
+    }
 
     if (t.pane) |p| try f.hit(body, .{ .mpane = p });
+    // Where a dragged row lands in your order.
+    const lands = if (s.drag) |d| landsAt(s, d) else null;
     if (l.rows.len == 0) {
         const msg = t.empty orelse if (snap.issues.len == 0) "No issues yet." else "No issues " ++
             "match the filter.";
@@ -169,15 +200,26 @@ pub fn drawTable(s: *AppState, f: ui.Frame, win: ui.Window, t: Table) Allocator.
     }
 
     var y: u16 = 0;
-    while (y < body.height and l.scroll + y < l.rows.len) : (y += 1) {
-        const index = l.scroll + y;
+    var index = l.scroll;
+    while (y < body.height and index < l.rows.len) : ({
+        y += 1;
+        index += 1;
+    }) {
+        if (grouped and startsGroup(snap, q, l.rows, index)) {
+            ui.divider(
+                body.child(.{ .y_off = y, .width = body.width -| 1, .height = 1 }),
+                try filter.groupName(f.arena, snap, q, l.rows[index].issue),
+            );
+            y += 1;
+            if (y >= body.height) break;
+        }
         const row_win = body.child(.{ .y_off = y, .height = 1 });
         const r = l.rows[index];
         const marked = for (t.marks) |*m| {
             if (m.eql(snap.issues[r.issue].id)) break true;
         } else false;
-        const dragged = if (s.drag) |d| d.moved and t.pane != null and d.card.column == t.pane.? and
-            d.card.index == index else false;
+        const dragged = if (s.drag) |d| d.moved and d.card.index == index and
+            (if (t.pane) |p| d.card.column == p else s.view == .list) else false;
         drawRow(
             s,
             f,
@@ -195,6 +237,10 @@ pub fn drawTable(s: *AppState, f: ui.Frame, win: ui.Window, t: Table) Allocator.
             row_win,
             if (t.pane) |p| .{ .mrow = .{ .column = p, .index = index } } else .{ .row = index },
         );
+        if (t.pane == null and lands == index) row_win.writeCell(0, 0, .{
+            .char = .{ .grapheme = "▶" },
+            .style = .{ .fg = palette.accent, .bold = true },
+        });
     }
     // Scroll position.
     if (l.rows.len > body.height and body.height > 0) {
@@ -255,11 +301,57 @@ fn drawHeader(f: ui.Frame, head: ui.Window, lay: Layout, q: filter.Query) Alloca
                 0,
                 if (q.reverse) " ↑" else " ↓",
                 .{ .fg = palette.accent },
+            ) else if (k == q.then) cx += ui.text(
+                cell,
+                cx,
+                0,
+                if (q.then_reverse) " ↑" else " ↓",
+                .{ .fg = palette.muted },
             );
             try f.hit(cell, .{ .sort = k });
         }
         x += w;
     }
+}
+
+/// The first row shown of its group: a divider above it.
+fn startsGroup(
+    snap: *const Snapshot,
+    q: filter.Query,
+    rows: []const filter.Row,
+    index: usize,
+) bool {
+    return index == 0 or !filter.sameGroup(snap, q, rows[index - 1].issue, rows[index].issue);
+}
+
+/// Screen lines from `from` to `to`, both rows and the dividers above them;
+/// counted up to just past `cap`.
+fn linesFor(
+    snap: *const Snapshot,
+    q: filter.Query,
+    rows: []const filter.Row,
+    from: usize,
+    to: usize,
+    cap: usize,
+) usize {
+    var n: usize = 0;
+    for (from..to + 1) |i| {
+        n += @as(usize, 1) + @intFromBool(startsGroup(snap, q, rows, i));
+        if (n > cap) break;
+    }
+    return n;
+}
+
+/// The first row from which the rest fit in `height` lines, dividers
+/// counted.
+fn maxScroll(snap: *const Snapshot, q: filter.Query, rows: []const filter.Row, height: u16) u32 {
+    var lines: usize = 0;
+    var i = rows.len;
+    while (i > 0) : (i -= 1) {
+        lines += @as(usize, 1) + @intFromBool(startsGroup(snap, q, rows, i - 1));
+        if (lines > height) break;
+    }
+    return @intCast(i);
 }
 
 const RowLook = struct {
@@ -399,7 +491,107 @@ fn drawRow(
 }
 
 pub fn key(s: *AppState, k: vaxis.Key) Allocator.Error!AppState.Action {
+    if (k.matches('K', .{}) or k.matches(K.up, .{ .shift = true })) return reorder(s, -1);
+    if (k.matches('J', .{}) or k.matches(K.down, .{ .shift = true })) return reorder(s, 1);
     return tableKey(s, &s.list, k) orelse .none;
+}
+
+/// Why rows can't be ordered by hand now; null when they can.
+fn notInYourOrder(s: *const AppState) ?[]const u8 {
+    const q = s.query;
+    if (!filter.byHand(q)) {
+        if (q.key == .rank) return "S first: rows are ordered by hand top to bottom";
+        if (q.then == .rank and q.then_reverse)
+            return "B first: rows are ordered by hand top to bottom";
+        return "s → rank orders rows by hand, b → rank within groups";
+    }
+    if (q.tree) return "t first: rows are ordered by hand without the tree";
+    return null;
+}
+
+/// The rows' issues, in the input arena.
+fn rowIssues(s: *AppState) Allocator.Error![]const u32 {
+    const out = try s.input_arena.allocator().alloc(u32, s.list.rows.len);
+    for (s.list.rows, out) |r, *i| i.* = r.issue;
+    return out;
+}
+
+/// The rows of `i`'s group, sorted by a key then by rank: where they are.
+fn groupOf(s: *const AppState, i: u32) filter.Range {
+    const rows = s.list.rows;
+    const q = s.currentQuery();
+    if (q.key == .rank) return .{ .start = 0, .end = rows.len };
+    var start: usize = 0;
+    while (start < rows.len and !filter.sameGroup(s.snap, q, rows[start].issue, i)) start += 1;
+    var end = start;
+    while (end < rows.len and filter.sameGroup(s.snap, q, rows[end].issue, i)) end += 1;
+    return .{ .start = start, .end = end };
+}
+
+/// Why a row can't go to `to`: out of its group, which rank doesn't leave.
+fn outsideGroup(s: *AppState, i: u32, to: usize) Allocator.Error!?[]const u8 {
+    const g = groupOf(s, i);
+    if (to >= g.start and to < g.end) return null;
+    return try filter.groupName(s.input_arena.allocator(), s.snap, s.currentQuery(), i);
+}
+
+/// Where the issue's row is now, if it is shown.
+fn rowOf(s: *const AppState, id: Id) ?usize {
+    for (s.list.rows, 0..) |r, n| if (id.eql(s.snap.issues[r.issue].id)) return n;
+    return null;
+}
+
+/// J and K: the selected row a place down or up.
+fn reorder(s: *AppState, delta: i32) Allocator.Error!AppState.Action {
+    const l = &s.list;
+    const i = l.selectedIssue() orelse return .none;
+    if (notInYourOrder(s)) |why| return s.noted("{s}", .{why});
+    const to = @as(i64, l.selected) + delta;
+    if (to >= 0 and to < l.rows.len) if (try outsideGroup(s, i, @intCast(to))) |group|
+        return s.noted("rank orders rows within {s}", .{group});
+    const g = groupOf(s, i);
+    const rows = (try rowIssues(s))[g.start..g.end];
+    const action = try s.reorderStep(rows, l.selected - g.start, delta);
+    if (action != .none) l.follow = true;
+    return action;
+}
+
+/// The row a drag on the list is over.
+pub fn slotAt(found: ?ui.Hits.Found) ?u32 {
+    const h = found orelse return null;
+    return switch (h.target) {
+        .row => |r| r,
+        else => null,
+    };
+}
+
+/// Where the dragged row would go: the place of the row under the
+/// pointer. Null when it wouldn't move or the list isn't in your order.
+fn landsAt(s: *const AppState, d: AppState.Drag) ?u32 {
+    if (s.view != .list or !d.moved or notInYourOrder(s) != null) return null;
+    const slot = d.slot orelse return null;
+    // The rows may be of a newer snapshot than the press: by its ID.
+    const from = rowOf(s, d.id) orelse return null;
+    if (slot == from or slot >= s.list.rows.len) return null;
+    const g = groupOf(s, s.list.rows[from].issue);
+    if (slot < g.start or slot >= g.end) return null;
+    return slot;
+}
+
+/// A row let go of over another takes its place.
+pub fn drop(s: *AppState, d: AppState.Drag) Allocator.Error!AppState.Action {
+    const slot = d.slot orelse return .none;
+    const from = rowOf(s, d.id) orelse return .none;
+    if (from == slot) return .none;
+    if (notInYourOrder(s)) |why| return s.noted("{s}", .{why});
+    const i = s.list.rows[from].issue;
+    if (slot < s.list.rows.len) if (try outsideGroup(s, i, slot)) |group|
+        return s.noted("rank orders rows within {s}", .{group});
+    const at = landsAt(s, d) orelse return .none;
+    s.list.follow = true;
+    const g = groupOf(s, i);
+    const others = try s.othersBut((try rowIssues(s))[g.start..g.end], d.id);
+    return .{ .reorder = .{ .id = d.id, .others = others, .at = @intCast(at - g.start) } };
 }
 
 /// Keys on an issue table; null when the key isn't one of them.
@@ -425,6 +617,12 @@ pub fn click(s: *AppState, row: u32, double: bool) AppState.Action {
     const l = &s.list;
     if (row >= l.rows.len) return .none;
     l.moveTo(s.snap, row);
-    if (double) s.openIssue(s.snap.issues[l.rows[row].issue].id);
+    const id = s.snap.issues[l.rows[row].issue].id;
+    if (double) {
+        s.openIssue(id);
+        return .none;
+    }
+    // Held, it may be dragged to another place.
+    s.drag = .{ .card = .{ .column = 0, .index = row }, .id = .of(id) };
     return .none;
 }

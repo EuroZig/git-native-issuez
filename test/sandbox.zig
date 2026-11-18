@@ -40,10 +40,31 @@ pub fn init(options: Options) !Sandbox {
         .{ cwd, sb.tmp.sub_path },
     );
 
+    // Nothing of the user's own: the TUI's state file is under it.
+    const home = try std.fmt.allocPrint(
+        sb.arena(),
+        "{s}/.zig-cache/tmp/{s}/home",
+        .{ cwd, sb.tmp.sub_path },
+    );
+    try std.Io.Dir.cwd().createDirPath(io, home);
+    try sb.env.put("HOME", home);
+    try sb.env.put("XDG_CONFIG_HOME", try std.fmt.allocPrint(sb.arena(), "{s}/.config", .{home}));
     try sb.env.put("GIT_CONFIG_NOSYSTEM", "1");
     try sb.env.put("GIT_CONFIG_GLOBAL", "/dev/null");
     for ([_][]const u8{
         "GIT_AUTHOR_NAME", "GIT_AUTHOR_EMAIL", "GIT_COMMITTER_NAME", "GIT_COMMITTER_EMAIL", "EMAIL",
+    }) |name| _ = sb.env.swapRemove(name);
+    // Run from a git hook (pre-commit), git says where its own repository
+    // is: the sandbox's git would write that index, those objects.
+    for ([_][]const u8{
+        "GIT_INDEX_FILE",
+        "GIT_DIR",
+        "GIT_WORK_TREE",
+        "GIT_PREFIX",
+        "GIT_OBJECT_DIRECTORY",
+        "GIT_COMMON_DIR",
+        "GIT_ALTERNATE_OBJECT_DIRECTORIES",
+        "GIT_NAMESPACE",
     }) |name| _ = sb.env.swapRemove(name);
     if (options.identity) {
         try sb.env.put("GIT_AUTHOR_NAME", identity_name);

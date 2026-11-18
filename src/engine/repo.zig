@@ -15,6 +15,8 @@ const uuid_fmt = @import("../format/uuid.zig");
 const core_fmt = @import("../format/core.zig");
 const attachment_fmt = @import("../format/attachment.zig");
 const fields_fmt = @import("../format/fields.zig");
+const rank_fmt = @import("../format/rank.zig");
+const order_mod = @import("order.zig");
 const settings_mod = @import("settings.zig");
 const errors_mod = @import("errors.zig");
 const issue_model = @import("../model/issue.zig");
@@ -191,6 +193,8 @@ pub const CreateSpec = struct {
     estimate_minutes: ?u32 = null,
     /// Callers check it against the configured workflow states.
     workflow: ?[]const u8 = null,
+    /// `X-Rank`, a key `format.rank` makes.
+    rank: ?[]const u8 = null,
     /// `X-Number`, unique in this clone (format.md §3).
     number: ?u64 = null,
     /// `X-Locked`, with `lock_reason`: it starts locked.
@@ -437,6 +441,8 @@ pub const EditSpec = struct {
     due_date: ?DateEdit = null,
     estimate_minutes: ?EstimateEdit = null,
     workflow: ?TextEdit = null,
+    /// `X-Rank`, a key `format.rank` makes.
+    rank: ?TextEdit = null,
     /// Replaces the description, in the same commit as the other changes:
     /// a `description-edit` event that also sets their fields.
     description: ?[]const u8 = null,
@@ -480,7 +486,7 @@ pub const EditSpec = struct {
     pub const EstimateEdit = Edit(u32);
     pub const PriorityEdit = Edit(core_fmt.Priority);
     pub const DateEdit = Edit(fields_fmt.Date);
-    /// An issue ID, a workflow state or a ref name.
+    /// An issue ID, a workflow state, a rank or a ref name.
     pub const TextEdit = Edit([]const u8);
 
     /// As the trailer has it: "" for `.clear`.
@@ -501,7 +507,7 @@ pub const EditSpec = struct {
             spec.add_blocked_by.len == 0 and spec.remove_blocked_by.len == 0 and
             spec.start_date == null and spec.due_date == null and
             spec.estimate_minutes == null and spec.workflow == null and
-            spec.description == null and
+            spec.rank == null and spec.description == null and
             spec.state == null and spec.comment == null and spec.number == null and
             spec.locked == null and spec.ref == null and spec.extra.len == 0 and
             spec.attachments.isEmpty();
@@ -524,6 +530,7 @@ pub const Change = enum {
     due_date,
     estimate,
     workflow,
+    rank,
     description,
     state,
     comment,
@@ -1299,6 +1306,10 @@ pub fn Repo(comptime B: type) type {
                 try self.checkWorkflow(v);
                 try list.append(arena, .{ .key = "X-Workflow-State", .value = v });
             }
+            if (spec.rank) |v| {
+                if (!rank_fmt.valid(v)) return error.InvalidValue;
+                try list.append(arena, .{ .key = "X-Rank", .value = v });
+            }
             if (ms.id) |mid| {
                 try list.append(arena, .{ .key = "X-Milestone-Id", .value = mid });
                 try list.append(arena, .{ .key = "X-Milestone-Mode", .value = explicit_mode });
@@ -1980,6 +1991,131 @@ pub fn Repo(comptime B: type) type {
 
         pub const BatchEdit = struct { ref_name: []const u8, spec: EditSpec };
 
+        /// A move in an order set by hand (`X-Rank`).
+        pub const Reorder = struct {
+            /// The issue moved, with what else its commit changes: the
+            /// workflow state of another board column, say.
+            ref_name: []const u8,
+            spec: EditSpec = .{},
+            /// The column's other issues in rank order, as shown: those with
+            /// a key by key, then the rest (`order.place`).
+            column: []const Placed,
+            /// Where it goes: 0 is the top, `column.len` the bottom.
+            at: usize,
+
+            pub const Placed = struct {
+                ref_name: []const u8,
+                rank: ?[]const u8,
+                /// The tip shown: a key given to it fails on another.
+                expect: ?Oid = null,
+            };
+        };
+
+        /// An issue to `r.at` in its column: its key, with `r.spec`, and
+        /// keys for the issues above it that have none, or for the whole
+        /// column when no key fits, in one batch, all or none. Most moves
+        /// write the moved issue alone. A column out of rank order is
+        /// InvalidValue.
+        pub fn reorder(
+            self: Self,
+            arena: Allocator,
+            r: Reorder,
+            options: WriteOptions,
+        ) Error![]EditResult {
+            if (r.at > r.column.len) return error.InvalidValue;
+            const ranks = try arena.alloc(?[]const u8, r.column.len);
+            for (r.column, ranks) |c, *k| {
+                if (c.rank) |v| if (!rank_fmt.valid(v)) return error.InvalidValue;
+                k.* = c.rank;
+            }
+            const p = order_mod.place(arena, ranks, r.at) catch |e| switch (e) {
+                error.NotInOrder => return error.InvalidValue,
+                error.OutOfMemory => return error.OutOfMemory,
+            };
+            const edits = try arena.alloc(BatchEdit, p.others.len + 1);
+            var spec = r.spec;
+            spec.rank = .{ .set = p.key };
+            edits[0] = .{ .ref_name = r.ref_name, .spec = spec };
+            for (p.others, edits[1..]) |o, *e| {
+                const c = r.column[o.index];
+                const spec_o: EditSpec = .{
+                    .rank = .{ .set = o.key },
+                    .expect = c.expect,
+                    .author = r.spec.author,
+                };
+                e.* = .{ .ref_name = c.ref_name, .spec = spec_o };
+            }
+            return self.editBatch(arena, edits, options);
+        }
+
+        /// `ref_name` right before `anchor`, or right after it, among the
+        /// issues of the anchor's board column: the open ones in its
+        /// workflow state (the first configured one when it has none), or
+        /// the done ones. `reorder` over them, with `spec`; the moved
+        /// issue's result. An anchor that is the issue itself is
+        /// InvalidValue, a deleted or missing one IssueDisappeared. Both are
+        /// refs, not IDs.
+        pub fn reorderBeside(
+            self: Self,
+            arena: Allocator,
+            ref_name: []const u8,
+            spec: EditSpec,
+            anchor: []const u8,
+            after: bool,
+            options: WriteOptions,
+        ) Error!EditResult {
+            for ([_][]const u8{ ref_name, anchor }) |ref| {
+                if (!std.mem.startsWith(u8, ref, issue_ref_prefix)) return error.InvalidIssueRef;
+            }
+            if (std.mem.eql(u8, ref_name, anchor)) return error.InvalidValue;
+            const moved_id = ref_name[issue_ref_prefix.len..];
+            const anchor_id = anchor[issue_ref_prefix.len..];
+            const all = try self.loadAll(arena);
+            // A deleted anchor has no place to give.
+            const wanted = for (all) |i| {
+                if (std.mem.eql(u8, i.id, anchor_id) and !i.deleted) break self.columnOf(i);
+            } else return error.IssueDisappeared;
+            var others: std.ArrayList(Issue) = .empty;
+            for (all) |i| {
+                if (i.deleted or std.mem.eql(u8, i.id, moved_id)) continue;
+                const same = if (self.columnOf(i)) |c|
+                    wanted != null and std.mem.eql(u8, c, wanted.?)
+                else
+                    wanted == null;
+                if (same) try others.append(arena, i);
+            }
+            std.mem.sort(Issue, others.items, {}, struct {
+                fn lessThan(_: void, a: Issue, b: Issue) bool {
+                    return order_mod.compare(.of(a), .of(b)) == .lt;
+                }
+            }.lessThan);
+            const column = try arena.alloc(Reorder.Placed, others.items.len);
+            var at: usize = 0;
+            for (others.items, column, 0..) |i, *c, n| {
+                c.* = .{
+                    .ref_name = try refFor(arena, issue_ref_prefix, i.id),
+                    .rank = i.rank,
+                    .expect = i.tip,
+                };
+                if (std.mem.eql(u8, i.id, anchor_id)) at = n + @intFromBool(after);
+            }
+            const results = try self.reorder(arena, .{
+                .ref_name = ref_name,
+                .spec = spec,
+                .column = column,
+                .at = at,
+            }, options);
+            return results[0];
+        }
+
+        /// The board column `issue` is in: its workflow state, the first
+        /// configured one when it has none, or null when it is done.
+        fn columnOf(self: Self, issue: Issue) ?[]const u8 {
+            if (issue.state.isDone(self.doneStates())) return null;
+            const states = self.settings.workflow_states;
+            return issue.workflow orelse if (states.len > 0) states[0] else "";
+        }
+
         /// Several issues' edits, one commit each, written in one ref
         /// transaction: all of them or, on any failure, none. Each edit is
         /// checked like `edit`, its guards against the issues as the whole
@@ -2219,6 +2355,10 @@ pub fn Repo(comptime B: type) type {
             if (spec.workflow) |v| {
                 if (v == .set) try self.checkWorkflow(v.set);
                 try changes.append(arena, .workflow);
+            }
+            if (spec.rank) |v| {
+                if (v == .set and !rank_fmt.valid(v.set)) return error.InvalidValue;
+                try changes.append(arena, .rank);
             }
             if (spec.description) |d| {
                 if (d.len > self.limits.max_body_bytes) return error.TooLong;
@@ -2586,6 +2726,10 @@ pub fn Repo(comptime B: type) type {
                 if (EditSpec.textOf(spec.workflow)) |v| try list.append(
                     arena,
                     .{ .key = "X-Workflow-State", .value = v },
+                );
+                if (EditSpec.textOf(spec.rank)) |v| try list.append(
+                    arena,
+                    .{ .key = "X-Rank", .value = v },
                 );
                 if (ms.id) |mid| {
                     try list.append(arena, .{ .key = "X-Milestone-Id", .value = mid });
@@ -4032,6 +4176,115 @@ test "several assignees" {
     const none = try repo.edit(arena, ref, .{ .set_assignees = &.{} }, .{});
     issue = try repo.load(arena, .{ .name = ref, .tip = none.tip });
     try testing.expectEqual(@as(usize, 0), issue.assignees.len);
+}
+
+test "rank: set on create and edit, cleared, a key checked" {
+    var fx: TestRepo = .{};
+    defer fx.deinit();
+    const arena, _, const repo = try fx.open(12);
+    const created, const ref = try fx.issue(.{ .title = "Card", .rank = "i" });
+    var issue = try repo.load(arena, .{ .name = ref, .tip = created.tip });
+    try testing.expectEqualStrings("i", issue.rank.?);
+    // With the workflow state, in one commit.
+    const moved = try repo.edit(
+        arena,
+        ref,
+        .{ .rank = .{ .set = "9" }, .workflow = .{ .set = "ready" } },
+        .{},
+    );
+    issue = try repo.load(arena, .{ .name = ref, .tip = moved.tip });
+    try testing.expectEqualStrings("9", issue.rank.?);
+    try testing.expectEqualStrings("ready", issue.workflow.?);
+    const cleared = try repo.edit(arena, ref, .{ .rank = .clear }, .{});
+    issue = try repo.load(arena, .{ .name = ref, .tip = cleared.tip });
+    try testing.expect(issue.rank == null);
+    try testing.expectError(
+        error.InvalidValue,
+        repo.edit(arena, ref, .{ .rank = .{ .set = "a0" } }, .{}),
+    );
+    try testing.expectError(
+        error.InvalidValue,
+        repo.create(arena, .{ .title = "x", .rank = "I" }, .{}),
+    );
+}
+
+test "reorder: one write between keys, keys for those above without, all or none" {
+    var fx: TestRepo = .{};
+    defer fx.deinit();
+    const arena, _, const repo = try fx.open(14);
+    _, const a = try fx.issue(.{ .title = "A", .rank = "a" });
+    _, const c = try fx.issue(.{ .title = "C", .rank = "c" });
+    _, const xr = try fx.issue(.{ .title = "X" });
+    const y, const yr = try fx.issue(.{ .title = "Y" });
+    const rankOf = struct {
+        fn f(r: Repo(GitSim), ar: Allocator, ref: []const u8) !?[]const u8 {
+            const tip = (try r.backend.resolveRef(ref)).?;
+            return (try r.load(ar, .{ .name = ref, .tip = tip })).rank;
+        }
+    }.f;
+
+    // X between A and C, moving to ready with it: X alone.
+    const moved = try repo.reorder(arena, .{
+        .ref_name = xr,
+        .spec = .{ .workflow = .{ .set = "ready" } },
+        .column = &.{
+            .{ .ref_name = a, .rank = "a" },
+            .{ .ref_name = c, .rank = "c" },
+            .{ .ref_name = yr, .rank = null },
+        },
+        .at = 1,
+    }, .{});
+    try testing.expectEqual(1, moved.len);
+    try testing.expectEqualStrings("b", (try rankOf(repo, arena, xr)).?);
+
+    // A below Y, which has no key: Y gets one too, above A's, in a commit
+    // by the same author.
+    const ada: Signature = .{
+        .name = "Ada",
+        .email = "ada@e.x",
+        .time = 9,
+        .tz_offset_minutes = 0,
+    };
+    const below = try repo.reorder(arena, .{
+        .ref_name = a,
+        .spec = .{ .author = ada },
+        .column = &.{
+            .{ .ref_name = xr, .rank = "b" },
+            .{ .ref_name = c, .rank = "c" },
+            .{ .ref_name = yr, .rank = null },
+        },
+        .at = 3,
+    }, .{});
+    try testing.expectEqual(2, below.len);
+    const yk = (try rankOf(repo, arena, yr)).?;
+    try testing.expectEqual(.lt, rank_fmt.order("c", yk));
+    try testing.expectEqual(.lt, rank_fmt.order(yk, (try rankOf(repo, arena, a)).?));
+    const y_tip = (try repo.backend.resolveRef(yr)).?;
+    const y_now = try repo.load(arena, .{ .name = yr, .tip = y_tip });
+    const y_moved = y_now.comments[y_now.comments.len - 1];
+    try testing.expectEqualStrings("ada@e.x", y_moved.author.email);
+    // Refs, not IDs.
+    try testing.expectError(
+        error.InvalidIssueRef,
+        repo.reorderBeside(arena, xr["refs/issues/".len..], .{}, yr, false, .{}),
+    );
+
+    // A neighbour that changed since it was shown: nothing written.
+    const stale = repo.reorder(arena, .{
+        .ref_name = c,
+        .column = &.{
+            .{ .ref_name = xr, .rank = "b" },
+            .{ .ref_name = yr, .rank = null, .expect = y.tip },
+        },
+        .at = 2,
+    }, .{});
+    try testing.expectError(error.VersionMismatch, stale);
+    try testing.expectEqualStrings("c", (try rankOf(repo, arena, c)).?);
+    try testing.expectError(error.InvalidValue, repo.reorder(arena, .{
+        .ref_name = c,
+        .column = &.{ .{ .ref_name = yr, .rank = null }, .{ .ref_name = xr, .rank = "b" } },
+        .at = 0,
+    }, .{}));
 }
 
 test "lock and ref" {

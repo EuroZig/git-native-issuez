@@ -496,6 +496,39 @@ pub fn Store(comptime B: type) type {
             self.reloadAfterWrite();
         }
 
+        /// `id` to `at` among `others`, its column's other issues in your
+        /// order as shown, with `spec` in its own commit: keys only where
+        /// needed, all or none, each expecting the tip shown.
+        pub fn reorder(
+            self: *Self,
+            id: []const u8,
+            others: []const Id,
+            at: usize,
+            spec_in: issuez.engine.EditSpec,
+        ) !void {
+            const a = self.begin();
+            var spec = spec_in;
+            spec.expect = self.expect(id, spec.expect);
+            if (spec.workflow) |w| if (w == .set) try self.snap.settings.checkWorkflow(w.set);
+            const column = try a.alloc(Repo.Reorder.Placed, others.len);
+            for (others, column) |o, *c| {
+                const i = self.snap.find(o.slice()) orelse return error.IssueDisappeared;
+                const issue = self.snap.issues[i];
+                c.* = .{
+                    .ref_name = try refName(a, o.slice()),
+                    .rank = issue.rank,
+                    .expect = issue.tip,
+                };
+            }
+            _ = try self.repo().reorder(a, .{
+                .ref_name = try refName(a, id),
+                .spec = spec,
+                .column = column,
+                .at = at,
+            }, .{});
+            self.reloadAfterWrite();
+        }
+
         /// Issue edits and milestones' due dates, all or none.
         pub fn applyPlan(self: *Self, items: []const BatchItem, dues: []const DueItem) !void {
             const a = self.begin();

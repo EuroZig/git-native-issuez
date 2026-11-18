@@ -2,7 +2,8 @@
 //!
 //! Upstream's layout. Values come from the whole history, so Assignee,
 //! Priority and Milestone don't vanish after later updates like they do
-//! upstream.
+//! upstream. On a terminal the description and comments are rendered as
+//! Markdown; anywhere else they are the text as it is, like upstream's.
 
 const std = @import("std");
 const context = @import("../context.zig");
@@ -13,6 +14,8 @@ const uuid = issuez.format.uuid;
 const attach = @import("attach.zig");
 const ext_flags = @import("../ext_flags.zig");
 const json = @import("../json.zig");
+const build_options = @import("build_options");
+const term = if (build_options.markdown) @import("markdown-term") else struct {};
 
 pub const help =
     \\usage: git issue show <issue-id>
@@ -25,6 +28,11 @@ pub const help =
     \\   --history     Also every earlier version of the description and of
     \\                 edited, deleted or restored comments
     \\   --json        The issue as JSON, comments included (docs/json.md)
+    \\   --raw         The description and comments as they are, not rendered
+    \\   --color <when>
+    \\                 auto (the default): rendered as Markdown on a terminal,
+    \\                 styled unless NO_COLOR is set; always: rendered and
+    \\                 styled, a pipe too; never: not styled
     \\   -h, --help    Show this help
     \\
 ;
@@ -40,6 +48,8 @@ pub fn main(comptime B: type, ctx: *context.Context(B), argv: []const []const u8
     var ids = false;
     var with_history = false;
     var as_json = false;
+    var raw = false;
+    var color_mode: ?[]const u8 = null;
     if (common.parseArgs(ctx, argv, .{
         .command = "show",
         .help = help,
@@ -48,8 +58,12 @@ pub fn main(comptime B: type, ctx: *context.Context(B), argv: []const []const u8
             .{ "--ids", .{ .on = &ids } },
             .{ "--history", .{ .on = &with_history } },
             .{ "--json", .{ .on = &as_json } },
+            .{ "--raw", .{ .on = &raw } },
+            .{ "--color", .{ .text = &color_mode } },
         },
     })) |exit| return exit;
+    const color = std.meta.stringToEnum(Color, color_mode orelse "auto") orelse
+        return common.fail(ctx.err, "error: --color takes auto, always or never\n");
     const prefix = issue_prefix orelse
         return common.missing(ctx.err, "show", "issue ID is required");
 
@@ -66,6 +80,7 @@ pub fn main(comptime B: type, ctx: *context.Context(B), argv: []const []const u8
         return common.exit_ok;
     }
     const w = ctx.out;
+    const style = styleFor(B, ctx, raw, color);
     w.print(
         "Issue {s} [{s}]{s}\n{s}\n",
         .{
@@ -126,7 +141,12 @@ pub fn main(comptime B: type, ctx: *context.Context(B), argv: []const []const u8
     for (issue.reactions) |r| if (r.target == null) {
         w.print("Reaction {s}: {d}\n", .{ r.emoji, r.users.len }) catch {};
     };
-    if (issue.description.len > 0) w.print("\n{s}\n", .{issue.description}) catch {};
+    if (issue.description.len > 0) {
+        w.writeAll("\n") catch {};
+        if (style) |st| {
+            render(ctx, w, issue.description, st, 0);
+        } else w.print("{s}\n", .{issue.description}) catch {};
+    }
     if (with_history and issue.description_history.len > 1) {
         w.writeAll("\nDescription history:\n") catch {};
         printHistory(w, issue.description_history);
@@ -156,8 +176,27 @@ pub fn main(comptime B: type, ctx: *context.Context(B), argv: []const []const u8
                 },
             ) catch {};
             if (c.state_change) |s| w.print("  [State changed to: {s}]\n", .{s.text()}) catch {};
-            w.print("  {s}\n", .{c.subject}) catch {};
-            for (c.text) |line| {
+            // Rendered: the subject and body as Markdown, then the lone
+            // trailer paragraph upstream shows (`X-Workflow-State: ready`)
+            // as written.
+            const rest = if (style) |st| blk: {
+                var text: std.ArrayList(u8) = .empty;
+                // The subject is the text's first paragraph.
+                text.appendSlice(arena, c.subject) catch {};
+                if (c.body.len > 0) text.append(arena, '\n') catch {};
+                for (c.body) |line| {
+                    if (isPurgeLine(line)) continue;
+                    text.append(arena, '\n') catch {};
+                    text.appendSlice(arena, line) catch {};
+                }
+                render(ctx, w, text.items, st, 2);
+                // `body` is `text` without its trailer block.
+                break :blk c.text[@min(c.body.len, c.text.len)..];
+            } else blk: {
+                w.print("  {s}\n", .{c.subject}) catch {};
+                break :blk c.text;
+            };
+            for (rest) |line| {
                 if (std.mem.trim(u8, line, " \t\r").len == 0) continue;
                 if (isPurgeLine(line)) continue;
                 w.print("  {s}\n", .{line}) catch {};
@@ -180,6 +219,65 @@ pub fn main(comptime B: type, ctx: *context.Context(B), argv: []const []const u8
     return common.exit_ok;
 }
 
+const Color = enum { auto, always, never };
+
+/// How the description and comments are rendered: null for as they are.
+const Style = struct { width: u16, color: bool };
+
+/// Rendered on a terminal (or with --color always), not with --raw; styled
+/// unless NO_COLOR is set or --color=never. Only git-issue renders, not
+/// the simulator.
+fn styleFor(comptime B: type, ctx: anytype, raw: bool, color: Color) ?Style {
+    if (!build_options.markdown or raw) return null;
+    if (B != issuez.backend.GitProcess) return null;
+    const stdout = std.Io.File.stdout();
+    const tty = stdout.isTty(ctx.io) catch false;
+    if (!tty and color != .always) return null;
+    const no_color = if (ctx.environ_map.get("NO_COLOR")) |v| v.len > 0 else false;
+    return .{
+        .width = terminalWidth(ctx, stdout) orelse 80,
+        .color = switch (color) {
+            .always => true,
+            .never => false,
+            .auto => !no_color,
+        },
+    };
+}
+
+/// The terminal's columns, else $COLUMNS.
+fn terminalWidth(ctx: anytype, file: std.Io.File) ?u16 {
+    if (@import("builtin").os.tag != .windows) {
+        var ws: std.posix.winsize = .{ .row = 0, .col = 0, .xpixel = 0, .ypixel = 0 };
+        const rc = std.posix.system.ioctl(
+            file.handle,
+            std.posix.T.IOCGWINSZ,
+            @intFromPtr(&ws),
+        );
+        if (std.posix.errno(rc) == .SUCCESS and ws.col > 0) return ws.col;
+    }
+    const columns = ctx.environ_map.get("COLUMNS") orelse return null;
+    const n = std.fmt.parseInt(u16, columns, 10) catch return null;
+    return if (n > 0) n else null;
+}
+
+/// `text` as Markdown, each line indented by `indent` columns. A text larger
+/// than git issue writes, or one that fails to render, is shown as it is.
+fn render(ctx: anytype, w: *std.Io.Writer, text: []const u8, style: Style, indent: u16) void {
+    if (!build_options.markdown) unreachable;
+    var out: std.Io.Writer.Allocating = .init(ctx.arena);
+    const rendered = text.len <= (issuez.Limits{}).max_body_bytes and
+        if (term.renderText(ctx.gpa, &out.writer, text, .{
+            .width = @max(style.width -| indent, 20),
+            .color = style.color,
+        })) true else |_| false;
+    const shown = if (rendered) out.written() else text;
+    var lines = std.mem.splitScalar(u8, std.mem.trimEnd(u8, shown, "\n"), '\n');
+    while (lines.next()) |line| {
+        if (line.len > 0) w.splatByteAll(' ', indent) catch {};
+        w.print("{s}\n", .{line}) catch {};
+    }
+}
+
 /// Each version with its author and date, the text indented.
 fn printHistory(w: *std.Io.Writer, list: []const issuez.model.issue.Revision) void {
     for (list) |r| {
@@ -200,6 +298,7 @@ const extension_fields = [_][]const u8{
     "X-Parent", "X-Start-Date",       "X-Due-Date",
     "X-Number", "X-Locked",           "X-Lock-Reason",
     "X-Ref",    "X-Estimate-Minutes", "X-Workflow-State",
+    "X-Rank",
 };
 
 fn isExtensionField(key: []const u8) bool {
@@ -231,6 +330,7 @@ fn printExtensions(
         w.writeAll("\n") catch {};
     }
     if (x.workflow) |s| w.print("Workflow: {s}\n", .{s}) catch {};
+    if (x.rank) |r| w.print("Rank:    {s}\n", .{r}) catch {};
 }
 
 fn reference(

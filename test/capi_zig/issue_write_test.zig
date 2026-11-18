@@ -828,3 +828,69 @@ test "issue and milestone writes: one whose commit landed returns OK, out of mem
         }
     }
 }
+
+// covers: issuez_clear_rank, issuez_rank_before, issuez_rank_after
+test "issuez_set_rank: a key, RANK_BEFORE and RANK_AFTER beside another issue, cleared" {
+    var r = try fixture.Repo.init(.{});
+    defer r.deinit();
+    const h = r.handle;
+    const a = try fixture.create(h, &.{
+        c.issuez_set_title(fixture.str("A")),
+        c.issuez_set_rank(fixture.str("m")),
+    });
+    const b = try fixture.titled(h, "B");
+    var i = try fixture.load(h, a.idStr());
+    try expect.str("m", c.issuez_issue_info_of(i).*.rank);
+    c.issuez_issue_free(i);
+
+    // B before A: one key, before A's.
+    _ = try fixture.update(h, b.idStr(), &.{c.issuez_rank_before(a.idStr())});
+    i = try fixture.load(h, b.idStr());
+    const before = c.issuez_issue_info_of(i).*.rank;
+    try testing.expect(std.mem.order(u8, before.ptr[0..before.len], "m") == .lt);
+    c.issuez_issue_free(i);
+    // A after B, with a label in the same commit.
+    _ = try fixture.update(h, a.idStr(), &.{
+        c.issuez_rank_after(b.idStr()),
+        c.issuez_add_label(fixture.str("x")),
+    });
+    i = try fixture.load(h, a.idStr());
+    try testing.expect(fixture.hasLabel(i, "x"));
+    c.issuez_issue_free(i);
+
+    // Not a key, or RANK_BEFORE with RANK: refused.
+    var w: ?*c.issuez_write = null;
+    try expect.code(
+        c.ISSUEZ_E_INVALID_VALUE,
+        fixture.updateRc(
+            h,
+            a.idStr(),
+            &.{c.issuez_set_rank(fixture.str("a0"))},
+            &fixture.ada,
+            null,
+            &w,
+            null,
+        ),
+        null,
+    );
+    try expect.code(
+        c.ISSUEZ_E_INVALID_VALUE,
+        fixture.updateRc(h, a.idStr(), &.{
+            c.issuez_rank_before(b.idStr()),
+            c.issuez_set_rank(fixture.str("b")),
+        }, &fixture.ada, null, &w, null),
+        null,
+    );
+    try expect.code(
+        c.ISSUEZ_E_INVALID_VALUE,
+        fixture.updateRc(h, a.idStr(), &.{
+            c.issuez_rank_before(b.idStr()),
+            c.issuez_rank_after(b.idStr()),
+        }, &fixture.ada, null, &w, null),
+        null,
+    );
+    _ = try fixture.update(h, a.idStr(), &.{c.issuez_clear_rank()});
+    i = try fixture.load(h, a.idStr());
+    try testing.expectEqual(@as(usize, 0), c.issuez_issue_info_of(i).*.rank.len);
+    c.issuez_issue_free(i);
+}

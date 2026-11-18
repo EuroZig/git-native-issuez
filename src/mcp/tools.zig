@@ -103,6 +103,8 @@ pub const Issue = struct {
     due: ?[]const u8 = null,
     estimate_minutes: ?u32 = null,
     workflow: ?[]const u8 = null,
+    /// Its key in your order (X-Rank), as on the board.
+    rank: ?[]const u8 = null,
     author: Person,
     created: []const u8,
     updated: []const u8,
@@ -239,7 +241,8 @@ pub const ListArgs = struct {
         .label = "Only issues with this label.",
         .assignee = "Only issues assigned to this email. Empty: unassigned issues.",
         .priority = "Only issues with this priority.",
-        .sort = "Newest, highest or not done first; reverse flips it.",
+        .sort = "Newest, highest or not done first, or rank: your order, as on the board; " ++
+            "reverse flips it.",
         .reverse = "Reverse the order.",
         .problems = "Only issues with problems (missing or looping parents or blockers, invalid " ++
             "values, ...), in any state unless state is given.",
@@ -307,6 +310,7 @@ pub const CreateArgs = struct {
     due: ?[]const u8 = null,
     estimate: ?[]const u8 = null,
     workflow: ?[]const u8 = null,
+    rank: ?[]const u8 = null,
     fields: []const Field = &.{},
     original_author: ?[]const u8 = null,
     original_id: ?[]const u8 = null,
@@ -332,6 +336,7 @@ pub const CreateArgs = struct {
         .estimate = "Minutes, or a duration like 2h, 90m, 1h30m.",
         .workflow = "A workflow state from git config issue.workflowStates (default backlog, " ++
             "ready, in-progress, review).",
+        .rank = rank_description,
         .fields = fields_description,
         .original_author = original_author_description,
         .original_id = original_id_description,
@@ -339,6 +344,8 @@ pub const CreateArgs = struct {
     };
 };
 
+const rank_description = "Its key in your order (X-Rank): 0-9 and a-z, not ending in 0. " ++
+    "Rather than a key, edit_issue's before or after places it.";
 const fields_description = "A host's own fields, keys starting X- that the format " ++
     "doesn't use (X-Forgejo-Project). An empty value clears one.";
 const original_author_description = "Imports: who wrote it where it came from.";
@@ -399,6 +406,9 @@ pub const EditArgs = struct {
     due: ?[]const u8 = null,
     estimate: ?[]const u8 = null,
     workflow: ?[]const u8 = null,
+    rank: ?[]const u8 = null,
+    before: ?[]const u8 = null,
+    after: ?[]const u8 = null,
     fields: []const Field = &.{},
     message: ?[]const u8 = null,
     comment: ?[]const u8 = null,
@@ -432,6 +442,10 @@ pub const EditArgs = struct {
             "fri, eom). Empty clears it.",
         .estimate = "Minutes, or a duration like 2h, 90m, 1h30m. Empty clears it.",
         .workflow = "A workflow state from git config issue.workflowStates. Empty clears it.",
+        .rank = rank_description ++ " Empty takes it out of your order.",
+        .before = "Right before this issue (ID or unique prefix) in your order, among the " ++
+            "issues of its board column. Not with rank or after.",
+        .after = "Right after this issue in your order. Not with rank or before.",
         .fields = fields_description,
         .message = "The commit subject. Default: what changed.",
         .comment = comment_description ++ " Not with description or message.",
@@ -928,6 +942,7 @@ pub fn Handler(comptime Repos: type) type {
                 .due_date = if (args.due) |d| try h.date(ctx, s, "due", d) else null,
                 .estimate_minutes = if (args.estimate) |e| try duration(ctx, e) else null,
                 .workflow = args.workflow,
+                .rank = args.rank,
                 .extra = args.fields,
                 .original = .{ .author = args.original_author, .id = args.original_id },
             }, .{}) catch |e| return s.fail(ctx, e);
@@ -975,6 +990,7 @@ pub fn Handler(comptime Repos: type) type {
                 .start_date = try h.dateEdit(ctx, s, "start", args.start),
                 .due_date = try h.dateEdit(ctx, s, "due", args.due),
                 .workflow = .fromInput(args.workflow),
+                .rank = .fromInput(args.rank),
                 .message = args.message,
                 .comment = args.comment,
                 .extra = args.fields,
@@ -1011,7 +1027,26 @@ pub fn Handler(comptime Repos: type) type {
                 spec.milestone = ms.edit();
             }
 
-            const result = s.repo.edit(arena, ref.name, spec, .{}) catch |e| return s.fail(ctx, e);
+            const anchor = args.before orelse args.after;
+            const both = args.before != null and args.after != null;
+            if (anchor != null and (args.rank != null or both))
+                return ctx.fail(error.InvalidValue, "before, after and rank go one at a time", .{});
+            const result: struct { tip: issuez.Oid, changes: []const issuez.engine.Change } =
+                if (anchor) |a| blk: {
+                    const r = s.repo.reorderBeside(
+                        arena,
+                        ref.name,
+                        spec,
+                        (try resolveIssue(ctx, s, a)).name,
+                        args.after != null,
+                        .{},
+                    ) catch |e| return s.fail(ctx, e);
+                    break :blk .{ .tip = r.tip, .changes = r.changes };
+                } else blk: {
+                    const r = s.repo.edit(arena, ref.name, spec, .{}) catch |e|
+                        return s.fail(ctx, e);
+                    break :blk .{ .tip = r.tip, .changes = r.changes };
+                };
             const changes = try arena.alloc([]const u8, result.changes.len);
             for (result.changes, changes) |c, *out| out.* = c.name();
             return .{
@@ -1278,6 +1313,7 @@ pub fn Handler(comptime Repos: type) type {
                 .due = if (i.due_date) |d| try std.fmt.allocPrint(arena, "{f}", .{d}) else null,
                 .estimate_minutes = i.estimate_minutes,
                 .workflow = try optionalText(arena, i.workflow),
+                .rank = try optionalText(arena, i.rank),
                 .author = try person(arena, i.author),
                 .created = try time(arena, i.created, i.author.tz_offset_minutes),
                 .updated = try time(arena, i.updated, i.updated_tz_offset_minutes),

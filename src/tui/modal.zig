@@ -17,6 +17,8 @@ const milestone_filter = @import("milestone_filter.zig");
 const draft_mod = @import("timeline_draft.zig");
 const star = @import("star.zig");
 const AppState = @import("State.zig");
+const custom_view = @import("custom_view.zig");
+const user_state = @import("user_state.zig");
 
 const Id = store.Id;
 const TextArea = text_mod.TextArea;
@@ -66,6 +68,8 @@ pub const Purpose = union(enum) {
     comment: Id,
     /// The list and board order, not a write.
     sort,
+    /// The order within the sort's groups, not a write.
+    then_sort,
     /// A milestone to filter by, not a write.
     milestones,
     /// The milestones view's order.
@@ -88,6 +92,14 @@ pub const Purpose = union(enum) {
     stage_ms_due: Id,
     stage_milestone: Id,
     stage_unblock: Id,
+    /// A name for the filter and sort shown, as a view of the user's.
+    view_name,
+    /// The key for the view named so, in the modal arena.
+    view_key: []const u8,
+    /// Save, load or delete a template of views.
+    templates,
+    /// A name for the views as a template.
+    template_name,
 
     pub const MilestonePart = struct { id: Id, tip: issuez.engine.Oid, what: enum { name, due } };
 
@@ -97,9 +109,10 @@ pub const Purpose = union(enum) {
         return switch (p) {
             .title, .description => |id| id,
             .field => |fp| fp.id,
-            .comment, .sort, .milestones, .milestone_sort, .milestone => null,
+            .comment, .sort, .then_sort, .milestones, .milestone_sort, .milestone => null,
             .move, .pane_pick, .quick_add, .add_to, .adopt => null,
             .stage_date, .stage_estimate, .stage_ms_due, .stage_milestone, .stage_unblock => null,
+            .view_name, .view_key, .templates, .template_name => null,
         };
     }
 };
@@ -685,27 +698,45 @@ fn durationText(s: *AppState, minutes: u32) []const u8 {
     return print(s, "{d}h{d}m", .{ h, m });
 }
 
-/// The sort keys; choosing the current one flips the order.
+/// The sort keys, and the second one's menu last; choosing the current
+/// one flips the order.
 pub fn openSort(s: *AppState) void {
-    openSortMenu(s, filter.SortKey, s.issueQuery().key, "Sort by", .sort);
+    // Not a letter first: t still jumps to title.
+    const then: Menu.Option = .{ .label = "→ then by…  b", .value = then_value };
+    openSortMenu(s, filter.SortKey, s.issueQuery().key, "Sort by", .sort, &.{then});
 }
 
-/// `Key`'s values as a menu, `current` marked.
+/// The sort menu's entry for the second key's.
+const then_value = "then";
+
+/// The keys that order the issues equal in the sort's, or none.
+pub fn openThenSort(s: *AppState) void {
+    const q = s.issueQuery();
+    const none: Menu.Option = .{
+        .label = "none      ties by the newest",
+        .value = "",
+        .current = q.then == null,
+    };
+    openSortMenu(s, filter.SortKey, q.then, "Then by", .then_sort, &.{none});
+}
+
+/// `Key`'s values as a menu, `current` marked, and `extra` after them.
 fn openSortMenu(
     s: *AppState,
     comptime Key: type,
-    current: Key,
+    current: ?Key,
     title: []const u8,
     purpose: Purpose,
+    extra: []const Menu.Option,
 ) void {
     s.closeModal();
     const keys = std.enums.values(Key);
     const options = s.modalArena().alloc(
         Menu.Option,
-        keys.len,
+        keys.len + extra.len,
     ) catch return s.fail("out of memory", .{});
     var selected: u16 = 0;
-    for (keys, options, 0..) |k, *o, n| {
+    for (keys, options[0..keys.len], 0..) |k, *o, n| {
         if (k == current) selected = @intCast(n);
         o.* = .{
             .label = print(s, "{s:<9} {s}", .{ k.label(), k.order() }),
@@ -713,6 +744,10 @@ fn openSortMenu(
             .current = k == current,
         };
     }
+    @memcpy(options[keys.len..], extra);
+    for (extra, keys.len..) |o, n| if (o.current) {
+        selected = @intCast(n);
+    };
     s.openModal(.{ .menu = .{
         .title = title,
         .options = options,
@@ -727,6 +762,20 @@ fn toggleSort(q: anytype, comptime Key: type, value: []const u8) void {
     if (q.key == k) q.reverse = !q.reverse else {
         q.key = k;
         q.reverse = false;
+    }
+}
+
+/// Choosing the second key in use flips its order; another sorts by it,
+/// none by the ties alone.
+pub fn toggleThen(q: *filter.Query, then: ?filter.SortKey) void {
+    const k = then orelse {
+        q.then = null;
+        q.then_reverse = false;
+        return;
+    };
+    if (q.then == k) q.then_reverse = !q.then_reverse else {
+        q.then = k;
+        q.then_reverse = false;
     }
 }
 
@@ -1055,7 +1104,8 @@ fn submit(s: *AppState) Action {
 
 fn menuSubmit(s: *AppState, mn: *Menu) Action {
     const o = mn.options[mn.selected];
-    if (o.disabled) return s.failed("{s}: reopen it first to add open work", .{o.label});
+    if (o.disabled and mn.purpose != .templates)
+        return s.failed("{s}: reopen it first to add open work", .{o.label});
     switch (mn.purpose) {
         .stage_milestone => |id| {
             const link: draft_mod.Link = switch (linkOf(o.value)) {
@@ -1078,16 +1128,52 @@ fn menuSubmit(s: *AppState, mn: *Menu) Action {
         .milestones => {
             var buf: [256]u8 = undefined;
             const term = std.fmt.bufPrint(&buf, "m:{s}", .{o.value}) catch "m:";
-            s.search.set(s.gpa, term) catch return s.failed("out of memory", .{});
+            s.searchBox().set(s.gpa, term) catch return s.failed("out of memory", .{});
             s.closeModal();
             s.filterChanged();
             return .none;
         },
-        .sort => toggleSort(s.issueQuery(), filter.SortKey, o.value),
+        .sort => {
+            if (std.mem.eql(u8, o.value, then_value)) {
+                openThenSort(s);
+                return .none;
+            }
+            toggleSort(s.issueQuery(), filter.SortKey, o.value);
+        },
+        .then_sort => toggleThen(s.issueQuery(), std.meta.stringToEnum(filter.SortKey, o.value)),
         .milestone_sort => {
             toggleSort(&s.ms_query, milestone_filter.SortKey, o.value);
             s.milestones.follow = true;
         },
+        .templates => {
+            if (o.disabled) return s.failed("no views of yours to save yet: V saves one", .{});
+            if (std.mem.eql(u8, o.value, "save")) {
+                openPrompt(
+                    s,
+                    "Save these views as a template",
+                    "a name; the template keeps every view of yours, with its key",
+                    "",
+                    .template_name,
+                    true,
+                );
+                return .none;
+            }
+            const name = o.value["load:".len..];
+            if (std.mem.startsWith(u8, o.value, "load:"))
+                return .{ .load_template = .{ .name = name } };
+            openConfirm(s, "Delete this template", &.{
+                s.fmtInput("{s} goes, for good.", .{name}),
+                "Views loaded from it stay as they are.",
+            }, &.{
+                .{ .label = "Keep it", .action = .none },
+                .{ .label = "Delete", .action = .{ .delete_template = dupe(s, name) } },
+            });
+            return .none;
+        },
+        .view_key => |name| return .{ .save_view = .{
+            .slot = custom_view.slotOf(o.value[0]).?,
+            .name = name,
+        } },
         .field => |fp| {
             if (o.current) return unchanged(s);
             if (o.other) {
@@ -1161,6 +1247,21 @@ fn promptSubmit(s: *AppState, p: *Prompt) Action {
                 .title = t,
                 .milestone_id = if (scope == .id) dupe(s, scope.id.slice()) else null,
             } };
+        },
+        .template_name => {
+            if (!custom_view.validName(t)) return s.failed(
+                "a template's name is one line of at most {d} bytes",
+                .{custom_view.max_name},
+            );
+            return .{ .save_template = .{ .name = t } };
+        },
+        .view_name => {
+            if (!custom_view.validName(t)) return s.failed(
+                "a view's name is one line of at most {d} bytes",
+                .{custom_view.max_name},
+            );
+            openViewKeys(s, t);
+            return .none;
         },
         .milestone => |mp| {
             var edit: store.MilestoneEdit = .{ .expect = mp.tip };
@@ -1735,15 +1836,107 @@ pub fn openConfirm(
     s.openModal(.{ .confirm = .{ .title = dupe(s, title), .lines = ls, .choices = cs } });
 }
 
+/// Whether `!`'s dialog is open: the notice waits for it.
+pub fn isStarOpen(s: *const AppState) bool {
+    const m = s.modal orelse return false;
+    if (m != .confirm) return false;
+    for (m.confirm.choices) |ch| if (ch.action == .star) return true;
+    return false;
+}
+
 /// `!` while the star notice shows: its buttons, with the keys.
 pub fn openStar(s: *AppState) void {
     openConfirm(s, "Star git issue on GitHub", &.{
         if (s.star.gh) "One click stars it, with gh." else "Opens " ++ star.url ++ ".",
-        "Later asks again in a month; Never stops asking.",
+        "Later may ask again in a month; Never stops asking.",
     }, &.{
         .{ .label = "Star it", .action = .{ .star = .star } },
         .{ .label = "Later", .action = .{ .star = .later } },
         .{ .label = "Never", .action = .{ .star = .never } },
+    });
+}
+
+// The user's views.
+
+/// `V`: a name for the filter and sort shown, then a key for them. The
+/// name of the view shown is offered, to save it again.
+pub fn openSaveView(s: *AppState) void {
+    const name = if (s.custom) |c| s.views[c].?.name else "";
+    openPrompt(
+        s,
+        "Save this view",
+        "its filter and sort, under a name; next, a key of 5 to 0",
+        name,
+        .view_name,
+        true,
+    );
+}
+
+/// The keys 5 to 0, with the views on them, the suggested one selected.
+fn openViewKeys(s: *AppState, name: []const u8) void {
+    // In the modal arena, which closing the prompt resets.
+    const kept = s.fmtInput("{s}", .{name});
+    s.closeModal();
+    const a = s.modalArena();
+    const options = a.alloc(Menu.Option, custom_view.max) catch return s.fail("out of memory", .{});
+    for (options, 0..) |*o, n| {
+        const digit = custom_view.keys[n .. n + 1];
+        o.* = .{
+            .label = if (s.views[n]) |v|
+                print(s, "{s}  {s}, replaced", .{ digit, v.name })
+            else
+                print(s, "{s}  free", .{digit}),
+            .value = digit,
+            .current = if (s.custom) |c| c == n else false,
+        };
+    }
+    s.openModal(.{ .menu = .{
+        .title = print(s, "Key for {s}", .{kept}),
+        .options = options,
+        .selected = custom_view.suggestedSlot(s),
+        .purpose = .{ .view_key = dupe(s, kept) },
+    } });
+}
+
+/// ctrl+t: save the views as a template, or load or delete one.
+pub fn openTemplates(s: *AppState, templates: []const user_state.Template) void {
+    s.closeModal();
+    const a = s.modalArena();
+    var options: std.ArrayList(Menu.Option) = .empty;
+    const views = custom_view.count(s);
+    options.append(a, .{
+        .label = print(s, "Save these {d} views as…", .{views}),
+        .value = "save",
+        .disabled = views == 0,
+    }) catch return s.fail("out of memory", .{});
+    for (templates) |t| options.append(a, .{
+        .label = print(s, "Load {s}  {d} {s}", .{
+            t.name,
+            t.views.len,
+            if (t.views.len == 1) "view" else "views",
+        }),
+        .value = print(s, "load:{s}", .{t.name}),
+    }) catch return s.fail("out of memory", .{});
+    for (templates) |t| options.append(a, .{
+        .label = print(s, "Delete {s}", .{t.name}),
+        .value = print(s, "drop:{s}", .{t.name}),
+    }) catch return s.fail("out of memory", .{});
+    s.openModal(.{ .menu = .{
+        .title = "Templates of views",
+        .options = options.items,
+        .purpose = .templates,
+    } });
+}
+
+/// `X` in a view of the user's.
+pub fn confirmDeleteView(s: *AppState, slot: u8) void {
+    const v = s.views[slot].?;
+    openConfirm(s, "Delete this view", &.{
+        s.fmtInput("{c} {s} goes, for good.", .{ custom_view.keys[slot], v.name }),
+        "Its issues stay as they are.",
+    }, &.{
+        .{ .label = "Keep it", .action = .none },
+        .{ .label = "Delete", .action = .{ .delete_view = slot } },
     });
 }
 
@@ -1757,6 +1950,7 @@ pub fn openMilestoneSort(s: *AppState) void {
         s.ms_query.key,
         "Sort milestones by",
         .milestone_sort,
+        &.{},
     );
 }
 
@@ -1992,8 +2186,12 @@ pub const MilestoneForm = struct {
 const help_lines = [_][]const u8{
     "Everywhere",
     "  1 2 3 4 / tab   list, board, milestones, timeline",
+    "  5 … 9 0         your views: a filter and sort of one of the four",
+    "  V               save the filter and sort shown as a view; X deletes yours",
+    "  ctrl+t          templates: save your views under a name, load them elsewhere",
     "  n               new issue",
     "  /               filter                s / S    sort by… / reverse",
+    "  b / B           then by…: order within the sort's groups / reverse it",
     "  f               open, done, all       ctrl+r   reload",
     "  M               milestones            p        sync with the remote",
     "  ?               this help             q        quit (back in an issue)",
@@ -2005,6 +2203,8 @@ const help_lines = [_][]const u8{
     "  a               new sub-issue         x        close / reopen",
     "  t               tree (list)           < >      move card (board)",
     "  ←→ h l          column (board)        g G      first / last",
+    "  J K shift+↑↓    row or card down / up, in your order: s → rank; or drag it",
+    "                  within the sort's groups, b → rank",
     "",
     "Issue",
     "  ↑↓ j k tab      select a part         ⏎ space  edit or open it",
@@ -2012,6 +2212,7 @@ const help_lines = [_][]const u8{
     "  a new sub-issue  A add existing issues as sub-issues",
     "  s state  w workflow  p priority  u assignee  l labels  m milestone",
     "  P parent  b blocked by  S start  d due  E estimate  o go to parent",
+    "  r               Markdown as written / rendered",
     "  esc ← h         back",
     "",
     "Milestones",
@@ -2060,7 +2261,8 @@ const help_lines = [_][]const u8{
     "",
     "Mouse",
     "  click selects, double-click opens; click any field to edit it;",
-    "  click column titles to sort; drag cards between board columns;",
+    "  click column titles to sort, shift-click to sort then by them;",
+    "  drag cards between board columns;",
     "  the wheel scrolls lists, columns, issues and text boxes.",
     "",
     "Filter",

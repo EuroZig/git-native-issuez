@@ -14,6 +14,9 @@ const filter = @import("filter.zig");
 const timeline_view = @import("timeline_view.zig");
 const timeline_edit = @import("timeline_edit.zig");
 const star = @import("star.zig");
+const custom_view = @import("custom_view.zig");
+const user_state = @import("user_state.zig");
+const milestone_filter = @import("milestone_filter.zig");
 const App = @import("app.zig").App;
 
 const core = issuez.format.core;
@@ -142,6 +145,10 @@ const Harness = struct {
     /// A click in the middle of the first hit with this target, which
     /// must be the one on top there.
     fn click(h: *Harness, target: ui.Target) !void {
+        return h.clickWith(target, .{});
+    }
+
+    fn clickWith(h: *Harness, target: ui.Target, mods: vaxis.Mouse.Modifiers) !void {
         const hit = for (h.app.state.hits.items.items) |x| {
             if (x.target.eql(target)) break x;
         } else return error.NoSuchTarget;
@@ -149,7 +156,7 @@ const Harness = struct {
             .col = @intCast(hit.x + hit.w / 2),
             .row = @intCast(hit.y + hit.h / 2),
             .button = .left,
-            .mods = .{},
+            .mods = mods,
             .type = .press,
         };
         const found = h.app.state.hits.find(m.col, m.row) orelse return error.TargetCovered;
@@ -172,6 +179,27 @@ const Harness = struct {
     }
 
     /// Whether the screen shows the text on some row.
+    /// The cell `needle` starts on, on the first row showing it.
+    fn cellOf(h: *Harness, needle: []const u8) ?vaxis.Cell {
+        var line: std.ArrayList(u8) = .empty;
+        defer line.deinit(testing.allocator);
+        var starts: std.ArrayList(u16) = .empty;
+        defer starts.deinit(testing.allocator);
+        for (0..rows) |y| {
+            line.clearRetainingCapacity();
+            starts.clearRetainingCapacity();
+            for (0..cols) |x| {
+                const cell = h.screen.readCell(@intCast(x), @intCast(y)) orelse continue;
+                for (cell.char.grapheme) |_|
+                    starts.append(testing.allocator, @intCast(x)) catch return null;
+                line.appendSlice(testing.allocator, cell.char.grapheme) catch return null;
+            }
+            const at = std.mem.find(u8, line.items, needle) orelse continue;
+            return h.screen.readCell(starts.items[at], @intCast(y));
+        }
+        return null;
+    }
+
     fn shows(h: *Harness, needle: []const u8) bool {
         var line: std.ArrayList(u8) = .empty;
         defer line.deinit(testing.allocator);
@@ -390,6 +418,35 @@ test "detail: number, lock, ref, origin, reactions and purged comments" {
     try testing.expect(!h.shows("Abuse"));
 }
 
+test "detail: descriptions and comments as Markdown, r as written" {
+    const h = try Harness.create();
+    defer h.destroy();
+    const id = try h.app.store.create(.{
+        .title = "Doc",
+        .body = "# Plan\n\nSome **bold** and [a link](https://example.com).\n\n" ++
+            "- one\n- two\n\n[WIP",
+    });
+    try h.app.store.comment(id.slice(), "A *note*\n\nmore text");
+    h.app.state.openIssue(id.slice());
+    try h.draw();
+    try testing.expect(h.shows("Some bold and a link."));
+    try testing.expect(!h.shows("**"));
+    try testing.expect(h.shows("[WIP"));
+    // The subject is the comment's first paragraph.
+    try testing.expect(h.shows("A note"));
+    try testing.expect(h.shows("more text"));
+    const bold = h.cellOf("bold and").?;
+    try testing.expect(bold.style.bold);
+    const link = h.cellOf("a link").?;
+    try testing.expectEqualStrings("https://example.com", link.link.uri);
+
+    try h.press('r', .{});
+    try testing.expect(h.shows("Some **bold** and [a link](https://example.com)."));
+    try testing.expect(h.shows("A *note*"));
+    try h.press('r', .{});
+    try testing.expect(!h.shows("**"));
+}
+
 test "board: move cards with keys and by dragging" {
     const h = try Harness.create();
     defer h.destroy();
@@ -431,6 +488,312 @@ test "board: move cards with keys and by dragging" {
     try h.press('>', .{});
     try testing.expect(h.snap().isDone(h.byTitle("Card").?));
     try testing.expect(h.shows("Done work is hidden."));
+}
+
+test "board: your order by default; J and K move a card, keys only where needed" {
+    const h = try Harness.create();
+    defer h.destroy();
+    _ = try h.app.store.create(.{ .title = "One" });
+    _ = try h.app.store.create(.{ .title = "Two" });
+    _ = try h.app.store.create(.{ .title = "Three" });
+    try h.press('2', .{});
+    const s = &h.app.state;
+    try testing.expectEqual(filter.SortKey.rank, s.bd_query.key);
+    // None has a key: oldest first, new ones last.
+    const titles = struct {
+        fn of(hh: *Harness) [3][]const u8 {
+            var out: [3][]const u8 = undefined;
+            const cards = hh.app.state.board.columns[0].cards;
+            for (cards[0..3], &out) |i, *t| t.* = hh.snap().issues[i].title;
+            return out;
+        }
+    }.of;
+    try testing.expectEqualStrings("One", titles(h)[0]);
+    try testing.expectEqualStrings("Three", titles(h)[2]);
+    // The list keeps its own sort.
+    try testing.expectEqual(filter.SortKey.updated, s.query.key);
+
+    // Three up one place: One and Two above it get keys, then Three.
+    try h.press('G', .{});
+    try h.press('K', .{});
+    try testing.expectEqualStrings("Three", titles(h)[1]);
+    try testing.expectEqualStrings("Two", titles(h)[2]);
+    try testing.expect(h.snap().issues[h.byTitle("One").?].rank != null);
+    try testing.expect(h.snap().issues[h.byTitle("Three").?].rank != null);
+    try testing.expect(h.snap().issues[h.byTitle("Two").?].rank == null);
+    // The selection follows the card.
+    try testing.expectEqualStrings("Three", h.snap().issues[s.board.selectedIssue().?].title);
+    // To the top with shift+↑: Three alone is written.
+    const two_tip = h.snap().issues[h.byTitle("Two").?].tip;
+    const one_tip = h.snap().issues[h.byTitle("One").?].tip;
+    try h.press(K.up, .{ .shift = true });
+    try testing.expectEqualStrings("Three", titles(h)[0]);
+    try testing.expect(h.snap().issues[h.byTitle("One").?].tip.eql(one_tip));
+    try testing.expect(h.snap().issues[h.byTitle("Two").?].tip.eql(two_tip));
+    // Already at the top: nothing.
+    try h.press('K', .{});
+    try testing.expectEqualStrings("Three", titles(h)[0]);
+    // J back down.
+    try h.press('J', .{});
+    try testing.expectEqualStrings("One", titles(h)[0]);
+    try testing.expectEqualStrings("Three", titles(h)[1]);
+
+    // Sorted otherwise, or reversed: a hint, nothing written.
+    const three_tip = h.snap().issues[h.byTitle("Three").?].tip;
+    try h.press('S', .{});
+    try h.press('K', .{});
+    try testing.expect(h.shows("S first"));
+    try h.press('S', .{});
+    try h.press('s', .{});
+    try h.press('t', .{});
+    try h.press(K.enter, .{});
+    try h.press('K', .{});
+    try testing.expect(h.shows("s → rank orders cards by hand"));
+    try testing.expect(h.snap().issues[h.byTitle("Three").?].tip.eql(three_tip));
+}
+
+/// Holds a board card and moves the pointer to `to`, `dy` rows into it,
+/// without letting go.
+fn dragCard(h: *Harness, from: ui.Target, to: ui.Target, dy: u16) !vaxis.Mouse {
+    const hit = struct {
+        fn of(hh: *Harness, t: ui.Target) !ui.Hit {
+            for (hh.app.state.hits.items.items) |x| if (x.target.eql(t)) return x;
+            return error.NoSuchTarget;
+        }
+    }.of;
+    const a = try hit(h, from);
+    const b = try hit(h, to);
+    // Not a double click with the last press.
+    h.now_ms += State.double_click_ms;
+    const press: vaxis.Mouse = .{
+        .col = @intCast(a.x + 2),
+        .row = @intCast(a.y + @min(a.h -| 1, 1)),
+        .button = .left,
+        .mods = .{},
+        .type = .press,
+    };
+    try h.input(.{ .mouse = press });
+    var drag = press;
+    drag.type = .drag;
+    drag.col = @intCast(b.x + 2);
+    drag.row = @intCast(b.y + dy);
+    try h.input(.{ .mouse = drag });
+    return drag;
+}
+
+fn release(h: *Harness, at: vaxis.Mouse) !void {
+    var up = at;
+    up.type = .release;
+    try h.input(.{ .mouse = up });
+}
+
+test "board: a card dragged to a place, in its column or another, with a drop line" {
+    const h = try Harness.create();
+    defer h.destroy();
+    for ([_][]const u8{ "One", "Two", "Three" }) |t| _ = try h.app.store.create(.{ .title = t });
+    const ready = try h.app.store.create(.{ .title = "Ready", .workflow = "ready" });
+    try h.app.store.edit(ready.slice(), .{ .rank = .{ .set = "i" } });
+    try h.press('2', .{});
+    const s = &h.app.state;
+    const card = struct {
+        fn of(c: u16, n: u32) ui.Target {
+            return .{ .card = .{ .column = c, .index = n } };
+        }
+    }.of;
+    const title = struct {
+        fn at(hh: *Harness, c: u16, n: u32) []const u8 {
+            return hh.snap().issues[hh.app.state.board.columns[c].cards[n]].title;
+        }
+    }.at;
+
+    // One into the lower half of Three: last; the line shows meanwhile.
+    var at = try dragCard(h, card(0, 0), card(0, 2), 3);
+    try testing.expectEqual(@as(?u32, 3), s.drag.?.slot);
+    try testing.expect(h.shows("━━━━"));
+    try release(h, at);
+    try testing.expectEqualStrings("Two", title(h, 0, 0));
+    try testing.expectEqualStrings("Three", title(h, 0, 1));
+    try testing.expectEqualStrings("One", title(h, 0, 2));
+    // Where it was: nothing written, no line.
+    const tip = h.snap().issues[h.byTitle("One").?].tip;
+    at = try dragCard(h, card(0, 2), card(0, 2), 0);
+    try testing.expect(!h.shows("━━━━"));
+    try release(h, at);
+    try testing.expect(h.snap().issues[h.byTitle("One").?].tip.eql(tip));
+
+    // Two above Ready in the next column: one commit, state and place.
+    at = try dragCard(h, card(0, 0), card(1, 0), 0);
+    try release(h, at);
+    const two = h.snap().issues[h.byTitle("Two").?];
+    try testing.expectEqualStrings("ready", two.workflow.?);
+    try testing.expectEqualStrings("Two", title(h, 1, 0));
+    try testing.expectEqualStrings("Ready", title(h, 1, 1));
+    try testing.expect(h.snap().issues[h.byTitle("Ready").?].rank.?.len > 0);
+    try testing.expect(h.shows("→ ready"));
+
+    // Sorted otherwise: in its column a hint, across a plain move.
+    try h.press('s', .{});
+    try h.press('t', .{});
+    try h.press(K.enter, .{});
+    const three = h.snap().issues[h.byTitle("Three").?].tip;
+    at = try dragCard(h, card(0, 0), card(0, 1), 3);
+    try testing.expect(!h.shows("━━━━"));
+    try release(h, at);
+    try testing.expect(h.shows("s → rank orders cards by hand"));
+    try testing.expect(h.snap().issues[h.byTitle("Three").?].tip.eql(three));
+}
+
+test "board: a drop after the column changed under the drag goes by the card's ID" {
+    const h = try Harness.create();
+    defer h.destroy();
+    for ([_][]const u8{ "One", "Two", "Three" }) |t| _ = try h.app.store.create(.{ .title = t });
+    try h.press('2', .{});
+    const s = &h.app.state;
+    // Three held (the third card), then the others close elsewhere: the
+    // column holds Three alone when it is let go of at its end.
+    const at = try dragCard(h, .{ .card = .{ .column = 0, .index = 2 } }, .{ .column = 0 }, 4);
+    for ([_][]const u8{ "One", "Two" }) |t| {
+        try h.app.store.setState(h.snap().issues[h.byTitle(t).?].id, .closed, null);
+    }
+    try h.draw();
+    try testing.expectEqual(1, s.board.columns[0].cards.len);
+    const tip = h.snap().issues[h.byTitle("Three").?].tip;
+    try release(h, at);
+    // Where it already is: nothing written, nothing out of bounds.
+    try testing.expect(h.snap().issues[h.byTitle("Three").?].tip.eql(tip));
+
+    // Within done work too, as J and K do.
+    s.bd_query.scope = .all;
+    s.filterChanged();
+    try h.draw();
+    const done: u16 = for (s.board.columns, 0..) |c, n| {
+        if (c.done and c.cards.len == 2) break @intCast(n);
+    } else return error.NoDoneColumn;
+    const cards = s.board.columns[done].cards;
+    // The snapshot goes with the write.
+    const first = try testing.allocator.dupe(u8, h.snap().issues[cards[0]].title);
+    defer testing.allocator.free(first);
+    const to = try dragCard(h, .{ .card = .{ .column = done, .index = 0 } }, .{
+        .card = .{ .column = done, .index = 1 },
+    }, 3);
+    try release(h, to);
+    const now = s.board.columns[done].cards;
+    try testing.expectEqualStrings(first, h.snap().issues[now[1]].title);
+}
+
+test "list: rows in your order, dragged to a place or moved with J and K" {
+    const h = try Harness.create();
+    defer h.destroy();
+    for ([_][]const u8{ "One", "Two", "Three" }) |t| _ = try h.app.store.create(.{ .title = t });
+    try h.draw();
+    const s = &h.app.state;
+    const title = struct {
+        fn at(hh: *Harness, n: u32) []const u8 {
+            return hh.snap().issues[hh.app.state.list.rows[n].issue].title;
+        }
+    }.at;
+    // Sorted otherwise: a hint, nothing written.
+    try h.press('K', .{});
+    try testing.expect(h.shows("s → rank orders rows by hand"));
+    try h.press('s', .{});
+    try h.press('r', .{});
+    try h.press(K.enter, .{});
+    try testing.expectEqual(filter.SortKey.rank, s.query.key);
+    try testing.expectEqualStrings("One", title(h, 0));
+
+    // Three dragged onto One takes its place, marked meanwhile.
+    const at = try dragCard(h, .{ .row = 2 }, .{ .row = 0 }, 0);
+    try testing.expectEqual(@as(?u32, 0), s.drag.?.slot);
+    try testing.expect(h.shows("▶"));
+    try release(h, at);
+    try testing.expectEqualStrings("Three", title(h, 0));
+    try testing.expectEqualStrings("One", title(h, 1));
+    try testing.expectEqualStrings("Two", title(h, 2));
+    // J moves the selected row down.
+    s.list.selected = 0;
+    s.list.selected_id = .of(h.snap().issues[s.list.rows[0].issue].id);
+    try h.press('J', .{});
+    try testing.expectEqualStrings("One", title(h, 0));
+    try testing.expectEqualStrings("Three", title(h, 1));
+    try testing.expectEqualStrings("Three", h.snap().issues[s.list.selectedIssue().?].title);
+    // In the tree: a hint.
+    try h.press('t', .{});
+    try h.press('K', .{});
+    try testing.expect(h.shows("t first"));
+}
+
+test "then by rank: J, K and drags order within the group, not out of it" {
+    const h = try Harness.create();
+    defer h.destroy();
+    _ = try h.app.store.create(.{ .title = "A", .priority = .high });
+    _ = try h.app.store.create(.{ .title = "B", .priority = .high });
+    _ = try h.app.store.create(.{ .title = "C", .priority = .low });
+    const s = &h.app.state;
+    const tip = struct {
+        fn of(hh: *Harness, t: []const u8) issuez.engine.Oid {
+            return hh.snap().issues[hh.byTitle(t).?].tip;
+        }
+    }.of;
+    const card = struct {
+        fn of(n: u32) ui.Target {
+            return .{ .card = .{ .column = 0, .index = n } };
+        }
+    }.of;
+
+    // The board, by priority, then by rank: high's A and B, then C.
+    try h.press('2', .{});
+    s.bd_query.key = .priority;
+    try h.press('J', .{});
+    try testing.expect(h.shows("b → rank within groups"));
+    s.bd_query.then = .rank;
+    try h.draw();
+    try expectTitles(h, s.board.columns[0].cards, &.{ "A", "B", "C" });
+    try h.press('J', .{});
+    try expectTitles(h, s.board.columns[0].cards, &.{ "B", "A", "C" });
+    const a = tip(h, "A");
+    const c = tip(h, "C");
+    try h.press('J', .{});
+    try testing.expect(h.shows("rank orders cards within high"));
+    try testing.expect(tip(h, "A").eql(a) and tip(h, "C").eql(c));
+    // Into another group: no drop line, a hint, nothing written.
+    var at = try dragCard(h, card(2), card(0), 0);
+    try testing.expect(!h.shows("━━━━"));
+    try release(h, at);
+    try testing.expect(h.shows("rank orders cards within low"));
+    try testing.expect(tip(h, "C").eql(c));
+    // Within it: B after A.
+    at = try dragCard(h, card(0), card(1), 3);
+    try testing.expect(h.shows("━━━━"));
+    try release(h, at);
+    try expectTitles(h, s.board.columns[0].cards, &.{ "A", "B", "C" });
+    try h.press('B', .{});
+    try h.press('J', .{});
+    try testing.expect(h.shows("B first"));
+    // By titles, which make no groups: rank orders nothing.
+    s.bd_query = .{ .key = .title, .then = .rank };
+    try h.press('J', .{});
+    try testing.expect(h.shows("s → rank orders cards by hand"));
+
+    // The list, the same.
+    try h.press('1', .{});
+    s.query.key = .priority;
+    s.query.then = .rank;
+    try h.draw();
+    try expectRows(h, &.{ "A", "B", "C" });
+    s.list.selected = 0;
+    s.list.selected_id = .of(h.snap().issues[s.list.rows[0].issue].id);
+    try h.press('J', .{});
+    try expectRows(h, &.{ "B", "A", "C" });
+    try h.press('J', .{});
+    try testing.expect(h.shows("rank orders rows within high"));
+    at = try dragCard(h, .{ .row = 2 }, .{ .row = 0 }, 0);
+    try testing.expect(!h.shows("▶"));
+    try release(h, at);
+    try testing.expect(h.shows("rank orders rows within low"));
+    try testing.expect(tip(h, "C").eql(c));
+    at = try dragCard(h, .{ .row = 1 }, .{ .row = 0 }, 0);
+    try release(h, at);
+    try expectRows(h, &.{ "A", "B", "C" });
 }
 
 test "list: filter, scope and sort" {
@@ -674,6 +1037,220 @@ test "sort by state: open first, in workflow order" {
     const rows = h.app.state.list.rows;
     const want = [_][]const u8{ "Default", "Ready", "Review" };
     for (want, rows) |t, r| try testing.expectEqualStrings(t, h.snap().issues[r.issue].title);
+}
+
+fn expectTitles(h: *Harness, issues: []const u32, want: []const []const u8) !void {
+    try testing.expectEqual(want.len, issues.len);
+    for (want, issues) |t, i| try testing.expectEqualStrings(t, h.snap().issues[i].title);
+}
+
+fn expectRows(h: *Harness, want: []const []const u8) !void {
+    var issues: [16]u32 = undefined;
+    for (h.app.state.list.rows, 0..) |r, n| issues[n] = r.issue;
+    try expectTitles(h, issues[0..h.app.state.list.rows.len], want);
+}
+
+test "sort then by a second key: by day, each key in its own order" {
+    const h = try Harness.create();
+    defer h.destroy();
+    // 2023-11-13, then 2023-11-14 at 21:13 and 22:13 UTC.
+    h.world.clock.now = 1_700_000_000 - 86_400;
+    _ = try h.app.store.create(.{ .title = "Old low", .priority = .low });
+    _ = try h.app.store.create(.{ .title = "Old high", .priority = .high });
+    h.world.clock.now = 1_700_000_000 - 3600;
+    _ = try h.app.store.create(.{ .title = "New low", .priority = .low });
+    h.world.clock.now = 1_700_000_000;
+    _ = try h.app.store.create(.{ .title = "New none" });
+    _ = try h.app.store.create(.{ .title = "New high", .priority = .high });
+    try h.draw();
+    const q = &h.app.state.query;
+    try expectRows(h, &.{ "New high", "New none", "New low", "Old high", "Old low" });
+
+    q.then = .priority;
+    try h.draw();
+    try expectRows(h, &.{ "New high", "New low", "New none", "Old high", "Old low" });
+    q.then_reverse = true;
+    try h.draw();
+    try expectRows(h, &.{ "New none", "New low", "New high", "Old low", "Old high" });
+    q.then_reverse = false;
+    q.reverse = true;
+    try h.draw();
+    try expectRows(h, &.{ "Old high", "Old low", "New high", "New low", "New none" });
+    q.reverse = false;
+
+    // Two hours ahead of UTC, 22:13 is the next day, and 21:13 the day
+    // the old ones are on.
+    h.app.state.utc_offset_s = 2 * 3600;
+    try h.draw();
+    try expectRows(h, &.{ "New high", "New none", "Old high", "New low", "Old low" });
+    const rows = h.app.state.list.rows;
+    const cq = h.app.state.currentQuery();
+    try testing.expect(filter.sameGroup(h.snap(), cq, rows[0].issue, rows[1].issue));
+    try testing.expect(!filter.sameGroup(h.snap(), cq, rows[1].issue, rows[2].issue));
+    try testing.expect(filter.sameGroup(h.snap(), cq, rows[2].issue, rows[4].issue));
+    h.app.state.utc_offset_s = 0;
+
+    // A key without equal issues leaves nothing to `then`.
+    q.key = .title;
+    try h.draw();
+    try expectRows(h, &.{ "New high", "New low", "New none", "Old high", "Old low" });
+
+    // The board's columns and done work, sorted the same.
+    const done = h.byTitle("Old low").?;
+    try h.app.store.setState(h.snap().issues[done].id, .closed, null);
+    h.app.state.bd_query = .{
+        .key = .priority,
+        .then = .title,
+        .then_reverse = true,
+        .scope = .all,
+    };
+    try h.press('2', .{});
+    const cols = h.app.state.board.columns;
+    const open = for (cols) |c| {
+        if (c.cards.len > 0) break c;
+    } else return error.NoCards;
+    try expectTitles(h, open.cards, &.{ "Old high", "New high", "New low", "New none" });
+    try expectTitles(h, cols[cols.len - 1].cards, &.{"Old low"});
+}
+
+test "then by: the menu, b and B, the bar and shift-clicked column titles" {
+    const h = try Harness.create();
+    defer h.destroy();
+    _ = try h.app.store.create(.{ .title = "Beta", .priority = .low });
+    _ = try h.app.store.create(.{ .title = "Alpha", .priority = .low });
+    _ = try h.app.store.create(.{ .title = "Gamma", .priority = .high });
+    try h.click(.{ .sort = .priority });
+    const q = &h.app.state.query;
+    try testing.expect(h.shows("then  … "));
+
+    // b: the menu; a letter jumps, as in the sort menu.
+    try h.press('b', .{});
+    try h.press('t', .{});
+    try h.press(K.enter, .{});
+    try testing.expectEqual(filter.SortKey.title, q.then.?);
+    try expectRows(h, &.{ "Gamma", "Alpha", "Beta" });
+    try testing.expect(h.shows("then  title ▾  ↓ "));
+    try h.press('B', .{});
+    try expectRows(h, &.{ "Gamma", "Beta", "Alpha" });
+    try h.click(.then_reverse);
+    try testing.expect(!q.then_reverse);
+
+    // From the sort menu; choosing the key in use flips it.
+    try h.press('s', .{});
+    const keys = std.enums.values(filter.SortKey).len;
+    try h.click(.{ .modal = .{ .choice = keys } });
+    try testing.expectEqualStrings("Then by", h.app.state.modal.?.menu.title);
+    try h.click(.{ .modal = .{ .choice = @backingInt(filter.SortKey.title) } });
+    try testing.expect(q.then_reverse);
+    try testing.expect(h.app.state.modal == null);
+
+    // None: the ties alone; B says how to get one.
+    try h.click(.{ .command = .then_sort });
+    try h.click(.{ .modal = .{ .choice = keys } });
+    try testing.expect(q.then == null and !q.then_reverse);
+    try h.press('B', .{});
+    try testing.expect(h.shows("b picks the key"));
+
+    // Shift on a column title: then by it; the key stays.
+    try h.clickWith(.{ .sort = .id }, .{ .shift = true });
+    try testing.expectEqual(filter.SortKey.priority, q.key);
+    try testing.expectEqual(filter.SortKey.id, q.then.?);
+    try h.clickWith(.{ .sort = .id }, .{ .shift = true });
+    try testing.expect(q.then_reverse);
+    try h.click(.{ .sort = .title });
+    try testing.expectEqual(filter.SortKey.title, q.key);
+    try testing.expectEqual(filter.SortKey.id, q.then.?);
+}
+
+test "then by: a group's name above it, in the list and on the board" {
+    const h = try Harness.create();
+    defer h.destroy();
+    _ = try h.app.store.create(.{ .title = "Beta", .priority = .high });
+    _ = try h.app.store.create(.{ .title = "Alpha", .priority = .high });
+    _ = try h.app.store.create(.{ .title = "Gamma", .priority = .low });
+    const s = &h.app.state;
+    s.query.key = .priority;
+    try h.draw();
+    try testing.expect(!h.shows("── high ──"));
+
+    s.query.then = .title;
+    try h.draw();
+    try expectRows(h, &.{ "Alpha", "Beta", "Gamma" });
+    try testing.expect(h.shows("── high ──"));
+    try testing.expect(h.shows("── low ──"));
+    // A line of its own, not a row: rows go on by row.
+    const y = struct {
+        fn of(hh: *Harness, needle: []const u8) usize {
+            for (0..Harness.rows) |row| {
+                var line: [512]u8 = undefined;
+                var len: usize = 0;
+                for (0..Harness.cols) |x| {
+                    const g = hh.screen.readCell(@intCast(x), @intCast(row)).?.char.grapheme;
+                    if (len + g.len > line.len) break;
+                    @memcpy(line[len..][0..g.len], g);
+                    len += g.len;
+                }
+                if (std.mem.find(u8, line[0..len], needle) != null) return row;
+            }
+            unreachable;
+        }
+    }.of;
+    try testing.expectEqual(y(h, "── high ──") + 1, y(h, "Alpha"));
+    try testing.expectEqual(y(h, "Alpha") + 1, y(h, "Beta"));
+    try testing.expectEqual(y(h, "Beta") + 2, y(h, "Gamma"));
+    try h.click(.{ .row = 2 });
+    try testing.expectEqualStrings("Gamma", h.snap().issues[s.list.selectedIssue().?].title);
+    // In the tree, or by a key without ties: none.
+    s.query.tree = true;
+    try h.draw();
+    try testing.expect(!h.shows("── high ──"));
+    s.query.tree = false;
+    s.query.key = .title;
+    try h.draw();
+    try testing.expect(!h.shows("── "));
+
+    try h.press('2', .{});
+    h.app.state.bd_query.key = .priority;
+    try h.draw();
+    try testing.expect(!h.shows("── high ──"));
+    h.app.state.bd_query.then = .title;
+    try h.draw();
+    try testing.expect(h.shows("── high ──"));
+    try testing.expect(h.shows("── low ──"));
+}
+
+test "then by: with a divider over every row, the selection stays in view" {
+    const h = try Harness.create();
+    defer h.destroy();
+    var buf: [16]u8 = undefined;
+    for (1..29) |d| {
+        const id = try h.app.store.create(.{
+            .title = try std.fmt.bufPrint(&buf, "Due {d:0>2}", .{d}),
+        });
+        const due = date(try std.fmt.bufPrint(&buf, "2026-12-{d:0>2}", .{d}));
+        try h.app.store.edit(id.slice(), .{ .due_date = due });
+    }
+    h.app.state.query.key = .due;
+    h.app.state.query.then = .title;
+    try h.draw();
+    try testing.expect(h.shows("── due 2026-12-01 ──"));
+    try h.press('G', .{});
+    const selected = h.app.state.list.selectedIssue().?;
+    try testing.expectEqualStrings("Due 28", h.snap().issues[selected].title);
+    try testing.expect(h.shows("Due 28"));
+    try testing.expect(h.shows("── due 2026-12-28 ──"));
+    try testing.expect(!h.shows("Due 01"));
+    // Frames that don't follow the selection keep it in view.
+    try h.draw();
+    try h.draw();
+    try testing.expect(h.shows("Due 28"));
+    try h.press('g', .{});
+    try testing.expect(h.shows("Due 01"));
+    // The wheel reaches the last row, and no further.
+    h.app.state.list.scrollBy(1000);
+    try h.draw();
+    try testing.expect(h.shows("Due 28") and !h.shows("Due 01"));
+    try testing.expect(h.app.state.list.scroll < 28);
 }
 
 test "board: a column for a state that isn't configured takes no cards" {
@@ -3218,4 +3795,377 @@ test "star notice: not at start, shown once checked, a click stars, gone untouch
     try testing.expectEqual(@as(u32, 2), Fake.stars);
     try testing.expect(!Fake.with_gh);
     try testing.expect(h.shows("Starring…"));
+
+    // The dialog open past the notice's time: Never still counts.
+    h.app.state.star = .{ .phase = .checking };
+    h.app.starChecked(.ask_browser, t0);
+    try h.draw();
+    try h.press('!', .{});
+    h.app.tick(t0 + (star.Timing{}).visible_s + 60);
+    try testing.expectEqual(star.Ui.Phase.shown, h.app.state.star.phase);
+    try h.press('n', .{});
+    try testing.expectEqual(@as(u32, 2), Fake.declines);
+    try testing.expect(h.app.state.modal == null);
+}
+
+/// The state file's views and templates, in memory.
+const MemoryStore = struct {
+    arena: std.heap.ArenaAllocator,
+    state: user_state.State = .{},
+
+    fn store(m: *MemoryStore) App(GitSim).ViewsStore {
+        return .{ .context = m, .save = save, .templates = templates, .set_template = setTemplate };
+    }
+
+    fn save(context: *anyopaque, views: []const custom_view.Saved) bool {
+        const m: *MemoryStore = @ptrCast(@alignCast(context));
+        const a = m.arena.allocator();
+        const owned = dupeViews(a, views);
+        m.state = user_state.withViews(a, m.state, "/repo/.git", owned) catch return false;
+        return true;
+    }
+
+    fn templates(context: *anyopaque, _: std.mem.Allocator) ?[]const user_state.Template {
+        const m: *MemoryStore = @ptrCast(@alignCast(context));
+        return m.state.templates;
+    }
+
+    fn setTemplate(context: *anyopaque, name: []const u8, views: ?[]const custom_view.Saved) bool {
+        const m: *MemoryStore = @ptrCast(@alignCast(context));
+        const a = m.arena.allocator();
+        const owned = if (views) |v| dupeViews(a, v) else null;
+        const n = a.dupe(u8, name) catch return false;
+        m.state = user_state.withTemplate(a, m.state, n, owned) catch return false;
+        return true;
+    }
+
+    /// Their strings are the views'; those go with the next input.
+    fn dupeViews(a: std.mem.Allocator, views: []const custom_view.Saved) []const custom_view.Saved {
+        const out = a.alloc(custom_view.Saved, views.len) catch return &.{};
+        for (views, out) |v, *o| {
+            o.* = v;
+            o.name = a.dupe(u8, v.name) catch "";
+            o.filter = a.dupe(u8, v.filter) catch "";
+            o.view = a.dupe(u8, v.view) catch "";
+            o.scope = a.dupe(u8, v.scope) catch "";
+            o.sort = a.dupe(u8, v.sort) catch "";
+        }
+        return out;
+    }
+
+    fn noTemplates(_: *anyopaque, _: std.mem.Allocator) ?[]const user_state.Template {
+        return &.{};
+    }
+
+    fn refuse(_: *anyopaque, _: []const u8, _: ?[]const custom_view.Saved) bool {
+        return false;
+    }
+};
+
+test "templates: views saved under a name, loaded elsewhere in place of others, deleted" {
+    const h = try Harness.create();
+    defer h.destroy();
+    var mem: MemoryStore = .{ .arena = .init(testing.allocator) };
+    defer mem.arena.deinit();
+    h.app.views_store = mem.store();
+    const s = &h.app.state;
+
+    // Nothing to save yet.
+    try h.press('t', .{ .ctrl = true });
+    try testing.expect(h.shows("Templates of views"));
+    try h.press(K.enter, .{});
+    try testing.expect(h.shows("no views of yours to save yet"));
+    try h.press(K.escape, .{});
+
+    _ = try custom_view.load(s, &.{
+        .{ .name = "Bugs", .key = 5, .filter = "label:bug" },
+        .{ .name = "Board", .key = 6, .view = "board" },
+    });
+    try h.draw();
+    try testing.expect(h.shows("+ View   ☰"));
+    try h.click(.{ .command = .templates });
+    try h.press(K.enter, .{});
+    try testing.expect(h.shows("Save these views as a template"));
+    try h.typeText("Triage");
+    try h.press(K.enter, .{});
+    try testing.expect(h.shows("template Triage saved: 2 views"));
+    try testing.expectEqual(2, user_state.findTemplate(mem.state.templates, "Triage").?.views.len);
+    // The same name again asks first.
+    try h.press('t', .{ .ctrl = true });
+    try h.press(K.enter, .{});
+    try h.typeText("Triage");
+    try h.press(K.enter, .{});
+    try testing.expect(h.shows("Replace this template"));
+    try h.press(K.escape, .{});
+
+    // Another set of views here; loading Triage asks, then replaces them.
+    _ = try custom_view.load(s, &.{.{ .name = "Other", .key = 9 }});
+    try h.press('9', .{});
+    try testing.expectEqual(@as(?u8, 4), s.custom);
+    try h.press('t', .{ .ctrl = true });
+    try h.press(K.down, .{});
+    try testing.expect(h.shows("Load Triage  2 views"));
+    try h.press(K.enter, .{});
+    try testing.expect(h.shows("Load this template"));
+    try h.press('L', .{});
+    try testing.expect(h.shows("template Triage loaded: 2 views"));
+    try testing.expect(s.custom == null);
+    try testing.expect(s.views[4] == null);
+    try testing.expectEqualStrings("Bugs", s.views[0].?.name);
+    try testing.expectEqual(2, user_state.viewsOf(mem.state, "/repo/.git").len);
+
+    // Deleted, after asking.
+    try h.press('t', .{ .ctrl = true });
+    try h.press(K.down, .{});
+    try h.press(K.down, .{});
+    try testing.expect(h.shows("Delete Triage"));
+    try h.press(K.enter, .{});
+    try h.press('D', .{});
+    try testing.expect(user_state.findTemplate(mem.state.templates, "Triage") == null);
+    try testing.expect(h.shows("template Triage deleted"));
+}
+
+test "custom views: saved from a default view, on their key, kept apart from it" {
+    const h = try Harness.create();
+    defer h.destroy();
+    const Fake = struct {
+        var saves: u32 = 0;
+        var ok: bool = true;
+        var last: [custom_view.max]?custom_view.Saved = @splat(null);
+        var names: [custom_view.max][custom_view.max_name]u8 = undefined;
+        fn save(_: *anyopaque, views: []const custom_view.Saved) bool {
+            saves += 1;
+            last = @splat(null);
+            for (views, 0..) |v, n| {
+                @memcpy(names[n][0..v.name.len], v.name);
+                last[n] = v;
+                last[n].?.name = names[n][0..v.name.len];
+            }
+            return ok;
+        }
+    };
+    var context: u8 = 0;
+    h.app.views_store = .{
+        .context = &context,
+        .save = Fake.save,
+        .templates = MemoryStore.noTemplates,
+        .set_template = MemoryStore.refuse,
+    };
+    _ = try h.app.store.create(.{ .title = "Alpha", .labels = &.{"ui"}, .priority = .low });
+    _ = try h.app.store.create(.{ .title = "Beta", .labels = &.{"ui"}, .priority = .critical });
+    _ = try h.app.store.create(.{ .title = "Gamma" });
+    try h.draw();
+    const s = &h.app.state;
+
+    // A key without a view says how to make one.
+    try h.press('5', .{});
+    try testing.expect(h.shows("no view on 5"));
+
+    // The list filtered and sorted, saved as 5.
+    try h.press('/', .{});
+    try h.typeText("label:ui");
+    try h.press(K.enter, .{});
+    try h.click(.{ .sort = .priority });
+    try testing.expect(h.shows("4 Timeline   + View"));
+    try h.click(.{ .command = .save_view });
+    try testing.expect(h.shows("Save this view"));
+    try h.typeText("UI work");
+    try h.press(K.enter, .{});
+    try testing.expect(h.shows("Key for UI work"));
+    try testing.expect(h.shows("5  free"));
+    try h.press(K.enter, .{});
+    try testing.expect(s.modal == null);
+    try testing.expectEqual(@as(u32, 1), Fake.saves);
+    try testing.expectEqualStrings("UI work", Fake.last[0].?.name);
+    try testing.expectEqualStrings("label:ui", Fake.last[0].?.filter);
+    try testing.expectEqualStrings("priority", Fake.last[0].?.sort);
+    try testing.expectEqual(@as(?u8, 5), Fake.last[0].?.key);
+    try testing.expect(h.shows("5 UI work  ×   + View"));
+    try testing.expectEqual(@as(?u8, 0), s.custom);
+
+    // The default list gets its own back; 5 shows the view again.
+    // Saved from it, the list kept what it had.
+    try h.press('1', .{});
+    try testing.expect(s.custom == null);
+    try testing.expectEqualStrings("label:ui", s.search.text());
+    try h.press('/', .{});
+    try h.press(K.escape, .{});
+    try h.typeText("Gamma");
+    try h.press(K.enter, .{});
+    try testing.expectEqual(@as(usize, 1), s.list.rows.len);
+    try h.press('5', .{});
+    try testing.expectEqualStrings("label:ui", s.search.text());
+    try testing.expectEqual(@as(usize, 2), s.list.rows.len);
+    try testing.expectEqualStrings("Beta", h.snap().issues[s.list.rows[0].issue].title);
+    // Changed in the view, then its key again: as saved.
+    try h.press('S', .{});
+    try h.press('5', .{});
+    try testing.expect(!s.query.reverse);
+    // The board leaves it, and has the list's own filter.
+    try h.press('2', .{});
+    try testing.expectEqualStrings("Gamma", s.search.text());
+    try h.press('1', .{});
+    try testing.expectEqualStrings("Gamma", s.search.text());
+    // A click on its tab shows it too; an issue opened from it goes back to it.
+    try h.click(.{ .custom_view = 0 });
+    try testing.expectEqualStrings("label:ui", s.search.text());
+    try h.press(K.enter, .{});
+    try testing.expectEqual(ui.View.detail, s.view);
+    // Not where nothing can be saved.
+    try testing.expect(!h.shows("+ View"));
+    try h.press(K.escape, .{});
+    try testing.expectEqual(ui.View.list, s.view);
+    try testing.expectEqual(@as(?u8, 0), s.custom);
+
+    // The milestones view as 0; saving again offers the view's own name and key.
+    try h.press('3', .{});
+    try h.click(.{ .ms_scope = .all });
+    try h.press('V', .{});
+    try h.typeText("All milestones");
+    try h.press(K.enter, .{});
+    try h.press('0', .{});
+    try h.press(K.enter, .{});
+    try testing.expectEqual(@as(u32, 2), Fake.saves);
+    try testing.expectEqualStrings("milestones", Fake.last[1].?.view);
+    try testing.expectEqualStrings("all", Fake.last[1].?.scope);
+    try h.click(.{ .ms_scope = .open });
+    try h.press('3', .{});
+    try testing.expectEqual(milestone_filter.Scope.all, s.ms_query.scope);
+    try h.click(.{ .ms_scope = .retired });
+    try h.press('0', .{});
+    try testing.expectEqual(ui.View.milestones, s.view);
+    try testing.expectEqual(milestone_filter.Scope.all, s.ms_query.scope);
+    try h.press('V', .{});
+    try testing.expect(h.shows("All milestones"));
+    try h.press(K.enter, .{});
+    try testing.expect(h.shows("0  All milestones, replaced"));
+    try h.press(K.escape, .{});
+
+    // X deletes the one shown, not a default one; then the default's are back.
+    try h.press('1', .{});
+    try h.press('X', .{});
+    try testing.expect(h.shows("this is a default one"));
+    try h.press('5', .{});
+    try testing.expect(h.shows("5 UI work  ×"));
+    try testing.expect(!h.shows("0 All milestones  ×"));
+    try h.click(.{ .command = .delete_view });
+    try testing.expect(h.shows("Delete this view"));
+    try h.press(K.escape, .{});
+    try testing.expect(s.views[0] != null);
+    try h.press('X', .{});
+    try testing.expect(h.shows("Delete this view"));
+    try h.press('D', .{});
+    try testing.expect(s.views[0] == null);
+    try testing.expect(s.custom == null);
+    try testing.expectEqualStrings("Gamma", s.search.text());
+    try testing.expectEqual(@as(u32, 3), Fake.saves);
+    try testing.expect(Fake.last[0] != null and Fake.last[1] == null);
+    try testing.expect(!h.shows("5 UI work"));
+
+    // When the file can't be written, the view is kept for the session and it says so.
+    Fake.ok = false;
+    try h.press('V', .{});
+    try h.typeText("Mine");
+    try h.press(K.enter, .{});
+    try h.press(K.enter, .{});
+    try testing.expect(h.shows("for this session only"));
+    try testing.expect(s.views[0] != null);
+}
+
+test "custom views: back from a long way keeps the view on its base" {
+    const h = try Harness.create();
+    defer h.destroy();
+    const id = try h.app.store.create(.{ .title = "Alpha" });
+    try h.draw();
+    const s = &h.app.state;
+    _ = try custom_view.load(s, &.{.{ .name = "B", .key = 5, .view = "board" }});
+    try h.press('5', .{});
+    try testing.expectEqual(ui.View.board, s.view);
+    // More issues and milestones than the way back holds.
+    for (0..10) |_| {
+        s.openIssue(id.slice());
+        s.openMilestone(.none);
+    }
+    for (0..30) |_| s.back();
+    try h.draw();
+    try testing.expectEqual(ui.View.board, s.view);
+    try testing.expect(s.custom != null);
+    // Saving from here saves the view shown (it crashed when back fell
+    // through to another tab with the view still set).
+    try h.press('V', .{});
+    try h.typeText("X");
+    try h.press(K.enter, .{});
+    try h.press(K.enter, .{});
+}
+
+test "custom views: a template's count leaves out what it skips; 4 leaves a timeline view" {
+    const h = try Harness.create();
+    defer h.destroy();
+    const s = &h.app.state;
+    try testing.expectEqual(1, try custom_view.load(s, &.{
+        .{ .name = "Late", .key = 6, .view = "timeline" },
+        .{ .name = "Taken", .key = 6 },
+        .{ .name = "Newer", .key = 7, .view = "gantt" },
+    }));
+    try h.draw();
+    try h.press('6', .{});
+    try testing.expectEqual(ui.View.timeline, s.view);
+    try testing.expect(s.custom != null);
+    // As the dialog for timeline changes does after Discard, on 4.
+    _ = h.app.perform(.{ .leave_timeline = .{ .apply = false, .then = .{ .view = .timeline } } });
+    try testing.expectEqual(ui.View.timeline, s.view);
+    try testing.expect(s.custom == null);
+}
+
+test "custom views: many give way to the sync badge and the buttons" {
+    const h = try Harness.createRemote();
+    defer h.destroy();
+    const s = &h.app.state;
+    var saved: [custom_view.max]custom_view.Saved = undefined;
+    for (&saved, 0..) |*v, n| {
+        v.* = .{ .name = "A rather long view name", .key = custom_view.keys[n] - '0' };
+    }
+    _ = try custom_view.load(s, &saved);
+    try h.draw();
+    try testing.expect(h.shows("5 A rather long view name"));
+    try testing.expect(!h.shows("0 A rather long view name"));
+    try testing.expect(h.shows("…"));
+    try testing.expect(h.shows("⇅ origin"));
+    try testing.expect(h.shows("+ New"));
+}
+
+test "custom views: a name is checked; a timeline draft holds the key back" {
+    const h = try Harness.create();
+    defer h.destroy();
+    const s = &h.app.state;
+    _ = try custom_view.load(s, &.{
+        .{ .name = "Late", .key = 6, .view = "timeline", .scope = "all" },
+    });
+    try h.draw();
+    try testing.expect(h.shows("6 Late"));
+
+    try h.press('V', .{});
+    try h.typeText("   ");
+    try h.press(K.enter, .{});
+    try testing.expect(h.shows("one line of at most 32 bytes"));
+    try h.press(K.escape, .{});
+
+    const id = try h.app.store.create(.{ .title = "Dated" });
+    try h.setDates(id.slice(), "2023-11-13", "2023-11-17");
+    try h.press('4', .{});
+    try h.press('j', .{});
+    try h.press('E', .{});
+    try testing.expect(s.timeline.editing);
+    try h.press('>', .{});
+    try testing.expectEqual(@as(usize, 1), s.timeline.changes());
+    try h.press('6', .{});
+    // Asked first: leaving would lose the change.
+    try testing.expect(s.modal != null and s.modal.? == .confirm);
+    try testing.expect(s.custom == null);
+    try h.press('D', .{});
+    try testing.expectEqual(@as(?u8, 1), s.custom);
+    try testing.expectEqual(filter.Scope.all, s.tl_query.scope);
+    try h.press('4', .{});
+    try testing.expectEqual(filter.Scope.open, s.tl_query.scope);
+    try testing.expectEqual(filter.SortKey.start, s.tl_query.key);
 }

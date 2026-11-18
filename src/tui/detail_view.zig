@@ -12,6 +12,7 @@ const issuez = @import("issuez");
 const ui = @import("ui.zig");
 const store = @import("store.zig");
 const text_mod = @import("text.zig");
+const md_view = @import("markdown.zig");
 const modal = @import("modal.zig");
 const AppState = @import("State.zig");
 
@@ -66,6 +67,8 @@ pub const State = struct {
     first: u16 = 0,
     content_rows: u32 = 0,
     visible: u16 = 1,
+    /// Descriptions and comments as written, not rendered (r).
+    raw: bool = false,
 
     pub fn deinit(d: *State, gpa: Allocator) void {
         d.items.deinit(gpa);
@@ -402,7 +405,7 @@ fn drawContent(c: *Canvas, i: u32) Allocator.Error!void {
                 "No description. Click or press e to write one.",
                 .{ .fg = palette.faint, .italic = true },
             );
-        } else try paragraph(c, issue.description, 2, .{});
+        } else try markdown(c, issue.description, 2);
         try c.end(span);
     }
     c.skip(1);
@@ -482,9 +485,13 @@ fn drawContent(c: *Canvas, i: u32) Allocator.Error!void {
                     l.word(f.fmt("→ {s}", .{st.text()}), .{ .fg = palette.done });
                 }
             }
+            // The subject is the text's first paragraph.
             const body = try std.mem.join(f.arena, "\n", cm.body);
-            const shown = if (std.mem.trim(u8, body, " \n").len == 0) cm.subject else body;
-            try paragraph(c, std.mem.trimEnd(u8, shown, "\n"), 4, .{});
+            const shown = if (std.mem.trim(u8, body, " \n").len == 0)
+                cm.subject
+            else
+                try std.mem.concat(f.arena, u8, &.{ cm.subject, "\n\n", body });
+            try markdown(c, std.mem.trimEnd(u8, shown, "\n"), 4);
             const rx = try reactionsText(f, issue, cm.oid);
             if (rx.len > 0) c.text(4, rx, .{ .fg = palette.muted });
         }
@@ -534,6 +541,27 @@ fn paragraph(c: *Canvas, body: []const u8, indent: u16, style: ui.Style) Allocat
     for (rows) |r| if (c.line()) |l| {
         _ = ui.text(l, indent, 0, text_mod.expandTabs(c.f.arena, body[r.start..r.end]), style);
     };
+}
+
+/// `body` rendered as Markdown, `indent` columns in; as written with r, or
+/// when it doesn't parse.
+fn markdown(c: *Canvas, body: []const u8, indent: u16) Allocator.Error!void {
+    const width = c.win.width -| indent -| 1;
+    if (width == 0 or c.s.detail.raw) return paragraph(c, body, indent, .{});
+    const measure = md_view.measureOf(&c.win);
+    const doc = try md_view.layout(c.f.arena, body, width, measure) orelse
+        return paragraph(c, body, indent, .{});
+    const top = c.y;
+    c.y += @intCast(doc.height);
+    const from = @max(top, c.scroll);
+    const to = @min(c.y, c.scroll + c.win.height);
+    if (to <= from) return;
+    md_view.paint(c.win.child(.{
+        .x_off = indent,
+        .y_off = @intCast(from - c.scroll),
+        .width = width,
+        .height = @intCast(to - from),
+    }), doc, from - top, measure);
 }
 
 fn progressBar(l: ui.Window, p: issuez.projection.Progress) void {
@@ -780,6 +808,8 @@ pub fn key(s: *AppState, k: vaxis.Key) Allocator.Error!AppState.Action {
         return activate(s, i, .add_existing);
     } else if (k.matches('x', .{})) {
         return activate(s, i, .toggle);
+    } else if (k.matches('r', .{})) {
+        d.raw = !d.raw;
     } else if (k.matches('o', .{})) {
         if (s.snap.proj.parent[i] != none) s.openIssue(s.snap.issues[s.snap.proj.parent[i]].id);
     } else {

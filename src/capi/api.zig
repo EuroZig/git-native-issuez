@@ -263,6 +263,8 @@ pub const Field = enum(u32) {
     /// timeline only: the lock's reason changed (the LOCKED change of the same commit carries it
     /// too)
     lock_reason,
+    /// X-Rank, the place in an order set by hand
+    rank,
     _,
 
     pub const c_name = "issuez_field";
@@ -297,6 +299,7 @@ pub const Field = enum(u32) {
             .milestone_status => "X-Milestone-Status",
             .extra => "",
             .lock_reason => "X-Lock-Reason",
+            .rank => "X-Rank",
             .unknown, _ => "",
         };
     }
@@ -347,6 +350,12 @@ pub const Opt = enum(u32) {
     /// ADD str: "<id> <media_type> <size> sha256:<sha256> <name>", from
     /// issuez_prepared_attachment_info; external storage only
     prepared_attachment,
+    /// update: str, an issue's full UUID. The issue goes right before that one in your order, among
+    /// the issues of its board column, its key (RANK) chosen to fit, with the other changes; not
+    /// with RANK, a comment event, a reaction or DELETED
+    rank_before,
+    /// update: str. As RANK_BEFORE, right after that issue
+    rank_after,
 
     /// query: num 0 not done (default), 1 done, -1 any
     q_done = 0x200,
@@ -518,6 +527,9 @@ pub const Sort = enum(u32) {
     due_date,
     comments,
     state,
+    /// your order (X-Rank): issues with a key by key, then the rest oldest
+    /// first; ascending reverses it, as for due dates and state
+    rank,
     _,
 
     pub const c_name = "issuez_sort";
@@ -737,6 +749,8 @@ pub const IssueInfo = extern struct {
     original_id: Str,
     /// issuez_issue_load_since's since isn't in the history; false from other loads
     rewritten: bool,
+    /// its key in your order (X-Rank); {NULL,0} for none
+    rank: Str,
 
     pub const c_name = "issuez_issue_info";
     pub const type_kind: TypeKind = .record;
@@ -2027,6 +2041,10 @@ pub const helpers = [_]Helper{
     h(.set, "alternate_object_dirs", .str, .{}),
     h(.set, "ref", .str, .{}),
     h(.clear, "ref", .none, .{}),
+    h(.set, "rank", .str, .{}),
+    h(.clear, "rank", .none, .{}),
+    h(.set, "rank_before", .str, .{ .name = "issuez_rank_before" }),
+    h(.set, "rank_after", .str, .{ .name = "issuez_rank_after" }),
     h(.set, "locked", .num_str, .{ .num_type = "bool", .param = "locked", .param2 = "reason" }),
     h(.add, "attachments", .attachment, .{}),
     h(.remove, "attachments", .str, .{}),

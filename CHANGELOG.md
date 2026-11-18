@@ -8,12 +8,86 @@ versions may change the library API; the on-disk format only ever grows (see
 
 ## [Unreleased]
 
+## [0.6.0] - 2026-11-18
+
+Your own order on the board, views of your own, a second sort key in the
+TUI, and Markdown rendered in the TUI and `show`. The on-disk format gains
+one optional field, `X-Rank` (format.md §3; `Format-Version` stays 1):
+upstream keeps it like any `X-` field, and older versions of
+git-native-issuez show it among the other fields. A C host needs the 0.6.0
+`issuez.h` (before 1.0, the header and the library must have the same
+minor version); `issuez_issue_info` gains `rank` at its end. In Zig,
+`query.SortKey` and the view's fields gain `rank`, so an exhaustive switch
+over either needs a branch for it. Building git-issue now also fetches
+markdownz and uucode (and, for the TUI, known-folders); projects that only
+use the library fetch none of them.
+
 ### Added
 
+- Descriptions and comments rendered as Markdown, with
+  [markdownz](https://github.com/StaffinityAI/markdownz)'s markdown-term:
+  in the TUI's issue view (`r` shows them as written, and back), and by
+  `show` on a terminal, wrapped to its width and styled unless `NO_COLOR`
+  is set. Into a pipe or a file, and with `--json`, `show` prints the text
+  as written, as before; `--raw` does on a terminal too. `--color always`
+  renders and styles into a pipe as well, `--color never` renders without
+  styles. An update's field lines (`Priority: high`) stay as written. The
+  library and the C API hand out the text as written.
 - TUI: now and then, never early in a session and at most once a month, the
   status bar asks for a star on GitHub. With `gh` logged in it stays quiet
-  once the project is starred and stars it in one click, or with `!`;
-  otherwise it opens the project's page. `Never` stops it for good.
+  once the project is starred (before a notice, `gh` asks GitHub whether
+  it is) and stars it in one click, or with `!` and `Star it`; otherwise
+  it opens the project's page. `Never` stops it for good.
+- TUI: views of your own. `V`, or `+ View` after the tabs, saves the filter
+  and sort of the list, the board, the milestones or the timeline under a
+  name and a key of 5 to 0, next to the default views' 1 to 4; the key or
+  its tab shows it again, `X` or the `×` on its tab deletes it. The default
+  view keeps its own filter and sort meanwhile. Each repository has its
+  own (its worktrees share them), kept in the TUI's state file, `tui.zon`.
+  `ctrl+t` (or `☰`) saves them under a name as a template, and
+  loads or deletes one: a template's views replace a repository's.
+- Your own order on the board: `X-Rank`, a new issue field (format.md §3),
+  is each issue's key in an order set by hand, merged like any field. The
+  board is in that order by default; drag a card to a place in its column
+  or in another (a line shows where), or move it with `J` and `K`. Most
+  moves write the moved issue alone; how keys are given is in format.md
+  §3. New issues come last. The board has its own filter and sort
+  now, apart from the list's. The list, sorted by rank, orders rows the
+  same way: dragged onto another row, or with `J` and `K`.
+- TUI: sort then by a second key. `b`, `→ then by…` in the sort menu, the
+  filter bar's `then` or a shift-click on a column title picks the key
+  that orders the issues equal in the sort's; `B` reverses it. With one,
+  `updated` and `created` count by the local day, so "updated, then by
+  priority" orders each day's work. Each group has its name above it, in
+  the list on a line of its own and on the board between the cards (not
+  in the tree, nor for titles, IDs and ranks, which hardly tie). Sorted
+  then by rank, `J`, `K` and drags order by hand within a group, as rank
+  can't move an issue out of it. Views of your own keep the second key.
+- `create --rank`, `edit --rank`, `--no-rank`, `--before` and `--after`,
+  `ls --sort rank`; `rank` in the JSON. MCP: `rank` on `create_issue`,
+  `rank`, `before` and `after` on `edit_issue`, `rank` as a sort. Library:
+  `issuez.format.rank`, `issuez.order`, `Repo.reorder` and
+  `Repo.reorderBeside`. C API: `ISSUEZ_FIELD_RANK`,
+  `ISSUEZ_OPT_RANK_BEFORE` / `_AFTER`, `ISSUEZ_SORT_RANK` and `rank` in
+  `issuez_issue_info`; Go: `Edit.SetRank`, `RankBefore`, `RankAfter`,
+  `Issue.Rank`, `SortRank`. With `Ascending`, `SortRank` is reversed, as
+  `SortDueDate` and `SortState` are.
+
+### Fixed
+
+- TUI: a comment of more than one paragraph showed only the text after
+  its first; the first paragraph (the commit's subject) shows too.
+- `THIRD_PARTY_LICENSES` listed nightwatch in libissuez and the Go module
+  since 0.4.0; it is only in the full flavor. It listed zigimg, which
+  libvaxis no longer links, since 0.5.0.
+
+### Known limitations
+
+- Two TUIs on one repository (its worktrees too) each write the views
+  they have: views saved in one are lost when the other saves its own.
+- `edit --before` / `--after` place the issue in the anchor's board
+  column, also when the same edit moves it to another workflow state.
+- The Windows builds are released but not tested yet.
 
 ## [0.5.0] - 2026-11-10
 

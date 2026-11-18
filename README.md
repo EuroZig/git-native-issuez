@@ -114,12 +114,32 @@ everywhere. The list is sortable and filterable
 (`label:ui @ada p:high is:blocked -label:wontfix`). It updates live when
 the CLI, another TUI or an agent writes.
 
+Descriptions and comments are rendered as Markdown: headings, emphasis,
+code, lists, quotes, tables and links (clickable where the terminal
+supports it); `r` in an issue shows them as written. `git issue show` does
+the same on a terminal, and prints the text as written into a pipe or a
+file, or with `--raw`; `--color never` or `NO_COLOR` leaves the styling
+out, `--color always` renders into a pipe too. The Markdown is
+[markdownz](https://github.com/StaffinityAI/markdownz)'s: no raw HTML,
+entities or bare URLs.
+
+The board (`2`) is in your order: drag a card to a place in its column or
+in another one, where a line shows where it lands, or move it with `J` and
+`K`. The list does the same once sorted by rank (`s`), without the tree.
+`b` sorts then by a second key, within the groups of issues the first
+one has in common: by priority then by rank, say, a line marks where
+each priority ends, and cards move by hand within their priority.
+The order is the issues' `X-Rank` keys, shared like any field
+([docs/format.md](docs/format.md) §3), and new issues come last. `git
+issue edit --before` / `--after` and `ls --sort rank` use it from the
+command line.
+
 Now and then the status bar asks for a star on GitHub: never in a
 session's first ten minutes, at most once a month, a few times in all.
-With the GitHub CLI (`gh`) logged in it never asks once the project is
-starred, and one click (or `!`) stars it; without it the click opens the
-project's page. `Never` stops it for good. What it asked when is kept in
-the TUI's state file, `git-issue/tui.zon` in your configuration folder
+With the GitHub CLI (`gh`) logged in it stays quiet once you have
+starred the project, and one click stars it (or `!`, then `Star it`);
+without `gh` the click opens the project's page. `Never` stops it for
+good. What it asked when is kept in the TUI's state file, `git-issue/tui.zon` in your configuration folder
 (`~/.config`, `~/Library/Application Support` on macOS, `%LOCALAPPDATA%`
 on Windows).
 
@@ -143,6 +163,16 @@ conflicts opened. `git config issue.remote` picks the remote, and `git
 config issue.autoSync 10` fetches and merges every 10 minutes (it never
 pushes on its own). git never prompts: it runs without a terminal, ssh in
 batch mode unless you set your own ssh command, so a key needs an agent.
+
+Views of your own sit next to the four on `1` to `4`: `V`, or the
+`+ View` button after the tabs, saves the filter and sort shown (of the
+list, the board, the milestones or the timeline) under a name and a key of
+`5` to `0`, and that key, or its tab, shows them again. The default view
+keeps its own filter and sort meanwhile; `X`, or the `×` on its tab,
+deletes the view shown. Each repository has its own views (its worktrees
+share them), kept in the TUI's state file, `git-issue/tui.zon`. `ctrl+t`,
+or `☰` after the tabs, saves them under a name as a template, for loading
+in place of another repository's.
 
 ### Coding agents (MCP)
 
@@ -205,8 +235,9 @@ for (open) |issue| std.debug.print("{s} {s}\n", .{ issue.state.text(), issue.tit
   `GitSim` is an in-memory repository for tests, or bring your own
   ([docs/design.md](docs/design.md)).
 - As a dependency the package builds only the library: libvaxis,
-  known-folders, blitzmcp and nightwatch are never fetched. Pass `.tui = true` or `.mcp = true` to
-  build them into `git-issue`.
+  known-folders, blitzmcp, nightwatch, markdownz and uucode are never
+  fetched. Pass `.tui = true` or `.mcp = true` to build them into
+  `git-issue`.
 
 | Example                                           | Shows                                                                                  | Run                                        |
 | ------------------------------------------------- | -------------------------------------------------------------------------------------- | ------------------------------------------ |
@@ -255,8 +286,8 @@ docs under `share/`. The Windows archive has `git-issue.exe` only: run
 one by hand, unpack it into a prefix with `bin/` on your `PATH`:
 
 ```sh
-gh release download v0.5.0 --repo EuroZig/git-native-issuez --pattern '*-full-aarch64-macos.tar.gz'
-tar -xzf git-native-issuez-0.5.0-full-aarch64-macos.tar.gz --strip-components=1 -C ~/.local
+gh release download v0.6.0 --repo EuroZig/git-native-issuez --pattern '*-full-aarch64-macos.tar.gz'
+tar -xzf git-native-issuez-0.6.0-full-aarch64-macos.tar.gz --strip-components=1 -C ~/.local
 ```
 
 On macOS, an archive downloaded with a browser is quarantined and
@@ -268,7 +299,7 @@ On macOS, an archive downloaded with a browser is quarantined and
 It downloads the latest release for your machine, checks it against
 `SHA256SUMS` and unpacks it into `~/.local`.
 
-- Options go after `sh -s --`: `--flavor minimal`, `--version 0.5.0`,
+- Options go after `sh -s --`: `--flavor minimal`, `--version 0.6.0`,
   `--prefix /usr/local`. For a prefix you can't write to, pipe it into
   `sudo sh -s -- --prefix /usr/local`.
 - It doesn't touch your shell configuration: if `~/.local/bin` isn't on

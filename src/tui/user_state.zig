@@ -15,11 +15,80 @@ const Environ = std.process.Environ;
 const known_folders = @import("known-folders");
 
 const star = @import("star.zig");
+const custom_view = @import("custom_view.zig");
 
 pub const State = struct {
     /// The star notice.
     star: star.Record = .{},
+    /// The user's own views of each repository, on keys 5 to 0.
+    projects: []const Project = &.{},
+    /// Sets of views by name, for any repository.
+    templates: []const Template = &.{},
 };
+
+pub const Project = struct {
+    /// The repository's git common directory, absolute, symlinks resolved:
+    /// its worktrees share it.
+    path: []const u8 = "",
+    views: []const custom_view.Saved = &.{},
+};
+
+pub const Template = struct {
+    name: []const u8 = "",
+    views: []const custom_view.Saved = &.{},
+};
+
+/// The views of the project at `project`, a `Project.path`; none when it
+/// has no entry.
+pub fn viewsOf(state: State, project: []const u8) []const custom_view.Saved {
+    for (state.projects) |p| if (std.mem.eql(u8, p.path, project)) return p.views;
+    return &.{};
+}
+
+/// `state` with `views` as the project's at `project`: an empty set drops
+/// its entry. The slices are `a`'s or the caller's.
+pub fn withViews(
+    a: Allocator,
+    state: State,
+    project: []const u8,
+    views: []const custom_view.Saved,
+) Allocator.Error!State {
+    var out = state;
+    var list: std.ArrayList(Project) = .empty;
+    for (state.projects) |p| if (!std.mem.eql(u8, p.path, project)) try list.append(a, p);
+    if (views.len > 0) try list.append(a, .{ .path = project, .views = views });
+    out.projects = list.items;
+    return out;
+}
+
+pub fn findTemplate(templates: []const Template, name: []const u8) ?Template {
+    for (templates) |t| if (std.mem.eql(u8, t.name, name)) return t;
+    return null;
+}
+
+/// `state` with the template `name` holding `views`, in place of one of
+/// that name; null `views` drops it.
+pub fn withTemplate(
+    a: Allocator,
+    state: State,
+    name: []const u8,
+    views: ?[]const custom_view.Saved,
+) Allocator.Error!State {
+    var out = state;
+    var list: std.ArrayList(Template) = .empty;
+    var placed = false;
+    for (state.templates) |t| {
+        if (!std.mem.eql(u8, t.name, name)) {
+            try list.append(a, t);
+        } else if (views) |v| {
+            try list.append(a, .{ .name = name, .views = v });
+            placed = true;
+        }
+    }
+    if (views) |v| if (!placed) try list.append(a, .{ .name = name, .views = v });
+    out.templates = list.items;
+    return out;
+}
 
 const header =
     \\// git issue tui: what it keeps for you between sessions. Fields left
@@ -37,10 +106,14 @@ pub fn path(io: std.Io, a: Allocator, environ_map: *const Environ.Map) ?[]const 
     return std.fs.path.join(a, &.{ dir, "git-issue", "tui.zon" }) catch null;
 }
 
+/// What reading takes at most: views of hundreds of repositories, and
+/// more. A file past it can't be read, and so isn't saved over.
+const max_bytes = 16 * 1024 * 1024;
+
 /// The defaults when there is no file yet; null when it can't be read or
 /// isn't the ZON it should be: then it isn't to be saved over either.
 pub fn load(io: std.Io, a: Allocator, file: []const u8) ?State {
-    const bytes = std.Io.Dir.cwd().readFileAlloc(io, file, a, .limited(64 * 1024)) catch |e|
+    const bytes = std.Io.Dir.cwd().readFileAlloc(io, file, a, .limited(max_bytes)) catch |e|
         switch (e) {
             error.FileNotFound => return .{},
             error.Canceled => {
@@ -70,6 +143,26 @@ pub fn write(state: State, w: *std.Io.Writer) std.Io.Writer.Error!void {
     try w.writeByte('\n');
 }
 
+/// The star notice's task and the UI both write the file: each change
+/// reads it again under this lock, so neither drops what the other wrote.
+var lock: std.Io.Mutex = .init;
+
+/// The file read, changed by `change(context, a, &state)` and saved,
+/// under the lock. False when it couldn't be read or written.
+pub fn update(
+    io: std.Io,
+    a: Allocator,
+    file: []const u8,
+    context: anytype,
+    comptime change: fn (@TypeOf(context), Allocator, *State) Allocator.Error!void,
+) bool {
+    lock.lockUncancelable(io);
+    defer lock.unlock(io);
+    var state = load(io, a, file) orelse return false;
+    change(context, a, &state) catch return false;
+    return save(io, a, file, state);
+}
+
 /// Whole or not at all: a temporary file renamed over it. False when it
 /// couldn't be written.
 pub fn save(io: std.Io, a: Allocator, file: []const u8, state: State) bool {
@@ -80,7 +173,16 @@ pub fn save(io: std.Io, a: Allocator, file: []const u8, state: State) bool {
     var suffix: [8]u8 = undefined;
     io.random(&suffix);
     const tmp = std.fmt.allocPrint(a, "{s}.tmp-{x}", .{ file, suffix }) catch return false;
-    cwd.writeFile(io, .{ .sub_path = tmp, .data = out.written() }) catch return false;
+    // On the disk before the rename: a crash leaves the old file or the
+    // new one, never an empty one.
+    const f = cwd.createFile(io, tmp, .{}) catch return false;
+    f.writeStreamingAll(io, out.written()) catch {
+        f.close(io);
+        cwd.deleteFile(io, tmp) catch {};
+        return false;
+    };
+    f.sync(io) catch {};
+    f.close(io);
     std.Io.Dir.rename(cwd, tmp, cwd, file, io) catch {
         cwd.deleteFile(io, tmp) catch {};
         return false;
@@ -90,19 +192,59 @@ pub fn save(io: std.Io, a: Allocator, file: []const u8, state: State) bool {
 
 const testing = std.testing;
 
+test "projects: each its own views; none drops the entry" {
+    var arena_state: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena_state.deinit();
+    const a = arena_state.allocator();
+    const mine: []const custom_view.Saved = &.{.{ .name = "Mine", .key = 5 }};
+    const theirs: []const custom_view.Saved = &.{.{ .name = "Theirs", .key = 6 }};
+    var s = try withViews(a, .{}, "/a/.git", mine);
+    s = try withViews(a, s, "/b/.git", theirs);
+    try testing.expectEqualStrings("Mine", viewsOf(s, "/a/.git")[0].name);
+    try testing.expectEqualStrings("Theirs", viewsOf(s, "/b/.git")[0].name);
+    try testing.expectEqual(0, viewsOf(s, "/c/.git").len);
+    s = try withViews(a, s, "/a/.git", theirs);
+    try testing.expectEqualStrings("Theirs", viewsOf(s, "/a/.git")[0].name);
+    s = try withViews(a, s, "/a/.git", &.{});
+    try testing.expectEqual(1, s.projects.len);
+    // Written and read back.
+    var out: std.Io.Writer.Allocating = .init(a);
+    try write(s, &out.writer);
+    try testing.expectEqualDeep(s, parse(a, out.written()).?);
+}
+
+test "templates: saved, replaced by name, dropped" {
+    var arena_state: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena_state.deinit();
+    const a = arena_state.allocator();
+    const one: []const custom_view.Saved = &.{.{ .name = "One", .key = 5 }};
+    const two: []const custom_view.Saved = &.{.{ .name = "Two", .key = 7 }};
+    var s = try withTemplate(a, .{}, "Triage", one);
+    s = try withTemplate(a, s, "Triage", two);
+    try testing.expectEqual(1, s.templates.len);
+    try testing.expectEqualStrings("Two", findTemplate(s.templates, "Triage").?.views[0].name);
+    s = try withTemplate(a, s, "Triage", null);
+    try testing.expect(findTemplate(s.templates, "Triage") == null);
+}
+
 test "state: written and read back; missing fields default, unknown ones are skipped" {
     var arena_state: std.heap.ArenaAllocator = .init(testing.allocator);
     defer arena_state.deinit();
     const a = arena_state.allocator();
     const s: State = .{
         .star = .{ .first_seen = 17, .last_shown = 42, .shown = 2, .done = .never },
+        .projects = &.{.{ .path = "/r/.git", .views = &.{
+            .{ .name = "Bugs", .key = 5, .filter = "label:bug", .sort = "priority", .tree = true },
+            .{ .name = "Due", .key = 0, .view = "milestones", .scope = "all", .reverse = true },
+            .{ .name = "Soon", .key = 6, .sort = "due", .then = "priority", .then_reverse = true },
+        } }},
     };
     var out: std.Io.Writer.Allocating = .init(a);
     try write(s, &out.writer);
-    try testing.expectEqual(s, parse(a, out.written()).?);
-    try testing.expectEqual(State{}, parse(a, ".{}").?);
+    try testing.expectEqualDeep(s, parse(a, out.written()).?);
+    try testing.expectEqualDeep(State{}, parse(a, ".{}").?);
     const newer = parse(a, ".{ .star = .{ .shown = 3, .later = 1 }, .theme = .dark }").?;
-    try testing.expectEqual(State{ .star = .{ .shown = 3 } }, newer);
+    try testing.expectEqualDeep(State{ .star = .{ .shown = 3 } }, newer);
 }
 
 test "state: damage is refused, not read as defaults" {
@@ -122,8 +264,35 @@ test "save: into a folder made for it, over what was there" {
     const a = arena_state.allocator();
     const root = try tmp.dir.realPathFileAlloc(testing.io, ".", a);
     const file = try std.fs.path.join(a, &.{ root, "git-issue", "tui.zon" });
-    try testing.expectEqual(State{}, load(testing.io, a, file).?);
+    try testing.expectEqualDeep(State{}, load(testing.io, a, file).?);
     try testing.expect(save(testing.io, a, file, .{ .star = .{ .shown = 1 } }));
     try testing.expect(save(testing.io, a, file, .{ .star = .{ .shown = 2 } }));
-    try testing.expectEqual(State{ .star = .{ .shown = 2 } }, load(testing.io, a, file).?);
+    try testing.expectEqualDeep(State{ .star = .{ .shown = 2 } }, load(testing.io, a, file).?);
+}
+
+test "update: what the other writer saved meanwhile is kept" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena_state: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena_state.deinit();
+    const a = arena_state.allocator();
+    const root = try tmp.dir.realPathFileAlloc(testing.io, ".", a);
+    const file = try std.fs.path.join(a, &.{ root, "tui.zon" });
+    try testing.expect(save(testing.io, a, file, .{ .star = .{ .shown = 1 } }));
+    const views: []const custom_view.Saved = &.{.{ .name = "Mine", .key = 6 }};
+    try testing.expect(update(testing.io, a, file, views, struct {
+        fn f(v: []const custom_view.Saved, ar: Allocator, st: *State) Allocator.Error!void {
+            st.templates = try ar.dupe(Template, &.{.{ .name = "T", .views = v }});
+        }
+    }.f));
+    try testing.expectEqualDeep(
+        State{ .star = .{ .shown = 1 }, .templates = &.{.{ .name = "T", .views = views }} },
+        load(testing.io, a, file).?,
+    );
+    try std.Io.Dir.cwd().writeFile(testing.io, .{ .sub_path = file, .data = "damaged" });
+    try testing.expect(!update(testing.io, a, file, views, struct {
+        fn f(v: []const custom_view.Saved, ar: Allocator, st: *State) Allocator.Error!void {
+            st.templates = try ar.dupe(Template, &.{.{ .name = "T", .views = v }});
+        }
+    }.f));
 }

@@ -9,6 +9,7 @@ const fields_fmt = @import("../format/fields.zig");
 
 const Issue = issue_model.Issue;
 const core_fmt = @import("../format/core.zig");
+const order_mod = @import("order.zig");
 const State = core_fmt.State;
 const Priority = core_fmt.Priority;
 
@@ -54,7 +55,8 @@ pub const Filter = struct {
     }
 };
 
-pub const SortKey = enum { created, updated, priority, state };
+/// `rank`: your order (`order.compare`), the board's.
+pub const SortKey = enum { created, updated, priority, state, rank };
 
 pub const Order = struct {
     key: SortKey = .created,
@@ -78,6 +80,10 @@ pub fn list(
 }
 
 fn lessThan(order: Order, a: Issue, b: Issue) bool {
+    if (order.key == .rank) {
+        const o = order_mod.compare(.of(a), .of(b));
+        return if (order.reverse) o == .gt else o == .lt;
+    }
     const ka = sortKey(a, order);
     const kb = sortKey(b, order);
     if (ka != kb) return if (order.reverse) ka < kb else ka > kb;
@@ -91,6 +97,7 @@ fn sortKey(issue: Issue, order: Order) i64 {
         // Values outside the four levels sort below `low`, like upstream.
         .priority => if (issue.priority) |p| p.rank() else 0,
         .state => if (issue.state.isDone(order.done_states)) 0 else 1,
+        .rank => unreachable,
     };
 }
 

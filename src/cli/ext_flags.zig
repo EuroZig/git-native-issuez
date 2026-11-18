@@ -18,6 +18,8 @@ pub const help_create =
     \\                             default backlog, ready, in-progress, review)
     \\   --milestone-id <id>       Put it in a catalog milestone (ID prefix or name)
     \\   --milestone-mode <mode>   inherit (the parent's milestone), none or explicit
+    \\   --rank <key>              Its place in your order (X-Rank): 0-9 and a-z,
+    \\                             not ending in 0; ls --sort rank shows the order
     \\
 ;
 
@@ -29,6 +31,7 @@ pub const help_edit = help_create ++
     \\   --no-due                  Clear the due date
     \\   --no-estimate             Clear the estimate
     \\   --no-workflow             Clear the workflow state
+    \\   --no-rank                 Leave your order (it goes after those in it)
     \\   --no-assignee             Clear the assignee
     \\   --no-priority             Clear the priority
     \\   --no-milestone            Clear the milestone (and stop inheriting one)
@@ -44,6 +47,7 @@ pub const Flags = struct {
     due: ?[]const u8 = null,
     estimate: ?[]const u8 = null,
     workflow: ?[]const u8 = null,
+    rank: ?[]const u8 = null,
     milestone_id: ?[]const u8 = null,
     milestone_mode: ?[]const u8 = null,
     // edit only
@@ -56,6 +60,7 @@ pub const Flags = struct {
         due,
         estimate,
         workflow,
+        rank,
         assignee,
         priority,
         milestone,
@@ -63,7 +68,7 @@ pub const Flags = struct {
     };
 
     /// The table entries for the flags `create` and `edit` share.
-    pub fn table(f: *Flags) [8]common.Flag {
+    pub fn table(f: *Flags) [9]common.Flag {
         return .{
             .{ "--parent", .{ .text = &f.parent } },
             .{ "--blocked-by", .{ .list = &f.blocked_by } },
@@ -71,6 +76,7 @@ pub const Flags = struct {
             .{ "--due", .{ .text = &f.due } },
             .{ "--estimate", .{ .text = &f.estimate } },
             .{ "--workflow", .{ .text = &f.workflow } },
+            .{ "--rank", .{ .text = &f.rank } },
             .{ "--milestone-id", .{ .text = &f.milestone_id } },
             .{ "--milestone-mode", .{ .text = &f.milestone_mode } },
         };
@@ -86,7 +92,8 @@ pub const Flags = struct {
     pub fn any(f: Flags) bool {
         return f.parent != null or f.blocked_by.items.len > 0 or f.unblock.items.len > 0 or
             f.start != null or f.due != null or f.estimate != null or f.workflow != null or
-            f.milestone_id != null or f.milestone_mode != null or f.no.count() > 0;
+            f.rank != null or f.milestone_id != null or f.milestone_mode != null or
+            f.no.count() > 0;
     }
 
     pub const Resolved = struct {
@@ -97,6 +104,7 @@ pub const Flags = struct {
         due: ?fields.Date = null,
         estimate: ?u32 = null,
         workflow: ?[]const u8 = null,
+        rank: ?[]const u8 = null,
     };
 
     /// Reports and returns null on the first bad value.
@@ -141,6 +149,16 @@ pub const Flags = struct {
             ) catch {};
             return null;
         };
+        if (f.rank) |r| {
+            if (!issuez.format.rank.valid(r)) {
+                ctx.err.print(
+                    "error: --rank takes " ++ issuez.format.rank.rule ++ ", not '{s}'\n",
+                    .{r},
+                ) catch {};
+                return null;
+            }
+            out.rank = r;
+        }
         if (f.workflow) |w| {
             const states = workflowStates(B, ctx, repo) orelse return null;
             if (issuez.format.labels.contains(states, w)) out.workflow = w else {

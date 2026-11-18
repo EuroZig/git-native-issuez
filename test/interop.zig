@@ -1049,7 +1049,7 @@ test "extension fields survive upstream" {
     const epic = try a.create(.ours, "Epic", .{});
     const blocker = try a.create(.ours, "Blocker", .{});
     const id = try a.create(.ours, "Child -l bug --parent {s} --blocked-by {s}" ++
-        " --due 2026-12-01 --estimate 2h --workflow ready", .{ epic, blocker });
+        " --due 2026-12-01 --estimate 2h --workflow ready --rank i", .{ epic, blocker });
     try a.ours("push origin", .{});
     try b.upstream("merge origin", .{});
 
@@ -1065,7 +1065,7 @@ test "extension fields survive upstream" {
     const shown = try a.read(.ours, "show {s}", .{id});
     for ([_][]const u8{
         "[closed]",        "Priority: high", "Due:     2026-12-01", "Estimate: 120 min (2h)",
-        "Workflow: ready", "Parent:  ",      "Blocked by: ",
+        "Workflow: ready", "Parent:  ",      "Blocked by: ",        "Rank:    i",
     }) |want| try expectContains(shown, want);
     try a.upstream("fsck", .{});
 }

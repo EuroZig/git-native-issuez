@@ -65,13 +65,13 @@ To try it, run `npx @modelcontextprotocol/inspector git issue mcp`.
 
 | Tool | Does |
 | --- | --- |
-| `list_issues` | Issues that aren't done, newest first; filters for state, label, assignee, priority, problems, conflicts and deleted issues, a sort order, a limit (default 100) and the total |
+| `list_issues` | Issues that aren't done, newest first; filters for state, label, assignee, priority, problems, conflicts and deleted issues, a sort order (`rank`: your order, as on the board), a limit (default 100) and the total |
 | `show_issue` | One issue with its description and its updates, each a `comment` or an `update` (`kind`; deleted comments left out), with reactions, import provenance and purged comments marked |
 | `search_issues` | Issues whose title, fields, description or comments contain a text, with the matching lines; a limit (default 50) and the total |
 | `list_milestones` | The milestone catalog with each milestone's progress |
-| `create_issue` | A new issue, with labels, assignee, priority, milestone, parent, blockers, dates, estimate, workflow state, a host's own `X-` fields and import provenance; dates are `YYYY-MM-DD` or relative to today in the user's time zone (`today`, `+3d`, `fri`, `eom`) |
+| `create_issue` | A new issue, with labels, assignee, priority, milestone, parent, blockers, dates, estimate, workflow state, rank, a host's own `X-` fields and import provenance; dates are `YYYY-MM-DD` or relative to today in the user's time zone (`today`, `+3d`, `fri`, `eom`) |
 | `comment_issue` | A comment on an issue, with import provenance |
-| `edit_issue` | Title, description and fields (a host's own `X-` fields too) in one commit; an empty value clears a field |
+| `edit_issue` | Title, description and fields (a host's own `X-` fields too) in one commit; an empty value clears a field; `before` or `after` another issue places it in your order, among the issues of that one's board column |
 | `react_issue` | An emoji reaction on an issue or a comment, or taking it back |
 | `set_issue_state` | Close, reopen or set another state, with reason, fixing commit and release |
 

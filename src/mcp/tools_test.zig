@@ -453,6 +453,39 @@ test "resources/subscribe and unsubscribe" {
     try testing.expectEqual(@as(u8, 1), h.handler.subscriptions.count);
 }
 
+test "your order: rank on create, before and after on edit, list sorted by rank" {
+    const h = try Harness.create();
+    defer h.destroy();
+    const arena = h.arena;
+    const a = str(try h.ok("create_issue", "{\"title\":\"A\",\"rank\":\"m\"}"), "id");
+    const b = str(try h.ok("create_issue", "{\"title\":\"B\"}"), "id");
+    const c = str(try h.ok("create_issue", "{\"title\":\"C\"}"), "id");
+
+    // C before A, then A after B: B gets a key too, after C's.
+    _ = try h.ok("edit_issue", try std.fmt.allocPrint(arena,
+        \\{{"id":"{s}","before":"{s}"}}
+    , .{ c, a[0..8] }));
+    const moved = try h.ok("edit_issue", try std.fmt.allocPrint(arena,
+        \\{{"id":"{s}","after":"{s}","priority":"high"}}
+    , .{ a, b }));
+    try testing.expectEqual(@as(usize, 2), moved.get("changes").?.array.items.len);
+    const listed = try h.ok("list_issues", "{\"sort\":\"rank\"}");
+    const items = listed.get("issues").?.array.items;
+    for ([_][]const u8{ "C", "B", "A" }, items) |want, i| {
+        try testing.expectEqualStrings(want, str(i.object, "title"));
+        try testing.expect(i.object.get("rank").? == .string);
+    }
+    try testing.expectEqualStrings(
+        "before, after and rank go one at a time",
+        try h.failed("edit_issue", try std.fmt.allocPrint(arena,
+            \\{{"id":"{s}","before":"{s}","rank":"b"}}
+        , .{ a, b })),
+    );
+    try testing.expect((try h.failed("edit_issue", try std.fmt.allocPrint(arena,
+        \\{{"id":"{s}","rank":"a0"}}
+    , .{a}))).len > 0);
+}
+
 test "tools/list" {
     const h = try Harness.create();
     defer h.destroy();
