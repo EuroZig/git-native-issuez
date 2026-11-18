@@ -152,7 +152,7 @@ pub const Flags = struct {
         if (f.rank) |r| {
             if (!issuez.format.rank.valid(r)) {
                 ctx.err.print(
-                    "error: --rank takes 0-9 and a-z, at most 128, not ending in 0, not '{s}'\n",
+                    "error: --rank takes " ++ issuez.format.rank.rule ++ ", not '{s}'\n",
                     .{r},
                 ) catch {};
                 return null;

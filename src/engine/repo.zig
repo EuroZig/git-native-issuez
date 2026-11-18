@@ -2038,7 +2038,11 @@ pub fn Repo(comptime B: type) type {
             edits[0] = .{ .ref_name = r.ref_name, .spec = spec };
             for (p.others, edits[1..]) |o, *e| {
                 const c = r.column[o.index];
-                const spec_o: EditSpec = .{ .rank = .{ .set = o.key }, .expect = c.expect };
+                const spec_o: EditSpec = .{
+                    .rank = .{ .set = o.key },
+                    .expect = c.expect,
+                    .author = r.spec.author,
+                };
                 e.* = .{ .ref_name = c.ref_name, .spec = spec_o };
             }
             return self.editBatch(arena, edits, options);
@@ -2049,7 +2053,8 @@ pub fn Repo(comptime B: type) type {
         /// workflow state (the first configured one when it has none), or
         /// the done ones. `reorder` over them, with `spec`; the moved
         /// issue's result. An anchor that is the issue itself is
-        /// InvalidValue, a deleted or missing one IssueDisappeared.
+        /// InvalidValue, a deleted or missing one IssueDisappeared. Both are
+        /// refs, not IDs.
         pub fn reorderBeside(
             self: Self,
             arena: Allocator,
@@ -2059,34 +2064,25 @@ pub fn Repo(comptime B: type) type {
             after: bool,
             options: WriteOptions,
         ) Error!EditResult {
+            for ([_][]const u8{ ref_name, anchor }) |ref| {
+                if (!std.mem.startsWith(u8, ref, issue_ref_prefix)) return error.InvalidIssueRef;
+            }
             if (std.mem.eql(u8, ref_name, anchor)) return error.InvalidValue;
-            const moved_id = ref_name[std.mem.findScalarLast(u8, ref_name, '/').? + 1 ..];
-            const anchor_id = anchor[std.mem.findScalarLast(u8, anchor, '/').? + 1 ..];
+            const moved_id = ref_name[issue_ref_prefix.len..];
+            const anchor_id = anchor[issue_ref_prefix.len..];
             const all = try self.loadAll(arena);
-            const Column = struct {
-                done: bool,
-                workflow: []const u8,
-
-                fn of(r: Self, issue: Issue) @This() {
-                    if (issue.state.isDone(r.doneStates()))
-                        return .{ .done = true, .workflow = "" };
-                    const states = r.workflowStates() orelse &.{};
-                    const first = if (states.len > 0) states[0] else "";
-                    return .{ .done = false, .workflow = issue.workflow orelse first };
-                }
-
-                fn eql(a: @This(), b: @This()) bool {
-                    return a.done == b.done and std.mem.eql(u8, a.workflow, b.workflow);
-                }
-            };
             // A deleted anchor has no place to give.
             const wanted = for (all) |i| {
-                if (std.mem.eql(u8, i.id, anchor_id) and !i.deleted) break Column.of(self, i);
+                if (std.mem.eql(u8, i.id, anchor_id) and !i.deleted) break self.columnOf(i);
             } else return error.IssueDisappeared;
             var others: std.ArrayList(Issue) = .empty;
             for (all) |i| {
                 if (i.deleted or std.mem.eql(u8, i.id, moved_id)) continue;
-                if (Column.of(self, i).eql(wanted)) try others.append(arena, i);
+                const same = if (self.columnOf(i)) |c|
+                    wanted != null and std.mem.eql(u8, c, wanted.?)
+                else
+                    wanted == null;
+                if (same) try others.append(arena, i);
             }
             std.mem.sort(Issue, others.items, {}, struct {
                 fn lessThan(_: void, a: Issue, b: Issue) bool {
@@ -2110,6 +2106,14 @@ pub fn Repo(comptime B: type) type {
                 .at = at,
             }, options);
             return results[0];
+        }
+
+        /// The board column `issue` is in: its workflow state, the first
+        /// configured one when it has none, or null when it is done.
+        fn columnOf(self: Self, issue: Issue) ?[]const u8 {
+            if (issue.state.isDone(self.doneStates())) return null;
+            const states = self.settings.workflow_states;
+            return issue.workflow orelse if (states.len > 0) states[0] else "";
         }
 
         /// Several issues' edits, one commit each, written in one ref
@@ -4233,9 +4237,17 @@ test "reorder: one write between keys, keys for those above without, all or none
     try testing.expectEqual(1, moved.len);
     try testing.expectEqualStrings("b", (try rankOf(repo, arena, xr)).?);
 
-    // A below Y, which has no key: Y gets one too, above A's.
+    // A below Y, which has no key: Y gets one too, above A's, in a commit
+    // by the same author.
+    const ada: Signature = .{
+        .name = "Ada",
+        .email = "ada@e.x",
+        .time = 9,
+        .tz_offset_minutes = 0,
+    };
     const below = try repo.reorder(arena, .{
         .ref_name = a,
+        .spec = .{ .author = ada },
         .column = &.{
             .{ .ref_name = xr, .rank = "b" },
             .{ .ref_name = c, .rank = "c" },
@@ -4247,6 +4259,15 @@ test "reorder: one write between keys, keys for those above without, all or none
     const yk = (try rankOf(repo, arena, yr)).?;
     try testing.expectEqual(.lt, rank_fmt.order("c", yk));
     try testing.expectEqual(.lt, rank_fmt.order(yk, (try rankOf(repo, arena, a)).?));
+    const y_tip = (try repo.backend.resolveRef(yr)).?;
+    const y_now = try repo.load(arena, .{ .name = yr, .tip = y_tip });
+    const y_moved = y_now.comments[y_now.comments.len - 1];
+    try testing.expectEqualStrings("ada@e.x", y_moved.author.email);
+    // Refs, not IDs.
+    try testing.expectError(
+        error.InvalidIssueRef,
+        repo.reorderBeside(arena, xr["refs/issues/".len..], .{}, yr, false, .{}),
+    );
 
     // A neighbour that changed since it was shown: nothing written.
     const stale = repo.reorder(arena, .{

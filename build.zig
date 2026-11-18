@@ -56,11 +56,9 @@ pub fn build(b: *std.Build) void {
         "mcp",
         "Include the MCP server (default: true, false with -Dminimal or as a dependency)",
     ) orelse full;
-    const markdown = b.option(
-        bool,
-        "markdown",
-        "Render Markdown in `show` and the TUI (default: true, false as a dependency)",
-    ) orelse isRootPackage(b);
+    // Markdown in `show` and the TUI, so markdownz and uucode are fetched
+    // for git-issue, not for projects that only use the library.
+    const markdown = isRootPackage(b) or tui;
     const fuzz = b.option(bool, "fuzz", "Install the fuzzer") orelse false;
 
     // Dependents and the tests get build.zig.zon's version, so a commit alone
@@ -1132,7 +1130,6 @@ const Cli = struct {
             }) orelse break :blk null;
             break :blk dep.module("uucode");
         };
-        // The TUI renders Markdown whatever -Dmarkdown says.
         const markdown_module: ?*std.Build.Module = if (uucode == null) null else blk: {
             const markdownz = b.lazyDependency("markdownz", .{
                 .target = cli.target,

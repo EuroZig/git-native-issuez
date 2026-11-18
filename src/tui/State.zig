@@ -281,6 +281,30 @@ pub fn failed(s: *State, comptime format: []const u8, args: anytype) Action {
 }
 
 /// `info`, likewise.
+/// J and K: the issue at `index` of `issues`, shown in your order, a place
+/// up or down.
+pub fn reorderStep(
+    s: *State,
+    issues: []const u32,
+    index: usize,
+    delta: i32,
+) Allocator.Error!Action {
+    const to = @as(i64, @intCast(index)) + delta;
+    if (to < 0 or to >= issues.len) return .none;
+    const id: Id = .of(s.snap.issues[issues[index]].id);
+    return .{ .reorder = .{ .id = id, .others = try s.othersBut(issues, id), .at = @intCast(to) } };
+}
+
+/// `issues` but `skip`, for `Action.reorder`: in the input arena.
+pub fn othersBut(s: *State, issues: []const u32, skip: Id) Allocator.Error![]const Id {
+    var out: std.ArrayList(Id) = .empty;
+    for (issues) |i| {
+        if (skip.eql(s.snap.issues[i].id)) continue;
+        try out.append(s.input_arena.allocator(), .of(s.snap.issues[i].id));
+    }
+    return out.items;
+}
+
 pub fn noted(s: *State, comptime format: []const u8, args: anytype) Action {
     s.info(format, args);
     return .none;

@@ -176,7 +176,10 @@ pub fn main(comptime B: type, ctx: *context.Context(B), argv: []const []const u8
                 },
             ) catch {};
             if (c.state_change) |s| w.print("  [State changed to: {s}]\n", .{s.text()}) catch {};
-            if (style) |st| {
+            // Rendered: the subject and body as Markdown, then the lone
+            // trailer paragraph upstream shows (`X-Workflow-State: ready`)
+            // as written.
+            const rest = if (style) |st| blk: {
                 var text: std.ArrayList(u8) = .empty;
                 // The subject is the text's first paragraph.
                 text.appendSlice(arena, c.subject) catch {};
@@ -187,12 +190,17 @@ pub fn main(comptime B: type, ctx: *context.Context(B), argv: []const []const u8
                     text.appendSlice(arena, line) catch {};
                 }
                 render(ctx, w, text.items, st, 2);
-            } else w.print("  {s}\n", .{c.subject}) catch {};
-            if (style == null) for (c.text) |line| {
+                // `body` is `text` without its trailer block.
+                break :blk c.text[@min(c.body.len, c.text.len)..];
+            } else blk: {
+                w.print("  {s}\n", .{c.subject}) catch {};
+                break :blk c.text;
+            };
+            for (rest) |line| {
                 if (std.mem.trim(u8, line, " \t\r").len == 0) continue;
                 if (isPurgeLine(line)) continue;
                 w.print("  {s}\n", .{line}) catch {};
-            };
+            }
             for (c.attachments) |id| {
                 const a = for (issue.attachments) |x| {
                     if (std.mem.eql(u8, x.id, id)) break x;
@@ -253,20 +261,17 @@ fn terminalWidth(ctx: anytype, file: std.Io.File) ?u16 {
 }
 
 /// `text` as Markdown, each line indented by `indent` columns. A text larger
-/// than git issue writes is shown as it is.
+/// than git issue writes, or one that fails to render, is shown as it is.
 fn render(ctx: anytype, w: *std.Io.Writer, text: []const u8, style: Style, indent: u16) void {
     if (!build_options.markdown) unreachable;
     var out: std.Io.Writer.Allocating = .init(ctx.arena);
-    if (text.len > (issuez.Limits{}).max_body_bytes) {
-        out.writer.writeAll(text) catch {};
-    } else term.renderText(ctx.gpa, &out.writer, text, .{
-        .width = @max(style.width -| indent, 20),
-        .color = style.color,
-    }) catch {
-        w.print("{s}\n", .{text}) catch {};
-        return;
-    };
-    var lines = std.mem.splitScalar(u8, std.mem.trimEnd(u8, out.written(), "\n"), '\n');
+    const rendered = text.len <= (issuez.Limits{}).max_body_bytes and
+        if (term.renderText(ctx.gpa, &out.writer, text, .{
+            .width = @max(style.width -| indent, 20),
+            .color = style.color,
+        })) true else |_| false;
+    const shown = if (rendered) out.written() else text;
+    var lines = std.mem.splitScalar(u8, std.mem.trimEnd(u8, shown, "\n"), '\n');
     while (lines.next()) |line| {
         if (line.len > 0) w.splatByteAll(' ', indent) catch {};
         w.print("{s}\n", .{line}) catch {};

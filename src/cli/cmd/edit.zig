@@ -211,8 +211,20 @@ pub fn main(comptime B: type, ctx: *context.Context(B), argv: []const []const u8
     if (clears.contains(.rank)) spec.rank = .clear;
     var names: std.ArrayList([]const u8) = .empty;
     if (anchor) |a| {
-        const r = reorder(B, ctx, repo, ref, a, after != null, spec) orelse
+        // In the anchor's board column (`Repo.reorderBeside`).
+        const target = common.resolveOne(B, repo, arena, ctx.err, a) orelse
             return common.exit_error;
+        if (std.mem.eql(u8, target.name, ref.name))
+            return common.fail(ctx.err, "error: an issue goes before or after another one\n");
+        const r = repo.reorderBeside(
+            arena,
+            ref.name,
+            spec,
+            target.name,
+            after != null,
+            .{},
+        ) catch |e|
+            return common.repoFailed(B, ctx, e);
         for (r.changes) |c| names.append(arena, c.name()) catch return common.oom(ctx.err);
     } else if (!spec.isEmpty()) {
         const result = repo.edit(arena, ref.name, spec, .{}) catch |e|
@@ -226,26 +238,4 @@ pub fn main(comptime B: type, ctx: *context.Context(B), argv: []const []const u8
     const joined = std.mem.join(arena, ", ", names.items) catch return common.oom(ctx.err);
     ctx.out.print("Updated {s} ({s})\n", .{ uuid.shortId(ref.id()), joined }) catch {};
     return common.exit_ok;
-}
-
-/// `ref` right before, or `after`, the issue `anchor` names, in its board
-/// column (`Repo.reorderBeside`). The moved issue's result.
-fn reorder(
-    comptime B: type,
-    ctx: *context.Context(B),
-    repo: issuez.engine.Repo(B),
-    ref: issuez.engine.IssueRef,
-    anchor: []const u8,
-    after: bool,
-    spec: issuez.engine.EditSpec,
-) ?issuez.engine.Repo(B).EditResult {
-    const target = common.resolveOne(B, repo, ctx.arena, ctx.err, anchor) orelse return null;
-    if (std.mem.eql(u8, target.name, ref.name)) {
-        _ = common.fail(ctx.err, "error: an issue goes before or after another one\n");
-        return null;
-    }
-    return repo.reorderBeside(ctx.arena, ref.name, spec, target.name, after, .{}) catch |e| {
-        _ = common.repoFailed(B, ctx, e);
-        return null;
-    };
 }

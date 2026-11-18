@@ -274,7 +274,8 @@ pub fn App(comptime B: type) type {
                         s.info("timeline changes discarded", .{});
                     }
                     switch (l.then) {
-                        .view => |v| if (v != .timeline) s.switchView(v),
+                        // From a view of the user's to the timeline, too.
+                        .view => |v| if (v != .timeline or s.custom != null) s.switchView(v),
                         .custom => |slot| custom_view.open(s, slot),
                         .quit => return s.quitUnlessSyncing() != .quit,
                         .issue => |id| s.openIssue(id.slice()),
@@ -367,12 +368,7 @@ pub fn App(comptime B: type) type {
 
         fn templatesMenu(self: *Self) void {
             const s = &self.state;
-            const list = self.readTemplates() orelse return;
-            const a = s.input_arena.allocator();
-            const rows = a.alloc(struct { []const u8, usize }, list.len) catch
-                return s.fail("out of memory", .{});
-            for (list, rows) |t, *r| r.* = .{ t.name, t.views.len };
-            modal.openTemplates(s, rows);
+            modal.openTemplates(s, self.readTemplates() orelse return);
         }
 
         fn saveTemplate(self: *Self, name_in: []const u8, replace: bool) void {
@@ -381,9 +377,7 @@ pub fn App(comptime B: type) type {
             const name = s.fmtInput("{s}", .{name_in});
             s.closeModal();
             const list = self.readTemplates() orelse return;
-            const taken = for (list) |t| {
-                if (std.mem.eql(u8, t.name, name)) break true;
-            } else false;
+            const taken = user_state.findTemplate(list, name) != null;
             if (taken and !replace) return modal.openConfirm(s, "Replace this template", &.{
                 s.fmtInput("{s} has views already: yours take their place.", .{name}),
             }, &.{
@@ -408,11 +402,9 @@ pub fn App(comptime B: type) type {
             const name = s.fmtInput("{s}", .{name_in});
             s.closeModal();
             const list = self.readTemplates() orelse return;
-            const t = for (list) |t| {
-                if (std.mem.eql(u8, t.name, name)) break t;
-            } else return s.fail("template {s} is gone", .{name});
-            var have: usize = 0;
-            for (s.views) |v| have += @intFromBool(v != null);
+            const t = user_state.findTemplate(list, name) orelse
+                return s.fail("template {s} is gone", .{name});
+            const have = custom_view.count(s);
             if (have > 0 and !confirmed) return modal.openConfirm(s, "Load this template", &.{
                 s.fmtInput(
                     "Its {d} views take the place of your {d} here.",
@@ -428,14 +420,12 @@ pub fn App(comptime B: type) type {
                     } },
                 },
             });
-            // The view shown gives its default view's filter back first.
-            custom_view.leave(s);
-            custom_view.load(s, t.views) catch return s.fail("out of memory", .{});
+            const loaded = custom_view.load(s, t.views) catch return s.fail("out of memory", .{});
             if (!self.saveViews()) return s.fail(
                 "template {s} is loaded for this session only: {s}",
                 .{ name, unwritten },
             );
-            s.info("template {s} loaded: {d} views", .{ name, t.views.len });
+            s.info("template {s} loaded: {d} views", .{ name, loaded });
         }
 
         fn deleteTemplate(self: *Self, name_in: []const u8) void {

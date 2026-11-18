@@ -160,9 +160,11 @@ pub fn slotOf(key: u21) ?u8 {
     return @intCast(n);
 }
 
-/// The views as read from the file, in place of any there were. A view
-/// this version doesn't know, or on a key taken already, is skipped.
-pub fn load(s: *AppState, saved: []const Saved) Allocator.Error!void {
+/// The views as read from the file, in place of any there were, leaving
+/// the one shown; how many there are now. A view this version doesn't
+/// know, or on a key taken already, is skipped.
+pub fn load(s: *AppState, saved: []const Saved) Allocator.Error!usize {
+    leave(s);
     for (&s.views) |*slot| if (slot.*) |*v| {
         v.deinit(s.gpa);
         slot.* = null;
@@ -174,6 +176,14 @@ pub fn load(s: *AppState, saved: []const Saved) Allocator.Error!void {
         if (s.views[n] != null) continue;
         s.views[n] = try View.fromSaved(s.gpa, sv) orelse continue;
     }
+    return count(s);
+}
+
+/// How many views of the user's there are.
+pub fn count(s: *const AppState) usize {
+    var n: usize = 0;
+    for (s.views) |v| n += @intFromBool(v != null);
+    return n;
 }
 
 /// The views to write, by key; strings are the views'.
@@ -334,7 +344,7 @@ test "saved: unknown views, keys and names skipped; unknown sorts are the defaul
     const gpa = testing.allocator;
     var s: AppState = .init(gpa, undefined);
     defer s.deinit();
-    try load(&s, &.{
+    _ = try load(&s, &.{
         .{ .name = "Bugs", .key = 5, .filter = "label:bug", .sort = "priority", .tree = true },
         .{ .name = "Taken", .key = 5 },
         .{ .name = "Gantt", .key = 6, .view = "gantt" },

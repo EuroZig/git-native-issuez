@@ -119,26 +119,24 @@ code, lists, quotes, tables and links (clickable where the terminal
 supports it); `r` in an issue shows them as written. `git issue show` does
 the same on a terminal, and prints the text as written into a pipe or a
 file, or with `--raw`; `--color never` or `NO_COLOR` leaves the styling
-out. The Markdown is
+out, `--color always` renders into a pipe too. The Markdown is
 [markdownz](https://github.com/StaffinityAI/markdownz)'s: no raw HTML,
-entities or bare URLs, and text it can't parse is shown as written.
+entities or bare URLs.
 
 The board (`2`) is in your order: drag a card to a place in its column or
 in another one, where a line shows where it lands, or move it with `J` and
 `K`. The list does the same once sorted by rank (`s`), without the tree.
-The order is the issues' `X-Rank` keys, shared like any field: a move
-writes the moved issue alone, unless the cards above it have no key yet
-(the first moves in a repository give them keys, one commit each), and
-new issues come last. `git issue edit
---before` / `--after` and `ls --sort rank` use it from the command line.
+The order is the issues' `X-Rank` keys, shared like any field
+([docs/format.md](docs/format.md) §3), and new issues come last. `git
+issue edit --before` / `--after` and `ls --sort rank` use it from the
+command line.
 
 Now and then the status bar asks for a star on GitHub: never in a
 session's first ten minutes, at most once a month, a few times in all.
-With the GitHub CLI (`gh`) logged in it never asks once the project is
-starred (before a notice, `gh` asks GitHub whether you have), and one
-click stars it, or `!` and then `Star it`; without `gh` the click opens
-the project's page. `Never` stops it for good. What it asked when is kept in
-the TUI's state file, `git-issue/tui.zon` in your configuration folder
+With the GitHub CLI (`gh`) logged in it stays quiet once you have
+starred the project, and one click stars it (or `!`, then `Star it`);
+without `gh` the click opens the project's page. `Never` stops it for
+good. What it asked when is kept in the TUI's state file, `git-issue/tui.zon` in your configuration folder
 (`~/.config`, `~/Library/Application Support` on macOS, `%LOCALAPPDATA%`
 on Windows).
 
@@ -234,8 +232,9 @@ for (open) |issue| std.debug.print("{s} {s}\n", .{ issue.state.text(), issue.tit
   `GitSim` is an in-memory repository for tests, or bring your own
   ([docs/design.md](docs/design.md)).
 - As a dependency the package builds only the library: libvaxis,
-  known-folders, blitzmcp and nightwatch are never fetched. Pass `.tui = true` or `.mcp = true` to
-  build them into `git-issue`.
+  known-folders, blitzmcp, nightwatch, markdownz and uucode are never
+  fetched. Pass `.tui = true` or `.mcp = true` to build them into
+  `git-issue`.
 
 | Example                                           | Shows                                                                                  | Run                                        |
 | ------------------------------------------------- | -------------------------------------------------------------------------------------- | ------------------------------------------ |

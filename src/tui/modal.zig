@@ -18,6 +18,7 @@ const draft_mod = @import("timeline_draft.zig");
 const star = @import("star.zig");
 const AppState = @import("State.zig");
 const custom_view = @import("custom_view.zig");
+const user_state = @import("user_state.zig");
 
 const Id = store.Id;
 const TextArea = text_mod.TextArea;
@@ -1852,26 +1853,28 @@ fn openViewKeys(s: *AppState, name: []const u8) void {
     } });
 }
 
-/// ctrl+t: save the views as a template, or load or delete one. `names`
-/// are the templates', with how many views each has.
-pub fn openTemplates(s: *AppState, templates: []const struct { []const u8, usize }) void {
+/// ctrl+t: save the views as a template, or load or delete one.
+pub fn openTemplates(s: *AppState, templates: []const user_state.Template) void {
     s.closeModal();
     const a = s.modalArena();
     var options: std.ArrayList(Menu.Option) = .empty;
-    var views: usize = 0;
-    for (s.views) |v| views += @intFromBool(v != null);
+    const views = custom_view.count(s);
     options.append(a, .{
         .label = print(s, "Save these {d} views as…", .{views}),
         .value = "save",
         .disabled = views == 0,
     }) catch return s.fail("out of memory", .{});
     for (templates) |t| options.append(a, .{
-        .label = print(s, "Load {s}  {d} {s}", .{ t[0], t[1], if (t[1] == 1) "view" else "views" }),
-        .value = print(s, "load:{s}", .{t[0]}),
+        .label = print(s, "Load {s}  {d} {s}", .{
+            t.name,
+            t.views.len,
+            if (t.views.len == 1) "view" else "views",
+        }),
+        .value = print(s, "load:{s}", .{t.name}),
     }) catch return s.fail("out of memory", .{});
     for (templates) |t| options.append(a, .{
-        .label = print(s, "Delete {s}", .{t[0]}),
-        .value = print(s, "drop:{s}", .{t[0]}),
+        .label = print(s, "Delete {s}", .{t.name}),
+        .value = print(s, "drop:{s}", .{t.name}),
     }) catch return s.fail("out of memory", .{});
     s.openModal(.{ .menu = .{
         .title = "Templates of views",

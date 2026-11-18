@@ -881,6 +881,14 @@ test "issuez_set_rank: a key, RANK_BEFORE and RANK_AFTER beside another issue, c
         }, &fixture.ada, null, &w, null),
         null,
     );
+    try expect.code(
+        c.ISSUEZ_E_INVALID_VALUE,
+        fixture.updateRc(h, a.idStr(), &.{
+            c.issuez_rank_before(b.idStr()),
+            c.issuez_rank_after(b.idStr()),
+        }, &fixture.ada, null, &w, null),
+        null,
+    );
     _ = try fixture.update(h, a.idStr(), &.{c.issuez_clear_rank()});
     i = try fixture.load(h, a.idStr());
     try testing.expectEqual(@as(usize, 0), c.issuez_issue_info_of(i).*.rank.len);

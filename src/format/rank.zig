@@ -11,6 +11,10 @@ const Allocator = std.mem.Allocator;
 /// A key's bytes at most.
 pub const max_len = 128;
 
+/// What `valid` takes, for messages.
+pub const rule =
+    std.fmt.comptimePrint("0-9 and a-z, at most {d} bytes, not ending in 0", .{max_len});
+
 const base = 36;
 
 pub const Error = Allocator.Error || error{
@@ -72,7 +76,6 @@ pub fn between(arena: Allocator, a: ?[]const u8, b: ?[]const u8) Error![]u8 {
         try out.append(arena, char(dl));
         hi = null;
     }
-    if (out.items.len > max_len) return error.TooLong;
     assert(valid(out.items));
     return out.items;
 }

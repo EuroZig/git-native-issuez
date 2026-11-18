@@ -911,7 +911,7 @@ test "your order: --rank, --before and --after, ls --sort rank" {
     try expectFailure(
         try gitIssue(&sb, &.{ "edit", a, "--rank", "a0" }),
         1,
-        "error: --rank takes 0-9 and a-z, at most 128, not ending in 0, not 'a0'\n",
+        "error: --rank takes 0-9 and a-z, at most 128 bytes, not ending in 0, not 'a0'\n",
     );
     try expectFailure(
         try gitIssue(&sb, &.{ "edit", a, "--before", b, "--rank", "b" }),
@@ -1315,6 +1315,11 @@ test "show renders Markdown only when asked or on a terminal" {
 
     const raw = try gitIssue(&sb, &.{ "show", id, "--color", "always", "--raw" });
     try testing.expectEqualStrings(piped.stdout, raw.stdout);
+
+    // An update's field lines stay, as written.
+    try expectSuccess(try gitIssue(&sb, &.{ "edit", id, "--priority", "high" }));
+    const update = try gitIssue(&sb, &.{ "show", id, "--color", "always" });
+    try testing.expect(std.mem.find(u8, update.stdout, "\n  Priority: high\n") != null);
 
     try expectFailure(
         try gitIssue(&sb, &.{ "show", id, "--color", "sometimes" }),

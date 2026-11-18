@@ -657,6 +657,24 @@ test "board: a drop after the column changed under the drag goes by the card's I
     try release(h, at);
     // Where it already is: nothing written, nothing out of bounds.
     try testing.expect(h.snap().issues[h.byTitle("Three").?].tip.eql(tip));
+
+    // Within done work too, as J and K do.
+    s.bd_query.scope = .all;
+    s.filterChanged();
+    try h.draw();
+    const done: u16 = for (s.board.columns, 0..) |c, n| {
+        if (c.done and c.cards.len == 2) break @intCast(n);
+    } else return error.NoDoneColumn;
+    const cards = s.board.columns[done].cards;
+    // The snapshot goes with the write.
+    const first = try testing.allocator.dupe(u8, h.snap().issues[cards[0]].title);
+    defer testing.allocator.free(first);
+    const to = try dragCard(h, .{ .card = .{ .column = done, .index = 0 } }, .{
+        .card = .{ .column = done, .index = 1 },
+    }, 3);
+    try release(h, to);
+    const now = s.board.columns[done].cards;
+    try testing.expectEqualStrings(first, h.snap().issues[now[1]].title);
 }
 
 test "list: rows in your order, dragged to a place or moved with J and K" {
@@ -3567,7 +3585,7 @@ test "templates: views saved under a name, loaded elsewhere in place of others, 
     try testing.expect(h.shows("no views of yours to save yet"));
     try h.press(K.escape, .{});
 
-    try custom_view.load(s, &.{
+    _ = try custom_view.load(s, &.{
         .{ .name = "Bugs", .key = 5, .filter = "label:bug" },
         .{ .name = "Board", .key = 6, .view = "board" },
     });
@@ -3579,7 +3597,7 @@ test "templates: views saved under a name, loaded elsewhere in place of others, 
     try h.typeText("Triage");
     try h.press(K.enter, .{});
     try testing.expect(h.shows("template Triage saved: 2 views"));
-    try testing.expectEqual(2, user_state.findTemplate(mem.state, "Triage").?.views.len);
+    try testing.expectEqual(2, user_state.findTemplate(mem.state.templates, "Triage").?.views.len);
     // The same name again asks first.
     try h.press('t', .{ .ctrl = true });
     try h.press(K.enter, .{});
@@ -3589,7 +3607,7 @@ test "templates: views saved under a name, loaded elsewhere in place of others, 
     try h.press(K.escape, .{});
 
     // Another set of views here; loading Triage asks, then replaces them.
-    try custom_view.load(s, &.{.{ .name = "Other", .key = 9 }});
+    _ = try custom_view.load(s, &.{.{ .name = "Other", .key = 9 }});
     try h.press('9', .{});
     try testing.expectEqual(@as(?u8, 4), s.custom);
     try h.press('t', .{ .ctrl = true });
@@ -3611,7 +3629,7 @@ test "templates: views saved under a name, loaded elsewhere in place of others, 
     try testing.expect(h.shows("Delete Triage"));
     try h.press(K.enter, .{});
     try h.press('D', .{});
-    try testing.expect(user_state.findTemplate(mem.state, "Triage") == null);
+    try testing.expect(user_state.findTemplate(mem.state.templates, "Triage") == null);
     try testing.expect(h.shows("template Triage deleted"));
 }
 
@@ -3768,7 +3786,7 @@ test "custom views: back from a long way keeps the view on its base" {
     const id = try h.app.store.create(.{ .title = "Alpha" });
     try h.draw();
     const s = &h.app.state;
-    try custom_view.load(s, &.{.{ .name = "B", .key = 5, .view = "board" }});
+    _ = try custom_view.load(s, &.{.{ .name = "B", .key = 5, .view = "board" }});
     try h.press('5', .{});
     try testing.expectEqual(ui.View.board, s.view);
     // More issues and milestones than the way back holds.
@@ -3788,6 +3806,25 @@ test "custom views: back from a long way keeps the view on its base" {
     try h.press(K.enter, .{});
 }
 
+test "custom views: a template's count leaves out what it skips; 4 leaves a timeline view" {
+    const h = try Harness.create();
+    defer h.destroy();
+    const s = &h.app.state;
+    try testing.expectEqual(1, try custom_view.load(s, &.{
+        .{ .name = "Late", .key = 6, .view = "timeline" },
+        .{ .name = "Taken", .key = 6 },
+        .{ .name = "Newer", .key = 7, .view = "gantt" },
+    }));
+    try h.draw();
+    try h.press('6', .{});
+    try testing.expectEqual(ui.View.timeline, s.view);
+    try testing.expect(s.custom != null);
+    // As the dialog for timeline changes does after Discard, on 4.
+    _ = h.app.perform(.{ .leave_timeline = .{ .apply = false, .then = .{ .view = .timeline } } });
+    try testing.expectEqual(ui.View.timeline, s.view);
+    try testing.expect(s.custom == null);
+}
+
 test "custom views: many give way to the sync badge and the buttons" {
     const h = try Harness.createRemote();
     defer h.destroy();
@@ -3796,7 +3833,7 @@ test "custom views: many give way to the sync badge and the buttons" {
     for (&saved, 0..) |*v, n| {
         v.* = .{ .name = "A rather long view name", .key = custom_view.keys[n] - '0' };
     }
-    try custom_view.load(s, &saved);
+    _ = try custom_view.load(s, &saved);
     try h.draw();
     try testing.expect(h.shows("5 A rather long view name"));
     try testing.expect(!h.shows("0 A rather long view name"));
@@ -3809,7 +3846,9 @@ test "custom views: a name is checked; a timeline draft holds the key back" {
     const h = try Harness.create();
     defer h.destroy();
     const s = &h.app.state;
-    try custom_view.load(s, &.{.{ .name = "Late", .key = 6, .view = "timeline", .scope = "all" }});
+    _ = try custom_view.load(s, &.{
+        .{ .name = "Late", .key = 6, .view = "timeline", .scope = "all" },
+    });
     try h.draw();
     try testing.expect(h.shows("6 Late"));
 

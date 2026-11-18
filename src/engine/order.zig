@@ -11,7 +11,8 @@ const Allocator = std.mem.Allocator;
 const rank = @import("../format/rank.zig");
 
 pub const Error = Allocator.Error || error{
-    /// A key after an issue without one: the column isn't in rank order.
+    /// A key after an issue without one, or after a greater key: the column
+    /// isn't in rank order.
     NotInOrder,
 };
 
@@ -57,33 +58,36 @@ pub fn place(arena: Allocator, ranks: []const ?[]const u8, at: usize) Error!Plac
     var ranked: usize = 0;
     while (ranked < ranks.len and ranks[ranked] != null) ranked += 1;
     for (ranks[ranked..]) |r| if (r != null) return error.NotInOrder;
-    for (ranks[0..ranked]) |r| assert(rank.valid(r.?));
+    for (ranks[0..ranked], 0..) |r, n| {
+        assert(rank.valid(r.?));
+        if (n > 0 and rank.order(ranks[n - 1].?, r.?) == .gt) return error.NotInOrder;
+    }
+    // No key fits: the whole column anew.
+    return fits(arena, ranks, ranked, at) catch |e| switch (e) {
+        error.TooLong => anew(arena, ranks.len, at),
+        error.OutOfMemory => error.OutOfMemory,
+    };
+}
 
+/// `place` in a column in order, `ranked` of its issues with keys.
+fn fits(
+    arena: Allocator,
+    ranks: []const ?[]const u8,
+    ranked: usize,
+    at: usize,
+) rank.Error!Placement {
     if (at <= ranked) {
         const lo = if (at > 0) ranks[at - 1].? else null;
         const hi = if (at < ranked) ranks[at].? else null;
-        const room = lo == null or hi == null or rank.order(lo.?, hi.?) == .lt;
-        if (room) {
-            if (rank.between(arena, lo, hi)) |key| return .{ .key = key } else |e| switch (e) {
-                error.TooLong => {},
-                error.OutOfMemory => return error.OutOfMemory,
-            }
-            return anew(arena, ranks.len, at);
-        }
-        // Out of order: no run to give keys.
-        if (!std.mem.eql(u8, lo.?, hi.?)) return anew(arena, ranks.len, at);
-        return rekeyRun(arena, ranks[0..ranked], at) catch |e| switch (e) {
-            error.TooLong => anew(arena, ranks.len, at),
-            error.OutOfMemory => error.OutOfMemory,
-        };
+        if (lo == null or hi == null or rank.order(lo.?, hi.?) == .lt)
+            return .{ .key = try rank.between(arena, lo, hi) };
+        // Between equal keys.
+        return rekeyRun(arena, ranks[0..ranked], at);
     }
     // Below issues without a key: those above it get keys, after the last
     // key, in the order shown.
     const lo = if (ranked > 0) ranks[ranked - 1].? else null;
-    const keys = rank.spread(arena, lo, null, at - ranked + 1) catch |e| switch (e) {
-        error.TooLong => return anew(arena, ranks.len, at),
-        error.OutOfMemory => return error.OutOfMemory,
-    };
+    const keys = try rank.spread(arena, lo, null, at - ranked + 1);
     const others = try arena.alloc(Placement.Other, at - ranked);
     for (others, keys[0 .. keys.len - 1], ranked..) |*o, k, n| o.* = .{ .index = n, .key = k };
     return .{ .key = keys[keys.len - 1], .others = others };
@@ -193,4 +197,5 @@ test "the same key on both sides: that run anew; too long: the column" {
     try testing.expectEqual(2, q.others.len);
     try testing.expect(q.key.len < 8);
     try testing.expectError(error.NotInOrder, place(a, &.{ null, "a" }, 0));
+    try testing.expectError(error.NotInOrder, place(a, &.{ "d", "b", "b", "a" }, 2));
 }

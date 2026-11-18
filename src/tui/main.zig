@@ -211,25 +211,16 @@ const ViewsFile = struct {
     /// The project's key: git's common directory, symlinks resolved.
     project: []const u8,
 
-    /// Into the UI; none when the file can't be read. The views from
-    /// before projects become a template first.
+    /// Into the UI; none when the file can't be read.
     fn load(vf: *ViewsFile, s: *State) void {
         var arena_state: std.heap.ArenaAllocator = .init(vf.gpa);
         defer arena_state.deinit();
         const a = arena_state.allocator();
         const file = user_state.path(vf.io, a, vf.environ_map) orelse return;
-        var state = user_state.load(vf.io, a, file) orelse
+        const state = user_state.load(vf.io, a, file) orelse
             return s.fail("your views couldn't be read: {s} isn't as it should be", .{file});
-        if (state.views.len > 0) {
-            _ = user_state.update(vf.io, a, file, {}, struct {
-                fn migrate(_: void, ar: std.mem.Allocator, st: *user_state.State) !void {
-                    if (try user_state.migrated(ar, st.*)) |m| st.* = m;
-                }
-            }.migrate);
-            state = user_state.load(vf.io, a, file) orelse state;
-        }
-        const views = user_state.viewsOf(state, vf.project);
-        custom_view.load(s, views) catch s.fail("out of memory", .{});
+        _ = custom_view.load(s, user_state.viewsOf(state, vf.project)) catch
+            s.fail("out of memory", .{});
     }
 
     fn save(context: *anyopaque, views: []const custom_view.Saved) bool {

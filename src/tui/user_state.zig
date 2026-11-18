@@ -20,9 +20,6 @@ const custom_view = @import("custom_view.zig");
 pub const State = struct {
     /// The star notice.
     star: star.Record = .{},
-    /// Before views were a project's: the views of every repository. Read
-    /// once into a template called Imported (`migrated`), written empty.
-    views: []const custom_view.Saved = &.{},
     /// The user's own views of each repository, on keys 5 to 0.
     projects: []const Project = &.{},
     /// Sets of views by name, for any repository.
@@ -64,8 +61,8 @@ pub fn withViews(
     return out;
 }
 
-pub fn findTemplate(state: State, name: []const u8) ?Template {
-    for (state.templates) |t| if (std.mem.eql(u8, t.name, name)) return t;
+pub fn findTemplate(templates: []const Template, name: []const u8) ?Template {
+    for (templates) |t| if (std.mem.eql(u8, t.name, name)) return t;
     return null;
 }
 
@@ -93,21 +90,6 @@ pub fn withTemplate(
     return out;
 }
 
-/// The views from before projects as a template, Imported (or Imported 2
-/// and on, when taken), and no longer on their own; null when there are
-/// none.
-pub fn migrated(a: Allocator, state: State) Allocator.Error!?State {
-    if (state.views.len == 0) return null;
-    var name: []const u8 = "Imported";
-    var n: u32 = 2;
-    while (findTemplate(state, name) != null) : (n += 1) {
-        name = try std.fmt.allocPrint(a, "Imported {d}", .{n});
-    }
-    var out = try withTemplate(a, state, name, state.views);
-    out.views = &.{};
-    return out;
-}
-
 const header =
     \\// git issue tui: what it keeps for you between sessions. Fields left
     \\// out take their defaults; deleting the file starts over.
@@ -126,7 +108,7 @@ pub fn path(io: std.Io, a: Allocator, environ_map: *const Environ.Map) ?[]const 
 
 /// What reading takes at most: views of hundreds of repositories, and
 /// more. A file past it can't be read, and so isn't saved over.
-pub const max_bytes = 16 * 1024 * 1024;
+const max_bytes = 16 * 1024 * 1024;
 
 /// The defaults when there is no file yet; null when it can't be read or
 /// isn't the ZON it should be: then it isn't to be saved over either.
@@ -231,7 +213,7 @@ test "projects: each its own views; none drops the entry" {
     try testing.expectEqualDeep(s, parse(a, out.written()).?);
 }
 
-test "templates: saved, replaced by name, dropped; the old views once as Imported" {
+test "templates: saved, replaced by name, dropped" {
     var arena_state: std.heap.ArenaAllocator = .init(testing.allocator);
     defer arena_state.deinit();
     const a = arena_state.allocator();
@@ -240,17 +222,9 @@ test "templates: saved, replaced by name, dropped; the old views once as Importe
     var s = try withTemplate(a, .{}, "Triage", one);
     s = try withTemplate(a, s, "Triage", two);
     try testing.expectEqual(1, s.templates.len);
-    try testing.expectEqualStrings("Two", findTemplate(s, "Triage").?.views[0].name);
+    try testing.expectEqualStrings("Two", findTemplate(s.templates, "Triage").?.views[0].name);
     s = try withTemplate(a, s, "Triage", null);
-    try testing.expect(findTemplate(s, "Triage") == null);
-
-    try testing.expect(try migrated(a, .{}) == null);
-    s = try withTemplate(a, .{ .views = one }, "Imported", two);
-    s = (try migrated(a, s)).?;
-    try testing.expectEqual(0, s.views.len);
-    try testing.expectEqualStrings("One", findTemplate(s, "Imported 2").?.views[0].name);
-    try testing.expectEqualStrings("Two", findTemplate(s, "Imported").?.views[0].name);
-    try testing.expect(try migrated(a, s) == null);
+    try testing.expect(findTemplate(s.templates, "Triage") == null);
 }
 
 test "state: written and read back; missing fields default, unknown ones are skipped" {
@@ -259,10 +233,10 @@ test "state: written and read back; missing fields default, unknown ones are ski
     const a = arena_state.allocator();
     const s: State = .{
         .star = .{ .first_seen = 17, .last_shown = 42, .shown = 2, .done = .never },
-        .views = &.{
+        .projects = &.{.{ .path = "/r/.git", .views = &.{
             .{ .name = "Bugs", .key = 5, .filter = "label:bug", .sort = "priority", .tree = true },
             .{ .name = "Due", .key = 0, .view = "milestones", .scope = "all", .reverse = true },
-        },
+        } }},
     };
     var out: std.Io.Writer.Allocating = .init(a);
     try write(s, &out.writer);
@@ -306,18 +280,18 @@ test "update: what the other writer saved meanwhile is kept" {
     try testing.expect(save(testing.io, a, file, .{ .star = .{ .shown = 1 } }));
     const views: []const custom_view.Saved = &.{.{ .name = "Mine", .key = 6 }};
     try testing.expect(update(testing.io, a, file, views, struct {
-        fn f(v: []const custom_view.Saved, _: Allocator, st: *State) Allocator.Error!void {
-            st.views = v;
+        fn f(v: []const custom_view.Saved, ar: Allocator, st: *State) Allocator.Error!void {
+            st.templates = try ar.dupe(Template, &.{.{ .name = "T", .views = v }});
         }
     }.f));
     try testing.expectEqualDeep(
-        State{ .star = .{ .shown = 1 }, .views = views },
+        State{ .star = .{ .shown = 1 }, .templates = &.{.{ .name = "T", .views = views }} },
         load(testing.io, a, file).?,
     );
     try std.Io.Dir.cwd().writeFile(testing.io, .{ .sub_path = file, .data = "damaged" });
     try testing.expect(!update(testing.io, a, file, views, struct {
-        fn f(v: []const custom_view.Saved, _: Allocator, st: *State) Allocator.Error!void {
-            st.views = v;
+        fn f(v: []const custom_view.Saved, ar: Allocator, st: *State) Allocator.Error!void {
+            st.templates = try ar.dupe(Template, &.{.{ .name = "T", .views = v }});
         }
     }.f));
 }

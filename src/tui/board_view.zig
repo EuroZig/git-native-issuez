@@ -231,16 +231,18 @@ pub fn slotAt(s: *const AppState, found: ?ui.Hits.Found) ?u32 {
 
 /// Where a drop puts the dragged card in your order: its place among the
 /// target column's other cards. Null when the drop doesn't order: not in
-/// your order, done work, nowhere to land, or the place it has.
+/// your order, into done work, nowhere to land, or the place it has.
 fn lands(s: *const AppState, d: AppState.Drag) ?u32 {
     const to = d.over orelse return null;
     if (notInYourOrder(s) != null or to >= s.board.columns.len) return null;
     const col = s.board.columns[to];
-    if (col.done or !col.target) return null;
     // The frame may be of a newer snapshot than the press: where the card
     // is now, by its ID.
+    const in = indexIn(s, to, d.id);
+    // Into done work, or where it can't go: a move, if any.
+    if (in == null and (col.done or !col.target)) return null;
     const slot = @min(d.slot orelse return null, col.cards.len);
-    const from = indexIn(s, to, d.id) orelse return @intCast(slot);
+    const from = in orelse return @intCast(slot);
     // Its own column: the others close the gap it leaves.
     const at = if (slot > from) slot - 1 else slot;
     return if (at == from) null else @intCast(at);
@@ -379,35 +381,21 @@ fn move(s: *AppState, delta: i32) AppState.Action {
 }
 
 /// Why cards can't be ordered by hand now; null when they can.
-pub fn notInYourOrder(s: *const AppState) ?[]const u8 {
+fn notInYourOrder(s: *const AppState) ?[]const u8 {
     const q = s.bd_query;
     if (q.key != .rank) return "s → rank orders cards by hand";
     if (q.reverse) return "S first: cards are ordered by hand top to bottom";
     return null;
 }
 
-/// A column's cards but the issue `skip`, for `reorder`: in the input
-/// arena.
-pub fn othersOf(s: *AppState, column: u16, skip: Id) Allocator.Error![]const Id {
-    var out: std.ArrayList(Id) = .empty;
-    for (s.board.columns[column].cards) |i| {
-        if (skip.eql(s.snap.issues[i].id)) continue;
-        try out.append(s.input_arena.allocator(), .of(s.snap.issues[i].id));
-    }
-    return out.items;
-}
-
 /// J and K: the selected card a place up or down its column.
 fn reorder(s: *AppState, delta: i32) Allocator.Error!AppState.Action {
     const b = &s.board;
-    const i = b.selectedIssue() orelse return .none;
+    _ = b.selectedIssue() orelse return .none;
     if (notInYourOrder(s)) |why| return s.noted("{s}", .{why});
-    const to: i64 = @as(i64, b.index) + delta;
-    if (to < 0 or to >= b.columns[b.column].cards.len) return .none;
-    const id: Id = .of(s.snap.issues[i].id);
-    const others = try othersOf(s, b.column, id);
-    b.follow = true;
-    return .{ .reorder = .{ .id = id, .others = others, .at = @intCast(to) } };
+    const action = try s.reorderStep(b.columns[b.column].cards, b.index, delta);
+    if (action != .none) b.follow = true;
+    return action;
 }
 
 pub fn click(s: *AppState, card: ui.Target.Card, double: bool) AppState.Action {
@@ -456,13 +444,14 @@ pub fn drop(s: *AppState, d: AppState.Drag) Allocator.Error!AppState.Action {
         if (notInYourOrder(s)) |why| return s.noted("{s}", .{why});
         const at = lands(s, d) orelse return .none;
         b.follow = true;
-        return .{ .reorder = .{ .id = d.id, .others = try othersOf(s, to, d.id), .at = at } };
+        const others = try s.othersBut(col.cards, d.id);
+        return .{ .reorder = .{ .id = d.id, .others = others, .at = at } };
     }
     if (refused(s, col)) return .none;
     b.column = to;
     if (lands(s, d)) |at| return .{ .reorder = .{
         .id = d.id,
-        .others = try othersOf(s, to, d.id),
+        .others = try s.othersBut(col.cards, d.id),
         .at = at,
         .column = col.name,
     } };

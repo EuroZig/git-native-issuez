@@ -29,10 +29,10 @@ them.
   in the TUI's issue view (`r` shows them as written, and back), and by
   `show` on a terminal, wrapped to its width and styled unless `NO_COLOR`
   is set. Into a pipe or a file, and with `--json`, `show` prints the text
-  as written, as before; `--raw` does on a terminal too, and `--color
-  auto|always|never` picks the styling. The library and the C API hand out
-  the text as written. `-Dmarkdown=false` builds without it (the TUI
-  keeps it).
+  as written, as before; `--raw` does on a terminal too. `--color always`
+  renders and styles into a pipe as well, `--color never` renders without
+  styles. An update's field lines (`Priority: high`) stay as written. The
+  library and the C API hand out the text as written.
 - TUI: now and then, never early in a session and at most once a month, the
   status bar asks for a star on GitHub. With `gh` logged in it stays quiet
   once the project is starred (before a notice, `gh` asks GitHub whether
@@ -45,16 +45,13 @@ them.
   view keeps its own filter and sort meanwhile. Each repository has its
   own (its worktrees share them), kept in the TUI's state file, `tui.zon`.
   `ctrl+t` (or `☰`) saves them under a name as a template, and
-  loads or deletes one: a template's views replace a repository's. Views
-  from before they were per repository are a template called Imported.
+  loads or deletes one: a template's views replace a repository's.
 - Your own order on the board: `X-Rank`, a new issue field (format.md §3),
   is each issue's key in an order set by hand, merged like any field. The
   board is in that order by default; drag a card to a place in its column
-  or in another (a line shows where), or move it with `J` and `K`. A move
-  writes the moved issue alone, or gives the cards above it keys when they
-  have none (the first moves in a repository: a commit for each); two
-  cards that got the same key on two clones get new ones on the next move
-  between them. New issues come last. The board has its own filter and sort
+  or in another (a line shows where), or move it with `J` and `K`. Most
+  moves write the moved issue alone; how keys are given is in format.md
+  §3. New issues come last. The board has its own filter and sort
   now, apart from the list's. The list, sorted by rank, orders rows the
   same way: dragged onto another row, or with `J` and `K`.
 - `create --rank`, `edit --rank`, `--no-rank`, `--before` and `--after`,
@@ -69,12 +66,11 @@ them.
 
 ### Fixed
 
-- TUI: with many views of your own the top bar dropped the sync badge and
-  its buttons; views that don't fit now end in `…`.
 - TUI: a comment of more than one paragraph showed only the text after
   its first; the first paragraph (the commit's subject) shows too.
 - `THIRD_PARTY_LICENSES` listed nightwatch in libissuez and the Go module
-  since 0.4.0; it is only in the full flavor.
+  since 0.4.0; it is only in the full flavor. It listed zigimg, which
+  libvaxis no longer links, since 0.5.0.
 
 ### Known limitations
 

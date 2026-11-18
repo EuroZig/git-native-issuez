@@ -150,6 +150,8 @@ pub fn drawTable(s: *AppState, f: ui.Frame, win: ui.Window, t: Table) Allocator.
     ui.settleScroll(&l.scroll, &l.follow, l.selected, l.rows.len, l.visible);
 
     if (t.pane) |p| try f.hit(body, .{ .mpane = p });
+    // Where a dragged row lands in your order.
+    const lands = if (s.drag) |d| landsAt(s, d) else null;
     if (l.rows.len == 0) {
         const msg = t.empty orelse if (snap.issues.len == 0) "No issues yet." else "No issues " ++
             "match the filter.";
@@ -195,8 +197,6 @@ pub fn drawTable(s: *AppState, f: ui.Frame, win: ui.Window, t: Table) Allocator.
             row_win,
             if (t.pane) |p| .{ .mrow = .{ .column = p, .index = index } } else .{ .row = index },
         );
-        // Where a dragged row lands in your order.
-        const lands = if (s.drag) |d| landsAt(s, d) else null;
         if (t.pane == null and lands == index) row_win.writeCell(0, 0, .{
             .char = .{ .grapheme = "▶" },
             .style = .{ .fg = palette.accent, .bold = true },
@@ -419,14 +419,11 @@ fn notInYourOrder(s: *const AppState) ?[]const u8 {
     return null;
 }
 
-/// The rows' issues but `skip`, for `reorder`: in the input arena.
-fn othersOf(s: *AppState, skip: Id) Allocator.Error![]const Id {
-    var out: std.ArrayList(Id) = .empty;
-    for (s.list.rows) |r| {
-        if (skip.eql(s.snap.issues[r.issue].id)) continue;
-        try out.append(s.input_arena.allocator(), .of(s.snap.issues[r.issue].id));
-    }
-    return out.items;
+/// The rows' issues, in the input arena.
+fn rowIssues(s: *AppState) Allocator.Error![]const u32 {
+    const out = try s.input_arena.allocator().alloc(u32, s.list.rows.len);
+    for (s.list.rows, out) |r, *i| i.* = r.issue;
+    return out;
 }
 
 /// Where the issue's row is now, if it is shown.
@@ -438,14 +435,11 @@ fn rowOf(s: *const AppState, id: Id) ?usize {
 /// J and K: the selected row a place down or up.
 fn reorder(s: *AppState, delta: i32) Allocator.Error!AppState.Action {
     const l = &s.list;
-    const i = l.selectedIssue() orelse return .none;
+    _ = l.selectedIssue() orelse return .none;
     if (notInYourOrder(s)) |why| return s.noted("{s}", .{why});
-    const to: i64 = @as(i64, l.selected) + delta;
-    if (to < 0 or to >= l.rows.len) return .none;
-    const id: Id = .of(s.snap.issues[i].id);
-    const others = try othersOf(s, id);
-    l.follow = true;
-    return .{ .reorder = .{ .id = id, .others = others, .at = @intCast(to) } };
+    const action = try s.reorderStep(try rowIssues(s), l.selected, delta);
+    if (action != .none) l.follow = true;
+    return action;
 }
 
 /// The row a drag on the list is over.
@@ -475,7 +469,8 @@ pub fn drop(s: *AppState, d: AppState.Drag) Allocator.Error!AppState.Action {
     if (notInYourOrder(s)) |why| return s.noted("{s}", .{why});
     const at = landsAt(s, d) orelse return .none;
     s.list.follow = true;
-    return .{ .reorder = .{ .id = d.id, .others = try othersOf(s, d.id), .at = at } };
+    const others = try s.othersBut(try rowIssues(s), d.id);
+    return .{ .reorder = .{ .id = d.id, .others = others, .at = at } };
 }
 
 /// Keys on an issue table; null when the key isn't one of them.

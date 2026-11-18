@@ -135,7 +135,7 @@ fn checkOps(a: Allocator, list: api.OpList, ops: []const api.Op, problems: *Prob
             .rank => if (!issuez.format.rank.valid(s)) try check.addValue(
                 .bad_format,
                 s,
-                "a rank is 0-9 and a-z, at most 128, not ending in 0",
+                "a rank is " ++ issuez.format.rank.rule,
             ),
             .locked, .fixed_by, .release, .reason => if (multiline)
                 try check.addValue(.newline, s, "must be one line"),
@@ -360,10 +360,11 @@ fn plan(a: Allocator, list: api.OpList, ops: []const api.Op, problems: *Problems
                 },
                 .reaction_target => p.reaction_target = rt.oidFrom(op.oid),
                 .rank_before, .rank_after => {
-                    if (!uuid_fmt.isCanonical(s)) {
-                        const check = whole.on(.rank, index);
+                    const check = whole.on(.rank, index);
+                    if (!uuid_fmt.isCanonical(s))
                         try check.addValue(.bad_format, s, "references are full UUIDs");
-                    }
+                    if (p.beside != null)
+                        try check.add(.incompatible, "one RANK_BEFORE or RANK_AFTER");
                     p.beside = .{ .id = s, .after = op.target == @backingInt(Opt.rank_after) };
                     p.has_fields = true;
                 },
@@ -1109,13 +1110,7 @@ pub fn issuez_issue_update(
         .{ .target = ce.target, .event = if (ce.delete) .delete else .restore }
     else
         null;
-    if (p.beside) |b| return besideWrite(&c, &w, o, err, p, .{
-        .ident = ident,
-        .ref_name = ref_name,
-        .old_tip = old_tip,
-        .anchor = b.id,
-        .after = b.after,
-    });
+    if (p.beside) |b| return besideWrite(&c, &w, o, err, p, ident, ref_name, old_tip, b);
     const receipt = engine.update(a, ref_name, .{
         .edit = p.edit,
         .comment_event = comment_event,
@@ -1155,16 +1150,12 @@ fn besideWrite(
     out: *?*api.Write,
     err: ?*?*api.Error,
     p: *Plan,
-    at: struct {
-        ident: []const u8,
-        ref_name: []const u8,
-        old_tip: Oid,
-        anchor: []const u8,
-        after: bool,
-    },
+    ident: []const u8,
+    ref_name: []const u8,
+    old_tip: Oid,
+    beside: @FieldType(Plan, "beside"),
 ) Code {
-    const a = c.arena();
-    const ident = at.ident;
+    const at = beside.?;
     const others = p.edit_comment != null or p.comment_event != null or p.reaction != null or
         p.deleted != null or p.edit.rank != null;
     if (others) return rt.fail(
@@ -1174,16 +1165,18 @@ fn besideWrite(
             "reactions or DELETED",
         .{},
     );
-    if (std.mem.eql(u8, at.anchor, ident))
+    if (std.mem.eql(u8, at.id, ident))
         return rt.fail(err, .e_invalid_value, "an issue goes beside another one", .{});
-    const anchor_ref = c.issueRef(at.anchor) catch return rt.oom(err);
+    const anchor_ref = c.issueRef(at.id) catch return rt.oom(err);
     const engine = c.engine();
-    const result = engine.reorderBeside(a, at.ref_name, p.edit, anchor_ref, at.after, .{}) catch |e|
-        return writeFailed(c, err, e, p, ident);
+    const a = c.arena();
+    const result = engine.reorderBeside(a, ref_name, p.edit, anchor_ref, at.after, .{}) catch |e|
+        // A missing anchor is the anchor's problem.
+        return writeFailed(c, err, e, p, if (e == error.IssueDisappeared) at.id else ident);
     c.skipped = false;
     const after_obj = loadObjAt(c, ident, result.tip) catch null;
     const changes = if (after_obj) |x| entryChanges(x, result.tip) else &.{};
-    const parent = parentOf(c, result.tip) orelse at.old_tip;
+    const parent = parentOf(c, result.tip) orelse old_tip;
     const slot = w.receipt.?;
     const write = makeWrite(c, slot, .issue, ident, parent, result.tip, .update, changes, w.who);
     return w.give(out, write);
