@@ -68,6 +68,8 @@ pub const Purpose = union(enum) {
     comment: Id,
     /// The list and board order, not a write.
     sort,
+    /// The order within the sort's groups, not a write.
+    then_sort,
     /// A milestone to filter by, not a write.
     milestones,
     /// The milestones view's order.
@@ -107,7 +109,7 @@ pub const Purpose = union(enum) {
         return switch (p) {
             .title, .description => |id| id,
             .field => |fp| fp.id,
-            .comment, .sort, .milestones, .milestone_sort, .milestone => null,
+            .comment, .sort, .then_sort, .milestones, .milestone_sort, .milestone => null,
             .move, .pane_pick, .quick_add, .add_to, .adopt => null,
             .stage_date, .stage_estimate, .stage_ms_due, .stage_milestone, .stage_unblock => null,
             .view_name, .view_key, .templates, .template_name => null,
@@ -696,27 +698,45 @@ fn durationText(s: *AppState, minutes: u32) []const u8 {
     return print(s, "{d}h{d}m", .{ h, m });
 }
 
-/// The sort keys; choosing the current one flips the order.
+/// The sort keys, and the second one's menu last; choosing the current
+/// one flips the order.
 pub fn openSort(s: *AppState) void {
-    openSortMenu(s, filter.SortKey, s.issueQuery().key, "Sort by", .sort);
+    // Not a letter first: t still jumps to title.
+    const then: Menu.Option = .{ .label = "→ then by…  b", .value = then_value };
+    openSortMenu(s, filter.SortKey, s.issueQuery().key, "Sort by", .sort, &.{then});
 }
 
-/// `Key`'s values as a menu, `current` marked.
+/// The sort menu's entry for the second key's.
+const then_value = "then";
+
+/// The keys that order the issues equal in the sort's, or none.
+pub fn openThenSort(s: *AppState) void {
+    const q = s.issueQuery();
+    const none: Menu.Option = .{
+        .label = "none      ties by the newest",
+        .value = "",
+        .current = q.then == null,
+    };
+    openSortMenu(s, filter.SortKey, q.then, "Then by", .then_sort, &.{none});
+}
+
+/// `Key`'s values as a menu, `current` marked, and `extra` after them.
 fn openSortMenu(
     s: *AppState,
     comptime Key: type,
-    current: Key,
+    current: ?Key,
     title: []const u8,
     purpose: Purpose,
+    extra: []const Menu.Option,
 ) void {
     s.closeModal();
     const keys = std.enums.values(Key);
     const options = s.modalArena().alloc(
         Menu.Option,
-        keys.len,
+        keys.len + extra.len,
     ) catch return s.fail("out of memory", .{});
     var selected: u16 = 0;
-    for (keys, options, 0..) |k, *o, n| {
+    for (keys, options[0..keys.len], 0..) |k, *o, n| {
         if (k == current) selected = @intCast(n);
         o.* = .{
             .label = print(s, "{s:<9} {s}", .{ k.label(), k.order() }),
@@ -724,6 +744,10 @@ fn openSortMenu(
             .current = k == current,
         };
     }
+    @memcpy(options[keys.len..], extra);
+    for (extra, keys.len..) |o, n| if (o.current) {
+        selected = @intCast(n);
+    };
     s.openModal(.{ .menu = .{
         .title = title,
         .options = options,
@@ -738,6 +762,20 @@ fn toggleSort(q: anytype, comptime Key: type, value: []const u8) void {
     if (q.key == k) q.reverse = !q.reverse else {
         q.key = k;
         q.reverse = false;
+    }
+}
+
+/// Choosing the second key in use flips its order; another sorts by it,
+/// none by the ties alone.
+pub fn toggleThen(q: *filter.Query, then: ?filter.SortKey) void {
+    const k = then orelse {
+        q.then = null;
+        q.then_reverse = false;
+        return;
+    };
+    if (q.then == k) q.then_reverse = !q.then_reverse else {
+        q.then = k;
+        q.then_reverse = false;
     }
 }
 
@@ -1095,7 +1133,14 @@ fn menuSubmit(s: *AppState, mn: *Menu) Action {
             s.filterChanged();
             return .none;
         },
-        .sort => toggleSort(s.issueQuery(), filter.SortKey, o.value),
+        .sort => {
+            if (std.mem.eql(u8, o.value, then_value)) {
+                openThenSort(s);
+                return .none;
+            }
+            toggleSort(s.issueQuery(), filter.SortKey, o.value);
+        },
+        .then_sort => toggleThen(s.issueQuery(), std.meta.stringToEnum(filter.SortKey, o.value)),
         .milestone_sort => {
             toggleSort(&s.ms_query, milestone_filter.SortKey, o.value);
             s.milestones.follow = true;
@@ -1905,6 +1950,7 @@ pub fn openMilestoneSort(s: *AppState) void {
         s.ms_query.key,
         "Sort milestones by",
         .milestone_sort,
+        &.{},
     );
 }
 
@@ -2145,6 +2191,7 @@ const help_lines = [_][]const u8{
     "  ctrl+t          templates: save your views under a name, load them elsewhere",
     "  n               new issue",
     "  /               filter                s / S    sort by… / reverse",
+    "  b / B           then by…: order within the sort's groups / reverse it",
     "  f               open, done, all       ctrl+r   reload",
     "  M               milestones            p        sync with the remote",
     "  ?               this help             q        quit (back in an issue)",
@@ -2157,6 +2204,7 @@ const help_lines = [_][]const u8{
     "  t               tree (list)           < >      move card (board)",
     "  ←→ h l          column (board)        g G      first / last",
     "  J K shift+↑↓    row or card down / up, in your order: s → rank; or drag it",
+    "                  within the sort's groups, b → rank",
     "",
     "Issue",
     "  ↑↓ j k tab      select a part         ⏎ space  edit or open it",
@@ -2213,7 +2261,8 @@ const help_lines = [_][]const u8{
     "",
     "Mouse",
     "  click selects, double-click opens; click any field to edit it;",
-    "  click column titles to sort; drag cards between board columns;",
+    "  click column titles to sort, shift-click to sort then by them;",
+    "  drag cards between board columns;",
     "  the wheel scrolls lists, columns, issues and text boxes.",
     "",
     "Filter",

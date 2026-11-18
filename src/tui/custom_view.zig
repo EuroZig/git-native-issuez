@@ -35,6 +35,10 @@ pub const Saved = struct {
     /// The view's own default when empty.
     sort: []const u8 = "",
     reverse: bool = false,
+    /// The list, the board and the timeline: the key within the sort's
+    /// groups, none when empty.
+    then: []const u8 = "",
+    then_reverse: bool = false,
     /// The list and the timeline: sub-issues under their parents.
     tree: bool = false,
 };
@@ -109,6 +113,9 @@ pub const View = struct {
             q.key = std.meta.stringToEnum(filter.SortKey, saved.sort) orelse q.key;
             q.reverse = saved.reverse;
             q.tree = saved.tree;
+            // One a newer version adds: none, rather than the view skipped.
+            q.then = std.meta.stringToEnum(filter.SortKey, saved.then);
+            q.then_reverse = q.then != null and saved.then_reverse;
         }
         v.name = try gpa.dupe(u8, saved.name);
         errdefer gpa.free(v.name);
@@ -133,6 +140,10 @@ pub const View = struct {
             out.sort = @tagName(v.issues.key);
             out.reverse = v.issues.reverse;
             out.tree = v.issues.tree;
+            if (v.issues.then) |t| {
+                out.then = @tagName(t);
+                out.then_reverse = v.issues.then_reverse;
+            }
         }
         return out;
     }
@@ -290,6 +301,8 @@ fn apply(s: *AppState, v: *const View) Allocator.Error!void {
             q.key = v.issues.key;
             q.reverse = v.issues.reverse;
             q.tree = v.issues.tree;
+            q.then = v.issues.then;
+            q.then_reverse = v.issues.then_reverse;
         },
     }
 }
@@ -352,10 +365,15 @@ test "saved: unknown views, keys and names skipped; unknown sorts are the defaul
         .{ .name = "Low", .key = 3 },
         .{ .name = "Late", .key = 0, .view = "timeline", .sort = "someday", .scope = "all" },
         .{ .name = "Ms", .key = 9, .view = "milestones", .sort = "health", .reverse = true },
+        .{ .name = "Soon", .key = 8, .then = "someday", .then_reverse = true },
+        .{ .name = "Due", .key = 6, .view = "board", .sort = "due", .then = "rank" },
     });
+    try testing.expect(s.views[3].?.issues.then == null and !s.views[3].?.issues.then_reverse);
+    try testing.expectEqual(filter.SortKey.rank, s.views[1].?.issues.then.?);
     try testing.expectEqualStrings("Bugs", s.views[0].?.name);
     try testing.expectEqual(filter.SortKey.priority, s.views[0].?.issues.key);
-    try testing.expect(s.views[1] == null and s.views[2] == null and s.views[3] == null);
+    // Skipped: Taken, Gantt, the nameless and Low; 6 and 8 are Due's and Soon's.
+    try testing.expect(s.views[2] == null);
     const late = s.views[5].?;
     try testing.expectEqual(filter.SortKey.start, late.issues.key);
     try testing.expectEqual(filter.Scope.all, late.issues.scope);
@@ -364,7 +382,7 @@ test "saved: unknown views, keys and names skipped; unknown sorts are the defaul
     var arena_state: std.heap.ArenaAllocator = .init(gpa);
     defer arena_state.deinit();
     const out = try toSaved(&s, arena_state.allocator());
-    try testing.expectEqual(3, out.len);
+    try testing.expectEqual(5, out.len);
     try testing.expectEqualDeep(Saved{
         .name = "Bugs",
         .key = 5,
@@ -372,7 +390,15 @@ test "saved: unknown views, keys and names skipped; unknown sorts are the defaul
         .sort = "priority",
         .tree = true,
     }, out[0]);
-    try testing.expectEqual(0, out[2].key);
+    try testing.expectEqualDeep(Saved{
+        .name = "Due",
+        .key = 6,
+        .view = "board",
+        .sort = "due",
+        .then = "rank",
+    }, out[1]);
+    try testing.expectEqualStrings("", out[2].then);
+    try testing.expectEqual(0, out[4].key);
 }
 
 test "names: one line, not blank, at most 32 bytes" {

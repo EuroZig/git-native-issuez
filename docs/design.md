@@ -386,7 +386,8 @@ hold identical refs: the fuzzer checks exactly that.
   under a lock, as the star notice's task writes it too.
 - `src/tui/custom_view.zig`: the user's views, a filter and sort of one of
   the four views on a key of 5 to 0. Views, scopes and sort keys are kept
-  by name, so one a newer version adds skips only that view. A view shown
+  by name, so one a newer version adds skips only that view; a second
+  sort key (`then`) this version doesn't know is none instead. A view shown
   puts its filter and sort in its default view's query; the default's own
   wait in a stash until another tab is chosen, so none of the views reads
   anything else.

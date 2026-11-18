@@ -10,17 +10,17 @@ versions may change the library API; the on-disk format only ever grows (see
 
 ## [0.6.0] - 2026-11-18
 
-Your own order on the board, views of your own, and Markdown rendered in
-the TUI and `show`. The on-disk format gains one optional field,
-`X-Rank` (format.md §3; `Format-Version` stays 1): upstream keeps it like
-any `X-` field, and older versions of git-native-issuez show it among the
-other fields. A C host needs the 0.6.0 `issuez.h` (before 1.0, the header
-and the library must have the same minor version); `issuez_issue_info`
-gains `rank` at its end. In Zig, `query.SortKey` and the view's fields
-gain `rank`, so an exhaustive switch over either needs a branch for it.
-Building git-issue now also fetches markdownz and uucode (and, for the
-TUI, known-folders); projects that only use the library fetch none of
-them.
+Your own order on the board, views of your own, a second sort key in the
+TUI, and Markdown rendered in the TUI and `show`. The on-disk format gains
+one optional field, `X-Rank` (format.md §3; `Format-Version` stays 1):
+upstream keeps it like any `X-` field, and older versions of
+git-native-issuez show it among the other fields. A C host needs the 0.6.0
+`issuez.h` (before 1.0, the header and the library must have the same
+minor version); `issuez_issue_info` gains `rank` at its end. In Zig,
+`query.SortKey` and the view's fields gain `rank`, so an exhaustive switch
+over either needs a branch for it. Building git-issue now also fetches
+markdownz and uucode (and, for the TUI, known-folders); projects that only
+use the library fetch none of them.
 
 ### Added
 
@@ -54,6 +54,15 @@ them.
   §3. New issues come last. The board has its own filter and sort
   now, apart from the list's. The list, sorted by rank, orders rows the
   same way: dragged onto another row, or with `J` and `K`.
+- TUI: sort then by a second key. `b`, `→ then by…` in the sort menu, the
+  filter bar's `then` or a shift-click on a column title picks the key
+  that orders the issues equal in the sort's; `B` reverses it. With one,
+  `updated` and `created` count by the local day, so "updated, then by
+  priority" orders each day's work. Each group has its name above it, in
+  the list on a line of its own and on the board between the cards (not
+  in the tree, nor for titles, IDs and ranks, which hardly tie). Sorted
+  then by rank, `J`, `K` and drags order by hand within a group, as rank
+  can't move an issue out of it. Views of your own keep the second key.
 - `create --rank`, `edit --rank`, `--no-rank`, `--before` and `--after`,
   `ls --sort rank`; `rank` in the JSON. MCP: `rank` on `create_issue`,
   `rank`, `before` and `after` on `edit_issue`, `rank` as a sort. Library:

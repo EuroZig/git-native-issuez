@@ -126,6 +126,9 @@ entities or bare URLs.
 The board (`2`) is in your order: drag a card to a place in its column or
 in another one, where a line shows where it lands, or move it with `J` and
 `K`. The list does the same once sorted by rank (`s`), without the tree.
+`b` sorts then by a second key, within the groups of issues the first
+one has in common: by priority then by rank, say, a line marks where
+each priority ends, and cards move by hand within their priority.
 The order is the issues' `X-Rank` keys, shared like any field
 ([docs/format.md](docs/format.md) §3), and new issues come last. `git
 issue edit --before` / `--after` and `ls --sort rank` use it from the

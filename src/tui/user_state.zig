@@ -236,6 +236,7 @@ test "state: written and read back; missing fields default, unknown ones are ski
         .projects = &.{.{ .path = "/r/.git", .views = &.{
             .{ .name = "Bugs", .key = 5, .filter = "label:bug", .sort = "priority", .tree = true },
             .{ .name = "Due", .key = 0, .view = "milestones", .scope = "all", .reverse = true },
+            .{ .name = "Soon", .key = 6, .sort = "due", .then = "priority", .then_reverse = true },
         } }},
     };
     var out: std.Io.Writer.Allocating = .init(a);

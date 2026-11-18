@@ -559,25 +559,21 @@ pub fn newIssue(s: *State, parent: ?u32) void {
     s.openModal(.{ .form = m });
 }
 
-/// The view's issue query with the filter text as typed.
+/// The view's issue query with the filter text as typed, and where days start.
 pub fn currentQuery(s: *const State) filter.Query {
-    if (s.view == .milestone) {
-        var q = s.mv_query;
-        q.text = s.mv_search.text();
-        return q;
-    }
-    if (s.view == .timeline) {
-        var q = s.tl_query;
-        q.text = s.tl_search.text();
-        return q;
-    }
-    if (s.view == .board) {
-        var q = s.bd_query;
-        q.text = s.bd_search.text();
-        return q;
-    }
-    var q = s.query;
-    q.text = s.search.text();
+    var q = switch (s.view) {
+        .milestone => s.mv_query,
+        .timeline => s.tl_query,
+        .board => s.bd_query,
+        else => s.query,
+    };
+    q.text = switch (s.view) {
+        .milestone => s.mv_search.text(),
+        .timeline => s.tl_search.text(),
+        .board => s.bd_search.text(),
+        else => s.search.text(),
+    };
+    q.utc_offset_s = s.utc_offset_s;
     return q;
 }
 
@@ -876,10 +872,10 @@ fn drawStatusBar(s: *State, f: ui.Frame, bar: ui.Window) Allocator.Error!void {
         return s.drawStarNotice(f, bar, 1 + used + 2);
     }
     const hint: []const u8 = if (s.modal) |m| m.hint() else switch (s.view) {
-        .list => "↑↓ move  ⏎ open  n new  a sub-issue  x close/reopen  / filter  s sort  t tree " ++
-            " J K order  f scope  ? help  q quit",
+        .list => "↑↓ move  ⏎ open  n new  a sub-issue  x close/reopen  / filter  s sort  " ++
+            "b then  t tree  J K order  f scope  ? help  q quit",
         .board => "←→ column  ↑↓ card  ⏎ open  < > move card  J K order  n new  x close/reopen  " ++
-            "/ filter  s sort  ? help",
+            "/ filter  s sort  b then  ? help",
         .milestones => "↑↓ move  ⏎ open  n new  e edit  r rename  d due  c complete  R retire  " ++
             "o reopen  / filter  s sort  f scope  w progress  ? help",
         .timeline => if (s.timeline.editing)
@@ -1081,6 +1077,15 @@ fn handleKey(s: *State, k: vaxis.Key) Allocator.Error!Action {
             q.reverse = !q.reverse;
             return .none;
         }
+        if (k.matches('b', .{})) {
+            modal_mod.openThenSort(s);
+            return .none;
+        }
+        if (k.matches('B', .{})) {
+            if (q.then == null) return s.noted("no then: b picks the key within the sort's", .{});
+            q.then_reverse = !q.then_reverse;
+            return .none;
+        }
         if (k.matches('M', .{})) {
             modal_mod.openMilestones(s);
             return .none;
@@ -1228,7 +1233,7 @@ fn handleMouse(s: *State, m: vaxis.Mouse, now_ms: i64) Allocator.Error!Action {
             s.filterChanged();
         },
         .tree => q.tree = !q.tree,
-        .sort => |key| {
+        .sort => |key| if (m.mods.shift) modal_mod.toggleThen(q, key) else {
             if (q.key == key) q.reverse = !q.reverse else {
                 q.key = key;
                 q.reverse = false;
@@ -1240,6 +1245,7 @@ fn handleMouse(s: *State, m: vaxis.Mouse, now_ms: i64) Allocator.Error!Action {
         } else {
             q.reverse = !q.reverse;
         },
+        .then_reverse => q.then_reverse = !q.then_reverse,
         .search => {
             s.search_focused = true;
             s.searchBox().clickLine(h.x);
@@ -1282,6 +1288,7 @@ pub fn command(s: *State, c: ui.Command) Action {
         .sort => if (s.view == .milestones) modal_mod.openMilestoneSort(
             s,
         ) else modal_mod.openSort(s),
+        .then_sort => modal_mod.openThenSort(s),
         .quit => return if (timeline_view.edit.mayLeave(s, .quit)) s.quitUnlessSyncing() else .none,
         .sync_panel => return .open_sync_panel,
         .back => s.back(),

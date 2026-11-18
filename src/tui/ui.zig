@@ -29,6 +29,7 @@ pub const Target = union(enum) {
     tree,
     sort: filter.SortKey,
     sort_reverse,
+    then_reverse,
     search,
     /// A list row, by position in the rows.
     row: u32,
@@ -76,6 +77,8 @@ pub const Command = enum {
     reload,
     help,
     sort,
+    /// The second key's menu.
+    then_sort,
     quit,
     back,
     ms_edit,
@@ -227,6 +230,16 @@ pub const palette = struct {
     pub const label: vaxis.Color = .{ .index = 180 };
     pub const id: vaxis.Color = .{ .index = 109 };
 };
+
+/// `── name ───`, faint: where a group starts, in the list and on the board.
+pub fn divider(line: Window, name: []const u8) void {
+    line.fill(.{ .char = .{ .grapheme = "─", .width = 1 }, .style = .{ .fg = palette.faint } });
+    // Narrow: the rule alone.
+    const w = line.gwidth(name);
+    if (w + 6 > line.width) return;
+    line.child(.{ .x_off = 2, .width = w + 2 }).fill(.{ .style = .{} });
+    _ = text(line, 3, 0, name, .{ .fg = palette.muted });
+}
 
 pub fn healthColor(h: issuez.schedule.Health) vaxis.Color {
     return switch (h) {

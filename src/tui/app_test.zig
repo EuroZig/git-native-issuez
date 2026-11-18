@@ -145,6 +145,10 @@ const Harness = struct {
     /// A click in the middle of the first hit with this target, which
     /// must be the one on top there.
     fn click(h: *Harness, target: ui.Target) !void {
+        return h.clickWith(target, .{});
+    }
+
+    fn clickWith(h: *Harness, target: ui.Target, mods: vaxis.Mouse.Modifiers) !void {
         const hit = for (h.app.state.hits.items.items) |x| {
             if (x.target.eql(target)) break x;
         } else return error.NoSuchTarget;
@@ -152,7 +156,7 @@ const Harness = struct {
             .col = @intCast(hit.x + hit.w / 2),
             .row = @intCast(hit.y + hit.h / 2),
             .button = .left,
-            .mods = .{},
+            .mods = mods,
             .type = .press,
         };
         const found = h.app.state.hits.find(m.col, m.row) orelse return error.TargetCovered;
@@ -718,6 +722,80 @@ test "list: rows in your order, dragged to a place or moved with J and K" {
     try testing.expect(h.shows("t first"));
 }
 
+test "then by rank: J, K and drags order within the group, not out of it" {
+    const h = try Harness.create();
+    defer h.destroy();
+    _ = try h.app.store.create(.{ .title = "A", .priority = .high });
+    _ = try h.app.store.create(.{ .title = "B", .priority = .high });
+    _ = try h.app.store.create(.{ .title = "C", .priority = .low });
+    const s = &h.app.state;
+    const tip = struct {
+        fn of(hh: *Harness, t: []const u8) issuez.engine.Oid {
+            return hh.snap().issues[hh.byTitle(t).?].tip;
+        }
+    }.of;
+    const card = struct {
+        fn of(n: u32) ui.Target {
+            return .{ .card = .{ .column = 0, .index = n } };
+        }
+    }.of;
+
+    // The board, by priority, then by rank: high's A and B, then C.
+    try h.press('2', .{});
+    s.bd_query.key = .priority;
+    try h.press('J', .{});
+    try testing.expect(h.shows("b → rank within groups"));
+    s.bd_query.then = .rank;
+    try h.draw();
+    try expectTitles(h, s.board.columns[0].cards, &.{ "A", "B", "C" });
+    try h.press('J', .{});
+    try expectTitles(h, s.board.columns[0].cards, &.{ "B", "A", "C" });
+    const a = tip(h, "A");
+    const c = tip(h, "C");
+    try h.press('J', .{});
+    try testing.expect(h.shows("rank orders cards within high"));
+    try testing.expect(tip(h, "A").eql(a) and tip(h, "C").eql(c));
+    // Into another group: no drop line, a hint, nothing written.
+    var at = try dragCard(h, card(2), card(0), 0);
+    try testing.expect(!h.shows("━━━━"));
+    try release(h, at);
+    try testing.expect(h.shows("rank orders cards within low"));
+    try testing.expect(tip(h, "C").eql(c));
+    // Within it: B after A.
+    at = try dragCard(h, card(0), card(1), 3);
+    try testing.expect(h.shows("━━━━"));
+    try release(h, at);
+    try expectTitles(h, s.board.columns[0].cards, &.{ "A", "B", "C" });
+    try h.press('B', .{});
+    try h.press('J', .{});
+    try testing.expect(h.shows("B first"));
+    // By titles, which make no groups: rank orders nothing.
+    s.bd_query = .{ .key = .title, .then = .rank };
+    try h.press('J', .{});
+    try testing.expect(h.shows("s → rank orders cards by hand"));
+
+    // The list, the same.
+    try h.press('1', .{});
+    s.query.key = .priority;
+    s.query.then = .rank;
+    try h.draw();
+    try expectRows(h, &.{ "A", "B", "C" });
+    s.list.selected = 0;
+    s.list.selected_id = .of(h.snap().issues[s.list.rows[0].issue].id);
+    try h.press('J', .{});
+    try expectRows(h, &.{ "B", "A", "C" });
+    try h.press('J', .{});
+    try testing.expect(h.shows("rank orders rows within high"));
+    at = try dragCard(h, .{ .row = 2 }, .{ .row = 0 }, 0);
+    try testing.expect(!h.shows("▶"));
+    try release(h, at);
+    try testing.expect(h.shows("rank orders rows within low"));
+    try testing.expect(tip(h, "C").eql(c));
+    at = try dragCard(h, .{ .row = 1 }, .{ .row = 0 }, 0);
+    try release(h, at);
+    try expectRows(h, &.{ "A", "B", "C" });
+}
+
 test "list: filter, scope and sort" {
     const h = try Harness.create();
     defer h.destroy();
@@ -959,6 +1037,220 @@ test "sort by state: open first, in workflow order" {
     const rows = h.app.state.list.rows;
     const want = [_][]const u8{ "Default", "Ready", "Review" };
     for (want, rows) |t, r| try testing.expectEqualStrings(t, h.snap().issues[r.issue].title);
+}
+
+fn expectTitles(h: *Harness, issues: []const u32, want: []const []const u8) !void {
+    try testing.expectEqual(want.len, issues.len);
+    for (want, issues) |t, i| try testing.expectEqualStrings(t, h.snap().issues[i].title);
+}
+
+fn expectRows(h: *Harness, want: []const []const u8) !void {
+    var issues: [16]u32 = undefined;
+    for (h.app.state.list.rows, 0..) |r, n| issues[n] = r.issue;
+    try expectTitles(h, issues[0..h.app.state.list.rows.len], want);
+}
+
+test "sort then by a second key: by day, each key in its own order" {
+    const h = try Harness.create();
+    defer h.destroy();
+    // 2023-11-13, then 2023-11-14 at 21:13 and 22:13 UTC.
+    h.world.clock.now = 1_700_000_000 - 86_400;
+    _ = try h.app.store.create(.{ .title = "Old low", .priority = .low });
+    _ = try h.app.store.create(.{ .title = "Old high", .priority = .high });
+    h.world.clock.now = 1_700_000_000 - 3600;
+    _ = try h.app.store.create(.{ .title = "New low", .priority = .low });
+    h.world.clock.now = 1_700_000_000;
+    _ = try h.app.store.create(.{ .title = "New none" });
+    _ = try h.app.store.create(.{ .title = "New high", .priority = .high });
+    try h.draw();
+    const q = &h.app.state.query;
+    try expectRows(h, &.{ "New high", "New none", "New low", "Old high", "Old low" });
+
+    q.then = .priority;
+    try h.draw();
+    try expectRows(h, &.{ "New high", "New low", "New none", "Old high", "Old low" });
+    q.then_reverse = true;
+    try h.draw();
+    try expectRows(h, &.{ "New none", "New low", "New high", "Old low", "Old high" });
+    q.then_reverse = false;
+    q.reverse = true;
+    try h.draw();
+    try expectRows(h, &.{ "Old high", "Old low", "New high", "New low", "New none" });
+    q.reverse = false;
+
+    // Two hours ahead of UTC, 22:13 is the next day, and 21:13 the day
+    // the old ones are on.
+    h.app.state.utc_offset_s = 2 * 3600;
+    try h.draw();
+    try expectRows(h, &.{ "New high", "New none", "Old high", "New low", "Old low" });
+    const rows = h.app.state.list.rows;
+    const cq = h.app.state.currentQuery();
+    try testing.expect(filter.sameGroup(h.snap(), cq, rows[0].issue, rows[1].issue));
+    try testing.expect(!filter.sameGroup(h.snap(), cq, rows[1].issue, rows[2].issue));
+    try testing.expect(filter.sameGroup(h.snap(), cq, rows[2].issue, rows[4].issue));
+    h.app.state.utc_offset_s = 0;
+
+    // A key without equal issues leaves nothing to `then`.
+    q.key = .title;
+    try h.draw();
+    try expectRows(h, &.{ "New high", "New low", "New none", "Old high", "Old low" });
+
+    // The board's columns and done work, sorted the same.
+    const done = h.byTitle("Old low").?;
+    try h.app.store.setState(h.snap().issues[done].id, .closed, null);
+    h.app.state.bd_query = .{
+        .key = .priority,
+        .then = .title,
+        .then_reverse = true,
+        .scope = .all,
+    };
+    try h.press('2', .{});
+    const cols = h.app.state.board.columns;
+    const open = for (cols) |c| {
+        if (c.cards.len > 0) break c;
+    } else return error.NoCards;
+    try expectTitles(h, open.cards, &.{ "Old high", "New high", "New low", "New none" });
+    try expectTitles(h, cols[cols.len - 1].cards, &.{"Old low"});
+}
+
+test "then by: the menu, b and B, the bar and shift-clicked column titles" {
+    const h = try Harness.create();
+    defer h.destroy();
+    _ = try h.app.store.create(.{ .title = "Beta", .priority = .low });
+    _ = try h.app.store.create(.{ .title = "Alpha", .priority = .low });
+    _ = try h.app.store.create(.{ .title = "Gamma", .priority = .high });
+    try h.click(.{ .sort = .priority });
+    const q = &h.app.state.query;
+    try testing.expect(h.shows("then  … "));
+
+    // b: the menu; a letter jumps, as in the sort menu.
+    try h.press('b', .{});
+    try h.press('t', .{});
+    try h.press(K.enter, .{});
+    try testing.expectEqual(filter.SortKey.title, q.then.?);
+    try expectRows(h, &.{ "Gamma", "Alpha", "Beta" });
+    try testing.expect(h.shows("then  title ▾  ↓ "));
+    try h.press('B', .{});
+    try expectRows(h, &.{ "Gamma", "Beta", "Alpha" });
+    try h.click(.then_reverse);
+    try testing.expect(!q.then_reverse);
+
+    // From the sort menu; choosing the key in use flips it.
+    try h.press('s', .{});
+    const keys = std.enums.values(filter.SortKey).len;
+    try h.click(.{ .modal = .{ .choice = keys } });
+    try testing.expectEqualStrings("Then by", h.app.state.modal.?.menu.title);
+    try h.click(.{ .modal = .{ .choice = @backingInt(filter.SortKey.title) } });
+    try testing.expect(q.then_reverse);
+    try testing.expect(h.app.state.modal == null);
+
+    // None: the ties alone; B says how to get one.
+    try h.click(.{ .command = .then_sort });
+    try h.click(.{ .modal = .{ .choice = keys } });
+    try testing.expect(q.then == null and !q.then_reverse);
+    try h.press('B', .{});
+    try testing.expect(h.shows("b picks the key"));
+
+    // Shift on a column title: then by it; the key stays.
+    try h.clickWith(.{ .sort = .id }, .{ .shift = true });
+    try testing.expectEqual(filter.SortKey.priority, q.key);
+    try testing.expectEqual(filter.SortKey.id, q.then.?);
+    try h.clickWith(.{ .sort = .id }, .{ .shift = true });
+    try testing.expect(q.then_reverse);
+    try h.click(.{ .sort = .title });
+    try testing.expectEqual(filter.SortKey.title, q.key);
+    try testing.expectEqual(filter.SortKey.id, q.then.?);
+}
+
+test "then by: a group's name above it, in the list and on the board" {
+    const h = try Harness.create();
+    defer h.destroy();
+    _ = try h.app.store.create(.{ .title = "Beta", .priority = .high });
+    _ = try h.app.store.create(.{ .title = "Alpha", .priority = .high });
+    _ = try h.app.store.create(.{ .title = "Gamma", .priority = .low });
+    const s = &h.app.state;
+    s.query.key = .priority;
+    try h.draw();
+    try testing.expect(!h.shows("── high ──"));
+
+    s.query.then = .title;
+    try h.draw();
+    try expectRows(h, &.{ "Alpha", "Beta", "Gamma" });
+    try testing.expect(h.shows("── high ──"));
+    try testing.expect(h.shows("── low ──"));
+    // A line of its own, not a row: rows go on by row.
+    const y = struct {
+        fn of(hh: *Harness, needle: []const u8) usize {
+            for (0..Harness.rows) |row| {
+                var line: [512]u8 = undefined;
+                var len: usize = 0;
+                for (0..Harness.cols) |x| {
+                    const g = hh.screen.readCell(@intCast(x), @intCast(row)).?.char.grapheme;
+                    if (len + g.len > line.len) break;
+                    @memcpy(line[len..][0..g.len], g);
+                    len += g.len;
+                }
+                if (std.mem.find(u8, line[0..len], needle) != null) return row;
+            }
+            unreachable;
+        }
+    }.of;
+    try testing.expectEqual(y(h, "── high ──") + 1, y(h, "Alpha"));
+    try testing.expectEqual(y(h, "Alpha") + 1, y(h, "Beta"));
+    try testing.expectEqual(y(h, "Beta") + 2, y(h, "Gamma"));
+    try h.click(.{ .row = 2 });
+    try testing.expectEqualStrings("Gamma", h.snap().issues[s.list.selectedIssue().?].title);
+    // In the tree, or by a key without ties: none.
+    s.query.tree = true;
+    try h.draw();
+    try testing.expect(!h.shows("── high ──"));
+    s.query.tree = false;
+    s.query.key = .title;
+    try h.draw();
+    try testing.expect(!h.shows("── "));
+
+    try h.press('2', .{});
+    h.app.state.bd_query.key = .priority;
+    try h.draw();
+    try testing.expect(!h.shows("── high ──"));
+    h.app.state.bd_query.then = .title;
+    try h.draw();
+    try testing.expect(h.shows("── high ──"));
+    try testing.expect(h.shows("── low ──"));
+}
+
+test "then by: with a divider over every row, the selection stays in view" {
+    const h = try Harness.create();
+    defer h.destroy();
+    var buf: [16]u8 = undefined;
+    for (1..29) |d| {
+        const id = try h.app.store.create(.{
+            .title = try std.fmt.bufPrint(&buf, "Due {d:0>2}", .{d}),
+        });
+        const due = date(try std.fmt.bufPrint(&buf, "2026-12-{d:0>2}", .{d}));
+        try h.app.store.edit(id.slice(), .{ .due_date = due });
+    }
+    h.app.state.query.key = .due;
+    h.app.state.query.then = .title;
+    try h.draw();
+    try testing.expect(h.shows("── due 2026-12-01 ──"));
+    try h.press('G', .{});
+    const selected = h.app.state.list.selectedIssue().?;
+    try testing.expectEqualStrings("Due 28", h.snap().issues[selected].title);
+    try testing.expect(h.shows("Due 28"));
+    try testing.expect(h.shows("── due 2026-12-28 ──"));
+    try testing.expect(!h.shows("Due 01"));
+    // Frames that don't follow the selection keep it in view.
+    try h.draw();
+    try h.draw();
+    try testing.expect(h.shows("Due 28"));
+    try h.press('g', .{});
+    try testing.expect(h.shows("Due 01"));
+    // The wheel reaches the last row, and no further.
+    h.app.state.list.scrollBy(1000);
+    try h.draw();
+    try testing.expect(h.shows("Due 28") and !h.shows("Due 01"));
+    try testing.expect(h.app.state.list.scroll < 28);
 }
 
 test "board: a column for a state that isn't configured takes no cards" {
